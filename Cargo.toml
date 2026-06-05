@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/presence-core", "crates/presence-web"]
+members = [".", "crates/presence-core", "crates/presence-web", "crates/station-web"]
 
 [package]
 name = "intendant"

@@ -1,5 +1,5 @@
-use crate::presence::{self, AgentStateSnapshot};
 use crate::event::{AppEvent, ControlMsg, EventBus};
+use crate::presence::{self, AgentStateSnapshot};
 use crate::types::LogLevel;
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -99,7 +99,9 @@ impl DisplayInputHolder {
     /// side gets a silent drop rather than mis-authorization.
     fn matches_local_ws(&self, connection_id: &str) -> bool {
         match self {
-            Self::LocalWs { connection_id: c, .. } => c == connection_id,
+            Self::LocalWs {
+                connection_id: c, ..
+            } => c == connection_id,
             Self::FederatedWebRtc { .. } => false,
         }
     }
@@ -108,11 +110,7 @@ impl DisplayInputHolder {
     /// `(federation_connection_id, session_id)` pair. Used by the
     /// federated input gate (in F-2) and the federated close-cleanup
     /// path.
-    fn matches_federated(
-        &self,
-        federation_connection_id: &str,
-        session_id: &str,
-    ) -> bool {
+    fn matches_federated(&self, federation_connection_id: &str, session_id: &str) -> bool {
         match self {
             Self::FederatedWebRtc {
                 federation_connection_id: c,
@@ -147,12 +145,22 @@ impl DisplayInputHolder {
     fn same_identity(&self, other: &DisplayInputHolder) -> bool {
         match (self, other) {
             (
-                Self::LocalWs { connection_id: a, .. },
-                Self::LocalWs { connection_id: b, .. },
+                Self::LocalWs {
+                    connection_id: a, ..
+                },
+                Self::LocalWs {
+                    connection_id: b, ..
+                },
             ) => a == b,
             (
-                Self::FederatedWebRtc { federation_connection_id: ca, session_id: sa },
-                Self::FederatedWebRtc { federation_connection_id: cb, session_id: sb },
+                Self::FederatedWebRtc {
+                    federation_connection_id: ca,
+                    session_id: sa,
+                },
+                Self::FederatedWebRtc {
+                    federation_connection_id: cb,
+                    session_id: sb,
+                },
             ) => ca == cb && sa == sb,
             _ => false,
         }
@@ -290,9 +298,7 @@ fn apply_grant_input_authority(
     // Arc-backed).
     let broadcast_holder = new_holder.clone();
     let prior = {
-        let mut map = authority
-            .write()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut map = authority.write().unwrap_or_else(|e| e.into_inner());
         map.insert(display_id, new_holder)
     };
     // Only `LocalWs` prior holders get the direct revoke confirmation
@@ -336,9 +342,7 @@ fn apply_release_input_authority(
     authority_change_tx: &broadcast::Sender<DisplayInputAuthorityChange>,
 ) -> bool {
     let removed = {
-        let mut map = authority
-            .write()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut map = authority.write().unwrap_or_else(|e| e.into_inner());
         match map.get(&display_id) {
             Some(entry) if entry.matches_local_ws(releaser_connection_id) => {
                 map.remove(&display_id);
@@ -391,9 +395,7 @@ fn apply_grant_input_authority_federated(
     };
     let broadcast_holder = new_holder.clone();
     let prior = {
-        let mut map = authority
-            .write()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut map = authority.write().unwrap_or_else(|e| e.into_inner());
         map.insert(display_id, new_holder)
     };
     // Prior LocalWs holder gets the legacy direct revoke; prior
@@ -435,13 +437,9 @@ fn apply_release_input_authority_federated(
     authority_change_tx: &broadcast::Sender<DisplayInputAuthorityChange>,
 ) -> bool {
     let removed = {
-        let mut map = authority
-            .write()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut map = authority.write().unwrap_or_else(|e| e.into_inner());
         match map.get(&display_id) {
-            Some(entry)
-                if entry.matches_federated(federation_connection_id, session_id) =>
-            {
+            Some(entry) if entry.matches_federated(federation_connection_id, session_id) => {
                 map.remove(&display_id);
                 true
             }
@@ -478,9 +476,7 @@ fn apply_federated_ws_close_input_authority(
     authority_change_tx: &broadcast::Sender<DisplayInputAuthorityChange>,
 ) -> Vec<u32> {
     let released: Vec<u32> = {
-        let mut map = authority
-            .write()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut map = authority.write().unwrap_or_else(|e| e.into_inner());
         let mut out = Vec::new();
         map.retain(|did, entry| match entry {
             DisplayInputHolder::FederatedWebRtc {
@@ -578,14 +574,8 @@ fn peer_id_for_federated_session(session_id: &str) -> crate::display::PeerId {
 /// gateway listener task; cloned per-WS for the inbound handler so
 /// every per-connection branch can register/unregister without
 /// passing the registry through every helper signature.
-type FederatedAuthoritySubscribers = Arc<
-    StdRwLock<
-        HashMap<
-            (String, String, u32),
-            FederatedAuthoritySubscriber,
-        >,
-    >,
->;
+type FederatedAuthoritySubscribers =
+    Arc<StdRwLock<HashMap<(String, String, u32), FederatedAuthoritySubscriber>>>;
 
 /// Compute the personalized authority state for one federated
 /// subscriber from a `Option<&DisplayInputHolder>`. Returns `You` if
@@ -634,9 +624,9 @@ fn build_federated_authority_handler(
 ) -> crate::display::webrtc::AuthorityChannelHandler {
     use crate::display::webrtc::AuthorityChannelMessage;
     Arc::new(move |msg| match msg {
-        AuthorityChannelMessage::Request { display_id: req_did }
-            if req_did == display_id =>
-        {
+        AuthorityChannelMessage::Request {
+            display_id: req_did,
+        } if req_did == display_id => {
             apply_grant_input_authority_federated(
                 display_id,
                 federation_connection_id.clone(),
@@ -645,9 +635,9 @@ fn build_federated_authority_handler(
                 &authority_change_tx,
             );
         }
-        AuthorityChannelMessage::Release { display_id: req_did }
-            if req_did == display_id =>
-        {
+        AuthorityChannelMessage::Release {
+            display_id: req_did,
+        } if req_did == display_id => {
             apply_release_input_authority_federated(
                 display_id,
                 &federation_connection_id,
@@ -656,8 +646,7 @@ fn build_federated_authority_handler(
                 &authority_change_tx,
             );
         }
-        AuthorityChannelMessage::Request { .. }
-        | AuthorityChannelMessage::Release { .. } => {
+        AuthorityChannelMessage::Request { .. } | AuthorityChannelMessage::Release { .. } => {
             // Display-ID mismatch — drop silently. See doc comment.
         }
     })
@@ -848,9 +837,7 @@ fn unregister_federated_authority_subscriber(
 /// `remove_peer`.
 async fn close_federated_peers_for_sessions(
     released: &[(String, u32)],
-    session_registry: Option<
-        &Arc<tokio::sync::RwLock<crate::display::SessionRegistry>>,
-    >,
+    session_registry: Option<&Arc<tokio::sync::RwLock<crate::display::SessionRegistry>>>,
 ) -> usize {
     if released.is_empty() {
         return 0;
@@ -895,9 +882,7 @@ fn unregister_all_federated_subscribers_for_connection(
     subscribers: &FederatedAuthoritySubscribers,
 ) -> Vec<(String, u32)> {
     let mut released = Vec::new();
-    let mut map = subscribers
-        .write()
-        .unwrap_or_else(|e| e.into_inner());
+    let mut map = subscribers.write().unwrap_or_else(|e| e.into_inner());
     map.retain(|(fcid, sid, did), sub| {
         if fcid == federation_connection_id {
             released.push((sid.clone(), *did));
@@ -923,9 +908,7 @@ fn apply_ws_close_input_authority(
     authority_change_tx: &broadcast::Sender<DisplayInputAuthorityChange>,
 ) -> Vec<u32> {
     let released: Vec<u32> = {
-        let mut map = authority
-            .write()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut map = authority.write().unwrap_or_else(|e| e.into_inner());
         let mut out = Vec::new();
         map.retain(|did, entry| {
             if entry.matches_local_ws(connection_id) {
@@ -1027,7 +1010,8 @@ async fn mint_session_token(provider: &str, model: &str) -> Result<String, Strin
             Ok(serde_json::json!({
                 "client_secret": { "value": token },
                 "expires_at": expires_at
-            }).to_string())
+            })
+            .to_string())
         }
         "gemini" => {
             let api_key = std::env::var("GEMINI_API_KEY")
@@ -1080,6 +1064,8 @@ const APP_HTML: &str = include_str!("../../../static/app.html");
 const AUDIO_PROCESSOR_JS: &str = include_str!("../../../static/audio-processor.js");
 const WASM_WEB_JS: &str = include_str!("../../../static/wasm-web/presence_web.js");
 const WASM_WEB_BIN: &[u8] = include_bytes!("../../../static/wasm-web/presence_web_bg.wasm");
+const WASM_STATION_JS: &str = include_str!("../../../static/wasm-station/station_web.js");
+const WASM_STATION_BIN: &[u8] = include_bytes!("../../../static/wasm-station/station_web_bg.wasm");
 
 /// Session-specific state that changes when a new agent session starts.
 /// Wrapped in `Arc<tokio::sync::RwLock<...>>` so the web gateway can observe
@@ -1193,9 +1179,7 @@ impl Default for WebGatewayConfig {
 /// `info` for older ones — scan both.  Replay uses the result to seed
 /// the status bar before any events are rendered, replacing the old
 /// prefix-based parsing inside `handle_log_replay`.
-fn scan_replay_status(
-    contents: &str,
-) -> (Option<String>, Option<String>, Option<String>) {
+fn scan_replay_status(contents: &str) -> (Option<String>, Option<String>, Option<String>) {
     let mut provider: Option<String> = None;
     let mut model: Option<String> = None;
     let mut autonomy: Option<String> = None;
@@ -1212,12 +1196,7 @@ fn scan_replay_status(
         };
         if provider.is_none() {
             if let Some(rest) = msg.strip_prefix("Provider: ") {
-                provider = Some(
-                    rest.split_whitespace()
-                        .next()
-                        .unwrap_or("")
-                        .to_string(),
-                );
+                provider = Some(rest.split_whitespace().next().unwrap_or("").to_string());
             }
         }
         if model.is_none() {
@@ -1303,6 +1282,8 @@ fn asset_version_hash() -> String {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     WASM_WEB_BIN.hash(&mut hasher);
     WASM_WEB_JS.hash(&mut hasher);
+    WASM_STATION_BIN.hash(&mut hasher);
+    WASM_STATION_JS.hash(&mut hasher);
     format!("{:016x}", hasher.finish())
 }
 
@@ -1318,8 +1299,7 @@ fn build_session_report_zip(session_dir: &std::path::Path) -> std::io::Result<Ve
 
     let buf = Cursor::new(Vec::<u8>::new());
     let mut zip = zip::ZipWriter::new(buf);
-    let options =
-        SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+    let options = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
 
     const FLAT_FILES: &[&str] = &[
         "session.jsonl",
@@ -1343,8 +1323,11 @@ fn build_session_report_zip(session_dir: &std::path::Path) -> std::io::Result<Ve
     let turns_dir = session_dir.join("turns");
     if turns_dir.is_dir() {
         if let Ok(entries) = std::fs::read_dir(&turns_dir) {
-            let mut files: Vec<PathBuf> =
-                entries.flatten().map(|e| e.path()).filter(|p| p.is_file()).collect();
+            let mut files: Vec<PathBuf> = entries
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| p.is_file())
+                .collect();
             files.sort();
             for path in files {
                 if let Some(fname) = path.file_name().and_then(|n| n.to_str()) {
@@ -1501,7 +1484,9 @@ fn list_recording_streams(recordings_dir: &std::path::Path) -> Vec<serde_json::V
     let mut entries = Vec::new();
     if let Ok(dirs) = std::fs::read_dir(recordings_dir) {
         for entry in dirs.flatten() {
-            if !entry.path().is_dir() { continue; }
+            if !entry.path().is_dir() {
+                continue;
+            }
             let name = entry.file_name().to_string_lossy().to_string();
             let stream_dir = entry.path();
             let manifest = std::fs::read_to_string(stream_dir.join("manifest.json"))
@@ -1513,13 +1498,16 @@ fn list_recording_streams(recordings_dir: &std::path::Path) -> Vec<serde_json::V
                 &stream_dir,
             );
             let total_duration = segments.last().map(|s| s.end_secs).unwrap_or(0.0);
-            let seg_json: Vec<serde_json::Value> = segments.iter().map(|s| {
-                serde_json::json!({
-                    "filename": s.filename,
-                    "start_secs": s.start_secs,
-                    "end_secs": s.end_secs,
+            let seg_json: Vec<serde_json::Value> = segments
+                .iter()
+                .map(|s| {
+                    serde_json::json!({
+                        "filename": s.filename,
+                        "start_secs": s.start_secs,
+                        "end_secs": s.end_secs,
+                    })
                 })
-            }).collect();
+                .collect();
             let mut e = manifest;
             e["stream_name"] = serde_json::json!(name);
             e["segments"] = serde_json::Value::Array(seg_json);
@@ -1527,9 +1515,7 @@ fn list_recording_streams(recordings_dir: &std::path::Path) -> Vec<serde_json::V
             entries.push(e);
         }
     }
-    entries.sort_by(|a, b| {
-        a["stream_name"].as_str().cmp(&b["stream_name"].as_str())
-    });
+    entries.sort_by(|a, b| a["stream_name"].as_str().cmp(&b["stream_name"].as_str()));
     entries
 }
 
@@ -1608,15 +1594,24 @@ fn list_sessions() -> String {
 
         if let Ok(meta_str) = std::fs::read_to_string(&meta_path) {
             if let Ok(meta) = serde_json::from_str::<serde_json::Value>(&meta_str) {
-                task = meta.get("task").and_then(|v| v.as_str()).map(|s| s.to_string());
-                created_at = meta.get("created_at").and_then(|v| v.as_str()).map(|s| s.to_string());
+                task = meta
+                    .get("task")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                created_at = meta
+                    .get("created_at")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
                 if let Some(s) = meta.get("status").and_then(|v| v.as_str()) {
                     status = s.to_string();
                 }
                 if let Some(t) = meta.get("last_turn").and_then(|v| v.as_u64()) {
                     turns = t;
                 }
-                role = meta.get("role").and_then(|v| v.as_str()).map(|s| s.to_string());
+                role = meta
+                    .get("role")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
             }
         }
 
@@ -1637,7 +1632,10 @@ fn list_sessions() -> String {
                 match event {
                     "session_start" => {
                         if created_at.is_none() {
-                            created_at = obj.get("ts").and_then(|v| v.as_str()).map(|s| s.to_string());
+                            created_at = obj
+                                .get("ts")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string());
                         }
                     }
                     "info" => {
@@ -1721,7 +1719,8 @@ fn list_sessions() -> String {
         let frames_dir = dir.join("frames");
         if frames_dir.is_dir() {
             if let Ok(fd) = std::fs::read_dir(&frames_dir) {
-                let mut clip_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+                let mut clip_ids: std::collections::HashSet<String> =
+                    std::collections::HashSet::new();
                 for fe in fd.flatten() {
                     let name = fe.file_name().to_string_lossy().to_string();
                     if name.starts_with("ann-") && name.ends_with(".jpg") {
@@ -1756,7 +1755,12 @@ fn list_sessions() -> String {
         }
 
         // Root-level log files size
-        for name in &["session.jsonl", "session_meta.json", "summary.json", "conversation.jsonl"] {
+        for name in &[
+            "session.jsonl",
+            "session_meta.json",
+            "summary.json",
+            "conversation.jsonl",
+        ] {
             if let Ok(m) = std::fs::metadata(dir.join(name)) {
                 if m.is_file() {
                     logs_bytes += m.len();
@@ -1794,8 +1798,11 @@ fn list_sessions() -> String {
         }
 
         // Estimate cost using the model's pricing (blended rate without cache info)
-        let estimated_cost = model.as_deref()
-            .and_then(|m| crate::app_state_pricing::estimate_session_cost(m, prompt_tokens, completion_tokens))
+        let estimated_cost = model
+            .as_deref()
+            .and_then(|m| {
+                crate::app_state_pricing::estimate_session_cost(m, prompt_tokens, completion_tokens)
+            })
             .unwrap_or(0.0);
 
         sessions.push(serde_json::json!({
@@ -1918,7 +1925,11 @@ fn handle_changes_list(baseline_dir: &Path, project_root: &Path) -> String {
                     }
                     (added, removed)
                 };
-                let kind = if baseline.is_empty() { "created" } else { "modified" };
+                let kind = if baseline.is_empty() {
+                    "created"
+                } else {
+                    "modified"
+                };
                 changes.push(serde_json::json!({
                     "path": rel_str,
                     "kind": kind,
@@ -1941,11 +1952,7 @@ fn handle_changes_list(baseline_dir: &Path, project_root: &Path) -> String {
 }
 
 /// Return a unified diff for a single file.
-fn handle_changes_file_diff(
-    file_path: &str,
-    baseline_dir: &Path,
-    project_root: &Path,
-) -> String {
+fn handle_changes_file_diff(file_path: &str, baseline_dir: &Path, project_root: &Path) -> String {
     // Reject path traversal.
     let rel = Path::new(file_path);
     for component in rel.components() {
@@ -1959,16 +1966,24 @@ fn handle_changes_file_diff(
 
     // Verify resolved paths stay within their roots.
     if let (Ok(resolved_baseline), Ok(resolved_root)) = (
-        baseline_path.canonicalize().or_else(|_| Ok::<PathBuf, std::io::Error>(baseline_path.clone())),
-        baseline_dir.canonicalize().or_else(|_| Ok::<PathBuf, std::io::Error>(baseline_dir.to_path_buf())),
+        baseline_path
+            .canonicalize()
+            .or_else(|_| Ok::<PathBuf, std::io::Error>(baseline_path.clone())),
+        baseline_dir
+            .canonicalize()
+            .or_else(|_| Ok::<PathBuf, std::io::Error>(baseline_dir.to_path_buf())),
     ) {
         if !resolved_baseline.starts_with(&resolved_root) {
             return serde_json::json!({"error": "invalid path"}).to_string();
         }
     }
     if let (Ok(resolved_current), Ok(resolved_root)) = (
-        current_path.canonicalize().or_else(|_| Ok::<PathBuf, std::io::Error>(current_path.clone())),
-        project_root.canonicalize().or_else(|_| Ok::<PathBuf, std::io::Error>(project_root.to_path_buf())),
+        current_path
+            .canonicalize()
+            .or_else(|_| Ok::<PathBuf, std::io::Error>(current_path.clone())),
+        project_root
+            .canonicalize()
+            .or_else(|_| Ok::<PathBuf, std::io::Error>(project_root.to_path_buf())),
     ) {
         if !resolved_current.starts_with(&resolved_root) {
             return serde_json::json!({"error": "invalid path"}).to_string();
@@ -2013,10 +2028,7 @@ fn handle_changes_file_diff(
 /// Read the full POST body (honoring Content-Length). Returns the peeked
 /// prefix if the headers already carried the entire payload; otherwise reads
 /// the remainder from the stream.
-async fn read_post_body(
-    header_text: &str,
-    stream: &mut tokio::net::TcpStream,
-) -> String {
+async fn read_post_body(header_text: &str, stream: &mut tokio::net::TcpStream) -> String {
     use tokio::io::AsyncReadExt;
     let content_length: usize = header_text
         .lines()
@@ -2092,8 +2104,7 @@ async fn stream_body_to_tempfile(
         .nth(1)
         .unwrap_or("")
         .as_bytes();
-    let mut tmp = tempfile::NamedTempFile::new()
-        .map_err(|e| format!("create tempfile: {e}"))?;
+    let mut tmp = tempfile::NamedTempFile::new().map_err(|e| format!("create tempfile: {e}"))?;
 
     // Write whatever body bytes we already have from the peek. These come
     // back through the same header_text split, so they're the leading
@@ -2223,10 +2234,7 @@ fn ensure_idle(
     agent_state: Option<&Arc<Mutex<AgentStateSnapshot>>>,
 ) -> Result<(), (&'static str, String)> {
     if let Some(state) = agent_state {
-        let phase = state
-            .lock()
-            .map(|g| g.phase.clone())
-            .unwrap_or_default();
+        let phase = state.lock().map(|g| g.phase.clone()).unwrap_or_default();
         if !presence::is_agent_idle(&phase) {
             let body = serde_json::json!({
                 "error": "agent is busy, stop the turn before rolling back",
@@ -2250,8 +2258,7 @@ async fn handle_history_get(
         );
     };
     let w = fw.lock().await;
-    let body = serde_json::to_string(w.history())
-        .unwrap_or_else(|_| "{}".to_string());
+    let body = serde_json::to_string(w.history()).unwrap_or_else(|_| "{}".to_string());
     ("200 OK", body)
 }
 
@@ -2515,7 +2522,10 @@ fn delete_session_data(session_id: &str, target: &str) -> String {
         "session" => {
             let bytes = dir_byte_size(&dir);
             match std::fs::remove_dir_all(&dir) {
-                Ok(_) => serde_json::json!({"ok": true, "deleted": "session", "bytes_freed": bytes}).to_string(),
+                Ok(_) => {
+                    serde_json::json!({"ok": true, "deleted": "session", "bytes_freed": bytes})
+                        .to_string()
+                }
                 Err(e) => serde_json::json!({"ok": false, "error": e.to_string()}).to_string(),
             }
         }
@@ -2525,15 +2535,21 @@ fn delete_session_data(session_id: &str, target: &str) -> String {
             let bytes = dir_byte_size(&rec_dir) + dir_byte_size(&frames_dir);
             let mut errors = Vec::new();
             if rec_dir.is_dir() {
-                if let Err(e) = std::fs::remove_dir_all(&rec_dir) { errors.push(format!("recordings: {}", e)); }
+                if let Err(e) = std::fs::remove_dir_all(&rec_dir) {
+                    errors.push(format!("recordings: {}", e));
+                }
             }
             if frames_dir.is_dir() {
-                if let Err(e) = std::fs::remove_dir_all(&frames_dir) { errors.push(format!("frames: {}", e)); }
+                if let Err(e) = std::fs::remove_dir_all(&frames_dir) {
+                    errors.push(format!("frames: {}", e));
+                }
             }
             if errors.is_empty() {
-                serde_json::json!({"ok": true, "deleted": "media", "bytes_freed": bytes}).to_string()
+                serde_json::json!({"ok": true, "deleted": "media", "bytes_freed": bytes})
+                    .to_string()
             } else {
-                serde_json::json!({"ok": false, "error": errors.join("; "), "bytes_freed": bytes}).to_string()
+                serde_json::json!({"ok": false, "error": errors.join("; "), "bytes_freed": bytes})
+                    .to_string()
             }
         }
         "recordings" | "frames" | "turns" => {
@@ -2543,8 +2559,14 @@ fn delete_session_data(session_id: &str, target: &str) -> String {
                 serde_json::json!({"ok": true, "deleted": target, "bytes_freed": 0}).to_string()
             } else {
                 match std::fs::remove_dir_all(&target_dir) {
-                    Ok(_) => serde_json::json!({"ok": true, "deleted": target, "bytes_freed": bytes}).to_string(),
-                    Err(e) => serde_json::json!({"ok": false, "error": e.to_string(), "bytes_freed": 0}).to_string(),
+                    Ok(_) => {
+                        serde_json::json!({"ok": true, "deleted": target, "bytes_freed": bytes})
+                            .to_string()
+                    }
+                    Err(e) => {
+                        serde_json::json!({"ok": false, "error": e.to_string(), "bytes_freed": 0})
+                            .to_string()
+                    }
                 }
             }
         }
@@ -2632,9 +2654,7 @@ fn default_settings_gemini_approval_mode() -> String {
     crate::project::normalize_gemini_approval_mode("")
 }
 
-fn settings_payload_from_config(
-    config: &crate::project::ProjectConfig,
-) -> SettingsPayload {
+fn settings_payload_from_config(config: &crate::project::ProjectConfig) -> SettingsPayload {
     let mut env_overrides = std::collections::HashMap::new();
     for (key, var) in [
         ("CU_PROVIDER", "CU_PROVIDER"),
@@ -2692,10 +2712,7 @@ fn settings_payload_from_config(
     }
 }
 
-fn apply_settings_payload(
-    config: &mut crate::project::ProjectConfig,
-    payload: &SettingsPayload,
-) {
+fn apply_settings_payload(config: &mut crate::project::ProjectConfig, payload: &SettingsPayload) {
     config.computer_use.provider = payload.cu_provider.clone();
     config.computer_use.model = payload.cu_model.clone();
     config.computer_use.backend = payload.cu_backend.clone();
@@ -2717,10 +2734,11 @@ fn apply_settings_payload(
     // Normalize empty strings to None so the TOML doesn't end up with
     // `default_backend = ""` — the loader treats "" as a valid override
     // and would try to resolve it to a backend.
-    config.agent.default_backend = payload
-        .external_agent
-        .as_ref()
-        .and_then(|s| if s.is_empty() { None } else { Some(s.clone()) });
+    config.agent.default_backend =
+        payload
+            .external_agent
+            .as_ref()
+            .and_then(|s| if s.is_empty() { None } else { Some(s.clone()) });
 }
 
 /// Return JSON with boolean flags indicating which API keys are configured.
@@ -2909,7 +2927,9 @@ async fn handle_mcp_http_request(
                 "version": env!("CARGO_PKG_VERSION"),
             }
         })),
-        "notifications/initialized" | "notifications/cancelled" | "notifications/progress"
+        "notifications/initialized"
+        | "notifications/cancelled"
+        | "notifications/progress"
         | "notifications/roots/list_changed" => {
             // All notification methods: acknowledge and return 202.
             return McpHttpOutcome::Accepted;
@@ -2917,10 +2937,7 @@ async fn handle_mcp_http_request(
         "tools/list" => Ok(server.list_tools_json()),
         "tools/call" => {
             let params = request.params.unwrap_or_default();
-            let name = params
-                .get("name")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+            let name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
             let args = params
                 .get("arguments")
                 .cloned()
@@ -3014,11 +3031,9 @@ pub fn spawn_web_gateway(
     // address. Multiple URLs let one daemon advertise itself reachable
     // via several paths (LAN IP, Tailscale, host port-forward, etc.)
     // — the connecting peer probes them in order.
-    let advertise_urls =
-        resolve_advertise_urls(listener.local_addr().ok(), &advertise_urls);
+    let advertise_urls = resolve_advertise_urls(listener.local_addr().ok(), &advertise_urls);
     let agent_card = build_local_agent_card(advertise_urls, local_card_auth);
-    let agent_card_json =
-        serde_json::to_string(&agent_card).unwrap_or_else(|_| "{}".to_string());
+    let agent_card_json = serde_json::to_string(&agent_card).unwrap_or_else(|_| "{}".to_string());
 
     // Pre-build ICE config for WebRTC display sessions from the gateway config.
     let ice_config = crate::display::IceConfig {
@@ -3037,10 +3052,7 @@ pub fn spawn_web_gateway(
     // tunnel/port-forward that already carries the dashboard — users
     // don't configure anything extra beyond what the dashboard already
     // requires.
-    let http_port = listener
-        .local_addr()
-        .map(|a| a.port())
-        .unwrap_or(0);
+    let http_port = listener.local_addr().map(|a| a.port()).unwrap_or(0);
     let tcp_peer_registry = crate::display::webrtc::TcpPeerRegistry::new();
     let tcp_advertised_port: Option<u16> = if http_port != 0 {
         Some(http_port)
@@ -3071,13 +3083,10 @@ pub fn spawn_web_gateway(
     // happens lazily at per-Answer rewrite time rather than once at
     // startup (hostnames may not resolve at boot for Tailscale /
     // mDNS / etc).
-    let relay_advertise_url: Option<String> = agent_card
-        .transports
-        .iter()
-        .find_map(|t| match t {
-            crate::peer::TransportSpec::IntendantWs { url } => Some(url.clone()),
-            _ => None,
-        });
+    let relay_advertise_url: Option<String> = agent_card.transports.iter().find_map(|t| match t {
+        crate::peer::TransportSpec::IntendantWs { url } => Some(url.clone()),
+        _ => None,
+    });
 
     // Inject content-hash version into WASM/JS URLs for cache-busting.
     let v = asset_version_hash();
@@ -3137,16 +3146,12 @@ pub fn spawn_web_gateway(
                 match display_events_rx.recv().await {
                     Ok(line) => {
                         if line.contains("\"event\":\"display_ready\"") {
-                            if let Ok(parsed) =
-                                serde_json::from_str::<serde_json::Value>(&line)
-                            {
+                            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&line) {
                                 let did = parsed["display_id"].as_u64().unwrap_or(0) as u32;
-                                let _ = authority_change_tx.send(
-                                    DisplayInputAuthorityChange {
-                                        display_id: did,
-                                        holder: None,
-                                    },
-                                );
+                                let _ = authority_change_tx.send(DisplayInputAuthorityChange {
+                                    display_id: did,
+                                    holder: None,
+                                });
                             }
                         }
                     }
@@ -3163,9 +3168,9 @@ pub fn spawn_web_gateway(
     // to existing shells. Keyed on host_id even though there's only one
     // host today so multi-host phase 1 can add siblings without refactor.
     let terminal_registry: Arc<crate::terminal::TerminalRegistry> = Arc::new(
-        crate::terminal::TerminalRegistry::new(
-            project_root.clone().unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))),
-        ),
+        crate::terminal::TerminalRegistry::new(project_root.clone().unwrap_or_else(|| {
+            std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
+        })),
     );
 
     // Cache the latest usage_update JSON so late-connecting browsers get it
@@ -3190,7 +3195,8 @@ pub fn spawn_web_gateway(
     let last_user_display_json: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     // Cache display_ready JSON per display_id for late-connecting browsers.
     // Using a HashMap so multiple concurrent display sessions are all replayed.
-    let display_ready_cache: Arc<Mutex<HashMap<u32, String>>> = Arc::new(Mutex::new(HashMap::new()));
+    let display_ready_cache: Arc<Mutex<HashMap<u32, String>>> =
+        Arc::new(Mutex::new(HashMap::new()));
     {
         let usage_cache = last_usage_json.clone();
         let live_usage_cache = last_live_usage_json.clone();
@@ -3303,10 +3309,7 @@ pub fn spawn_web_gateway(
                             crate::peer::RegistryEvent::PeerStateChanged(snap) => {
                                 crate::types::OutboundEvent::PeerStateChanged { peer: snap }
                             }
-                            crate::peer::RegistryEvent::PeerEventForwarded {
-                                peer,
-                                event,
-                            } => {
+                            crate::peer::RegistryEvent::PeerEventForwarded { peer, event } => {
                                 // Slice 3b: when a federated Answer
                                 // comes back toward the browser, rewrite
                                 // the SDP to inject a TCP candidate
@@ -3349,6 +3352,14 @@ pub fn spawn_web_gateway(
             .replace(
                 "/wasm-web/presence_web_bg.wasm",
                 &format!("/wasm-web/presence_web_bg.wasm?v={}", v),
+            )
+            .replace(
+                "/wasm-station/station_web.js",
+                &format!("/wasm-station/station_web.js?v={}", v),
+            )
+            .replace(
+                "/wasm-station/station_web_bg.wasm",
+                &format!("/wasm-station/station_web_bg.wasm?v={}", v),
             ),
     );
 
@@ -3437,27 +3448,21 @@ pub fn spawn_web_gateway(
                 // lives at peek offset 6..10 once we account for the
                 // length prefix. A valid HTTP request never starts with
                 // these bytes (method chars are ASCII >= 0x41).
-                let looks_like_stun_tcp = n >= 22
-                    && buf[2] < 2
-                    && buf[6..10] == [0x21, 0x12, 0xA4, 0x42];
+                let looks_like_stun_tcp =
+                    n >= 22 && buf[2] < 2 && buf[6..10] == [0x21, 0x12, 0xA4, 0x42];
                 if looks_like_stun_tcp {
                     // Consume the first RFC 4571 frame from the stream
                     // (peek leaves it in the kernel buffer; we have to
                     // read it through to hand a clean stream to the peer
                     // reader task).
-                    let first_frame = match crate::display::webrtc::read_rfc4571_frame_pub(
-                        &mut stream,
-                    )
-                    .await
-                    {
-                        Ok(f) => f,
-                        Err(e) => {
-                            eprintln!(
-                                "[web_gateway] ICE-TCP first-frame read failed: {e}"
-                            );
-                            return;
-                        }
-                    };
+                    let first_frame =
+                        match crate::display::webrtc::read_rfc4571_frame_pub(&mut stream).await {
+                            Ok(f) => f,
+                            Err(e) => {
+                                eprintln!("[web_gateway] ICE-TCP first-frame read failed: {e}");
+                                return;
+                            }
+                        };
                     let remote_addr = match stream.peer_addr() {
                         Ok(a) => a,
                         Err(_) => return,
@@ -3486,9 +3491,8 @@ pub fn spawn_web_gateway(
                             }
                         }
                         Some(ufrag) if tcp_relay_registry.contains_ufrag(&ufrag) => {
-                            if let Err(e) = tcp_relay_registry
-                                .route_accepted(stream, first_frame)
-                                .await
+                            if let Err(e) =
+                                tcp_relay_registry.route_accepted(stream, first_frame).await
                             {
                                 eprintln!(
                                     "[web_gateway] ICE-TCP relay routing for ufrag={ufrag} from {remote_addr} failed: {e}"
@@ -3567,8 +3571,7 @@ pub fn spawn_web_gateway(
 
                     // Direct response channel: tool_response and state_snapshot
                     // messages for this specific connection (not broadcast).
-                    let (direct_tx, mut direct_rx) =
-                        mpsc::unbounded_channel::<String>();
+                    let (direct_tx, mut direct_rx) = mpsc::unbounded_channel::<String>();
 
                     // Register connection with WebTui for per-connection rendering
                     if let Some(ref tx) = web_tui_tx {
@@ -3584,13 +3587,17 @@ pub fn spawn_web_gateway(
                     // Include config (provider/model) since AgentStateSnapshot
                     // doesn't carry those.
                     if let Some(ref ctx) = query_ctx {
-                        let state = ctx.agent_state.lock()
+                        let state = ctx
+                            .agent_state
+                            .lock()
                             .unwrap_or_else(|e| e.into_inner())
                             .clone();
-                        let config: serde_json::Value = serde_json::from_str(&config_json)
-                            .unwrap_or_default();
+                        let config: serde_json::Value =
+                            serde_json::from_str(&config_json).unwrap_or_default();
                         // Extract session_id from log_dir path name
-                        let session_id = ctx.log_dir.file_name()
+                        let session_id = ctx
+                            .log_dir
+                            .file_name()
                             .and_then(|n| n.to_str())
                             .unwrap_or("");
                         let bootstrap = serde_json::json!({
@@ -3815,7 +3822,10 @@ pub fn spawn_web_gateway(
                             expected: usize,
                             frames: Vec<(String, String)>, // (frame_id, base64_data)
                         }
-                        let mut clip_accumulators: std::collections::HashMap<String, ClipAccumulator> = std::collections::HashMap::new();
+                        let mut clip_accumulators: std::collections::HashMap<
+                            String,
+                            ClipAccumulator,
+                        > = std::collections::HashMap::new();
 
                         // Display IDs this peer has WebRTC connections to,
                         // used for cleanup when the WebSocket disconnects.
@@ -3835,17 +3845,22 @@ pub fn spawn_web_gateway(
                                     continue;
                                 }
                                 // Try to parse as JSON for type-tagged messages
-                                if let Ok(json) = serde_json::from_str::<serde_json::Value>(trimmed) {
+                                if let Ok(json) = serde_json::from_str::<serde_json::Value>(trimmed)
+                                {
                                     match json.get("t").and_then(|v| v.as_str()) {
                                         Some("key") => {
                                             // Route key events to this connection's
                                             // ViewState via WebTuiCommand (not EventBus).
-                                            if let Some(key_event) = crate::tui::web::parse_web_key(&json) {
+                                            if let Some(key_event) =
+                                                crate::tui::web::parse_web_key(&json)
+                                            {
                                                 if let Some(ref tx) = web_tui_tx {
-                                                    let _ = tx.send(crate::tui::web::WebTuiCommand::Key {
-                                                        id: connection_id_inbound.clone(),
-                                                        key: key_event,
-                                                    });
+                                                    let _ = tx.send(
+                                                        crate::tui::web::WebTuiCommand::Key {
+                                                            id: connection_id_inbound.clone(),
+                                                            key: key_event,
+                                                        },
+                                                    );
                                                 } else if is_active {
                                                     // Fallback: no WebTui (headless web mode)
                                                     bus_inbound.send(AppEvent::Key(key_event));
@@ -3857,11 +3872,13 @@ pub fn spawn_web_gateway(
                                             let cols = json["cols"].as_u64().unwrap_or(80) as u16;
                                             let rows = json["rows"].as_u64().unwrap_or(24) as u16;
                                             if let Some(ref tx) = web_tui_tx {
-                                                let _ = tx.send(crate::tui::web::WebTuiCommand::Resize {
-                                                    id: connection_id_inbound.clone(),
-                                                    cols,
-                                                    rows,
-                                                });
+                                                let _ = tx.send(
+                                                    crate::tui::web::WebTuiCommand::Resize {
+                                                        id: connection_id_inbound.clone(),
+                                                        cols,
+                                                        rows,
+                                                    },
+                                                );
                                             } else if is_active {
                                                 bus_inbound.send(AppEvent::Resize(cols, rows));
                                             }
@@ -3875,9 +3892,11 @@ pub fn spawn_web_gateway(
                                             // stays idle instead of flooding the socket
                                             // with frames nobody is watching.
                                             if let Some(ref tx) = web_tui_tx {
-                                                let _ = tx.send(crate::tui::web::WebTuiCommand::Subscribe {
-                                                    id: connection_id_inbound.clone(),
-                                                });
+                                                let _ = tx.send(
+                                                    crate::tui::web::WebTuiCommand::Subscribe {
+                                                        id: connection_id_inbound.clone(),
+                                                    },
+                                                );
                                             }
                                         }
                                         Some("term_unsubscribe") => {
@@ -3885,28 +3904,37 @@ pub fn spawn_web_gateway(
                                             // emitting ratatui frames to this connection
                                             // until the next term_subscribe.
                                             if let Some(ref tx) = web_tui_tx {
-                                                let _ = tx.send(crate::tui::web::WebTuiCommand::Unsubscribe {
-                                                    id: connection_id_inbound.clone(),
-                                                });
+                                                let _ = tx.send(
+                                                    crate::tui::web::WebTuiCommand::Unsubscribe {
+                                                        id: connection_id_inbound.clone(),
+                                                    },
+                                                );
                                             }
                                         }
                                         Some("presence_connect") => {
                                             is_presence_connected = true;
-                                            voice_debug_inbound.lock().unwrap_or_else(|e| e.into_inner()).connected = true;
-                                            let server_session_id = json.get("server_session_id")
+                                            voice_debug_inbound
+                                                .lock()
+                                                .unwrap_or_else(|e| e.into_inner())
+                                                .connected = true;
+                                            let server_session_id = json
+                                                .get("server_session_id")
                                                 .and_then(|v| v.as_str())
                                                 .map(String::from);
-                                            let last_event_seq = json.get("last_event_seq")
+                                            let last_event_seq = json
+                                                .get("last_event_seq")
                                                 .and_then(|v| v.as_u64())
                                                 .unwrap_or(0);
                                             // Use provider/model from the browser if sent,
                                             // fall back to config defaults.
-                                            let msg_provider = json.get("provider")
+                                            let msg_provider = json
+                                                .get("provider")
                                                 .and_then(|v| v.as_str())
                                                 .filter(|s| !s.is_empty())
                                                 .map(String::from)
                                                 .unwrap_or_else(|| live_provider.clone());
-                                            let msg_model = json.get("model")
+                                            let msg_model = json
+                                                .get("model")
                                                 .and_then(|v| v.as_str())
                                                 .filter(|s| !s.is_empty())
                                                 .map(String::from)
@@ -3914,48 +3942,65 @@ pub fn spawn_web_gateway(
 
                                             // Determine if this connection becomes active or passive.
                                             // Browsers can request always-passive mode (observer/follow-along).
-                                            let force_passive = json.get("passive")
+                                            let force_passive = json
+                                                .get("passive")
                                                 .and_then(|v| v.as_bool())
                                                 .unwrap_or(false);
                                             let becomes_active = if force_passive {
                                                 false
                                             } else {
-                                                let slot = active_presence_inbound.lock()
+                                                let slot = active_presence_inbound
+                                                    .lock()
                                                     .unwrap_or_else(|e| e.into_inner());
                                                 // Empty slot → first connect wins.
                                                 // Slot occupied by THIS connection → already active
                                                 // (happens when active browser reconnects voice after handover).
                                                 slot.is_none()
-                                                    || slot.as_ref()
-                                                        .map(|a| a.connection_id == connection_id_inbound)
+                                                    || slot
+                                                        .as_ref()
+                                                        .map(|a| {
+                                                            a.connection_id == connection_id_inbound
+                                                        })
                                                         .unwrap_or(false)
                                             };
 
                                             let was_already_active = is_active;
                                             if becomes_active {
                                                 // First-connect wins (or re-confirm already-active)
-                                                *active_presence_inbound.lock()
-                                                    .unwrap_or_else(|e| e.into_inner()) = Some(ActivePresence {
-                                                    connection_id: connection_id_inbound.clone(),
-                                                    direct_tx: direct_tx_inbound.clone(),
-                                                });
+                                                *active_presence_inbound
+                                                    .lock()
+                                                    .unwrap_or_else(|e| e.into_inner()) =
+                                                    Some(ActivePresence {
+                                                        connection_id: connection_id_inbound
+                                                            .clone(),
+                                                        direct_tx: direct_tx_inbound.clone(),
+                                                    });
                                                 is_active = true;
                                             }
 
                                             // Send welcome with replay window if presence session is available
                                             if let Some(ref ctx) = query_ctx_inbound {
                                                 // Build conversation context from recent voice transcripts
-                                                let conversation_ctx = presence::build_conversation_context(&ctx.log_dir, 20);
+                                                let conversation_ctx =
+                                                    presence::build_conversation_context(
+                                                        &ctx.log_dir,
+                                                        20,
+                                                    );
 
                                                 if let Some(ref ps) = ctx.presence_session {
-                                                    let mut session = ps.lock().unwrap_or_else(|e| e.into_inner());
+                                                    let mut session = ps
+                                                        .lock()
+                                                        .unwrap_or_else(|e| e.into_inner());
                                                     if becomes_active {
                                                         session.set_connected(true);
                                                     }
-                                                    let state = ctx.agent_state.lock()
+                                                    let state = ctx
+                                                        .agent_state
+                                                        .lock()
                                                         .unwrap_or_else(|e| e.into_inner())
                                                         .clone();
-                                                    let welcome = session.build_welcome(last_event_seq, &state);
+                                                    let welcome = session
+                                                        .build_welcome(last_event_seq, &state);
                                                     let welcome_msg = serde_json::json!({
                                                         "t": "presence_welcome",
                                                         "session_id": welcome.session_id,
@@ -3966,14 +4011,16 @@ pub fn spawn_web_gateway(
                                                         "is_active": becomes_active,
                                                         "conversation_context": conversation_ctx,
                                                     });
-                                                    let _ = direct_tx_inbound.send(welcome_msg.to_string());
+                                                    let _ = direct_tx_inbound
+                                                        .send(welcome_msg.to_string());
                                                 } else {
                                                     let welcome_msg = serde_json::json!({
                                                         "t": "presence_welcome",
                                                         "is_active": becomes_active,
                                                         "conversation_context": conversation_ctx,
                                                     });
-                                                    let _ = direct_tx_inbound.send(welcome_msg.to_string());
+                                                    let _ = direct_tx_inbound
+                                                        .send(welcome_msg.to_string());
                                                 }
                                             } else {
                                                 // No presence session — still send a minimal welcome with is_active
@@ -3981,7 +4028,8 @@ pub fn spawn_web_gateway(
                                                     "t": "presence_welcome",
                                                     "is_active": becomes_active,
                                                 });
-                                                let _ = direct_tx_inbound.send(welcome_msg.to_string());
+                                                let _ =
+                                                    direct_tx_inbound.send(welcome_msg.to_string());
                                             }
 
                                             // Only emit PresenceConnected for the active browser
@@ -3991,7 +4039,10 @@ pub fn spawn_web_gateway(
                                             if becomes_active && !was_already_active {
                                                 if let Some(ref sl) = session_log_inbound {
                                                     if let Ok(mut l) = sl.lock() {
-                                                        l.presence_connected(Some(&msg_provider), Some(&msg_model));
+                                                        l.presence_connected(
+                                                            Some(&msg_provider),
+                                                            Some(&msg_model),
+                                                        );
                                                     }
                                                 }
                                                 bus_inbound.send(AppEvent::PresenceConnected {
@@ -4004,19 +4055,30 @@ pub fn spawn_web_gateway(
                                         }
                                         Some("presence_disconnect") => {
                                             is_presence_connected = false;
-                                            voice_debug_inbound.lock().unwrap_or_else(|e| e.into_inner()).connected = false;
+                                            voice_debug_inbound
+                                                .lock()
+                                                .unwrap_or_else(|e| e.into_inner())
+                                                .connected = false;
                                             if let Some(ref ctx) = query_ctx_inbound {
                                                 if let Some(ref ps) = ctx.presence_session {
-                                                    ps.lock().unwrap_or_else(|e| e.into_inner())
+                                                    ps.lock()
+                                                        .unwrap_or_else(|e| e.into_inner())
                                                         .set_connected(false);
                                                 }
                                             }
                                             // Only emit PresenceDisconnected if this was the active browser
                                             if is_active {
                                                 // Clear the active slot
-                                                let mut slot = active_presence_inbound.lock()
+                                                let mut slot = active_presence_inbound
+                                                    .lock()
                                                     .unwrap_or_else(|e| e.into_inner());
-                                                if slot.as_ref().map(|a| a.connection_id == connection_id_inbound).unwrap_or(false) {
+                                                if slot
+                                                    .as_ref()
+                                                    .map(|a| {
+                                                        a.connection_id == connection_id_inbound
+                                                    })
+                                                    .unwrap_or(false)
+                                                {
                                                     *slot = None;
                                                 }
                                                 is_active = false;
@@ -4030,9 +4092,11 @@ pub fn spawn_web_gateway(
                                         }
                                         Some("make_active") => {
                                             // Request to become the active voice owner
-                                            let mut slot = active_presence_inbound.lock()
+                                            let mut slot = active_presence_inbound
+                                                .lock()
                                                 .unwrap_or_else(|e| e.into_inner());
-                                            let previous_active = slot.as_ref()
+                                            let previous_active = slot
+                                                .as_ref()
                                                 .map(|active| active.connection_id.clone());
                                             if let Some(ref sl) = session_log_inbound {
                                                 if let Ok(mut l) = sl.lock() {
@@ -4054,7 +4118,8 @@ pub fn spawn_web_gateway(
                                                         "t": "force_disconnect_voice",
                                                         "reason": "handover",
                                                     });
-                                                    let _ = old.direct_tx.send(force_msg.to_string());
+                                                    let _ =
+                                                        old.direct_tx.send(force_msg.to_string());
                                                     if let Some(ref sl) = session_log_inbound {
                                                         if let Ok(mut l) = sl.lock() {
                                                             l.voice_diagnostic(
@@ -4088,22 +4153,34 @@ pub fn spawn_web_gateway(
 
                                             is_active = true;
                                             is_presence_connected = true;
-                                            voice_debug_inbound.lock().unwrap_or_else(|e| e.into_inner()).connected = true;
+                                            voice_debug_inbound
+                                                .lock()
+                                                .unwrap_or_else(|e| e.into_inner())
+                                                .connected = true;
 
                                             // Build handover context from latest checkpoint
-                                            let handover_context = query_ctx_inbound.as_ref()
+                                            let handover_context = query_ctx_inbound
+                                                .as_ref()
                                                 .and_then(|ctx| ctx.presence_session.as_ref())
                                                 .and_then(|ps| {
-                                                    let session = ps.lock().unwrap_or_else(|e| e.into_inner());
+                                                    let session = ps
+                                                        .lock()
+                                                        .unwrap_or_else(|e| e.into_inner());
                                                     session.last_checkpoint_summary()
                                                 })
                                                 .unwrap_or_default();
 
                                             // Build conversation context from recent voice transcripts
-                                            let conversation_ctx = query_ctx_inbound.as_ref()
-                                                .and_then(|ctx| presence::build_conversation_context(&ctx.log_dir, 20));
+                                            let conversation_ctx =
+                                                query_ctx_inbound.as_ref().and_then(|ctx| {
+                                                    presence::build_conversation_context(
+                                                        &ctx.log_dir,
+                                                        20,
+                                                    )
+                                                });
                                             let has_handover_context = !handover_context.is_empty();
-                                            let has_conversation_context = conversation_ctx.as_deref()
+                                            let has_conversation_context = conversation_ctx
+                                                .as_deref()
                                                 .map(|s| !s.is_empty())
                                                 .unwrap_or(false);
 
@@ -4132,7 +4209,10 @@ pub fn spawn_web_gateway(
                                             // Emit PresenceConnected for the new active browser
                                             if let Some(ref sl) = session_log_inbound {
                                                 if let Ok(mut l) = sl.lock() {
-                                                    l.presence_connected(Some(&live_provider), Some(&live_model));
+                                                    l.presence_connected(
+                                                        Some(&live_provider),
+                                                        Some(&live_model),
+                                                    );
                                                 }
                                             }
                                             bus_inbound.send(AppEvent::PresenceConnected {
@@ -4143,19 +4223,27 @@ pub fn spawn_web_gateway(
                                             });
                                         }
                                         Some("voice_log") => {
-                                            let text = json["text"].as_str().unwrap_or("").to_string();
+                                            let text =
+                                                json["text"].as_str().unwrap_or("").to_string();
                                             let seq = json["seq"].as_u64().unwrap_or(0);
-                                            let tool_context = json.get("tool_context")
+                                            let tool_context = json
+                                                .get("tool_context")
                                                 .and_then(|v| v.as_str())
                                                 .map(String::from);
                                             {
-                                                let mut vd = voice_debug_inbound.lock().unwrap_or_else(|e| e.into_inner());
+                                                let mut vd = voice_debug_inbound
+                                                    .lock()
+                                                    .unwrap_or_else(|e| e.into_inner());
                                                 vd.voice_log_count += 1;
                                                 vd.last_voice_log = text.clone();
                                             }
                                             if let Some(ref sl) = session_log_inbound {
                                                 if let Ok(mut l) = sl.lock() {
-                                                    l.voice_log(&text, seq, tool_context.as_deref());
+                                                    l.voice_log(
+                                                        &text,
+                                                        seq,
+                                                        tool_context.as_deref(),
+                                                    );
                                                 }
                                             }
                                             bus_inbound.send(AppEvent::VoiceLog {
@@ -4166,36 +4254,57 @@ pub fn spawn_web_gateway(
                                         }
                                         Some("live_usage_update") => {
                                             bus_inbound.send(AppEvent::LiveUsageUpdate {
-                                                provider: json["provider"].as_str().unwrap_or("").to_string(),
-                                                model: json["model"].as_str().unwrap_or("").to_string(),
-                                                input_tokens: json["input_tokens"].as_u64().unwrap_or(0),
-                                                output_tokens: json["output_tokens"].as_u64().unwrap_or(0),
-                                                cached_tokens: json["cached_tokens"].as_u64().unwrap_or(0),
-                                                total_tokens: json["total_tokens"].as_u64().unwrap_or(0),
-                                                thinking_tokens: json["thinking_tokens"].as_u64().unwrap_or(0),
+                                                provider: json["provider"]
+                                                    .as_str()
+                                                    .unwrap_or("")
+                                                    .to_string(),
+                                                model: json["model"]
+                                                    .as_str()
+                                                    .unwrap_or("")
+                                                    .to_string(),
+                                                input_tokens: json["input_tokens"]
+                                                    .as_u64()
+                                                    .unwrap_or(0),
+                                                output_tokens: json["output_tokens"]
+                                                    .as_u64()
+                                                    .unwrap_or(0),
+                                                cached_tokens: json["cached_tokens"]
+                                                    .as_u64()
+                                                    .unwrap_or(0),
+                                                total_tokens: json["total_tokens"]
+                                                    .as_u64()
+                                                    .unwrap_or(0),
+                                                thinking_tokens: json["thinking_tokens"]
+                                                    .as_u64()
+                                                    .unwrap_or(0),
                                             });
                                         }
                                         Some("presence_checkpoint") => {
-                                            let summary = json["summary"].as_str().unwrap_or("").to_string();
-                                            let last_event_seq = json.get("last_event_seq")
+                                            let summary =
+                                                json["summary"].as_str().unwrap_or("").to_string();
+                                            let last_event_seq = json
+                                                .get("last_event_seq")
                                                 .and_then(|v| v.as_u64())
                                                 .unwrap_or(0);
 
                                             // Record checkpoint and send ack
                                             if let Some(ref ctx) = query_ctx_inbound {
                                                 if let Some(ref ps) = ctx.presence_session {
-                                                    let checkpoint = presence_core::PresenceCheckpoint {
-                                                        summary: summary.clone(),
-                                                        last_event_seq,
-                                                    };
-                                                    let ack = ps.lock()
+                                                    let checkpoint =
+                                                        presence_core::PresenceCheckpoint {
+                                                            summary: summary.clone(),
+                                                            last_event_seq,
+                                                        };
+                                                    let ack = ps
+                                                        .lock()
                                                         .unwrap_or_else(|e| e.into_inner())
                                                         .record_checkpoint(checkpoint);
                                                     let ack_msg = serde_json::json!({
                                                         "t": "presence_checkpoint_ack",
                                                         "seq": ack.seq,
                                                     });
-                                                    let _ = direct_tx_inbound.send(ack_msg.to_string());
+                                                    let _ =
+                                                        direct_tx_inbound.send(ack_msg.to_string());
                                                 }
                                             }
 
@@ -4204,44 +4313,61 @@ pub fn spawn_web_gateway(
                                                     l.presence_checkpoint(&summary, last_event_seq);
                                                 }
                                             }
-                                            bus_inbound.send(AppEvent::PresenceCheckpointReceived {
-                                                summary,
-                                                last_event_seq,
-                                            });
+                                            bus_inbound.send(
+                                                AppEvent::PresenceCheckpointReceived {
+                                                    summary,
+                                                    last_event_seq,
+                                                },
+                                            );
                                         }
                                         Some("voice_diagnostic") => {
-                                            let kind = json["kind"].as_str().unwrap_or("unknown").to_string();
-                                            let detail = json["detail"].as_str().unwrap_or("").to_string();
+                                            let kind = json["kind"]
+                                                .as_str()
+                                                .unwrap_or("unknown")
+                                                .to_string();
+                                            let detail =
+                                                json["detail"].as_str().unwrap_or("").to_string();
                                             if let Some(ref sl) = session_log_inbound {
                                                 if let Ok(mut l) = sl.lock() {
                                                     l.voice_diagnostic(&kind, &detail);
                                                 }
                                             }
-                                            bus_inbound.send(AppEvent::VoiceDiagnostic {
-                                                kind,
-                                                detail,
-                                            });
+                                            bus_inbound
+                                                .send(AppEvent::VoiceDiagnostic { kind, detail });
                                         }
                                         Some("user_audio") => {
                                             // Browser sends base64-encoded PCM16 audio for server-side transcription.
                                             if let Some(ref transcriber) = transcriber_inbound {
                                                 if let Some(data_b64) = json["data"].as_str() {
                                                     use base64::Engine;
-                                                    if let Ok(pcm_bytes) = base64::engine::general_purpose::STANDARD
-                                                        .decode(data_b64)
+                                                    if let Ok(pcm_bytes) =
+                                                        base64::engine::general_purpose::STANDARD
+                                                            .decode(data_b64)
                                                     {
                                                         audio_buf.extend_from_slice(&pcm_bytes);
                                                         // Drain at ~3s of audio (16kHz * 2 bytes/sample * 1 channel * 3s = 96000)
-                                                        let threshold = (audio_sample_rate as usize) * 2 * 3;
+                                                        let threshold =
+                                                            (audio_sample_rate as usize) * 2 * 3;
                                                         if audio_buf.len() >= threshold {
                                                             // Skip silent buffers — compute RMS energy of PCM16 samples.
                                                             // Whisper hallucinates on silence (outputs "you", ".", etc).
                                                             let rms = {
-                                                                let samples = audio_buf.chunks_exact(2)
-                                                                    .map(|c| i16::from_le_bytes([c[0], c[1]]) as f64);
-                                                                let sum_sq: f64 = samples.map(|s| s * s).sum();
+                                                                let samples = audio_buf
+                                                                    .chunks_exact(2)
+                                                                    .map(|c| {
+                                                                        i16::from_le_bytes([
+                                                                            c[0], c[1],
+                                                                        ])
+                                                                            as f64
+                                                                    });
+                                                                let sum_sq: f64 =
+                                                                    samples.map(|s| s * s).sum();
                                                                 let n = audio_buf.len() / 2;
-                                                                if n > 0 { (sum_sq / n as f64).sqrt() } else { 0.0 }
+                                                                if n > 0 {
+                                                                    (sum_sq / n as f64).sqrt()
+                                                                } else {
+                                                                    0.0
+                                                                }
                                                             };
                                                             if rms < 1000.0 {
                                                                 // Below speech threshold — skip transcription.
@@ -4250,24 +4376,33 @@ pub fn spawn_web_gateway(
                                                                 audio_buf.clear();
                                                                 continue;
                                                             }
-                                                            let wav = crate::transcription::encode_wav(
-                                                                &audio_buf,
-                                                                audio_sample_rate,
-                                                                1,
-                                                            );
+                                                            let wav =
+                                                                crate::transcription::encode_wav(
+                                                                    &audio_buf,
+                                                                    audio_sample_rate,
+                                                                    1,
+                                                                );
                                                             audio_buf.clear();
                                                             audio_seq += 1;
                                                             let seq = audio_seq;
                                                             let t = transcriber.clone();
                                                             let bus_tx = bus_inbound.clone();
-                                                            let session_log_tx = session_log_inbound.clone();
+                                                            let session_log_tx =
+                                                                session_log_inbound.clone();
                                                             tokio::spawn(async move {
                                                                 match t.transcribe(&wav).await {
                                                                     Ok(segment) => {
-                                                                        let text = segment.text.trim().to_string();
+                                                                        let text = segment
+                                                                            .text
+                                                                            .trim()
+                                                                            .to_string();
                                                                         if !text.is_empty() {
-                                                                            if let Some(ref sl) = session_log_tx {
-                                                                                if let Ok(mut l) = sl.lock() {
+                                                                            if let Some(ref sl) =
+                                                                                session_log_tx
+                                                                            {
+                                                                                if let Ok(mut l) =
+                                                                                    sl.lock()
+                                                                                {
                                                                                     l.user_transcript(&text, seq);
                                                                                 }
                                                                             }
@@ -4286,29 +4421,48 @@ pub fn spawn_web_gateway(
                                         }
                                         Some("video_frame") => {
                                             // Browser sends a video frame for HQ archival in the frame registry.
-                                            let frame_id = json["frame_id"].as_str().unwrap_or("").to_string();
-                                            let stream = json["stream"].as_str().unwrap_or("cam0").to_string();
+                                            let frame_id =
+                                                json["frame_id"].as_str().unwrap_or("").to_string();
+                                            let stream = json["stream"]
+                                                .as_str()
+                                                .unwrap_or("cam0")
+                                                .to_string();
                                             if let Some(data_b64) = json["data"].as_str() {
                                                 use base64::Engine;
-                                                if let Ok(jpeg_bytes) = base64::engine::general_purpose::STANDARD.decode(data_b64) {
+                                                if let Ok(jpeg_bytes) =
+                                                    base64::engine::general_purpose::STANDARD
+                                                        .decode(data_b64)
+                                                {
                                                     // Register in frame registry
-                                                    if let Some(ref registry) = frame_registry_inbound {
+                                                    if let Some(ref registry) =
+                                                        frame_registry_inbound
+                                                    {
                                                         let meta = presence_core::FrameMeta {
                                                             frame_id: frame_id.clone(),
                                                             stream: stream.clone(),
-                                                            timestamp: chrono::Utc::now().to_rfc3339(),
+                                                            timestamp: chrono::Utc::now()
+                                                                .to_rfc3339(),
                                                             sent_to_live: true,
-                                                            live_resolution: Some("768x768".to_string()),
+                                                            live_resolution: Some(
+                                                                "768x768".to_string(),
+                                                            ),
                                                             hq_resolution: None,
                                                             note: None,
                                                         };
                                                         let mut reg = registry.write().await;
-                                                        if let Err(e) = reg.register(meta, &jpeg_bytes) {
-                                                            eprintln!("frame registry write failed: {}", e);
+                                                        if let Err(e) =
+                                                            reg.register(meta, &jpeg_bytes)
+                                                        {
+                                                            eprintln!(
+                                                                "frame registry write failed: {}",
+                                                                e
+                                                            );
                                                         }
                                                     }
                                                     // Feed into recording pipeline (auto-starts on first frame)
-                                                    if let Some(ref rec_reg) = recording_registry_inbound {
+                                                    if let Some(ref rec_reg) =
+                                                        recording_registry_inbound
+                                                    {
                                                         let mut rreg = rec_reg.write().await;
                                                         if rreg.is_enabled() {
                                                             if !rreg.is_recording(&stream) {
@@ -4322,7 +4476,9 @@ pub fn spawn_web_gateway(
                                                                     }
                                                                 }
                                                             }
-                                                            let _ = rreg.feed_frame(&stream, &jpeg_bytes).await;
+                                                            let _ = rreg
+                                                                .feed_frame(&stream, &jpeg_bytes)
+                                                                .await;
                                                         }
                                                     }
                                                 }
@@ -4336,23 +4492,38 @@ pub fn spawn_web_gateway(
                                             //
                                             // Works regardless of presence/agent state — attachments
                                             // are independent of any running task.
-                                            let frame_id = json["frame_id"].as_str().unwrap_or("").to_string();
-                                            let stream = json["stream"].as_str().unwrap_or("annotation").to_string();
-                                            let note = json["note"].as_str().unwrap_or("").to_string();
+                                            let frame_id =
+                                                json["frame_id"].as_str().unwrap_or("").to_string();
+                                            let stream = json["stream"]
+                                                .as_str()
+                                                .unwrap_or("annotation")
+                                                .to_string();
+                                            let note =
+                                                json["note"].as_str().unwrap_or("").to_string();
                                             if let Some(data_b64) = json["data"].as_str() {
                                                 use base64::Engine;
-                                                if let Ok(jpeg_bytes) = base64::engine::general_purpose::STANDARD.decode(data_b64) {
+                                                if let Ok(jpeg_bytes) =
+                                                    base64::engine::general_purpose::STANDARD
+                                                        .decode(data_b64)
+                                                {
                                                     let mut saved_path = String::new();
                                                     let mut registered = false;
-                                                    if let Some(ref registry) = frame_registry_inbound {
+                                                    if let Some(ref registry) =
+                                                        frame_registry_inbound
+                                                    {
                                                         let meta = presence_core::FrameMeta {
                                                             frame_id: frame_id.clone(),
                                                             stream: stream.clone(),
-                                                            timestamp: chrono::Utc::now().to_rfc3339(),
+                                                            timestamp: chrono::Utc::now()
+                                                                .to_rfc3339(),
                                                             sent_to_live: false,
                                                             live_resolution: None,
                                                             hq_resolution: None,
-                                                            note: if note.is_empty() { None } else { Some(note.clone()) },
+                                                            note: if note.is_empty() {
+                                                                None
+                                                            } else {
+                                                                Some(note.clone())
+                                                            },
                                                         };
                                                         let mut reg = registry.write().await;
                                                         match reg.register(meta, &jpeg_bytes) {
@@ -4363,14 +4534,17 @@ pub fn spawn_web_gateway(
                                                             Err(e) => eprintln!("annotation_attach frame registry write failed: {}", e),
                                                         }
                                                     }
-                                                    let _ = direct_tx_inbound.send(serde_json::json!({
-                                                        "t": "annotation_attached",
-                                                        "frame_id": frame_id,
-                                                        "stream": stream,
-                                                        "path": saved_path,
-                                                        "note": note,
-                                                        "ok": registered,
-                                                    }).to_string());
+                                                    let _ = direct_tx_inbound.send(
+                                                        serde_json::json!({
+                                                            "t": "annotation_attached",
+                                                            "frame_id": frame_id,
+                                                            "stream": stream,
+                                                            "path": saved_path,
+                                                            "note": note,
+                                                            "ok": registered,
+                                                        })
+                                                        .to_string(),
+                                                    );
                                                     bus_inbound.send(AppEvent::PresenceLog {
                                                         message: format!(
                                                             "[annotation] {} attached (pending)",
@@ -4384,24 +4558,39 @@ pub fn spawn_web_gateway(
                                         }
                                         Some("annotation_submit") => {
                                             // User drew annotations on a frame and submitted it with a note.
-                                            let frame_id = json["frame_id"].as_str().unwrap_or("").to_string();
-                                            let stream = json["stream"].as_str().unwrap_or("annotation").to_string();
-                                            let note = json["note"].as_str().unwrap_or("").to_string();
+                                            let frame_id =
+                                                json["frame_id"].as_str().unwrap_or("").to_string();
+                                            let stream = json["stream"]
+                                                .as_str()
+                                                .unwrap_or("annotation")
+                                                .to_string();
+                                            let note =
+                                                json["note"].as_str().unwrap_or("").to_string();
                                             let inject = json["inject"].as_bool().unwrap_or(false);
                                             if let Some(data_b64) = json["data"].as_str() {
                                                 use base64::Engine;
-                                                if let Ok(jpeg_bytes) = base64::engine::general_purpose::STANDARD.decode(data_b64) {
+                                                if let Ok(jpeg_bytes) =
+                                                    base64::engine::general_purpose::STANDARD
+                                                        .decode(data_b64)
+                                                {
                                                     // Register in frame registry
                                                     let mut saved_path = String::new();
-                                                    if let Some(ref registry) = frame_registry_inbound {
+                                                    if let Some(ref registry) =
+                                                        frame_registry_inbound
+                                                    {
                                                         let meta = presence_core::FrameMeta {
                                                             frame_id: frame_id.clone(),
                                                             stream: stream.clone(),
-                                                            timestamp: chrono::Utc::now().to_rfc3339(),
+                                                            timestamp: chrono::Utc::now()
+                                                                .to_rfc3339(),
                                                             sent_to_live: false,
                                                             live_resolution: None,
                                                             hq_resolution: None,
-                                                            note: if note.is_empty() { None } else { Some(note.clone()) },
+                                                            note: if note.is_empty() {
+                                                                None
+                                                            } else {
+                                                                Some(note.clone())
+                                                            },
                                                         };
                                                         let mut reg = registry.write().await;
                                                         match reg.register(meta, &jpeg_bytes) {
@@ -4413,12 +4602,17 @@ pub fn spawn_web_gateway(
                                                     let mut injected_to_queue = false;
                                                     if inject {
                                                         if let Some(ref ctx) = query_ctx_inbound {
-                                                            if let Some(ref ciq) = ctx.context_injection {
+                                                            if let Some(ref ciq) =
+                                                                ctx.context_injection
+                                                            {
                                                                 if let Ok(mut q) = ciq.lock() {
                                                                     let label = if note.is_empty() {
                                                                         "[User Annotation] User highlighted something on the screen.".to_string()
                                                                     } else {
-                                                                        format!("[User Annotation] {}", note)
+                                                                        format!(
+                                                                            "[User Annotation] {}",
+                                                                            note
+                                                                        )
                                                                     };
                                                                     q.push(crate::event::ContextInjection {
                                                                         text: label,
@@ -4438,12 +4632,15 @@ pub fn spawn_web_gateway(
                                                     // actually landed in the queue (not just whether the user
                                                     // pressed Send), so the UI doesn't lie when no presence is
                                                     // running.
-                                                    let _ = direct_tx_inbound.send(serde_json::json!({
-                                                        "t": "annotation_saved",
-                                                        "frame_id": frame_id,
-                                                        "path": saved_path,
-                                                        "injected": injected_to_queue,
-                                                    }).to_string());
+                                                    let _ = direct_tx_inbound.send(
+                                                        serde_json::json!({
+                                                            "t": "annotation_saved",
+                                                            "frame_id": frame_id,
+                                                            "path": saved_path,
+                                                            "injected": injected_to_queue,
+                                                        })
+                                                        .to_string(),
+                                                    );
                                                     let status_label = if inject {
                                                         if injected_to_queue {
                                                             " (sent to agent)"
@@ -4465,65 +4662,99 @@ pub fn spawn_web_gateway(
                                             }
                                         }
                                         Some("clip_start") => {
-                                            let clip_id = json["clip_id"].as_str().unwrap_or("").to_string();
-                                            let stream = json["stream"].as_str().unwrap_or("recording").to_string();
-                                            let note = json["note"].as_str().unwrap_or("").to_string();
+                                            let clip_id =
+                                                json["clip_id"].as_str().unwrap_or("").to_string();
+                                            let stream = json["stream"]
+                                                .as_str()
+                                                .unwrap_or("recording")
+                                                .to_string();
+                                            let note =
+                                                json["note"].as_str().unwrap_or("").to_string();
                                             let inject = json["inject"].as_bool().unwrap_or(false);
                                             let in_secs = json["in_secs"].as_f64().unwrap_or(0.0);
                                             let out_secs = json["out_secs"].as_f64().unwrap_or(0.0);
                                             let fps = json["fps"].as_u64().unwrap_or(2) as u32;
-                                            let total = json["total_frames"].as_u64().unwrap_or(0) as usize;
-                                            clip_accumulators.insert(clip_id.clone(), ClipAccumulator {
-                                                stream, note, inject, in_secs, out_secs, fps,
-                                                expected: total,
-                                                frames: Vec::with_capacity(total),
-                                            });
+                                            let total =
+                                                json["total_frames"].as_u64().unwrap_or(0) as usize;
+                                            clip_accumulators.insert(
+                                                clip_id.clone(),
+                                                ClipAccumulator {
+                                                    stream,
+                                                    note,
+                                                    inject,
+                                                    in_secs,
+                                                    out_secs,
+                                                    fps,
+                                                    expected: total,
+                                                    frames: Vec::with_capacity(total),
+                                                },
+                                            );
                                             bus_inbound.send(AppEvent::PresenceLog {
-                                                message: format!("[clip] started {} ({} frames, {}fps)", clip_id, total, fps),
+                                                message: format!(
+                                                    "[clip] started {} ({} frames, {}fps)",
+                                                    clip_id, total, fps
+                                                ),
                                                 level: Some(LogLevel::Debug),
                                                 turn: None,
                                             });
                                         }
                                         Some("clip_frame") => {
-                                            let clip_id = json["clip_id"].as_str().unwrap_or("").to_string();
-                                            let frame_id = json["frame_id"].as_str().unwrap_or("").to_string();
-                                            let timestamp_secs = json["timestamp_secs"].as_f64().unwrap_or(0.0);
+                                            let clip_id =
+                                                json["clip_id"].as_str().unwrap_or("").to_string();
+                                            let frame_id =
+                                                json["frame_id"].as_str().unwrap_or("").to_string();
+                                            let timestamp_secs =
+                                                json["timestamp_secs"].as_f64().unwrap_or(0.0);
                                             if let Some(data_b64) = json["data"].as_str() {
                                                 // Register frame in frame registry
                                                 use base64::Engine;
-                                                if let Ok(jpeg_bytes) = base64::engine::general_purpose::STANDARD.decode(data_b64) {
-                                                    if let Some(ref registry) = frame_registry_inbound {
+                                                if let Ok(jpeg_bytes) =
+                                                    base64::engine::general_purpose::STANDARD
+                                                        .decode(data_b64)
+                                                {
+                                                    if let Some(ref registry) =
+                                                        frame_registry_inbound
+                                                    {
                                                         let meta = presence_core::FrameMeta {
                                                             frame_id: frame_id.clone(),
                                                             stream: format!("clip:{}", clip_id),
-                                                            timestamp: chrono::Utc::now().to_rfc3339(),
+                                                            timestamp: chrono::Utc::now()
+                                                                .to_rfc3339(),
                                                             sent_to_live: false,
                                                             live_resolution: None,
                                                             hq_resolution: None,
                                                             note: None,
                                                         };
                                                         let mut reg = registry.write().await;
-                                                        if let Err(e) = reg.register(meta, &jpeg_bytes) {
+                                                        if let Err(e) =
+                                                            reg.register(meta, &jpeg_bytes)
+                                                        {
                                                             eprintln!("clip frame registry write failed: {}", e);
                                                         }
                                                     }
                                                 }
                                                 // Accumulate for context injection
-                                                if let Some(acc) = clip_accumulators.get_mut(&clip_id) {
-                                                    acc.frames.push((frame_id, data_b64.to_string()));
+                                                if let Some(acc) =
+                                                    clip_accumulators.get_mut(&clip_id)
+                                                {
+                                                    acc.frames
+                                                        .push((frame_id, data_b64.to_string()));
                                                 }
                                             }
                                         }
                                         Some("clip_end") => {
-                                            let clip_id = json["clip_id"].as_str().unwrap_or("").to_string();
-                                            let frames_sent = json["frames_sent"].as_u64().unwrap_or(0) as usize;
+                                            let clip_id =
+                                                json["clip_id"].as_str().unwrap_or("").to_string();
+                                            let frames_sent =
+                                                json["frames_sent"].as_u64().unwrap_or(0) as usize;
                                             let mut injected = false;
 
                                             if let Some(acc) = clip_accumulators.remove(&clip_id) {
                                                 let frames_registered = acc.frames.len();
                                                 if acc.inject {
                                                     if let Some(ref ctx) = query_ctx_inbound {
-                                                        if let Some(ref ciq) = ctx.context_injection {
+                                                        if let Some(ref ciq) = ctx.context_injection
+                                                        {
                                                             if let Ok(mut q) = ciq.lock() {
                                                                 let label = if acc.note.is_empty() {
                                                                     format!(
@@ -4560,18 +4791,26 @@ pub fn spawn_web_gateway(
                                                     }
                                                 }
 
-                                                let _ = direct_tx_inbound.send(serde_json::json!({
-                                                    "t": "clip_saved",
-                                                    "clip_id": clip_id,
-                                                    "frames_registered": frames_registered,
-                                                    "injected": injected,
-                                                }).to_string());
+                                                let _ = direct_tx_inbound.send(
+                                                    serde_json::json!({
+                                                        "t": "clip_saved",
+                                                        "clip_id": clip_id,
+                                                        "frames_registered": frames_registered,
+                                                        "injected": injected,
+                                                    })
+                                                    .to_string(),
+                                                );
 
                                                 bus_inbound.send(AppEvent::PresenceLog {
                                                     message: format!(
                                                         "[clip] {} — {} frames{}",
-                                                        clip_id, frames_registered,
-                                                        if injected { " (sent to agent)" } else { " (saved)" }
+                                                        clip_id,
+                                                        frames_registered,
+                                                        if injected {
+                                                            " (sent to agent)"
+                                                        } else {
+                                                            " (saved)"
+                                                        }
                                                     ),
                                                     level: Some(LogLevel::Info),
                                                     turn: None,
@@ -4579,73 +4818,124 @@ pub fn spawn_web_gateway(
                                             }
                                         }
                                         Some("tool_request") => {
-                                            let req_id = json["id"].as_str().unwrap_or("").to_string();
-                                            let tool = json["tool"].as_str().unwrap_or("").to_string();
-                                            let args = json.get("args").cloned()
-                                                .unwrap_or(serde_json::Value::Object(Default::default()));
+                                            let req_id =
+                                                json["id"].as_str().unwrap_or("").to_string();
+                                            let tool =
+                                                json["tool"].as_str().unwrap_or("").to_string();
+                                            let args = json.get("args").cloned().unwrap_or(
+                                                serde_json::Value::Object(Default::default()),
+                                            );
 
                                             // Log the incoming tool request at Debug level
                                             let args_preview = {
-                                                let s = serde_json::to_string(&args).unwrap_or_default();
-                                                if s.len() > 200 { format!("{}...", &s[..200]) } else { s }
+                                                let s = serde_json::to_string(&args)
+                                                    .unwrap_or_default();
+                                                if s.len() > 200 {
+                                                    format!("{}...", &s[..200])
+                                                } else {
+                                                    s
+                                                }
                                             };
                                             bus_inbound.send(AppEvent::PresenceLog {
-                                                message: format!("[tool_request] {}({})", tool, args_preview),
+                                                message: format!(
+                                                    "[tool_request] {}({})",
+                                                    tool, args_preview
+                                                ),
                                                 level: Some(LogLevel::Debug),
                                                 turn: None,
                                             });
 
                                             // Dispatch through presence-core (single canonical layer)
-                                            let state = query_ctx_inbound.as_ref()
-                                                .map(|ctx| ctx.agent_state.lock().unwrap_or_else(|e| e.into_inner()).clone())
+                                            let state = query_ctx_inbound
+                                                .as_ref()
+                                                .map(|ctx| {
+                                                    ctx.agent_state
+                                                        .lock()
+                                                        .unwrap_or_else(|e| e.into_inner())
+                                                        .clone()
+                                                })
                                                 .unwrap_or_default();
-                                            let action = presence::dispatch_tool_call(&tool, &args, &state);
+                                            let action =
+                                                presence::dispatch_tool_call(&tool, &args, &state);
 
                                             // SubmitTask: send directly to task_tx (bypasses TUI)
-                                            let query_result = if let presence::PresenceAction::SubmitTask(envelope) = action {
-                                                let msg = format!("Task submitted: {}", envelope.task);
-                                                if let Some(ref tx) = task_tx_inbound {
-                                                    let _ = tx.send(envelope).await;
-                                                } else {
-                                                    // Fallback: dispatch via EventBus if no task_tx
-                                                    let ctrl_action = presence::PresenceAction::SubmitTask(envelope);
-                                                    if let Some((ctrl, _)) = presence::action_to_control_msg(&ctrl_action) {
-                                                        bus_inbound.send(AppEvent::ControlCommand(ctrl));
-                                                    }
-                                                }
-                                                presence::ToolQueryResult::text(msg)
-                                            } else if let Some((ctrl, msg)) = presence::action_to_control_msg(&action) {
-                                                // Other action tools: dispatch via EventBus
-                                                bus_inbound.send(AppEvent::ControlCommand(ctrl));
-                                                presence::ToolQueryResult::text(msg)
-                                            } else {
-                                                match action {
-                                                    presence::PresenceAction::TextResult(text) => {
-                                                        presence::ToolQueryResult::text(text)
-                                                    }
-                                                    presence::PresenceAction::NeedsIO { tool_name, args: io_args } => {
-                                                        if let Some(ref ctx) = query_ctx_inbound {
-                                                            if let Some(result) = presence::handle_tool_query(
-                                                                &ctx.agent_state,
-                                                                &ctx.project_root,
-                                                                &ctx.log_dir,
-                                                                &ctx.knowledge_path,
-                                                                &tool_name,
-                                                                &io_args,
-                                                                frame_registry_inbound.as_ref(),
-                                                                ctx.context_injection.as_ref(),
-                                                            ).await {
-                                                                result
-                                                            } else {
-                                                                presence::ToolQueryResult::text(format!("Unknown tool: {}", tool))
-                                                            }
-                                                        } else {
-                                                            presence::ToolQueryResult::text("Presence query context not available".to_string())
+                                            let query_result =
+                                                if let presence::PresenceAction::SubmitTask(
+                                                    envelope,
+                                                ) = action
+                                                {
+                                                    let msg = format!(
+                                                        "Task submitted: {}",
+                                                        envelope.task
+                                                    );
+                                                    if let Some(ref tx) = task_tx_inbound {
+                                                        let _ = tx.send(envelope).await;
+                                                    } else {
+                                                        // Fallback: dispatch via EventBus if no task_tx
+                                                        let ctrl_action =
+                                                            presence::PresenceAction::SubmitTask(
+                                                                envelope,
+                                                            );
+                                                        if let Some((ctrl, _)) =
+                                                            presence::action_to_control_msg(
+                                                                &ctrl_action,
+                                                            )
+                                                        {
+                                                            bus_inbound.send(
+                                                                AppEvent::ControlCommand(ctrl),
+                                                            );
                                                         }
                                                     }
-                                                    _ => unreachable!(),
-                                                }
-                                            };
+                                                    presence::ToolQueryResult::text(msg)
+                                                } else if let Some((ctrl, msg)) =
+                                                    presence::action_to_control_msg(&action)
+                                                {
+                                                    // Other action tools: dispatch via EventBus
+                                                    bus_inbound
+                                                        .send(AppEvent::ControlCommand(ctrl));
+                                                    presence::ToolQueryResult::text(msg)
+                                                } else {
+                                                    match action {
+                                                        presence::PresenceAction::TextResult(
+                                                            text,
+                                                        ) => presence::ToolQueryResult::text(text),
+                                                        presence::PresenceAction::NeedsIO {
+                                                            tool_name,
+                                                            args: io_args,
+                                                        } => {
+                                                            if let Some(ref ctx) = query_ctx_inbound
+                                                            {
+                                                                if let Some(result) =
+                                                                    presence::handle_tool_query(
+                                                                        &ctx.agent_state,
+                                                                        &ctx.project_root,
+                                                                        &ctx.log_dir,
+                                                                        &ctx.knowledge_path,
+                                                                        &tool_name,
+                                                                        &io_args,
+                                                                        frame_registry_inbound
+                                                                            .as_ref(),
+                                                                        ctx.context_injection
+                                                                            .as_ref(),
+                                                                    )
+                                                                    .await
+                                                                {
+                                                                    result
+                                                                } else {
+                                                                    presence::ToolQueryResult::text(
+                                                                        format!(
+                                                                            "Unknown tool: {}",
+                                                                            tool
+                                                                        ),
+                                                                    )
+                                                                }
+                                                            } else {
+                                                                presence::ToolQueryResult::text("Presence query context not available".to_string())
+                                                            }
+                                                        }
+                                                        _ => unreachable!(),
+                                                    }
+                                                };
 
                                             // Log the tool response at Debug level
                                             let result_preview = if query_result.text.len() > 200 {
@@ -4654,7 +4944,10 @@ pub fn spawn_web_gateway(
                                                 query_result.text.clone()
                                             };
                                             bus_inbound.send(AppEvent::PresenceLog {
-                                                message: format!("[tool_response] {} → {}", tool, result_preview),
+                                                message: format!(
+                                                    "[tool_response] {} → {}",
+                                                    tool, result_preview
+                                                ),
                                                 level: Some(LogLevel::Debug),
                                                 turn: None,
                                             });
@@ -4665,13 +4958,19 @@ pub fn spawn_web_gateway(
                                                 "result": query_result.text,
                                             });
                                             if !query_result.images.is_empty() {
-                                                let img_array: Vec<serde_json::Value> = query_result.images.iter().map(|img| {
-                                                    serde_json::json!({
-                                                        "mime_type": img.media_type,
-                                                        "data": img.data,
-                                                    })
-                                                }).collect();
-                                                response["images"] = serde_json::Value::Array(img_array);
+                                                let img_array: Vec<serde_json::Value> =
+                                                    query_result
+                                                        .images
+                                                        .iter()
+                                                        .map(|img| {
+                                                            serde_json::json!({
+                                                                "mime_type": img.media_type,
+                                                                "data": img.data,
+                                                            })
+                                                        })
+                                                        .collect();
+                                                response["images"] =
+                                                    serde_json::Value::Array(img_array);
                                             }
                                             let _ = direct_tx_inbound.send(response.to_string());
                                         }
@@ -4679,10 +4978,13 @@ pub fn spawn_web_gateway(
                                             // Async query from browser — same dispatch as tool_request
                                             // but result goes back as async_query_result (injected into
                                             // voice session as text, not as a tool response).
-                                            let req_id = json["id"].as_str().unwrap_or("").to_string();
-                                            let tool = json["tool"].as_str().unwrap_or("").to_string();
-                                            let args = json.get("args").cloned()
-                                                .unwrap_or(serde_json::Value::Object(Default::default()));
+                                            let req_id =
+                                                json["id"].as_str().unwrap_or("").to_string();
+                                            let tool =
+                                                json["tool"].as_str().unwrap_or("").to_string();
+                                            let args = json.get("args").cloned().unwrap_or(
+                                                serde_json::Value::Object(Default::default()),
+                                            );
 
                                             bus_inbound.send(AppEvent::PresenceLog {
                                                 message: format!("[async_query] {}", tool),
@@ -4690,7 +4992,9 @@ pub fn spawn_web_gateway(
                                                 turn: None,
                                             });
 
-                                            let query_result = if let Some(ref ctx) = query_ctx_inbound {
+                                            let query_result = if let Some(ref ctx) =
+                                                query_ctx_inbound
+                                            {
                                                 if let Some(result) = presence::handle_tool_query(
                                                     &ctx.agent_state,
                                                     &ctx.project_root,
@@ -4700,13 +5004,21 @@ pub fn spawn_web_gateway(
                                                     &args,
                                                     frame_registry_inbound.as_ref(),
                                                     ctx.context_injection.as_ref(),
-                                                ).await {
+                                                )
+                                                .await
+                                                {
                                                     result
                                                 } else {
-                                                    presence::ToolQueryResult::text(format!("Unknown query tool: {}", tool))
+                                                    presence::ToolQueryResult::text(format!(
+                                                        "Unknown query tool: {}",
+                                                        tool
+                                                    ))
                                                 }
                                             } else {
-                                                presence::ToolQueryResult::text("Presence query context not available".to_string())
+                                                presence::ToolQueryResult::text(
+                                                    "Presence query context not available"
+                                                        .to_string(),
+                                                )
                                             };
 
                                             let result_preview = if query_result.text.len() > 200 {
@@ -4715,7 +5027,10 @@ pub fn spawn_web_gateway(
                                                 query_result.text.clone()
                                             };
                                             bus_inbound.send(AppEvent::PresenceLog {
-                                                message: format!("[async_query_result] {} → {}", tool, result_preview),
+                                                message: format!(
+                                                    "[async_query_result] {} → {}",
+                                                    tool, result_preview
+                                                ),
                                                 level: Some(LogLevel::Debug),
                                                 turn: None,
                                             });
@@ -4727,20 +5042,28 @@ pub fn spawn_web_gateway(
                                                 "result": query_result.text,
                                             });
                                             if !query_result.images.is_empty() {
-                                                let img_array: Vec<serde_json::Value> = query_result.images.iter().map(|img| {
-                                                    serde_json::json!({
-                                                        "mime_type": img.media_type,
-                                                        "data": img.data,
-                                                    })
-                                                }).collect();
-                                                response["images"] = serde_json::Value::Array(img_array);
+                                                let img_array: Vec<serde_json::Value> =
+                                                    query_result
+                                                        .images
+                                                        .iter()
+                                                        .map(|img| {
+                                                            serde_json::json!({
+                                                                "mime_type": img.media_type,
+                                                                "data": img.data,
+                                                            })
+                                                        })
+                                                        .collect();
+                                                response["images"] =
+                                                    serde_json::Value::Array(img_array);
                                             }
                                             let _ = direct_tx_inbound.send(response.to_string());
                                         }
                                         Some("display_offer") => {
                                             // WebRTC SDP offer from browser for a display session
-                                            let display_id = json["display_id"].as_u64().unwrap_or(0) as u32;
-                                            let sdp = json["sdp"].as_str().unwrap_or("").to_string();
+                                            let display_id =
+                                                json["display_id"].as_u64().unwrap_or(0) as u32;
+                                            let sdp =
+                                                json["sdp"].as_str().unwrap_or("").to_string();
 
                                             // Clone the Arc<DisplaySession> out of the read
                                             // lock before calling handle_offer. Holding the
@@ -4749,53 +5072,66 @@ pub fn spawn_web_gateway(
                                             // registry.write()) for as long as this block
                                             // runs. The Arc keeps the session alive
                                             // independently of the lock.
-                                            let session: Option<Arc<crate::display::DisplaySession>> = match session_registry_inbound.as_ref() {
+                                            let session: Option<
+                                                Arc<crate::display::DisplaySession>,
+                                            > = match session_registry_inbound.as_ref() {
                                                 Some(sr) => sr.read().await.get(display_id),
                                                 None => None,
                                             };
                                             if let Some(session) = session {
-                                                let (ice_tx, mut ice_rx) = mpsc::channel::<(crate::display::PeerId, String)>(64);
-                                                    // Combine the Host-header IP with the
-                                                    // port we want to advertise (HTTP port
-                                                    // for Phase 3 multiplex, or standalone
-                                                    // Phase 2 port) to form the single TCP
-                                                    // candidate the peer will emit. None
-                                                    // if either piece is missing (typically
-                                                    // because the browser connected via
-                                                    // hostname).
-                                                    let tcp_advertised_addr: Option<std::net::SocketAddr> =
-                                                        match (browser_host_ip, tcp_advertised_port) {
-                                                            (Some(ip), Some(port)) => {
-                                                                Some(std::net::SocketAddr::new(ip, port))
-                                                            }
-                                                            _ => None,
-                                                        };
-                                                    // Phase 5a.1 input authority gate.  The closure
-                                                    // returns true when this connection is the
-                                                    // authority holder OR when the display has no
-                                                    // holder (unclaimed = pre-phase-5 default).
-                                                    // `display/mod.rs` only sees this boolean; it
-                                                    // never learns about DisplayInputHolder, the
-                                                    // map, or connection IDs.  See
-                                                    // [`build_local_ws_input_authorizer`] for the
-                                                    // closure semantics + tests.
-                                                    let input_authorized = build_local_ws_input_authorizer(
+                                                let (ice_tx, mut ice_rx) = mpsc::channel::<(
+                                                    crate::display::PeerId,
+                                                    String,
+                                                )>(
+                                                    64
+                                                );
+                                                // Combine the Host-header IP with the
+                                                // port we want to advertise (HTTP port
+                                                // for Phase 3 multiplex, or standalone
+                                                // Phase 2 port) to form the single TCP
+                                                // candidate the peer will emit. None
+                                                // if either piece is missing (typically
+                                                // because the browser connected via
+                                                // hostname).
+                                                let tcp_advertised_addr: Option<
+                                                    std::net::SocketAddr,
+                                                > = match (browser_host_ip, tcp_advertised_port) {
+                                                    (Some(ip), Some(port)) => {
+                                                        Some(std::net::SocketAddr::new(ip, port))
+                                                    }
+                                                    _ => None,
+                                                };
+                                                // Phase 5a.1 input authority gate.  The closure
+                                                // returns true when this connection is the
+                                                // authority holder OR when the display has no
+                                                // holder (unclaimed = pre-phase-5 default).
+                                                // `display/mod.rs` only sees this boolean; it
+                                                // never learns about DisplayInputHolder, the
+                                                // map, or connection IDs.  See
+                                                // [`build_local_ws_input_authorizer`] for the
+                                                // closure semantics + tests.
+                                                let input_authorized =
+                                                    build_local_ws_input_authorizer(
                                                         display_id,
                                                         connection_id_inbound.clone(),
-                                                        Arc::clone(&display_input_authority_inbound),
+                                                        Arc::clone(
+                                                            &display_input_authority_inbound,
+                                                        ),
                                                     );
-                                                    // F-1.3b2 transport plumbing: local DisplaySlot's
-                                                    // browser doesn't create the
-                                                    // `display_input_authority` data channel
-                                                    // (5a/5c uses the WS path), so the handler is
-                                                    // never invoked here. The no-op keeps the
-                                                    // transport-layer signature uniform across
-                                                    // both peer kinds; the real federated handler
-                                                    // is wired by the federated path's caller in
-                                                    // a later slice.
-                                                    let authority_handler =
-                                                        crate::display::webrtc::noop_authority_handler();
-                                                    match session.handle_offer(
+                                                // F-1.3b2 transport plumbing: local DisplaySlot's
+                                                // browser doesn't create the
+                                                // `display_input_authority` data channel
+                                                // (5a/5c uses the WS path), so the handler is
+                                                // never invoked here. The no-op keeps the
+                                                // transport-layer signature uniform across
+                                                // both peer kinds; the real federated handler
+                                                // is wired by the federated path's caller in
+                                                // a later slice.
+                                                let authority_handler =
+                                                    crate::display::webrtc::noop_authority_handler(
+                                                    );
+                                                match session
+                                                    .handle_offer(
                                                         peer_id,
                                                         &sdp,
                                                         &ice_config,
@@ -4804,36 +5140,45 @@ pub fn spawn_web_gateway(
                                                         ice_tx,
                                                         input_authorized,
                                                         authority_handler,
-                                                    ).await {
-                                                        Ok(answer_sdp) => {
-                                                            peer_display_ids.push(display_id);
-                                                            let answer = serde_json::json!({
-                                                                "t": "display_answer",
-                                                                "display_id": display_id,
-                                                                "sdp": answer_sdp,
-                                                            });
-                                                            let _ = direct_tx_inbound.send(answer.to_string());
+                                                    )
+                                                    .await
+                                                {
+                                                    Ok(answer_sdp) => {
+                                                        peer_display_ids.push(display_id);
+                                                        let answer = serde_json::json!({
+                                                            "t": "display_answer",
+                                                            "display_id": display_id,
+                                                            "sdp": answer_sdp,
+                                                        });
+                                                        let _ = direct_tx_inbound
+                                                            .send(answer.to_string());
 
-                                                            // Forward server ICE candidates to browser
-                                                            let ice_direct_tx = direct_tx_inbound.clone();
-                                                            tokio::spawn(async move {
-                                                                while let Some((_pid, candidate_json)) = ice_rx.recv().await {
-                                                                    let msg = serde_json::json!({
-                                                                        "t": "display_ice",
-                                                                        "display_id": display_id,
-                                                                        "candidate": serde_json::from_str::<serde_json::Value>(&candidate_json).unwrap_or_default(),
-                                                                    });
-                                                                    if ice_direct_tx.send(msg.to_string()).is_err() {
-                                                                        break;
-                                                                    }
+                                                        // Forward server ICE candidates to browser
+                                                        let ice_direct_tx =
+                                                            direct_tx_inbound.clone();
+                                                        tokio::spawn(async move {
+                                                            while let Some((_pid, candidate_json)) =
+                                                                ice_rx.recv().await
+                                                            {
+                                                                let msg = serde_json::json!({
+                                                                    "t": "display_ice",
+                                                                    "display_id": display_id,
+                                                                    "candidate": serde_json::from_str::<serde_json::Value>(&candidate_json).unwrap_or_default(),
+                                                                });
+                                                                if ice_direct_tx
+                                                                    .send(msg.to_string())
+                                                                    .is_err()
+                                                                {
+                                                                    break;
                                                                 }
-                                                            });
-                                                        }
-                                                        Err(e) => {
-                                                            eprintln!("[web_gateway] WebRTC offer failed for display {}: {}", display_id, e);
-                                                        }
+                                                            }
+                                                        });
+                                                    }
+                                                    Err(e) => {
+                                                        eprintln!("[web_gateway] WebRTC offer failed for display {}: {}", display_id, e);
                                                     }
                                                 }
+                                            }
                                         }
                                         Some("display_ice") => {
                                             // Trickle ICE candidate from browser. Spawn the
@@ -4855,7 +5200,8 @@ pub fn spawn_web_gateway(
                                             // same "mdns resolve failed" diagnostic; losing
                                             // a candidate is survivable (ICE has others),
                                             // whereas blocking the reader is not.
-                                            let display_id = json["display_id"].as_u64().unwrap_or(0) as u32;
+                                            let display_id =
+                                                json["display_id"].as_u64().unwrap_or(0) as u32;
                                             let candidate = json["candidate"].to_string();
                                             let sr_clone = session_registry_inbound.clone();
                                             let pid = peer_id;
@@ -4872,12 +5218,17 @@ pub fn spawn_web_gateway(
                                                 // first lets deactivate proceed
                                                 // immediately; the session Arc keeps the
                                                 // target alive while mDNS resolves.
-                                                let session: Option<Arc<crate::display::DisplaySession>> = match sr_clone.as_ref() {
+                                                let session: Option<
+                                                    Arc<crate::display::DisplaySession>,
+                                                > = match sr_clone.as_ref() {
                                                     Some(sr) => sr.read().await.get(display_id),
                                                     None => None,
                                                 };
                                                 if let Some(session) = session {
-                                                    if let Err(e) = session.add_ice_candidate(pid, &candidate).await {
+                                                    if let Err(e) = session
+                                                        .add_ice_candidate(pid, &candidate)
+                                                        .await
+                                                    {
                                                         eprintln!("[web_gateway] ICE candidate failed for display {}: {}", display_id, e);
                                                     }
                                                 }
@@ -4885,18 +5236,31 @@ pub fn spawn_web_gateway(
                                         }
                                         Some("terminal_open") => {
                                             // {"t":"terminal_open","host_id":"local","terminal_id":"shell-0","cols":80,"rows":24}
-                                            let host_id = json["host_id"].as_str().unwrap_or("local").to_string();
-                                            let terminal_id = json["terminal_id"].as_str().unwrap_or("shell-0").to_string();
+                                            let host_id = json["host_id"]
+                                                .as_str()
+                                                .unwrap_or("local")
+                                                .to_string();
+                                            let terminal_id = json["terminal_id"]
+                                                .as_str()
+                                                .unwrap_or("shell-0")
+                                                .to_string();
                                             let cols = json["cols"].as_u64().unwrap_or(80) as u16;
                                             let rows = json["rows"].as_u64().unwrap_or(24) as u16;
-                                            let key = crate::terminal::TerminalKey { host_id: host_id.clone(), terminal_id: terminal_id.clone() };
+                                            let key = crate::terminal::TerminalKey {
+                                                host_id: host_id.clone(),
+                                                terminal_id: terminal_id.clone(),
+                                            };
 
-                                            match terminal_registry_inbound.open_or_attach(key.clone(), cols, rows).await {
+                                            match terminal_registry_inbound
+                                                .open_or_attach(key.clone(), cols, rows)
+                                                .await
+                                            {
                                                 Ok(session) => {
                                                     // Spawn a forwarder task that drains the session's
                                                     // per-listener channel and sends base64-encoded
                                                     // output to this WS connection.
-                                                    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+                                                    let (tx, mut rx) =
+                                                        tokio::sync::mpsc::unbounded_channel();
                                                     session.attach(tx);
 
                                                     let forwarder_tx = direct_tx_inbound.clone();
@@ -4924,7 +5288,10 @@ pub fn spawn_web_gateway(
                                                                     })
                                                                 }
                                                             };
-                                                            if forwarder_tx.send(msg.to_string()).is_err() {
+                                                            if forwarder_tx
+                                                                .send(msg.to_string())
+                                                                .is_err()
+                                                            {
                                                                 break;
                                                             }
                                                         }
@@ -4950,33 +5317,67 @@ pub fn spawn_web_gateway(
                                         }
                                         Some("terminal_input") => {
                                             // {"t":"terminal_input","host_id":"local","terminal_id":"shell-0","data":"<base64>"}
-                                            let host_id = json["host_id"].as_str().unwrap_or("local").to_string();
-                                            let terminal_id = json["terminal_id"].as_str().unwrap_or("shell-0").to_string();
+                                            let host_id = json["host_id"]
+                                                .as_str()
+                                                .unwrap_or("local")
+                                                .to_string();
+                                            let terminal_id = json["terminal_id"]
+                                                .as_str()
+                                                .unwrap_or("shell-0")
+                                                .to_string();
                                             let data_b64 = json["data"].as_str().unwrap_or("");
                                             use base64::Engine as _;
-                                            if let Ok(data) = base64::engine::general_purpose::STANDARD.decode(data_b64) {
-                                                let key = crate::terminal::TerminalKey { host_id, terminal_id };
-                                                if let Some(session) = terminal_registry_inbound.get(&key).await {
+                                            if let Ok(data) =
+                                                base64::engine::general_purpose::STANDARD
+                                                    .decode(data_b64)
+                                            {
+                                                let key = crate::terminal::TerminalKey {
+                                                    host_id,
+                                                    terminal_id,
+                                                };
+                                                if let Some(session) =
+                                                    terminal_registry_inbound.get(&key).await
+                                                {
                                                     session.write_input(&data);
                                                 }
                                             }
                                         }
                                         Some("terminal_resize") => {
                                             // {"t":"terminal_resize","host_id":"local","terminal_id":"shell-0","cols":N,"rows":N}
-                                            let host_id = json["host_id"].as_str().unwrap_or("local").to_string();
-                                            let terminal_id = json["terminal_id"].as_str().unwrap_or("shell-0").to_string();
+                                            let host_id = json["host_id"]
+                                                .as_str()
+                                                .unwrap_or("local")
+                                                .to_string();
+                                            let terminal_id = json["terminal_id"]
+                                                .as_str()
+                                                .unwrap_or("shell-0")
+                                                .to_string();
                                             let cols = json["cols"].as_u64().unwrap_or(80) as u16;
                                             let rows = json["rows"].as_u64().unwrap_or(24) as u16;
-                                            let key = crate::terminal::TerminalKey { host_id, terminal_id };
-                                            if let Some(session) = terminal_registry_inbound.get(&key).await {
+                                            let key = crate::terminal::TerminalKey {
+                                                host_id,
+                                                terminal_id,
+                                            };
+                                            if let Some(session) =
+                                                terminal_registry_inbound.get(&key).await
+                                            {
                                                 session.resize(cols, rows);
                                             }
                                         }
                                         Some("terminal_close") => {
                                             // {"t":"terminal_close","host_id":"local","terminal_id":"shell-0"}
-                                            let host_id = json["host_id"].as_str().unwrap_or("local").to_string();
-                                            let terminal_id = json["terminal_id"].as_str().unwrap_or("shell-0").to_string();
-                                            let key = crate::terminal::TerminalKey { host_id, terminal_id };
+                                            let host_id = json["host_id"]
+                                                .as_str()
+                                                .unwrap_or("local")
+                                                .to_string();
+                                            let terminal_id = json["terminal_id"]
+                                                .as_str()
+                                                .unwrap_or("shell-0")
+                                                .to_string();
+                                            let key = crate::terminal::TerminalKey {
+                                                host_id,
+                                                terminal_id,
+                                            };
                                             terminal_registry_inbound.close(&key).await;
                                         }
                                         Some("display_input") => {
@@ -4985,7 +5386,8 @@ pub fn spawn_web_gateway(
                                             // (which runs xdotool/cliclick subprocesses) so a
                                             // concurrent deactivate can take the write lock
                                             // without waiting on subprocess exits.
-                                            let display_id = json["display_id"].as_u64().unwrap_or(0) as u32;
+                                            let display_id =
+                                                json["display_id"].as_u64().unwrap_or(0) as u32;
 
                                             // Phase 5 authority gate: if someone has claimed
                                             // input authority for this display, only that
@@ -5014,13 +5416,21 @@ pub fn spawn_web_gateway(
                                             }
 
                                             if let Some(evt) = json.get("event") {
-                                                if let Ok(input_event) = serde_json::from_value::<crate::display::InputEvent>(evt.clone()) {
-                                                    let session: Option<Arc<crate::display::DisplaySession>> = match session_registry_inbound.as_ref() {
+                                                if let Ok(input_event) = serde_json::from_value::<
+                                                    crate::display::InputEvent,
+                                                >(
+                                                    evt.clone()
+                                                ) {
+                                                    let session: Option<
+                                                        Arc<crate::display::DisplaySession>,
+                                                    > = match session_registry_inbound.as_ref() {
                                                         Some(sr) => sr.read().await.get(display_id),
                                                         None => None,
                                                     };
                                                     if let Some(session) = session {
-                                                        if let Err(e) = session.inject_input(input_event).await {
+                                                        if let Err(e) =
+                                                            session.inject_input(input_event).await
+                                                        {
                                                             eprintln!("[web_gateway] display input injection failed: {}", e);
                                                         }
                                                     }
@@ -5045,8 +5455,10 @@ pub fn spawn_web_gateway(
                                             // operator running a smoke run sets it, all
                                             // viewers see the marker until they unset it.
                                             // No covert-stamp scenario worth gating against.
-                                            let display_id = json["display_id"].as_u64().unwrap_or(0) as u32;
-                                            let enabled = json["enabled"].as_bool().unwrap_or(false);
+                                            let display_id =
+                                                json["display_id"].as_u64().unwrap_or(0) as u32;
+                                            let enabled =
+                                                json["enabled"].as_bool().unwrap_or(false);
                                             match session_registry_inbound.as_ref() {
                                                 Some(sr) => {
                                                     let applied = sr
@@ -5078,7 +5490,11 @@ pub fn spawn_web_gateway(
                                             // gets re-broadcast as AppEvent::ControlCommand
                                             // for the agent loop / TUI / MCP consumers.
                                             match serde_json::from_value::<ControlMsg>(json) {
-                                                Ok(ControlMsg::WebRtcSignal { display_id, session_id, signal }) => {
+                                                Ok(ControlMsg::WebRtcSignal {
+                                                    display_id,
+                                                    session_id,
+                                                    signal,
+                                                }) => {
                                                     handle_federated_webrtc_signal(
                                                         display_id,
                                                         session_id,
@@ -5100,7 +5516,9 @@ pub fn spawn_web_gateway(
                                                         Arc::clone(&federated_authority_subscribers_inbound),
                                                     ).await;
                                                 }
-                                                Ok(ControlMsg::RequestDisplayInputAuthority { display_id }) => {
+                                                Ok(ControlMsg::RequestDisplayInputAuthority {
+                                                    display_id,
+                                                }) => {
                                                     // Phase 5a.1: handler body lives in
                                                     // `apply_grant_input_authority` so the
                                                     // authority-change emission is unit-testable
@@ -5122,7 +5540,8 @@ pub fn spawn_web_gateway(
                                                     let granted = serde_json::json!({
                                                         "t": "display_input_authority_granted",
                                                         "display_id": display_id,
-                                                    }).to_string();
+                                                    })
+                                                    .to_string();
                                                     let _ = direct_tx_inbound.send(granted);
                                                     bus_inbound.send(AppEvent::PresenceLog {
                                                         message: format!(
@@ -5133,7 +5552,9 @@ pub fn spawn_web_gateway(
                                                         turn: None,
                                                     });
                                                 }
-                                                Ok(ControlMsg::ReleaseDisplayInputAuthority { display_id }) => {
+                                                Ok(ControlMsg::ReleaseDisplayInputAuthority {
+                                                    display_id,
+                                                }) => {
                                                     let removed = apply_release_input_authority(
                                                         display_id,
                                                         connection_id_inbound.as_str(),
@@ -5151,7 +5572,10 @@ pub fn spawn_web_gateway(
                                                         });
                                                     }
                                                 }
-                                                Ok(ControlMsg::SetDiagnosticsVisualMarker { display_id, enabled }) => {
+                                                Ok(ControlMsg::SetDiagnosticsVisualMarker {
+                                                    display_id,
+                                                    enabled,
+                                                }) => {
                                                     // Accept the documented ControlMsg wire form
                                                     // (`{"action":"set_diagnostics_visual_marker", ...}`)
                                                     // in addition to the low-level `t` form
@@ -5186,19 +5610,31 @@ pub fn spawn_web_gateway(
                                                 }
                                                 Ok(ctrl) => {
                                                     bus_inbound.send(AppEvent::PresenceLog {
-                                                        message: format!("[ws] ControlMsg: {:?}",
+                                                        message: format!(
+                                                            "[ws] ControlMsg: {:?}",
                                                             match &ctrl {
-                                                                ControlMsg::StartTask { task, .. } => format!("StartTask({})", &task[..task.len().min(60)]),
+                                                                ControlMsg::StartTask {
+                                                                    task,
+                                                                    ..
+                                                                } => format!(
+                                                                    "StartTask({})",
+                                                                    &task[..task.len().min(60)]
+                                                                ),
                                                                 other => format!("{:?}", other),
-                                                            }),
+                                                            }
+                                                        ),
                                                         level: Some(LogLevel::Debug),
                                                         turn: None,
                                                     });
-                                                    bus_inbound.send(AppEvent::ControlCommand(ctrl));
+                                                    bus_inbound
+                                                        .send(AppEvent::ControlCommand(ctrl));
                                                 }
                                                 Err(e) => {
                                                     bus_inbound.send(AppEvent::PresenceLog {
-                                                        message: format!("[ws] ControlMsg parse failed: {}", e),
+                                                        message: format!(
+                                                            "[ws] ControlMsg parse failed: {}",
+                                                            e
+                                                        ),
                                                         level: Some(LogLevel::Warn),
                                                         turn: None,
                                                     });
@@ -5214,9 +5650,14 @@ pub fn spawn_web_gateway(
                         // server presence if this was the active browser (covers tab
                         // close without beforeunload, network drops, etc.)
                         if is_active {
-                            let mut slot = active_presence_inbound.lock()
+                            let mut slot = active_presence_inbound
+                                .lock()
                                 .unwrap_or_else(|e| e.into_inner());
-                            if slot.as_ref().map(|a| a.connection_id == connection_id_inbound).unwrap_or(false) {
+                            if slot
+                                .as_ref()
+                                .map(|a| a.connection_id == connection_id_inbound)
+                                .unwrap_or(false)
+                            {
                                 *slot = None;
                             }
                         }
@@ -5481,6 +5922,8 @@ pub fn spawn_web_gateway(
                     // Route WASM binaries (need async write_all for large payloads)
                     let wasm_binary = if request_line.contains("/wasm-web/presence_web_bg.wasm") {
                         Some(WASM_WEB_BIN)
+                    } else if request_line.contains("/wasm-station/station_web_bg.wasm") {
+                        Some(WASM_STATION_BIN)
                     } else {
                         None
                     };
@@ -5534,11 +5977,14 @@ pub fn spawn_web_gateway(
                                  Connection: close\r\n\
                                  \r\n\
                                  {}",
-                                body.len(), body
+                                body.len(),
+                                body
                             );
                             let _ = stream.write_all(response.as_bytes()).await;
                         }
-                    } else if request_line.starts_with("POST") && request_line.contains("/api/settings") {
+                    } else if request_line.starts_with("POST")
+                        && request_line.contains("/api/settings")
+                    {
                         use tokio::io::{AsyncReadExt as _, AsyncWriteExt};
                         // Read POST body — may be partially or fully outside the peek buffer
                         let content_length: usize = header_text
@@ -5564,23 +6010,31 @@ pub fn spawn_web_gateway(
                             &body_owned
                         };
                         let result = match &project_root {
-                            Some(root) => {
-                                match serde_json::from_str::<SettingsPayload>(body_text) {
-                                    Ok(payload) => {
-                                        match crate::project::Project::from_root(root.clone()) {
-                                            Ok(mut proj) => {
-                                                apply_settings_payload(&mut proj.config, &payload);
-                                                match proj.save_config() {
-                                                    Ok(()) => serde_json::json!({"ok": true}).to_string(),
-                                                    Err(e) => serde_json::json!({"error": e.to_string()}).to_string(),
+                            Some(root) => match serde_json::from_str::<SettingsPayload>(body_text) {
+                                Ok(payload) => {
+                                    match crate::project::Project::from_root(root.clone()) {
+                                        Ok(mut proj) => {
+                                            apply_settings_payload(&mut proj.config, &payload);
+                                            match proj.save_config() {
+                                                Ok(()) => {
+                                                    serde_json::json!({"ok": true}).to_string()
+                                                }
+                                                Err(e) => {
+                                                    serde_json::json!({"error": e.to_string()})
+                                                        .to_string()
                                                 }
                                             }
-                                            Err(e) => serde_json::json!({"error": e.to_string()}).to_string(),
+                                        }
+                                        Err(e) => {
+                                            serde_json::json!({"error": e.to_string()}).to_string()
                                         }
                                     }
-                                    Err(e) => serde_json::json!({"error": format!("Invalid settings: {}", e)}).to_string(),
                                 }
-                            }
+                                Err(e) => {
+                                    serde_json::json!({"error": format!("Invalid settings: {}", e)})
+                                        .to_string()
+                                }
+                            },
                             None => serde_json::json!({"error": "No project root"}).to_string(),
                         };
                         let response = format!(
@@ -5591,7 +6045,8 @@ pub fn spawn_web_gateway(
                              Connection: close\r\n\
                              \r\n\
                              {}",
-                            result.len(), result
+                            result.len(),
+                            result
                         );
                         let _ = stream.write_all(response.as_bytes()).await;
                     } else if request_line.starts_with("POST")
@@ -5639,8 +6094,7 @@ pub fn spawn_web_gateway(
                         let body_bytes: &[u8] = if peeked_body.len() >= content_length {
                             &peeked_body.as_bytes()[..content_length]
                         } else {
-                            let remaining =
-                                content_length.saturating_sub(peeked_body.len());
+                            let remaining = content_length.saturating_sub(peeked_body.len());
                             let mut full: Vec<u8> = peeked_body.as_bytes().to_vec();
                             if remaining > 0 {
                                 let mut rest = vec![0u8; remaining];
@@ -5684,15 +6138,14 @@ pub fn spawn_web_gateway(
                     } else if request_line.contains("/api/settings") {
                         use tokio::io::AsyncWriteExt;
                         let body = match &project_root {
-                            Some(root) => {
-                                match crate::project::Project::from_root(root.clone()) {
-                                    Ok(proj) => {
-                                        let payload = settings_payload_from_config(&proj.config);
-                                        serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_string())
-                                    }
-                                    Err(e) => serde_json::json!({"error": e.to_string()}).to_string(),
+                            Some(root) => match crate::project::Project::from_root(root.clone()) {
+                                Ok(proj) => {
+                                    let payload = settings_payload_from_config(&proj.config);
+                                    serde_json::to_string(&payload)
+                                        .unwrap_or_else(|_| "{}".to_string())
                                 }
-                            }
+                                Err(e) => serde_json::json!({"error": e.to_string()}).to_string(),
+                            },
                             None => serde_json::json!({"error": "No project root"}).to_string(),
                         };
                         let response = format!(
@@ -5703,10 +6156,13 @@ pub fn spawn_web_gateway(
                              Connection: close\r\n\
                              \r\n\
                              {}",
-                            body.len(), body
+                            body.len(),
+                            body
                         );
                         let _ = stream.write_all(response.as_bytes()).await;
-                    } else if request_line.starts_with("POST") && request_line.contains("/api/api-keys") {
+                    } else if request_line.starts_with("POST")
+                        && request_line.contains("/api/api-keys")
+                    {
                         use tokio::io::{AsyncReadExt as _, AsyncWriteExt};
                         let content_length: usize = header_text
                             .lines()
@@ -5739,7 +6195,8 @@ pub fn spawn_web_gateway(
                              Connection: close\r\n\
                              \r\n\
                              {}",
-                            result.len(), result
+                            result.len(),
+                            result
                         );
                         let _ = stream.write_all(response.as_bytes()).await;
                     } else if request_line.contains("/api/api-key-status") {
@@ -5753,14 +6210,21 @@ pub fn spawn_web_gateway(
                              Connection: close\r\n\
                              \r\n\
                              {}",
-                            body.len(), body
+                            body.len(),
+                            body
                         );
                         let _ = stream.write_all(response.as_bytes()).await;
-                    } else if request_line.starts_with("POST") && request_line.contains(" /session") && !request_line.contains("/api/session/") {
+                    } else if request_line.starts_with("POST")
+                        && request_line.contains(" /session")
+                        && !request_line.contains("/api/session/")
+                    {
                         let result = mint_session_token(&session_provider, &session_model).await;
                         let (status, body) = match result {
                             Ok(json) => ("200 OK", json),
-                            Err(msg) => ("502 Bad Gateway", serde_json::json!({"error": msg}).to_string()),
+                            Err(msg) => (
+                                "502 Bad Gateway",
+                                serde_json::json!({"error": msg}).to_string(),
+                            ),
                         };
                         let response = format!(
                             "HTTP/1.1 {}\r\n\
@@ -5769,11 +6233,15 @@ pub fn spawn_web_gateway(
                              Connection: close\r\n\
                              \r\n\
                              {}",
-                            status, body.len(), body
+                            status,
+                            body.len(),
+                            body
                         );
                         use tokio::io::AsyncWriteExt;
                         let _ = stream.write_all(response.as_bytes()).await;
-                    } else if request_line.contains("/recordings/") && !request_line.contains("/api/session/") {
+                    } else if request_line.contains("/recordings/")
+                        && !request_line.contains("/api/session/")
+                    {
                         // Serve recording data: segment files and metadata.
                         use tokio::io::AsyncWriteExt;
                         let path_part = request_line
@@ -5799,13 +6267,16 @@ pub fn spawn_web_gateway(
                                         &stream_dir,
                                     );
                                 }
-                                let json: Vec<serde_json::Value> = segments.iter().map(|s| {
-                                    serde_json::json!({
-                                        "filename": s.filename,
-                                        "start_secs": s.start_secs,
-                                        "end_secs": s.end_secs,
+                                let json: Vec<serde_json::Value> = segments
+                                    .iter()
+                                    .map(|s| {
+                                        serde_json::json!({
+                                            "filename": s.filename,
+                                            "start_secs": s.start_secs,
+                                            "end_secs": s.end_secs,
+                                        })
                                     })
-                                }).collect();
+                                    .collect();
                                 let body = serde_json::to_string(&json).unwrap_or("[]".to_string());
                                 let response = format!(
                                     "HTTP/1.1 200 OK\r\n\
@@ -5815,7 +6286,8 @@ pub fn spawn_web_gateway(
                                      Connection: close\r\n\
                                      \r\n\
                                      {}",
-                                    body.len(), body
+                                    body.len(),
+                                    body
                                 );
                                 let _ = stream.write_all(response.as_bytes()).await;
                             } else if parts.len() == 2 && parts[1] == "playlist.m3u8" {
@@ -5830,12 +6302,23 @@ pub fn spawn_web_gateway(
                                         &stream_dir,
                                     );
                                 }
-                                let mut m3u8 = String::from("#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-MEDIA-SEQUENCE:0\n");
-                                let max_dur = segments.iter().map(|s| s.end_secs - s.start_secs).fold(0.0f64, f64::max);
-                                m3u8.push_str(&format!("#EXT-X-TARGETDURATION:{}\n", max_dur.ceil() as u64));
+                                let mut m3u8 = String::from(
+                                    "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-MEDIA-SEQUENCE:0\n",
+                                );
+                                let max_dur = segments
+                                    .iter()
+                                    .map(|s| s.end_secs - s.start_secs)
+                                    .fold(0.0f64, f64::max);
+                                m3u8.push_str(&format!(
+                                    "#EXT-X-TARGETDURATION:{}\n",
+                                    max_dur.ceil() as u64
+                                ));
                                 for s in &segments {
                                     let dur = s.end_secs - s.start_secs;
-                                    m3u8.push_str(&format!("#EXTINF:{:.3},\n{}\n", dur, s.filename));
+                                    m3u8.push_str(&format!(
+                                        "#EXTINF:{:.3},\n{}\n",
+                                        dur, s.filename
+                                    ));
                                 }
                                 m3u8.push_str("#EXT-X-ENDLIST\n");
                                 let response = format!(
@@ -5846,7 +6329,8 @@ pub fn spawn_web_gateway(
                                      Connection: close\r\n\
                                      \r\n\
                                      {}",
-                                    m3u8.len(), m3u8
+                                    m3u8.len(),
+                                    m3u8
                                 );
                                 let _ = stream.write_all(response.as_bytes()).await;
                             } else if parts.len() == 2 {
@@ -5860,7 +6344,8 @@ pub fn spawn_web_gateway(
                                     && !filename.contains("..");
                                 if valid {
                                     // Check session dir first, then daemon dir
-                                    let session_path = reg.session_dir()
+                                    let session_path = reg
+                                        .session_dir()
                                         .join("recordings")
                                         .join(stream_name)
                                         .join(filename);
@@ -5872,7 +6357,11 @@ pub fn spawn_web_gateway(
                                     } else {
                                         daemon_path
                                     };
-                                    let content_type = if filename.ends_with(".ts") { "video/mp2t" } else { "video/mp4" };
+                                    let content_type = if filename.ends_with(".ts") {
+                                        "video/mp2t"
+                                    } else {
+                                        "video/mp4"
+                                    };
                                     match tokio::fs::read(&seg_path).await {
                                         Ok(data) => {
                                             let header = format!(
@@ -5882,7 +6371,8 @@ pub fn spawn_web_gateway(
                                                  Cache-Control: public, max-age=3600\r\n\
                                                  Connection: close\r\n\
                                                  \r\n",
-                                                content_type, data.len()
+                                                content_type,
+                                                data.len()
                                             );
                                             let _ = stream.write_all(header.as_bytes()).await;
                                             let _ = stream.write_all(&data).await;
@@ -5896,7 +6386,8 @@ pub fn spawn_web_gateway(
                                                  Connection: close\r\n\
                                                  \r\n\
                                                  {}",
-                                                body.len(), body
+                                                body.len(),
+                                                body
                                             );
                                             let _ = stream.write_all(response.as_bytes()).await;
                                         }
@@ -5910,7 +6401,8 @@ pub fn spawn_web_gateway(
                                          Connection: close\r\n\
                                          \r\n\
                                          {}",
-                                        body.len(), body
+                                        body.len(),
+                                        body
                                     );
                                     let _ = stream.write_all(response.as_bytes()).await;
                                 }
@@ -5923,7 +6415,8 @@ pub fn spawn_web_gateway(
                                      Connection: close\r\n\
                                      \r\n\
                                      {}",
-                                    body.len(), body
+                                    body.len(),
+                                    body
                                 );
                                 let _ = stream.write_all(response.as_bytes()).await;
                             }
@@ -5936,12 +6429,15 @@ pub fn spawn_web_gateway(
                                  Connection: close\r\n\
                                  \r\n\
                                  {}",
-                                body.len(), body
+                                body.len(),
+                                body
                             );
                             use tokio::io::AsyncWriteExt;
                             let _ = stream.write_all(response.as_bytes()).await;
                         }
-                    } else if request_line.contains("/recordings") && !request_line.contains("/api/session/") {
+                    } else if request_line.contains("/recordings")
+                        && !request_line.contains("/api/session/")
+                    {
                         // GET /recordings — list all streams (session + daemon-scoped)
                         use tokio::io::AsyncWriteExt;
 
@@ -5954,16 +6450,18 @@ pub fn spawn_web_gateway(
                             for name in &streams {
                                 let manifest = reg.manifest(name).unwrap_or(serde_json::json!({}));
                                 let segments = reg.segments(name);
-                                let total_duration = segments.last()
-                                    .map(|s| s.end_secs)
-                                    .unwrap_or(0.0);
-                                let seg_json: Vec<serde_json::Value> = segments.iter().map(|s| {
-                                    serde_json::json!({
-                                        "filename": s.filename,
-                                        "start_secs": s.start_secs,
-                                        "end_secs": s.end_secs,
+                                let total_duration =
+                                    segments.last().map(|s| s.end_secs).unwrap_or(0.0);
+                                let seg_json: Vec<serde_json::Value> = segments
+                                    .iter()
+                                    .map(|s| {
+                                        serde_json::json!({
+                                            "filename": s.filename,
+                                            "start_secs": s.start_secs,
+                                            "end_secs": s.end_secs,
+                                        })
                                     })
-                                }).collect();
+                                    .collect();
                                 let mut entry = manifest;
                                 entry["segments"] = serde_json::Value::Array(seg_json);
                                 entry["total_duration_secs"] = serde_json::json!(total_duration);
@@ -5973,7 +6471,8 @@ pub fn spawn_web_gateway(
 
                         // Daemon-scoped recordings (from ~/.intendant/recordings/)
                         let daemon_dir = crate::debug::daemon_recordings_dir();
-                        let mut daemon_streams: std::collections::HashSet<String> = std::collections::HashSet::new();
+                        let mut daemon_streams: std::collections::HashSet<String> =
+                            std::collections::HashSet::new();
                         for entry in list_recording_streams(&daemon_dir) {
                             if let Some(name) = entry["stream_name"].as_str() {
                                 daemon_streams.insert(name.to_string());
@@ -5990,10 +6489,12 @@ pub fn spawn_web_gateway(
                              Connection: close\r\n\
                              \r\n\
                              {}",
-                            body.len(), body
+                            body.len(),
+                            body
                         );
                         let _ = stream.write_all(response.as_bytes()).await;
-                    } else if (request_line.starts_with("DELETE") || request_line.starts_with("POST"))
+                    } else if (request_line.starts_with("DELETE")
+                        || request_line.starts_with("POST"))
                         && request_line.contains("/api/session/")
                         && request_line.contains("/delete")
                     {
@@ -6005,7 +6506,8 @@ pub fn spawn_web_gateway(
                             .nth(1)
                             .and_then(|r| r.split_whitespace().next())
                             .unwrap_or("");
-                        let rest_parts: Vec<&str> = rest.split('/')
+                        let rest_parts: Vec<&str> = rest
+                            .split('/')
                             .filter(|s| !s.is_empty() && *s != "delete")
                             .collect();
                         let session_id = rest_parts.first().copied().unwrap_or("");
@@ -6020,10 +6522,13 @@ pub fn spawn_web_gateway(
                              Connection: close\r\n\
                              \r\n\
                              {}",
-                            body.len(), body
+                            body.len(),
+                            body
                         );
                         let _ = stream.write_all(response.as_bytes()).await;
-                    } else if request_line.starts_with("DELETE") && request_line.contains("/api/session/") {
+                    } else if request_line.starts_with("DELETE")
+                        && request_line.contains("/api/session/")
+                    {
                         // Plain DELETE without /delete in path (curl, regular browser)
                         use tokio::io::AsyncWriteExt;
                         let rest = request_line
@@ -6031,7 +6536,8 @@ pub fn spawn_web_gateway(
                             .nth(1)
                             .and_then(|r| r.split_whitespace().next())
                             .unwrap_or("");
-                        let rest_parts: Vec<&str> = rest.split('/').filter(|s| !s.is_empty()).collect();
+                        let rest_parts: Vec<&str> =
+                            rest.split('/').filter(|s| !s.is_empty()).collect();
                         let session_id = rest_parts.first().copied().unwrap_or("");
                         let target = rest_parts.get(1).copied().unwrap_or("session");
                         let body = delete_session_data(session_id, target);
@@ -6044,10 +6550,13 @@ pub fn spawn_web_gateway(
                              Connection: close\r\n\
                              \r\n\
                              {}",
-                            body.len(), body
+                            body.len(),
+                            body
                         );
                         let _ = stream.write_all(response.as_bytes()).await;
-                    } else if request_line.starts_with("POST") && request_line.contains(" /api/session/current/uploads") {
+                    } else if request_line.starts_with("POST")
+                        && request_line.contains(" /api/session/current/uploads")
+                    {
                         // POST /api/session/current/uploads?name=<fn>&destination=task|workspace
                         //   Content-Type: <mime>
                         //   <raw bytes>
@@ -6104,10 +6613,9 @@ pub fn spawn_web_gateway(
                                 Ok((tmp, size)) => {
                                     let (session_dir, session_id) = {
                                         match slog.lock() {
-                                            Ok(l) => (
-                                                l.dir().to_path_buf(),
-                                                l.session_id().to_string(),
-                                            ),
+                                            Ok(l) => {
+                                                (l.dir().to_path_buf(), l.session_id().to_string())
+                                            }
                                             Err(_) => {
                                                 break 'upload upload_error_response(
                                                     "500 Internal Server Error",
@@ -6154,7 +6662,9 @@ pub fn spawn_web_gateway(
                             }
                         };
                         let _ = stream.write_all(response.as_bytes()).await;
-                    } else if request_line.starts_with("GET") && request_line.contains(" /api/session/current/uploads") {
+                    } else if request_line.starts_with("GET")
+                        && request_line.contains(" /api/session/current/uploads")
+                    {
                         // GET /api/session/current/uploads           — list uploads for the current session
                         // GET /api/session/current/uploads/<id>/raw  — stream bytes of one upload
                         use tokio::io::AsyncWriteExt;
@@ -6181,10 +6691,7 @@ pub fn spawn_web_gateway(
                                 }
                             };
                             // Path after /api/session/current/uploads
-                            let path_and_q = request_line
-                                .split_whitespace()
-                                .nth(1)
-                                .unwrap_or("");
+                            let path_and_q = request_line.split_whitespace().nth(1).unwrap_or("");
                             let path = path_and_q.splitn(2, '?').next().unwrap_or("");
                             let suffix = path
                                 .trim_start_matches("/api/session/current/uploads")
@@ -6208,10 +6715,9 @@ pub fn spawn_web_gateway(
                             } else if let Some(id) = suffix.strip_suffix("/raw") {
                                 // GET raw bytes for one upload.
                                 match crate::upload_store::find_upload(id, &session_dir, root) {
-                                    None => upload_error_response(
-                                        "404 Not Found",
-                                        "upload not found",
-                                    ),
+                                    None => {
+                                        upload_error_response("404 Not Found", "upload not found")
+                                    }
                                     Some(d) => {
                                         match std::fs::read(&d.path) {
                                             Ok(bytes) => {
@@ -6241,10 +6747,7 @@ pub fn spawn_web_gateway(
                                     }
                                 }
                             } else {
-                                upload_error_response(
-                                    "404 Not Found",
-                                    "unknown upload route",
-                                )
+                                upload_error_response("404 Not Found", "unknown upload route")
                             }
                         };
                         if !response.is_empty() {
@@ -6277,10 +6780,7 @@ pub fn spawn_web_gateway(
                                     );
                                 }
                             };
-                            let path_and_q = request_line
-                                .split_whitespace()
-                                .nth(1)
-                                .unwrap_or("");
+                            let path_and_q = request_line.split_whitespace().nth(1).unwrap_or("");
                             let path = path_and_q.splitn(2, '?').next().unwrap_or("");
                             let id = path
                                 .trim_start_matches("/api/session/current/uploads/")
@@ -6317,7 +6817,9 @@ pub fn spawn_web_gateway(
                             }
                         };
                         let _ = stream.write_all(response.as_bytes()).await;
-                    } else if request_line.starts_with("GET") && request_line.contains("/api/session/current/changes") {
+                    } else if request_line.starts_with("GET")
+                        && request_line.contains("/api/session/current/changes")
+                    {
                         // File change tracking endpoints:
                         //   GET /api/session/current/changes        — list all changed files
                         //   GET /api/session/current/changes/{path} — unified diff for one file
@@ -6336,10 +6838,13 @@ pub fn spawn_web_gateway(
                              Connection: close\r\n\
                              \r\n\
                              {}",
-                            body.len(), body
+                            body.len(),
+                            body
                         );
                         let _ = stream.write_all(response.as_bytes()).await;
-                    } else if request_line.starts_with("GET") && request_line.contains("/api/session/current/history") {
+                    } else if request_line.starts_with("GET")
+                        && request_line.contains("/api/session/current/history")
+                    {
                         // GET /api/session/current/history — serialized History.
                         use tokio::io::AsyncWriteExt;
                         let (status, body) = handle_history_get(file_watcher.as_ref()).await;
@@ -6352,25 +6857,28 @@ pub fn spawn_web_gateway(
                              Connection: close\r\n\
                              \r\n\
                              {}",
-                            status, body.len(), body,
+                            status,
+                            body.len(),
+                            body,
                         );
                         let _ = stream.write_all(response.as_bytes()).await;
-                    } else if request_line.starts_with("POST") && request_line.contains("/api/session/current/rollback") {
+                    } else if request_line.starts_with("POST")
+                        && request_line.contains("/api/session/current/rollback")
+                    {
                         // POST /api/session/current/rollback body:
                         //   {"round_id": N,
                         //    "revert_files": bool (default true),
                         //    "revert_conversation": bool (default false)}
                         use tokio::io::{AsyncReadExt as _, AsyncWriteExt};
                         let body_text = read_post_body(&header_text, &mut stream).await;
-                        let agent_state = query_ctx
-                            .as_ref()
-                            .map(|ctx| ctx.agent_state.clone());
+                        let agent_state = query_ctx.as_ref().map(|ctx| ctx.agent_state.clone());
                         let (status, body) = handle_history_rollback(
                             &body_text,
                             file_watcher.as_ref(),
                             agent_state.as_ref(),
                             &bus,
-                        ).await;
+                        )
+                        .await;
                         let response = format!(
                             "HTTP/1.1 {}\r\n\
                              Content-Type: application/json\r\n\
@@ -6380,20 +6888,20 @@ pub fn spawn_web_gateway(
                              Connection: close\r\n\
                              \r\n\
                              {}",
-                            status, body.len(), body,
+                            status,
+                            body.len(),
+                            body,
                         );
                         let _ = stream.write_all(response.as_bytes()).await;
-                    } else if request_line.starts_with("POST") && request_line.contains("/api/session/current/redo") {
+                    } else if request_line.starts_with("POST")
+                        && request_line.contains("/api/session/current/redo")
+                    {
                         // POST /api/session/current/redo — no body required.
                         use tokio::io::{AsyncReadExt as _, AsyncWriteExt};
                         let _ = read_post_body(&header_text, &mut stream).await;
-                        let agent_state = query_ctx
-                            .as_ref()
-                            .map(|ctx| ctx.agent_state.clone());
-                        let (status, body) = handle_history_redo(
-                            file_watcher.as_ref(),
-                            agent_state.as_ref(),
-                        ).await;
+                        let agent_state = query_ctx.as_ref().map(|ctx| ctx.agent_state.clone());
+                        let (status, body) =
+                            handle_history_redo(file_watcher.as_ref(), agent_state.as_ref()).await;
                         let response = format!(
                             "HTTP/1.1 {}\r\n\
                              Content-Type: application/json\r\n\
@@ -6403,10 +6911,14 @@ pub fn spawn_web_gateway(
                              Connection: close\r\n\
                              \r\n\
                              {}",
-                            status, body.len(), body,
+                            status,
+                            body.len(),
+                            body,
                         );
                         let _ = stream.write_all(response.as_bytes()).await;
-                    } else if request_line.starts_with("POST") && request_line.contains("/api/session/current/prune") {
+                    } else if request_line.starts_with("POST")
+                        && request_line.contains("/api/session/current/prune")
+                    {
                         // POST /api/session/current/prune — no body required.
                         use tokio::io::{AsyncReadExt as _, AsyncWriteExt};
                         let _ = read_post_body(&header_text, &mut stream).await;
@@ -6420,7 +6932,9 @@ pub fn spawn_web_gateway(
                              Connection: close\r\n\
                              \r\n\
                              {}",
-                            status, body.len(), body,
+                            status,
+                            body.len(),
+                            body,
                         );
                         let _ = stream.write_all(response.as_bytes()).await;
                     } else if request_line.contains("/api/session/") {
@@ -6441,23 +6955,28 @@ pub fn spawn_web_gateway(
                             if rec_rest.len() == 2 && rec_rest[1] == "segments" {
                                 // GET /api/session/{id}/recordings/{stream}/segments
                                 let stream_name = rec_rest[0];
-                                let body = if let Some(session_dir) = resolve_session_dir(session_id) {
-                                    let stream_dir = session_dir.join("recordings").join(stream_name);
-                                    let segments = crate::recording::parse_segment_csv_pub(
-                                        &stream_dir.join("segments.csv"),
-                                        &stream_dir,
-                                    );
-                                    let seg_json: Vec<serde_json::Value> = segments.iter().map(|s| {
-                                        serde_json::json!({
-                                            "filename": s.filename,
-                                            "start_secs": s.start_secs,
-                                            "end_secs": s.end_secs,
-                                        })
-                                    }).collect();
-                                    serde_json::to_string(&seg_json).unwrap_or("[]".to_string())
-                                } else {
-                                    "[]".to_string()
-                                };
+                                let body =
+                                    if let Some(session_dir) = resolve_session_dir(session_id) {
+                                        let stream_dir =
+                                            session_dir.join("recordings").join(stream_name);
+                                        let segments = crate::recording::parse_segment_csv_pub(
+                                            &stream_dir.join("segments.csv"),
+                                            &stream_dir,
+                                        );
+                                        let seg_json: Vec<serde_json::Value> = segments
+                                            .iter()
+                                            .map(|s| {
+                                                serde_json::json!({
+                                                    "filename": s.filename,
+                                                    "start_secs": s.start_secs,
+                                                    "end_secs": s.end_secs,
+                                                })
+                                            })
+                                            .collect();
+                                        serde_json::to_string(&seg_json).unwrap_or("[]".to_string())
+                                    } else {
+                                        "[]".to_string()
+                                    };
                                 let response = format!(
                                     "HTTP/1.1 200 OK\r\n\
                                      Content-Type: application/json\r\n\
@@ -6466,7 +6985,8 @@ pub fn spawn_web_gateway(
                                      Connection: close\r\n\
                                      \r\n\
                                      {}",
-                                    body.len(), body
+                                    body.len(),
+                                    body
                                 );
                                 let _ = stream.write_all(response.as_bytes()).await;
                             } else if rec_rest.len() == 2 {
@@ -6478,9 +6998,14 @@ pub fn spawn_web_gateway(
                                     && filename.len() < 30
                                     && !filename.contains("..");
                                 if valid {
-                                    let seg_ct = if filename.ends_with(".ts") { "video/mp2t" } else { "video/mp4" };
-                                    let seg_path = resolve_session_dir(session_id)
-                                        .map(|d| d.join("recordings").join(stream_name).join(filename));
+                                    let seg_ct = if filename.ends_with(".ts") {
+                                        "video/mp2t"
+                                    } else {
+                                        "video/mp4"
+                                    };
+                                    let seg_path = resolve_session_dir(session_id).map(|d| {
+                                        d.join("recordings").join(stream_name).join(filename)
+                                    });
                                     if let Some(path) = seg_path.filter(|p| p.exists()) {
                                         match tokio::fs::read(&path).await {
                                             Ok(data) => {
@@ -6491,7 +7016,8 @@ pub fn spawn_web_gateway(
                                                      Cache-Control: public, max-age=3600\r\n\
                                                      Connection: close\r\n\
                                                      \r\n",
-                                                    seg_ct, data.len()
+                                                    seg_ct,
+                                                    data.len()
                                                 );
                                                 let _ = stream.write_all(header.as_bytes()).await;
                                                 let _ = stream.write_all(&data).await;
@@ -6505,7 +7031,8 @@ pub fn spawn_web_gateway(
                                                      Connection: close\r\n\
                                                      \r\n\
                                                      {}",
-                                                    body.len(), body
+                                                    body.len(),
+                                                    body
                                                 );
                                                 let _ = stream.write_all(response.as_bytes()).await;
                                             }
@@ -6519,7 +7046,8 @@ pub fn spawn_web_gateway(
                                              Connection: close\r\n\
                                              \r\n\
                                              {}",
-                                            body.len(), body
+                                            body.len(),
+                                            body
                                         );
                                         let _ = stream.write_all(response.as_bytes()).await;
                                     }
@@ -6532,19 +7060,21 @@ pub fn spawn_web_gateway(
                                          Connection: close\r\n\
                                          \r\n\
                                          {}",
-                                        body.len(), body
+                                        body.len(),
+                                        body
                                     );
                                     let _ = stream.write_all(response.as_bytes()).await;
                                 }
                             } else {
                                 // GET /api/session/{id}/recordings — list streams
-                                let body = if let Some(session_dir) = resolve_session_dir(session_id) {
-                                    let recordings_dir = session_dir.join("recordings");
-                                    let entries = list_recording_streams(&recordings_dir);
-                                    serde_json::to_string(&entries).unwrap_or("[]".to_string())
-                                } else {
-                                    "[]".to_string()
-                                };
+                                let body =
+                                    if let Some(session_dir) = resolve_session_dir(session_id) {
+                                        let recordings_dir = session_dir.join("recordings");
+                                        let entries = list_recording_streams(&recordings_dir);
+                                        serde_json::to_string(&entries).unwrap_or("[]".to_string())
+                                    } else {
+                                        "[]".to_string()
+                                    };
                                 let response = format!(
                                     "HTTP/1.1 200 OK\r\n\
                                      Content-Type: application/json\r\n\
@@ -6553,7 +7083,8 @@ pub fn spawn_web_gateway(
                                      Connection: close\r\n\
                                      \r\n\
                                      {}",
-                                    body.len(), body
+                                    body.len(),
+                                    body
                                 );
                                 let _ = stream.write_all(response.as_bytes()).await;
                             }
@@ -6599,7 +7130,8 @@ pub fn spawn_web_gateway(
                                              Connection: close\r\n\
                                              \r\n\
                                              {}",
-                                            body.len(), body
+                                            body.len(),
+                                            body
                                         );
                                         let _ = stream.write_all(response.as_bytes()).await;
                                     }
@@ -6613,7 +7145,8 @@ pub fn spawn_web_gateway(
                                          Connection: close\r\n\
                                          \r\n\
                                          {}",
-                                        body.len(), body
+                                        body.len(),
+                                        body
                                     );
                                     let _ = stream.write_all(response.as_bytes()).await;
                                 }
@@ -6627,11 +7160,16 @@ pub fn spawn_web_gateway(
                             if frame_rest.len() == 1 {
                                 // GET /api/session/{id}/frames/{filename}
                                 let filename = frame_rest[0];
-                                let valid = (filename.ends_with(".jpg") || filename.ends_with(".png"))
+                                let valid = (filename.ends_with(".jpg")
+                                    || filename.ends_with(".png"))
                                     && filename.len() < 80
                                     && !filename.contains("..");
                                 if valid {
-                                    let ct = if filename.ends_with(".png") { "image/png" } else { "image/jpeg" };
+                                    let ct = if filename.ends_with(".png") {
+                                        "image/png"
+                                    } else {
+                                        "image/jpeg"
+                                    };
                                     let frame_path = resolve_session_dir(session_id)
                                         .map(|d| d.join("frames").join(filename));
                                     if let Some(path) = frame_path.filter(|p| p.exists()) {
@@ -6644,7 +7182,8 @@ pub fn spawn_web_gateway(
                                                      Cache-Control: public, max-age=3600\r\n\
                                                      Connection: close\r\n\
                                                      \r\n",
-                                                    ct, data.len()
+                                                    ct,
+                                                    data.len()
                                                 );
                                                 let _ = stream.write_all(header.as_bytes()).await;
                                                 let _ = stream.write_all(&data).await;
@@ -6658,7 +7197,8 @@ pub fn spawn_web_gateway(
                                                      Connection: close\r\n\
                                                      \r\n\
                                                      {}",
-                                                    body.len(), body
+                                                    body.len(),
+                                                    body
                                                 );
                                                 let _ = stream.write_all(response.as_bytes()).await;
                                             }
@@ -6672,7 +7212,8 @@ pub fn spawn_web_gateway(
                                              Connection: close\r\n\
                                              \r\n\
                                              {}",
-                                            body.len(), body
+                                            body.len(),
+                                            body
                                         );
                                         let _ = stream.write_all(response.as_bytes()).await;
                                     }
@@ -6685,13 +7226,16 @@ pub fn spawn_web_gateway(
                                          Connection: close\r\n\
                                          \r\n\
                                          {}",
-                                        body.len(), body
+                                        body.len(),
+                                        body
                                     );
                                     let _ = stream.write_all(response.as_bytes()).await;
                                 }
                             } else {
                                 // GET /api/session/{id}/frames — list frame filenames
-                                let body = if let Some(session_dir) = resolve_session_dir(session_id) {
+                                let body = if let Some(session_dir) =
+                                    resolve_session_dir(session_id)
+                                {
                                     let frames_dir = session_dir.join("frames");
                                     let mut names: Vec<String> = Vec::new();
                                     if frames_dir.is_dir() {
@@ -6717,13 +7261,15 @@ pub fn spawn_web_gateway(
                                      Connection: close\r\n\
                                      \r\n\
                                      {}",
-                                    body.len(), body
+                                    body.len(),
+                                    body
                                 );
                                 let _ = stream.write_all(response.as_bytes()).await;
                             }
                         } else {
                             // GET /api/session/{id} — session detail
-                            let session_id = rest_parts[0].split('?').next().unwrap_or(rest_parts[0]);
+                            let session_id =
+                                rest_parts[0].split('?').next().unwrap_or(rest_parts[0]);
                             let body = get_session_detail(session_id);
                             let response = format!(
                                 "HTTP/1.1 200 OK\r\n\
@@ -6733,7 +7279,8 @@ pub fn spawn_web_gateway(
                                  Connection: close\r\n\
                                  \r\n\
                                  {}",
-                                body.len(), body
+                                body.len(),
+                                body
                             );
                             let _ = stream.write_all(response.as_bytes()).await;
                         }
@@ -6743,7 +7290,8 @@ pub fn spawn_web_gateway(
                         let displays =
                             crate::display::enumerate_displays_with_sessions(&session_registry)
                                 .await;
-                        let body = serde_json::to_string(&displays).unwrap_or_else(|_| "[]".to_string());
+                        let body =
+                            serde_json::to_string(&displays).unwrap_or_else(|_| "[]".to_string());
                         let response = format!(
                             "HTTP/1.1 200 OK\r\n\
                              Content-Type: application/json\r\n\
@@ -6753,7 +7301,8 @@ pub fn spawn_web_gateway(
                              Connection: close\r\n\
                              \r\n\
                              {}",
-                            body.len(), body
+                            body.len(),
+                            body
                         );
                         let _ = stream.write_all(response.as_bytes()).await;
                     } else if request_line.contains(" /api/peers") {
@@ -6780,10 +7329,7 @@ pub fn spawn_web_gateway(
                         // `/api/peers` directly would walk into the
                         // ` HTTP/1.1` suffix and mistake `HTTP` and `1.1`
                         // for path segments.
-                        let path_token = request_line
-                            .split_whitespace()
-                            .nth(1)
-                            .unwrap_or("");
+                        let path_token = request_line.split_whitespace().nth(1).unwrap_or("");
                         // Split path from query string. `/api/peers/eligible
                         // ?capability=display` needs the query stripped before
                         // we extract subpath segments.
@@ -6807,8 +7353,7 @@ pub fn spawn_web_gateway(
                                 .to_string(),
                             ),
                             Some(registry)
-                                if segments.is_empty()
-                                    && request_line.starts_with("GET") =>
+                                if segments.is_empty() && request_line.starts_with("GET") =>
                             {
                                 (200, peers_list_response_body(registry))
                             }
@@ -6817,11 +7362,7 @@ pub fn spawn_web_gateway(
                                     && (request_line.starts_with("POST")
                                         || request_line.starts_with("DELETE")) =>
                             {
-                                let body_text = read_request_body(
-                                    &mut stream,
-                                    &header_text,
-                                )
-                                .await;
+                                let body_text = read_request_body(&mut stream, &header_text).await;
                                 if request_line.starts_with("POST") {
                                     peers_add(registry, &body_text).await
                                 } else {
@@ -6829,8 +7370,7 @@ pub fn spawn_web_gateway(
                                 }
                             }
                             Some(registry)
-                                if segments == ["eligible"]
-                                    && request_line.starts_with("GET") =>
+                                if segments == ["eligible"] && request_line.starts_with("GET") =>
                             {
                                 // GET /api/peers/eligible?capability=display
                                 // — list peers that satisfy all listed
@@ -6843,26 +7383,16 @@ pub fn spawn_web_gateway(
                                 peers_eligible(registry, query_str)
                             }
                             Some(registry)
-                                if segments.len() == 2
-                                    && request_line.starts_with("POST") =>
+                                if segments.len() == 2 && request_line.starts_with("POST") =>
                             {
                                 let id = segments[0];
                                 let op = segments[1];
-                                let body_text = read_request_body(
-                                    &mut stream,
-                                    &header_text,
-                                )
-                                .await;
+                                let body_text = read_request_body(&mut stream, &header_text).await;
                                 match op {
-                                    "message" => {
-                                        peers_send_message(registry, id, &body_text).await
-                                    }
-                                    "task" => {
-                                        peers_delegate_task(registry, id, &body_text).await
-                                    }
+                                    "message" => peers_send_message(registry, id, &body_text).await,
+                                    "task" => peers_delegate_task(registry, id, &body_text).await,
                                     "approval" => {
-                                        peers_resolve_approval(registry, id, &body_text)
-                                            .await
+                                        peers_resolve_approval(registry, id, &body_text).await
                                     }
                                     "webrtc" => {
                                         peers_webrtc_signal(registry, id, &body_text, &bus).await
@@ -6935,8 +7465,7 @@ pub fn spawn_web_gateway(
                                 .to_string(),
                             ),
                             Some(registry) => {
-                                let body_text =
-                                    read_request_body(&mut stream, &header_text).await;
+                                let body_text = read_request_body(&mut stream, &header_text).await;
                                 coordinator_route(registry, &body_text).await
                             }
                         };
@@ -6979,16 +7508,25 @@ pub fn spawn_web_gateway(
                              Connection: close\r\n\
                              \r\n\
                              {}",
-                            body.len(), body
+                            body.len(),
+                            body
                         );
                         use tokio::io::AsyncWriteExt;
                         let _ = stream.write_all(response.as_bytes()).await;
                     } else if request_line.contains("/debug") {
                         // Debug endpoint: returns agent state + voice connection info
-                        let state = query_ctx.as_ref()
-                            .map(|ctx| ctx.agent_state.lock().unwrap_or_else(|e| e.into_inner()).clone());
-                        let vd = voice_debug.lock().unwrap_or_else(|e| e.into_inner()).clone();
-                        let active_id = active_presence.lock()
+                        let state = query_ctx.as_ref().map(|ctx| {
+                            ctx.agent_state
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .clone()
+                        });
+                        let vd = voice_debug
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .clone();
+                        let active_id = active_presence
+                            .lock()
                             .unwrap_or_else(|e| e.into_inner())
                             .as_ref()
                             .map(|a| a.connection_id.clone());
@@ -6996,7 +7534,8 @@ pub fn spawn_web_gateway(
                             "agent_state": state,
                             "voice": vd,
                             "active_connection_id": active_id,
-                        }).to_string();
+                        })
+                        .to_string();
                         let response = format!(
                             "HTTP/1.1 200 OK\r\n\
                              Content-Type: application/json\r\n\
@@ -7056,12 +7595,11 @@ pub fn spawn_web_gateway(
                                         json,
                                     )
                                 }
-                                McpHttpOutcome::Accepted => {
-                                    "HTTP/1.1 202 Accepted\r\n\
+                                McpHttpOutcome::Accepted => "HTTP/1.1 202 Accepted\r\n\
                                      Access-Control-Allow-Origin: *\r\n\
                                      Content-Length: 0\r\n\
-                                     \r\n".to_string()
-                                }
+                                     \r\n"
+                                    .to_string(),
                             };
                             let _ = stream.write_all(http_response.as_bytes()).await;
                         } else {
@@ -7072,11 +7610,13 @@ pub fn spawn_web_gateway(
                                  Content-Length: {}\r\n\
                                  \r\n\
                                  {}",
-                                err.len(), err
+                                err.len(),
+                                err
                             );
                             let _ = stream.write_all(http.as_bytes()).await;
                         }
-                    } else if (request_line.starts_with("GET") || request_line.starts_with("DELETE"))
+                    } else if (request_line.starts_with("GET")
+                        || request_line.starts_with("DELETE"))
                         && request_line.contains(" /mcp")
                     {
                         // MCP Streamable HTTP: GET (SSE stream) and DELETE (session cleanup)
@@ -7089,22 +7629,37 @@ pub fn spawn_web_gateway(
                                     \r\n";
                         let _ = stream.write_all(http.as_bytes()).await;
                     } else {
-                        let (content_type, body, cache) = if request_line.contains("/wasm-web/presence_web.js") {
-                            ("application/javascript", WASM_WEB_JS.to_string(), "no-cache, must-revalidate")
-                        } else if request_line.contains("/audio-processor.js") {
-                            ("application/javascript", AUDIO_PROCESSOR_JS.to_string(), "no-cache")
-                        } else if request_line.contains("/.well-known/agent-card.json") {
-                            // Canonical peer identity + capability surface.
-                            // Served alongside /config so the browser and
-                            // federated peers can discover who this daemon
-                            // is without parsing the voice-runtime config.
-                            ("application/json", agent_card_json.clone(), "no-cache")
-                        } else if request_line.contains("/config") {
-                            ("application/json", config_json.clone(), "no-cache")
-                        } else {
-                            // Default: serve app.html (also matches /app for backward compat)
-                            ("text/html; charset=utf-8", app_html.to_string(), "no-cache")
-                        };
+                        let (content_type, body, cache) =
+                            if request_line.contains("/wasm-web/presence_web.js") {
+                                (
+                                    "application/javascript",
+                                    WASM_WEB_JS.to_string(),
+                                    "no-cache, must-revalidate",
+                                )
+                            } else if request_line.contains("/wasm-station/station_web.js") {
+                                (
+                                    "application/javascript",
+                                    WASM_STATION_JS.to_string(),
+                                    "no-cache, must-revalidate",
+                                )
+                            } else if request_line.contains("/audio-processor.js") {
+                                (
+                                    "application/javascript",
+                                    AUDIO_PROCESSOR_JS.to_string(),
+                                    "no-cache",
+                                )
+                            } else if request_line.contains("/.well-known/agent-card.json") {
+                                // Canonical peer identity + capability surface.
+                                // Served alongside /config so the browser and
+                                // federated peers can discover who this daemon
+                                // is without parsing the voice-runtime config.
+                                ("application/json", agent_card_json.clone(), "no-cache")
+                            } else if request_line.contains("/config") {
+                                ("application/json", config_json.clone(), "no-cache")
+                            } else {
+                                // Default: serve app.html (also matches /app for backward compat)
+                                ("text/html; charset=utf-8", app_html.to_string(), "no-cache")
+                            };
 
                         // CORS: allow the multi-host dashboard to
                         // `fetch()` /config and /.well-known/agent-card.json
@@ -7230,17 +7785,13 @@ fn peers_list_response_body(registry: &crate::peer::PeerRegistry) -> String {
 
 /// Handle a `POST /api/peers` body: parse, call
 /// `PeerRegistry::add_peer`, return `(status_code, body_json)`.
-async fn peers_add(
-    registry: &crate::peer::PeerRegistry,
-    body_text: &str,
-) -> (u16, String) {
+async fn peers_add(registry: &crate::peer::PeerRegistry, body_text: &str) -> (u16, String) {
     let req: AddPeerRequest = match serde_json::from_str(body_text) {
         Ok(r) => r,
         Err(e) => {
             return (
                 400,
-                serde_json::json!({"error": format!("invalid request body: {e}")})
-                    .to_string(),
+                serde_json::json!({"error": format!("invalid request body: {e}")}).to_string(),
             );
         }
     };
@@ -7258,26 +7809,19 @@ async fn peers_add(
             200,
             serde_json::json!({"peer_id": peer_id.as_str()}).to_string(),
         ),
-        Err(e) => (
-            502,
-            serde_json::json!({"error": e.to_string()}).to_string(),
-        ),
+        Err(e) => (502, serde_json::json!({"error": e.to_string()}).to_string()),
     }
 }
 
 /// Handle a `DELETE /api/peers` body: parse, call
 /// `PeerRegistry::remove_peer`, return `(status_code, body_json)`.
-async fn peers_remove(
-    registry: &crate::peer::PeerRegistry,
-    body_text: &str,
-) -> (u16, String) {
+async fn peers_remove(registry: &crate::peer::PeerRegistry, body_text: &str) -> (u16, String) {
     let req: RemovePeerRequest = match serde_json::from_str(body_text) {
         Ok(r) => r,
         Err(e) => {
             return (
                 400,
-                serde_json::json!({"error": format!("invalid request body: {e}")})
-                    .to_string(),
+                serde_json::json!({"error": format!("invalid request body: {e}")}).to_string(),
             );
         }
     };
@@ -7288,10 +7832,7 @@ async fn peers_remove(
             404,
             serde_json::json!({"error": "peer not found"}).to_string(),
         ),
-        Err(e) => (
-            500,
-            serde_json::json!({"error": e.to_string()}).to_string(),
-        ),
+        Err(e) => (500, serde_json::json!({"error": e.to_string()}).to_string()),
     }
 }
 
@@ -7307,10 +7848,7 @@ async fn peers_remove(
 /// Factored out of the original inline body-reading block in the
 /// `/api/peers` handler so the per-peer outbound op handlers below
 /// can share it without duplicating the peek-then-stream pattern.
-async fn read_request_body(
-    stream: &mut tokio::net::TcpStream,
-    header_text: &str,
-) -> String {
+async fn read_request_body(stream: &mut tokio::net::TcpStream, header_text: &str) -> String {
     use tokio::io::AsyncReadExt;
     let content_length: usize = header_text
         .lines()
@@ -7496,8 +8034,7 @@ async fn peers_webrtc_signal(
             });
             return (
                 400,
-                serde_json::json!({"error": format!("invalid request body: {e}")})
-                    .to_string(),
+                serde_json::json!({"error": format!("invalid request body: {e}")}).to_string(),
             );
         }
     };
@@ -7524,9 +8061,7 @@ async fn peers_webrtc_signal(
             bus.send(AppEvent::LogEntry {
                 level: "warn".to_string(),
                 source: LOG_SOURCE.to_string(),
-                content: format!(
-                    "peer {id} not in registry — dropping {signal_kind}"
-                ),
+                content: format!("peer {id} not in registry — dropping {signal_kind}"),
                 turn: None,
             });
             return (
@@ -7581,15 +8116,10 @@ async fn peers_webrtc_signal(
             bus.send(AppEvent::LogEntry {
                 level: "error".to_string(),
                 source: LOG_SOURCE.to_string(),
-                content: format!(
-                    "webrtc_signal to peer {id} failed: {e}"
-                ),
+                content: format!("webrtc_signal to peer {id} failed: {e}"),
                 turn: None,
             });
-            (
-                500,
-                serde_json::json!({"error": e.to_string()}).to_string(),
-            )
+            (500, serde_json::json!({"error": e.to_string()}).to_string())
         }
     }
 }
@@ -7770,9 +8300,7 @@ async fn maybe_rewrite_federated_answer(
 /// Returns `None` on any parse or resolution failure. Callers treat
 /// that as "no TCP candidate, UDP-only path" — the same behavior as
 /// slice 3a's pre-3a.2 baseline.
-async fn resolve_url_to_socket_addr(
-    url: &str,
-) -> Option<std::net::SocketAddr> {
+async fn resolve_url_to_socket_addr(url: &str) -> Option<std::net::SocketAddr> {
     let rest = url
         .strip_prefix("wss://")
         .or_else(|| url.strip_prefix("ws://"))
@@ -7891,6 +8419,41 @@ async fn handle_federated_webrtc_signal(
     };
     let session = match registry.read().await.get(display_id) {
         Some(s) => s,
+        None if matches!(&signal, crate::peer::WebRtcSignal::Offer { .. }) => {
+            bus.send(AppEvent::LogEntry {
+                level: "info".to_string(),
+                source: LOG_SOURCE.to_string(),
+                content: format!(
+                    "display {display_id} is not active; requesting display grant for federated offer (session {session_id})"
+                ),
+                turn: None,
+            });
+            bus.send(AppEvent::UserDisplayGranted { display_id });
+            match wait_for_federated_display_session(registry, display_id).await {
+                Some(s) => {
+                    bus.send(AppEvent::LogEntry {
+                        level: "info".to_string(),
+                        source: LOG_SOURCE.to_string(),
+                        content: format!(
+                            "display {display_id} became active for federated offer (session {session_id})"
+                        ),
+                        turn: None,
+                    });
+                    s
+                }
+                None => {
+                    bus.send(AppEvent::LogEntry {
+                        level: "warn".to_string(),
+                        source: LOG_SOURCE.to_string(),
+                        content: format!(
+                            "dropping offer: display {display_id} did not become active before timeout (session {session_id})"
+                        ),
+                        turn: None,
+                    });
+                    return;
+                }
+            }
+        }
         None => {
             bus.send(AppEvent::LogEntry {
                 level: "warn".to_string(),
@@ -7910,8 +8473,7 @@ async fn handle_federated_webrtc_signal(
     // WebRtcPeer in the session's peer map. Centralized via
     // `peer_id_for_federated_session` so the cleanup path can't drift
     // from this derivation.
-    let peer_id: crate::display::PeerId =
-        peer_id_for_federated_session(&session_id);
+    let peer_id: crate::display::PeerId = peer_id_for_federated_session(&session_id);
 
     match signal {
         crate::peer::WebRtcSignal::Offer {
@@ -8052,9 +8614,7 @@ async fn handle_federated_webrtc_signal(
                     let answer = crate::types::OutboundEvent::WebRtcSignal {
                         display_id,
                         session_id: session_id.clone(),
-                        signal: crate::peer::WebRtcSignal::Answer {
-                            sdp: answer_sdp,
-                        },
+                        signal: crate::peer::WebRtcSignal::Answer { sdp: answer_sdp },
                     };
                     match serde_json::to_string(&answer) {
                         Ok(s) => {
@@ -8095,9 +8655,7 @@ async fn handle_federated_webrtc_signal(
                             let evt = crate::types::OutboundEvent::WebRtcSignal {
                                 display_id,
                                 session_id: session_id_ice.clone(),
-                                signal: crate::peer::WebRtcSignal::IceCandidate {
-                                    candidate_json,
-                                },
+                                signal: crate::peer::WebRtcSignal::IceCandidate { candidate_json },
                             };
                             if let Ok(s) = serde_json::to_string(&evt) {
                                 if direct_tx_ice.send(s).is_err() {
@@ -8227,6 +8785,24 @@ async fn handle_federated_webrtc_signal(
     }
 }
 
+async fn wait_for_federated_display_session(
+    registry: &Arc<RwLock<crate::display::SessionRegistry>>,
+    display_id: u32,
+) -> Option<Arc<crate::display::DisplaySession>> {
+    let started = tokio::time::Instant::now();
+    let timeout = std::time::Duration::from_secs(310);
+    let poll_interval = std::time::Duration::from_millis(250);
+    loop {
+        if let Some(session) = registry.read().await.get(display_id) {
+            return Some(session);
+        }
+        if started.elapsed() >= timeout {
+            return None;
+        }
+        tokio::time::sleep(poll_interval).await;
+    }
+}
+
 /// Handle `POST /api/peers/{id}/message`.
 async fn peers_send_message(
     registry: &crate::peer::PeerRegistry,
@@ -8238,18 +8814,14 @@ async fn peers_send_message(
         Err(e) => {
             return (
                 400,
-                serde_json::json!({"error": format!("invalid request body: {e}")})
-                    .to_string(),
+                serde_json::json!({"error": format!("invalid request body: {e}")}).to_string(),
             );
         }
     };
     let msg = match req.into_message() {
         Ok(m) => m,
         Err(e) => {
-            return (
-                400,
-                serde_json::json!({"error": e}).to_string(),
-            );
+            return (400, serde_json::json!({"error": e}).to_string());
         }
     };
     let handle = match peer_handle_or_404(registry, id) {
@@ -8276,8 +8848,7 @@ async fn peers_delegate_task(
         Err(e) => {
             return (
                 400,
-                serde_json::json!({"error": format!("invalid request body: {e}")})
-                    .to_string(),
+                serde_json::json!({"error": format!("invalid request body: {e}")}).to_string(),
             );
         }
     };
@@ -8291,10 +8862,7 @@ async fn peers_delegate_task(
         Err(resp) => return resp,
     };
     match handle.delegate_task(task).await {
-        Ok(task_id) => (
-            200,
-            serde_json::json!({"task_id": task_id.0}).to_string(),
-        ),
+        Ok(task_id) => (200, serde_json::json!({"task_id": task_id.0}).to_string()),
         Err(e) => peer_error_response(e),
     }
 }
@@ -8310,8 +8878,7 @@ async fn peers_resolve_approval(
         Err(e) => {
             return (
                 400,
-                serde_json::json!({"error": format!("invalid request body: {e}")})
-                    .to_string(),
+                serde_json::json!({"error": format!("invalid request body: {e}")}).to_string(),
             );
         }
     };
@@ -8356,10 +8923,7 @@ fn parse_capability_query(query: &str) -> (Vec<crate::peer::Capability>, Vec<Str
 /// connected peers whose Agent Card advertises every requested
 /// capability. Each entry is a [`crate::peer::PeerSnapshot`] —
 /// same shape as `/api/peers` so the dashboard can reuse rendering.
-fn peers_eligible(
-    registry: &crate::peer::PeerRegistry,
-    query_str: &str,
-) -> (u16, String) {
+fn peers_eligible(registry: &crate::peer::PeerRegistry, query_str: &str) -> (u16, String) {
     let (caps, unknown) = parse_capability_query(query_str);
     if !unknown.is_empty() {
         return (
@@ -8417,17 +8981,13 @@ struct CoordinatorRouteTask {
 /// connected peer that satisfies all required capabilities,
 /// returning the assigned task id on success or a structured error
 /// on no-route / delegation failure.
-async fn coordinator_route(
-    registry: &crate::peer::PeerRegistry,
-    body_text: &str,
-) -> (u16, String) {
+async fn coordinator_route(registry: &crate::peer::PeerRegistry, body_text: &str) -> (u16, String) {
     let req: CoordinatorRouteRequest = match serde_json::from_str(body_text) {
         Ok(r) => r,
         Err(e) => {
             return (
                 400,
-                serde_json::json!({"error": format!("invalid request body: {e}")})
-                    .to_string(),
+                serde_json::json!({"error": format!("invalid request body: {e}")}).to_string(),
             );
         }
     };
@@ -8620,8 +9180,7 @@ pub(crate) fn verify_bearer_token(
         None => {
             return Err((
                 401,
-                serde_json::json!({"error": "missing Authorization header"})
-                    .to_string(),
+                serde_json::json!({"error": "missing Authorization header"}).to_string(),
             ));
         }
     };
@@ -8718,12 +9277,11 @@ pub(crate) fn resolve_advertise_urls(
 
 /// Build the auto-detected URL list from the listener bind address.
 /// See [`resolve_advertise_urls`] for the full resolution rules.
-fn auto_detect_advertise_urls(
-    local_addr: Option<std::net::SocketAddr>,
-    port: u16,
-) -> Vec<String> {
+fn auto_detect_advertise_urls(local_addr: Option<std::net::SocketAddr>, port: u16) -> Vec<String> {
     use std::net::IpAddr;
-    let Some(addr) = local_addr else { return Vec::new() };
+    let Some(addr) = local_addr else {
+        return Vec::new();
+    };
 
     // Specific bind: that one IP wins, no enumeration.
     match addr.ip() {
@@ -8861,7 +9419,11 @@ fn build_config_inner(
 
     // If an explicit live model is given, detect provider from the model name.
     if let Some(model) = live_model {
-        if model.starts_with("gpt") || model.starts_with("o1") || model.starts_with("o3") || model.starts_with("o4") {
+        if model.starts_with("gpt")
+            || model.starts_with("o1")
+            || model.starts_with("o3")
+            || model.starts_with("o4")
+        {
             return WebGatewayConfig {
                 provider: "openai".to_string(),
                 model: model.to_string(),
@@ -9116,12 +9678,16 @@ mod tests {
     #[tokio::test]
     async fn resolve_url_returns_none_on_malformed_inputs() {
         // Unknown scheme
-        assert!(resolve_url_to_socket_addr("foo://127.0.0.1:8766").await.is_none());
+        assert!(resolve_url_to_socket_addr("foo://127.0.0.1:8766")
+            .await
+            .is_none());
         // Empty authority
         assert!(resolve_url_to_socket_addr("ws:///path").await.is_none());
         // No port (authority parses as IP but not SocketAddr; lookup_host
         // rejects a bare host with no port).
-        assert!(resolve_url_to_socket_addr("ws://127.0.0.1/ws").await.is_none());
+        assert!(resolve_url_to_socket_addr("ws://127.0.0.1/ws")
+            .await
+            .is_none());
     }
 
     /// Operator overrides come first in the merged list (preference
@@ -9244,21 +9810,36 @@ mod tests {
 
     #[test]
     fn test_build_config_gemini_model() {
-        let config = build_config(None, Some("gemini-2.5-flash-native-audio-preview-12-2025"), false, crate::display::IceConfig::default());
+        let config = build_config(
+            None,
+            Some("gemini-2.5-flash-native-audio-preview-12-2025"),
+            false,
+            crate::display::IceConfig::default(),
+        );
         assert_eq!(config.provider, "gemini");
         assert_eq!(config.input_sample_rate, 16000);
     }
 
     #[test]
     fn test_build_config_openai_model() {
-        let config = build_config(None, Some("gpt-4o-realtime-preview"), false, crate::display::IceConfig::default());
+        let config = build_config(
+            None,
+            Some("gpt-4o-realtime-preview"),
+            false,
+            crate::display::IceConfig::default(),
+        );
         assert_eq!(config.provider, "openai");
         assert_eq!(config.input_sample_rate, 24000);
     }
 
     #[test]
     fn test_build_config_explicit_provider() {
-        let config = build_config(Some("openai"), None, false, crate::display::IceConfig::default());
+        let config = build_config(
+            Some("openai"),
+            None,
+            false,
+            crate::display::IceConfig::default(),
+        );
         assert_eq!(config.provider, "openai");
         assert_eq!(config.model, "gpt-4o-realtime-preview");
     }
@@ -9322,8 +9903,7 @@ mod tests {
         log.round_complete(1, 3);
         drop(log);
 
-        let contents =
-            std::fs::read_to_string(log_dir.join("session.jsonl")).unwrap();
+        let contents = std::fs::read_to_string(log_dir.join("session.jsonl")).unwrap();
         let entries = replay_jsonl_to_outbound_entries(&contents, &log_dir);
 
         // First entry is the replay_start marker.
@@ -9379,8 +9959,7 @@ mod tests {
         log.agent_input(r#"{"commands":[{"function":"execAsAgent","nonce":1}]}"#); // -> skip
         drop(log);
 
-        let contents =
-            std::fs::read_to_string(log_dir.join("session.jsonl")).unwrap();
+        let contents = std::fs::read_to_string(log_dir.join("session.jsonl")).unwrap();
         let entries = replay_jsonl_to_outbound_entries(&contents, &log_dir);
 
         // Entries are: [replay_start, turn_started].  messages_input,
@@ -9402,7 +9981,22 @@ mod tests {
         let (broadcast_tx, _) = broadcast::channel::<String>(16);
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None, None, Vec::new(), None, crate::peer::AuthRequirements::none());
+        let handle = spawn_web_gateway(
+            listener,
+            bus,
+            broadcast_tx,
+            config,
+            ActiveSessionState::empty(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Vec::new(),
+            None,
+            crate::peer::AuthRequirements::none(),
+        );
 
         // Give it a moment to start
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
@@ -9421,7 +10015,22 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None, None, Vec::new(), None, crate::peer::AuthRequirements::none());
+        let handle = spawn_web_gateway(
+            listener,
+            bus,
+            broadcast_tx,
+            config,
+            ActiveSessionState::empty(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Vec::new(),
+            None,
+            crate::peer::AuthRequirements::none(),
+        );
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         // Connect as WebSocket client
@@ -9437,13 +10046,10 @@ mod tests {
         // (may be preceded by a PresenceLog debug event from the diagnostic logging)
         let mut found = false;
         for _ in 0..5 {
-            let event = tokio::time::timeout(
-                tokio::time::Duration::from_secs(2),
-                rx.recv(),
-            )
-            .await
-            .expect("timeout")
-            .expect("channel closed");
+            let event = tokio::time::timeout(tokio::time::Duration::from_secs(2), rx.recv())
+                .await
+                .expect("timeout")
+                .expect("channel closed");
 
             if matches!(event, AppEvent::ControlCommand(ControlMsg::Status)) {
                 found = true;
@@ -9464,7 +10070,22 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(listener, bus, broadcast_tx.clone(), config, ActiveSessionState::empty(), None, None, None, None, None, None, Vec::new(), None, crate::peer::AuthRequirements::none());
+        let handle = spawn_web_gateway(
+            listener,
+            bus,
+            broadcast_tx.clone(),
+            config,
+            ActiveSessionState::empty(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Vec::new(),
+            None,
+            crate::peer::AuthRequirements::none(),
+        );
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         // Connect as WebSocket client
@@ -9487,14 +10108,11 @@ mod tests {
         crate::control::broadcast_event(&broadcast_tx, &event);
 
         // Verify the WebSocket client receives it
-        let msg = tokio::time::timeout(
-            tokio::time::Duration::from_secs(2),
-            ws_rx.next(),
-        )
-        .await
-        .expect("timeout")
-        .unwrap()
-        .unwrap();
+        let msg = tokio::time::timeout(tokio::time::Duration::from_secs(2), ws_rx.next())
+            .await
+            .expect("timeout")
+            .unwrap()
+            .unwrap();
 
         if let Message::Text(text) = msg {
             assert!(text.contains("\"event\":\"status\""));
@@ -9613,22 +10231,19 @@ mod tests {
 
     #[test]
     fn verify_bearer_token_accepts_correct_token() {
-        let header =
-            "GET /api/peers HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer right\r\n\r\n";
+        let header = "GET /api/peers HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer right\r\n\r\n";
         assert!(verify_bearer_token(header, Some("right")).is_ok());
     }
 
     #[test]
     fn verify_bearer_token_header_name_case_insensitive() {
-        let header =
-            "GET /api/peers HTTP/1.1\r\nHost: x\r\nauthorization: Bearer right\r\n\r\n";
+        let header = "GET /api/peers HTTP/1.1\r\nHost: x\r\nauthorization: Bearer right\r\n\r\n";
         assert!(verify_bearer_token(header, Some("right")).is_ok());
     }
 
     #[test]
     fn verify_bearer_token_scheme_case_insensitive() {
-        let header =
-            "GET /api/peers HTTP/1.1\r\nHost: x\r\nAuthorization: bearer right\r\n\r\n";
+        let header = "GET /api/peers HTTP/1.1\r\nHost: x\r\nAuthorization: bearer right\r\n\r\n";
         assert!(verify_bearer_token(header, Some("right")).is_ok());
     }
 
@@ -9645,14 +10260,12 @@ mod tests {
     fn is_federation_path_recognizes_federation_endpoints() {
         assert!(is_federation_path("GET /api/peers HTTP/1.1"));
         assert!(is_federation_path("POST /api/peers HTTP/1.1"));
-        assert!(is_federation_path(
-            "DELETE /api/peers HTTP/1.1"
-        ));
+        assert!(is_federation_path("DELETE /api/peers HTTP/1.1"));
         assert!(is_federation_path("GET /api/peers/eligible HTTP/1.1"));
-        assert!(is_federation_path("POST /api/peers/intendant:foo/message HTTP/1.1"));
         assert!(is_federation_path(
-            "POST /api/coordinator/route HTTP/1.1"
+            "POST /api/peers/intendant:foo/message HTTP/1.1"
         ));
+        assert!(is_federation_path("POST /api/coordinator/route HTTP/1.1"));
         assert!(is_federation_path("GET /api/sessions HTTP/1.1"));
     }
 
@@ -9682,8 +10295,7 @@ mod tests {
     /// without an Authorization header is rejected 401.
     #[tokio::test]
     async fn test_federation_endpoint_rejects_missing_bearer() {
-        let (port, handle) =
-            spawn_test_gateway_with_auth(None, Some("test-token".into())).await;
+        let (port, handle) = spawn_test_gateway_with_auth(None, Some("test-token".into())).await;
         // Request without auth — should 401, NOT pass through to the
         // 503-no-registry response that would happen otherwise.
         let resp = http_request(port, "GET /api/peers HTTP/1.1\r\nHost: x\r\n\r\n").await;
@@ -9699,8 +10311,7 @@ mod tests {
     /// Wrong bearer token → 401 with "invalid bearer token".
     #[tokio::test]
     async fn test_federation_endpoint_rejects_wrong_bearer() {
-        let (port, handle) =
-            spawn_test_gateway_with_auth(None, Some("test-token".into())).await;
+        let (port, handle) = spawn_test_gateway_with_auth(None, Some("test-token".into())).await;
         let resp = http_request(
             port,
             "GET /api/peers HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer wrong\r\n\r\n",
@@ -9716,15 +10327,17 @@ mod tests {
     /// configured — proves auth passed and dispatch ran).
     #[tokio::test]
     async fn test_federation_endpoint_accepts_correct_bearer() {
-        let (port, handle) =
-            spawn_test_gateway_with_auth(None, Some("test-token".into())).await;
+        let (port, handle) = spawn_test_gateway_with_auth(None, Some("test-token".into())).await;
         let resp = http_request(
             port,
             "GET /api/peers HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer test-token\r\n\r\n",
         )
         .await;
         // Auth passed; handler returned its 503 (no registry).
-        assert!(resp.contains("503"), "expected 503 (auth passed, registry missing), got: {resp}");
+        assert!(
+            resp.contains("503"),
+            "expected 503 (auth passed, registry missing), got: {resp}"
+        );
         assert!(!resp.contains("401"));
         handle.abort();
     }
@@ -9736,8 +10349,7 @@ mod tests {
     /// bearer for WAN federation.
     #[tokio::test]
     async fn test_config_endpoint_unauthenticated_when_bearer_set() {
-        let (port, handle) =
-            spawn_test_gateway_with_auth(None, Some("test-token".into())).await;
+        let (port, handle) = spawn_test_gateway_with_auth(None, Some("test-token".into())).await;
         let resp = http_request(port, "GET /config HTTP/1.1\r\nHost: x\r\n\r\n").await;
         assert!(
             resp.contains("200 OK"),
@@ -9770,10 +10382,7 @@ mod tests {
     #[test]
     fn extract_token_query_param_returns_none_when_absent() {
         assert_eq!(extract_token_query_param("GET /ws HTTP/1.1"), None);
-        assert_eq!(
-            extract_token_query_param("GET /ws?other=x HTTP/1.1"),
-            None
-        );
+        assert_eq!(extract_token_query_param("GET /ws?other=x HTTP/1.1"), None);
     }
 
     #[test]
@@ -9789,8 +10398,7 @@ mod tests {
 
     #[test]
     fn verify_bearer_for_ws_accepts_authorization_header() {
-        let header =
-            "GET /ws HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer right\r\n\r\n";
+        let header = "GET /ws HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer right\r\n\r\n";
         assert!(verify_bearer_for_ws(header, Some("right")).is_ok());
     }
 
@@ -9834,8 +10442,7 @@ mod tests {
     /// not a successful upgrade then immediate close.
     #[tokio::test]
     async fn test_ws_upgrade_rejects_missing_bearer() {
-        let (port, handle) =
-            spawn_test_gateway_with_auth(None, Some("ws-token".into())).await;
+        let (port, handle) = spawn_test_gateway_with_auth(None, Some("ws-token".into())).await;
         let resp = http_request(
             port,
             "GET /ws HTTP/1.1\r\n\
@@ -9864,8 +10471,7 @@ mod tests {
     /// that IntendantWsTransport uses.
     #[tokio::test]
     async fn test_ws_upgrade_accepts_matching_authorization_header() {
-        let (port, handle) =
-            spawn_test_gateway_with_auth(None, Some("ws-token".into())).await;
+        let (port, handle) = spawn_test_gateway_with_auth(None, Some("ws-token".into())).await;
         let resp = http_request(
             port,
             "GET /ws HTTP/1.1\r\n\
@@ -9890,8 +10496,7 @@ mod tests {
     /// headers on `WebSocket` opens, so the token rides on the URL).
     #[tokio::test]
     async fn test_ws_upgrade_accepts_matching_query_token() {
-        let (port, handle) =
-            spawn_test_gateway_with_auth(None, Some("ws-token".into())).await;
+        let (port, handle) = spawn_test_gateway_with_auth(None, Some("ws-token".into())).await;
         let resp = http_request(
             port,
             "GET /ws?token=ws-token HTTP/1.1\r\n\
@@ -9936,8 +10541,7 @@ mod tests {
     /// see what auth they need to satisfy.
     #[tokio::test]
     async fn test_agent_card_endpoint_unauthenticated_when_bearer_set() {
-        let (port, handle) =
-            spawn_test_gateway_with_auth(None, Some("test-token".into())).await;
+        let (port, handle) = spawn_test_gateway_with_auth(None, Some("test-token".into())).await;
         let resp = http_request(
             port,
             "GET /.well-known/agent-card.json HTTP/1.1\r\nHost: x\r\n\r\n",
@@ -9990,20 +10594,16 @@ mod tests {
     #[tokio::test]
     async fn test_api_peers_add_list_remove_end_to_end() {
         // Gateway A: the target peer this dashboard will federate with.
-        let (target_port, target_handle) =
-            spawn_test_gateway_with_registry(None).await;
+        let (target_port, target_handle) = spawn_test_gateway_with_registry(None).await;
 
         // Gateway B: the dashboard, with its own peer registry.
         let (log_tx, _log_rx) =
             tokio::sync::mpsc::channel::<crate::peer::event::TaggedPeerEvent>(64);
         let registry = crate::peer::PeerRegistry::new(log_tx);
-        let (dash_port, dash_handle) =
-            spawn_test_gateway_with_registry(Some(registry)).await;
+        let (dash_port, dash_handle) = spawn_test_gateway_with_registry(Some(registry)).await;
 
         // POST A's Agent Card URL to B's /api/peers.
-        let card_url = format!(
-            "http://127.0.0.1:{target_port}/.well-known/agent-card.json"
-        );
+        let card_url = format!("http://127.0.0.1:{target_port}/.well-known/agent-card.json");
         let body = serde_json::json!({"card_url": card_url}).to_string();
         let req = format!(
             "POST /api/peers HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
@@ -10159,21 +10759,17 @@ mod tests {
         tokio::task::JoinHandle<()>,
     ) {
         // Gateway A: the target peer this dashboard will federate with.
-        let (target_port, target_handle) =
-            spawn_test_gateway_with_registry(None).await;
+        let (target_port, target_handle) = spawn_test_gateway_with_registry(None).await;
 
         // Gateway B: the dashboard, with its own peer registry.
         let (log_tx, _log_rx) =
             tokio::sync::mpsc::channel::<crate::peer::event::TaggedPeerEvent>(64);
         let registry = crate::peer::PeerRegistry::new(log_tx);
         let registry_for_wait = registry.clone();
-        let (dash_port, dash_handle) =
-            spawn_test_gateway_with_registry(Some(registry)).await;
+        let (dash_port, dash_handle) = spawn_test_gateway_with_registry(Some(registry)).await;
 
         // POST A's Agent Card URL to B's /api/peers.
-        let card_url = format!(
-            "http://127.0.0.1:{target_port}/.well-known/agent-card.json"
-        );
+        let card_url = format!("http://127.0.0.1:{target_port}/.well-known/agent-card.json");
         let body = serde_json::json!({"card_url": card_url}).to_string();
         let req = format!(
             "POST /api/peers HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
@@ -10211,8 +10807,7 @@ mod tests {
     /// by `peer::transport::intendant::tests::send_message_writes_followup_control_msg`.
     #[tokio::test]
     async fn test_api_peers_send_message_text_shorthand_returns_200() {
-        let (dash_port, peer_id, target_handle, dash_handle) =
-            setup_peer_op_test().await;
+        let (dash_port, peer_id, target_handle, dash_handle) = setup_peer_op_test().await;
 
         let body = serde_json::json!({"text": "hello peer"}).to_string();
         let req = format!(
@@ -10239,8 +10834,7 @@ mod tests {
     /// wins over `text` when both are present).
     #[tokio::test]
     async fn test_api_peers_send_message_full_shape_returns_200() {
-        let (dash_port, peer_id, target_handle, dash_handle) =
-            setup_peer_op_test().await;
+        let (dash_port, peer_id, target_handle, dash_handle) = setup_peer_op_test().await;
 
         let body = serde_json::json!({
             "role": "user",
@@ -10264,8 +10858,7 @@ mod tests {
     /// `peer::transport::intendant::tests::delegate_task_writes_start_task_control_msg`.
     #[tokio::test]
     async fn test_api_peers_delegate_task_returns_200() {
-        let (dash_port, peer_id, target_handle, dash_handle) =
-            setup_peer_op_test().await;
+        let (dash_port, peer_id, target_handle, dash_handle) = setup_peer_op_test().await;
 
         let body = serde_json::json!({
             "instructions": "do the thing",
@@ -10294,8 +10887,7 @@ mod tests {
     /// `peer::transport::intendant::tests::resolve_approval_maps_each_decision_to_its_control_msg`.
     #[tokio::test]
     async fn test_api_peers_resolve_approval_returns_200() {
-        let (dash_port, peer_id, target_handle, dash_handle) =
-            setup_peer_op_test().await;
+        let (dash_port, peer_id, target_handle, dash_handle) = setup_peer_op_test().await;
 
         let body = serde_json::json!({
             "request_id": "42",
@@ -10483,8 +11075,7 @@ mod tests {
     /// (the fixture doesn't advertise Display).
     #[tokio::test]
     async fn test_api_peers_eligible_returns_matching_peers() {
-        let (dash_port, peer_id, target_handle, dash_handle) =
-            setup_peer_op_test().await;
+        let (dash_port, peer_id, target_handle, dash_handle) = setup_peer_op_test().await;
 
         // Hits: the test peer's card advertises ComputerUse.
         let resp = http_request(
@@ -10523,8 +11114,7 @@ mod tests {
     /// peer::transport::intendant::tests.
     #[tokio::test]
     async fn test_api_coordinator_route_returns_200() {
-        let (dash_port, peer_id, target_handle, dash_handle) =
-            setup_peer_op_test().await;
+        let (dash_port, peer_id, target_handle, dash_handle) = setup_peer_op_test().await;
 
         let body = serde_json::json!({
             "required_capabilities": ["computer-use"],
@@ -10560,8 +11150,7 @@ mod tests {
     /// with the considered peer ids surfaced for diagnostics.
     #[tokio::test]
     async fn test_api_coordinator_route_no_match_returns_404() {
-        let (dash_port, peer_id, target_handle, dash_handle) =
-            setup_peer_op_test().await;
+        let (dash_port, peer_id, target_handle, dash_handle) = setup_peer_op_test().await;
 
         // Voice is the "gated, not-advertised-by-default" capability
         // that the stock build_local_agent_card fixture doesn't claim
@@ -10668,7 +11257,22 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None, None, Vec::new(), None, crate::peer::AuthRequirements::none());
+        let handle = spawn_web_gateway(
+            listener,
+            bus,
+            broadcast_tx,
+            config,
+            ActiveSessionState::empty(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Vec::new(),
+            None,
+            crate::peer::AuthRequirements::none(),
+        );
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         // Plain HTTP GET
@@ -10712,7 +11316,22 @@ mod tests {
             ice_servers: Vec::new(),
             ..Default::default()
         };
-        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None, None, Vec::new(), None, crate::peer::AuthRequirements::none());
+        let handle = spawn_web_gateway(
+            listener,
+            bus,
+            broadcast_tx,
+            config,
+            ActiveSessionState::empty(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Vec::new(),
+            None,
+            crate::peer::AuthRequirements::none(),
+        );
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         // GET /config
@@ -10757,7 +11376,14 @@ mod tests {
             broadcast_tx,
             WebGatewayConfig::default(),
             ActiveSessionState::empty(),
-            None, None, None, None, None, None, Vec::new(), None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Vec::new(),
+            None,
             crate::peer::AuthRequirements::none(),
         );
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
@@ -10784,11 +11410,13 @@ mod tests {
             .split("\r\n\r\n")
             .nth(1)
             .expect("body after headers");
-        let parsed: serde_json::Value =
-            serde_json::from_str(body).expect("body is JSON");
+        let parsed: serde_json::Value = serde_json::from_str(body).expect("body is JSON");
         let obj = parsed.as_object().expect("body is an object");
 
-        assert!(obj.contains_key("provider"), "should still have runtime fields");
+        assert!(
+            obj.contains_key("provider"),
+            "should still have runtime fields"
+        );
         assert!(obj.contains_key("model"));
         assert!(
             !obj.contains_key("host_label"),
@@ -10826,7 +11454,14 @@ mod tests {
             broadcast_tx,
             WebGatewayConfig::default(),
             ActiveSessionState::empty(),
-            None, None, None, None, None, None, Vec::new(), None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Vec::new(),
+            None,
             crate::peer::AuthRequirements::none(),
         );
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
@@ -10835,9 +11470,7 @@ mod tests {
             .await
             .unwrap();
         stream
-            .write_all(
-                b"GET /.well-known/agent-card.json HTTP/1.1\r\nHost: localhost\r\n\r\n",
-            )
+            .write_all(b"GET /.well-known/agent-card.json HTTP/1.1\r\nHost: localhost\r\n\r\n")
             .await
             .unwrap();
         let mut response = Vec::new();
@@ -10858,8 +11491,7 @@ mod tests {
             .split("\r\n\r\n")
             .nth(1)
             .expect("body after headers");
-        let card: AgentCard =
-            serde_json::from_str(body).expect("body deserializes as AgentCard");
+        let card: AgentCard = serde_json::from_str(body).expect("body deserializes as AgentCard");
 
         // Identity fields must be populated from live state.
         assert_eq!(
@@ -10934,27 +11566,45 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None, None, Vec::new(), None, crate::peer::AuthRequirements::none());
+        let handle = spawn_web_gateway(
+            listener,
+            bus,
+            broadcast_tx,
+            config,
+            ActiveSessionState::empty(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Vec::new(),
+            None,
+            crate::peer::AuthRequirements::none(),
+        );
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         let url = format!("ws://127.0.0.1:{}", port);
         let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
 
         // Send presence_connect (new protocol)
-        ws.send(Message::Text(r#"{"t":"presence_connect","server_session_id":"sess-1","last_event_seq":5}"#.into()))
-            .await
-            .unwrap();
-
-        let event = tokio::time::timeout(
-            tokio::time::Duration::from_secs(2),
-            rx.recv(),
-        )
+        ws.send(Message::Text(
+            r#"{"t":"presence_connect","server_session_id":"sess-1","last_event_seq":5}"#.into(),
+        ))
         .await
-        .expect("timeout")
-        .expect("channel closed");
+        .unwrap();
+
+        let event = tokio::time::timeout(tokio::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("timeout")
+            .expect("channel closed");
 
         match event {
-            AppEvent::PresenceConnected { server_session_id, last_event_seq, .. } => {
+            AppEvent::PresenceConnected {
+                server_session_id,
+                last_event_seq,
+                ..
+            } => {
                 assert_eq!(server_session_id.as_deref(), Some("sess-1"));
                 assert_eq!(last_event_seq, 5);
             }
@@ -10966,13 +11616,10 @@ mod tests {
             .await
             .unwrap();
 
-        let event = tokio::time::timeout(
-            tokio::time::Duration::from_secs(2),
-            rx.recv(),
-        )
-        .await
-        .expect("timeout")
-        .expect("channel closed");
+        let event = tokio::time::timeout(tokio::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("timeout")
+            .expect("channel closed");
 
         assert!(matches!(event, AppEvent::PresenceDisconnected));
 
@@ -10989,26 +11636,44 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None, None, Vec::new(), None, crate::peer::AuthRequirements::none());
+        let handle = spawn_web_gateway(
+            listener,
+            bus,
+            broadcast_tx,
+            config,
+            ActiveSessionState::empty(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Vec::new(),
+            None,
+            crate::peer::AuthRequirements::none(),
+        );
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         let url = format!("ws://127.0.0.1:{}", port);
         let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
 
-        ws.send(Message::Text(r#"{"t":"voice_log","text":"hello","seq":3,"tool_context":"check_status"}"#.into()))
-            .await
-            .unwrap();
-
-        let event = tokio::time::timeout(
-            tokio::time::Duration::from_secs(2),
-            rx.recv(),
-        )
+        ws.send(Message::Text(
+            r#"{"t":"voice_log","text":"hello","seq":3,"tool_context":"check_status"}"#.into(),
+        ))
         .await
-        .expect("timeout")
-        .expect("channel closed");
+        .unwrap();
+
+        let event = tokio::time::timeout(tokio::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("timeout")
+            .expect("channel closed");
 
         match event {
-            AppEvent::VoiceLog { text, seq, tool_context } => {
+            AppEvent::VoiceLog {
+                text,
+                seq,
+                tool_context,
+            } => {
                 assert_eq!(text, "hello");
                 assert_eq!(seq, 3);
                 assert_eq!(tool_context.as_deref(), Some("check_status"));
@@ -11045,10 +11710,25 @@ mod tests {
 
         let config = WebGatewayConfig::default();
         let handle = {
-                let ss = ActiveSessionState::empty();
-                ss.write().await.query_ctx = query_ctx;
-                spawn_web_gateway(listener, bus, broadcast_tx, config, ss, None, None, None, None, None, None, Vec::new(), None, crate::peer::AuthRequirements::none())
-            };
+            let ss = ActiveSessionState::empty();
+            ss.write().await.query_ctx = query_ctx;
+            spawn_web_gateway(
+                listener,
+                bus,
+                broadcast_tx,
+                config,
+                ss,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Vec::new(),
+                None,
+                crate::peer::AuthRequirements::none(),
+            )
+        };
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         let url = format!("ws://127.0.0.1:{}", port);
@@ -11056,14 +11736,11 @@ mod tests {
         let (_ws_tx_split, mut ws_rx) = ws.split();
 
         // First message should be the bootstrap state_snapshot
-        let msg = tokio::time::timeout(
-            tokio::time::Duration::from_secs(2),
-            ws_rx.next(),
-        )
-        .await
-        .expect("timeout")
-        .unwrap()
-        .unwrap();
+        let msg = tokio::time::timeout(tokio::time::Duration::from_secs(2), ws_rx.next())
+            .await
+            .expect("timeout")
+            .unwrap()
+            .unwrap();
 
         if let Message::Text(text) = msg {
             let json: serde_json::Value = serde_json::from_str(&text).unwrap();
@@ -11104,10 +11781,25 @@ mod tests {
 
         let config = WebGatewayConfig::default();
         let handle = {
-                let ss = ActiveSessionState::empty();
-                ss.write().await.query_ctx = query_ctx;
-                spawn_web_gateway(listener, bus, broadcast_tx, config, ss, None, None, None, None, None, None, Vec::new(), None, crate::peer::AuthRequirements::none())
-            };
+            let ss = ActiveSessionState::empty();
+            ss.write().await.query_ctx = query_ctx;
+            spawn_web_gateway(
+                listener,
+                bus,
+                broadcast_tx,
+                config,
+                ss,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Vec::new(),
+                None,
+                crate::peer::AuthRequirements::none(),
+            )
+        };
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         let url = format!("ws://127.0.0.1:{}", port);
@@ -11173,10 +11865,25 @@ mod tests {
 
         let config = WebGatewayConfig::default();
         let handle = {
-                let ss = ActiveSessionState::empty();
-                ss.write().await.query_ctx = query_ctx;
-                spawn_web_gateway(listener, bus, broadcast_tx, config, ss, None, None, None, None, None, None, Vec::new(), None, crate::peer::AuthRequirements::none())
-            };
+            let ss = ActiveSessionState::empty();
+            ss.write().await.query_ctx = query_ctx;
+            spawn_web_gateway(
+                listener,
+                bus,
+                broadcast_tx,
+                config,
+                ss,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Vec::new(),
+                None,
+                crate::peer::AuthRequirements::none(),
+            )
+        };
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         let url = format!("ws://127.0.0.1:{}", port);
@@ -11193,13 +11900,10 @@ mod tests {
         // (may be preceded by PresenceLog debug events)
         let mut found = false;
         for _ in 0..10 {
-            let event = tokio::time::timeout(
-                tokio::time::Duration::from_secs(2),
-                rx.recv(),
-            )
-            .await
-            .expect("timeout")
-            .expect("channel closed");
+            let event = tokio::time::timeout(tokio::time::Duration::from_secs(2), rx.recv())
+                .await
+                .expect("timeout")
+                .expect("channel closed");
             if let AppEvent::ControlCommand(ControlMsg::Approve { id }) = event {
                 assert_eq!(id, 42);
                 found = true;
@@ -11250,37 +11954,48 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None, None, Vec::new(), None, crate::peer::AuthRequirements::none());
+        let handle = spawn_web_gateway(
+            listener,
+            bus,
+            broadcast_tx,
+            config,
+            ActiveSessionState::empty(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Vec::new(),
+            None,
+            crate::peer::AuthRequirements::none(),
+        );
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         let url = format!("ws://127.0.0.1:{}", port);
         let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
 
         // Send presence_connect
-        ws.send(Message::Text(r#"{"t":"presence_connect","last_event_seq":0}"#.into()))
-            .await
-            .unwrap();
-
-        let event = tokio::time::timeout(
-            tokio::time::Duration::from_secs(2),
-            rx.recv(),
-        )
+        ws.send(Message::Text(
+            r#"{"t":"presence_connect","last_event_seq":0}"#.into(),
+        ))
         .await
-        .expect("timeout")
-        .expect("channel closed");
+        .unwrap();
+
+        let event = tokio::time::timeout(tokio::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("timeout")
+            .expect("channel closed");
         assert!(matches!(event, AppEvent::PresenceConnected { .. }));
 
         // Drop the WebSocket WITHOUT sending presence_disconnect
         ws.close(None).await.unwrap();
 
         // Server should auto-send PresenceDisconnected
-        let event = tokio::time::timeout(
-            tokio::time::Duration::from_secs(2),
-            rx.recv(),
-        )
-        .await
-        .expect("timeout waiting for auto PresenceDisconnected")
-        .expect("channel closed");
+        let event = tokio::time::timeout(tokio::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("timeout waiting for auto PresenceDisconnected")
+            .expect("channel closed");
 
         assert!(matches!(event, AppEvent::PresenceDisconnected));
 
@@ -11299,7 +12014,22 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None, None, Vec::new(), None, crate::peer::AuthRequirements::none());
+        let handle = spawn_web_gateway(
+            listener,
+            bus,
+            broadcast_tx,
+            config,
+            ActiveSessionState::empty(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Vec::new(),
+            None,
+            crate::peer::AuthRequirements::none(),
+        );
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         let url = format!("ws://127.0.0.1:{}", port);
@@ -11314,13 +12044,10 @@ mod tests {
         // (may be preceded by PresenceLog debug events)
         let mut found = false;
         for _ in 0..5 {
-            let event = tokio::time::timeout(
-                tokio::time::Duration::from_secs(2),
-                rx.recv(),
-            )
-            .await
-            .expect("timeout")
-            .expect("channel closed");
+            let event = tokio::time::timeout(tokio::time::Duration::from_secs(2), rx.recv())
+                .await
+                .expect("timeout")
+                .expect("channel closed");
             if matches!(event, AppEvent::ControlCommand(ControlMsg::Status)) {
                 found = true;
                 break;
@@ -11332,11 +12059,7 @@ mod tests {
         ws.close(None).await.unwrap();
 
         // Should NOT receive PresenceDisconnected — only a timeout
-        let result = tokio::time::timeout(
-            tokio::time::Duration::from_millis(500),
-            rx.recv(),
-        )
-        .await;
+        let result = tokio::time::timeout(tokio::time::Duration::from_millis(500), rx.recv()).await;
         assert!(result.is_err(), "expected timeout, got {:?}", result);
 
         handle.abort();
@@ -11352,7 +12075,22 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None, None, Vec::new(), None, crate::peer::AuthRequirements::none());
+        let handle = spawn_web_gateway(
+            listener,
+            bus,
+            broadcast_tx,
+            config,
+            ActiveSessionState::empty(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Vec::new(),
+            None,
+            crate::peer::AuthRequirements::none(),
+        );
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         // POST /session without any API key env var set
@@ -11372,8 +12110,16 @@ mod tests {
         .await;
 
         let response_str = String::from_utf8_lossy(&response);
-        assert!(response_str.contains("502 Bad Gateway"), "response: {}", response_str);
-        assert!(response_str.contains("not set on server"), "response: {}", response_str);
+        assert!(
+            response_str.contains("502 Bad Gateway"),
+            "response: {}",
+            response_str
+        );
+        assert!(
+            response_str.contains("not set on server"),
+            "response: {}",
+            response_str
+        );
 
         handle.abort();
     }
@@ -11387,7 +12133,22 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None, None, Vec::new(), None, crate::peer::AuthRequirements::none());
+        let handle = spawn_web_gateway(
+            listener,
+            bus,
+            broadcast_tx,
+            config,
+            ActiveSessionState::empty(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Vec::new(),
+            None,
+            crate::peer::AuthRequirements::none(),
+        );
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         let mut stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{}", port))
@@ -11406,9 +12167,21 @@ mod tests {
         .await;
 
         let response_str = String::from_utf8_lossy(&response);
-        assert!(response_str.contains("200 OK"), "response: {}", response_str);
-        assert!(response_str.contains("application/javascript"), "response: {}", response_str);
-        assert!(response_str.contains("AudioCaptureProcessor"), "response: {}", response_str);
+        assert!(
+            response_str.contains("200 OK"),
+            "response: {}",
+            response_str
+        );
+        assert!(
+            response_str.contains("application/javascript"),
+            "response: {}",
+            response_str
+        );
+        assert!(
+            response_str.contains("AudioCaptureProcessor"),
+            "response: {}",
+            response_str
+        );
 
         handle.abort();
     }
@@ -11424,38 +12197,49 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None, None, Vec::new(), None, crate::peer::AuthRequirements::none());
+        let handle = spawn_web_gateway(
+            listener,
+            bus,
+            broadcast_tx,
+            config,
+            ActiveSessionState::empty(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Vec::new(),
+            None,
+            crate::peer::AuthRequirements::none(),
+        );
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         let url = format!("ws://127.0.0.1:{}", port);
         let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
 
         // Send presence_connect
-        ws.send(Message::Text(r#"{"t":"presence_connect","last_event_seq":0}"#.into()))
-            .await
-            .unwrap();
+        ws.send(Message::Text(
+            r#"{"t":"presence_connect","last_event_seq":0}"#.into(),
+        ))
+        .await
+        .unwrap();
 
         // Should get PresenceConnected on the bus (active browser emits it)
-        let event = tokio::time::timeout(
-            tokio::time::Duration::from_secs(2),
-            rx.recv(),
-        )
-        .await
-        .expect("timeout")
-        .expect("channel closed");
+        let event = tokio::time::timeout(tokio::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("timeout")
+            .expect("channel closed");
         assert!(matches!(event, AppEvent::PresenceConnected { .. }));
 
         // Should receive a presence_welcome with is_active: true via direct channel
         // (We need to read WS messages to find it)
         let (_ws_tx_split, mut ws_rx) = ws.split();
-        let msg = tokio::time::timeout(
-            tokio::time::Duration::from_secs(2),
-            ws_rx.next(),
-        )
-        .await
-        .expect("timeout")
-        .unwrap()
-        .unwrap();
+        let msg = tokio::time::timeout(tokio::time::Duration::from_secs(2), ws_rx.next())
+            .await
+            .expect("timeout")
+            .unwrap()
+            .unwrap();
 
         if let Message::Text(text) = msg {
             let json: serde_json::Value = serde_json::from_str(&text).unwrap();
@@ -11479,40 +12263,55 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None, None, Vec::new(), None, crate::peer::AuthRequirements::none());
+        let handle = spawn_web_gateway(
+            listener,
+            bus,
+            broadcast_tx,
+            config,
+            ActiveSessionState::empty(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Vec::new(),
+            None,
+            crate::peer::AuthRequirements::none(),
+        );
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         let url = format!("ws://127.0.0.1:{}", port);
 
         // First browser connects — becomes active
         let (mut ws1, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
-        ws1.send(Message::Text(r#"{"t":"presence_connect","last_event_seq":0}"#.into()))
-            .await
-            .unwrap();
+        ws1.send(Message::Text(
+            r#"{"t":"presence_connect","last_event_seq":0}"#.into(),
+        ))
+        .await
+        .unwrap();
 
         // Drain PresenceConnected from first browser
-        let event = tokio::time::timeout(
-            tokio::time::Duration::from_secs(2),
-            rx.recv(),
-        )
-        .await
-        .expect("timeout")
-        .expect("channel closed");
+        let event = tokio::time::timeout(tokio::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("timeout")
+            .expect("channel closed");
         assert!(matches!(event, AppEvent::PresenceConnected { .. }));
 
         // Second browser connects — should be passive
         let (mut ws2, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
-        ws2.send(Message::Text(r#"{"t":"presence_connect","last_event_seq":0}"#.into()))
-            .await
-            .unwrap();
+        ws2.send(Message::Text(
+            r#"{"t":"presence_connect","last_event_seq":0}"#.into(),
+        ))
+        .await
+        .unwrap();
 
         // Should NOT receive PresenceConnected on bus (passive)
-        let result = tokio::time::timeout(
-            tokio::time::Duration::from_millis(500),
-            rx.recv(),
-        )
-        .await;
-        assert!(result.is_err(), "passive browser should not emit PresenceConnected");
+        let result = tokio::time::timeout(tokio::time::Duration::from_millis(500), rx.recv()).await;
+        assert!(
+            result.is_err(),
+            "passive browser should not emit PresenceConnected"
+        );
 
         // Second browser should receive welcome with is_active: false
         // Drain bootstrap state_snapshot first
@@ -11523,7 +12322,10 @@ mod tests {
                 Ok(Some(Ok(Message::Text(text)))) => {
                     if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) {
                         if json["t"] == "presence_welcome" {
-                            assert_eq!(json["is_active"], false, "second browser should be passive");
+                            assert_eq!(
+                                json["is_active"], false,
+                                "second browser should be passive"
+                            );
                             found_welcome = true;
                             break;
                         }
@@ -11532,7 +12334,10 @@ mod tests {
                 _ => break,
             }
         }
-        assert!(found_welcome, "second browser should receive presence_welcome");
+        assert!(
+            found_welcome,
+            "second browser should receive presence_welcome"
+        );
 
         handle.abort();
     }
@@ -11548,7 +12353,22 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None, None, Vec::new(), None, crate::peer::AuthRequirements::none());
+        let handle = spawn_web_gateway(
+            listener,
+            bus,
+            broadcast_tx,
+            config,
+            ActiveSessionState::empty(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Vec::new(),
+            None,
+            crate::peer::AuthRequirements::none(),
+        );
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         let url = format!("ws://127.0.0.1:{}", port);
@@ -11556,18 +12376,24 @@ mod tests {
         // Browser 1 connects and becomes active
         let (ws1, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
         let (mut ws1_tx, mut ws1_rx) = ws1.split();
-        ws1_tx.send(Message::Text(r#"{"t":"presence_connect","last_event_seq":0}"#.into()))
+        ws1_tx
+            .send(Message::Text(
+                r#"{"t":"presence_connect","last_event_seq":0}"#.into(),
+            ))
             .await
             .unwrap();
 
         // Drain PresenceConnected
         let event = tokio::time::timeout(tokio::time::Duration::from_secs(2), rx.recv())
-            .await.expect("timeout").expect("closed");
+            .await
+            .expect("timeout")
+            .expect("closed");
         assert!(matches!(event, AppEvent::PresenceConnected { .. }));
 
         // Drain ws1's bootstrap + welcome messages
         for _ in 0..3 {
-            let _ = tokio::time::timeout(tokio::time::Duration::from_millis(300), ws1_rx.next()).await;
+            let _ =
+                tokio::time::timeout(tokio::time::Duration::from_millis(300), ws1_rx.next()).await;
         }
 
         // Browser 2 connects (passive — no presence_connect yet, just make_active)
@@ -11578,7 +12404,8 @@ mod tests {
         let _ = tokio::time::timeout(tokio::time::Duration::from_millis(300), ws2_rx.next()).await;
 
         // Browser 2 sends make_active
-        ws2_tx.send(Message::Text(r#"{"t":"make_active"}"#.into()))
+        ws2_tx
+            .send(Message::Text(r#"{"t":"make_active"}"#.into()))
             .await
             .unwrap();
 
@@ -11598,7 +12425,10 @@ mod tests {
                 _ => break,
             }
         }
-        assert!(found_force_disconnect, "browser 1 should receive force_disconnect_voice");
+        assert!(
+            found_force_disconnect,
+            "browser 1 should receive force_disconnect_voice"
+        );
 
         // Browser 2 should receive active_granted
         let mut found_active_granted = false;
@@ -11616,7 +12446,10 @@ mod tests {
                 _ => break,
             }
         }
-        assert!(found_active_granted, "browser 2 should receive active_granted");
+        assert!(
+            found_active_granted,
+            "browser 2 should receive active_granted"
+        );
 
         // EventBus should have received a new PresenceConnected for browser 2
         let mut found_connected = false;
@@ -11645,20 +12478,39 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None, None, Vec::new(), None, crate::peer::AuthRequirements::none());
+        let handle = spawn_web_gateway(
+            listener,
+            bus,
+            broadcast_tx,
+            config,
+            ActiveSessionState::empty(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Vec::new(),
+            None,
+            crate::peer::AuthRequirements::none(),
+        );
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         let url = format!("ws://127.0.0.1:{}", port);
 
         // First browser connects and becomes active
         let (mut ws1, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
-        ws1.send(Message::Text(r#"{"t":"presence_connect","last_event_seq":0}"#.into()))
-            .await
-            .unwrap();
+        ws1.send(Message::Text(
+            r#"{"t":"presence_connect","last_event_seq":0}"#.into(),
+        ))
+        .await
+        .unwrap();
 
         // Drain PresenceConnected
         let event = tokio::time::timeout(tokio::time::Duration::from_secs(2), rx.recv())
-            .await.expect("timeout").expect("closed");
+            .await
+            .expect("timeout")
+            .expect("closed");
         assert!(matches!(event, AppEvent::PresenceConnected { .. }));
 
         // Drop the active browser
@@ -11666,7 +12518,9 @@ mod tests {
 
         // Should get PresenceDisconnected
         let event = tokio::time::timeout(tokio::time::Duration::from_secs(2), rx.recv())
-            .await.expect("timeout").expect("closed");
+            .await
+            .expect("timeout")
+            .expect("closed");
         assert!(matches!(event, AppEvent::PresenceDisconnected));
 
         // Give server a moment to process the drop
@@ -11674,13 +12528,17 @@ mod tests {
 
         // Second browser connects — should now become active
         let (mut ws2, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
-        ws2.send(Message::Text(r#"{"t":"presence_connect","last_event_seq":0}"#.into()))
-            .await
-            .unwrap();
+        ws2.send(Message::Text(
+            r#"{"t":"presence_connect","last_event_seq":0}"#.into(),
+        ))
+        .await
+        .unwrap();
 
         // Should get PresenceConnected (new active)
         let event = tokio::time::timeout(tokio::time::Duration::from_secs(2), rx.recv())
-            .await.expect("timeout").expect("closed");
+            .await
+            .expect("timeout")
+            .expect("closed");
         assert!(matches!(event, AppEvent::PresenceConnected { .. }));
 
         // Should receive welcome with is_active: true
@@ -11700,7 +12558,10 @@ mod tests {
                 _ => break,
             }
         }
-        assert!(found_welcome, "new browser should be active after old one dropped");
+        assert!(
+            found_welcome,
+            "new browser should be active after old one dropped"
+        );
 
         handle.abort();
     }
@@ -11717,7 +12578,22 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
 
         let config = WebGatewayConfig::default();
-        let handle = spawn_web_gateway(listener, bus, broadcast_tx, config, ActiveSessionState::empty(), None, None, None, None, None, None, Vec::new(), None, crate::peer::AuthRequirements::none());
+        let handle = spawn_web_gateway(
+            listener,
+            bus,
+            broadcast_tx,
+            config,
+            ActiveSessionState::empty(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Vec::new(),
+            None,
+            crate::peer::AuthRequirements::none(),
+        );
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         let url = format!("ws://127.0.0.1:{}", port);
@@ -11726,22 +12602,31 @@ mod tests {
         let (mut ws_tx, mut ws_rx) = ws.split();
 
         // First presence_connect — becomes active
-        ws_tx.send(Message::Text(r#"{"t":"presence_connect","last_event_seq":0}"#.into()))
+        ws_tx
+            .send(Message::Text(
+                r#"{"t":"presence_connect","last_event_seq":0}"#.into(),
+            ))
             .await
             .unwrap();
 
         // Drain PresenceConnected from first connect
         let event = tokio::time::timeout(tokio::time::Duration::from_secs(2), rx.recv())
-            .await.expect("timeout").expect("closed");
+            .await
+            .expect("timeout")
+            .expect("closed");
         assert!(matches!(event, AppEvent::PresenceConnected { .. }));
 
         // Drain welcome + bootstrap messages
         for _ in 0..5 {
-            let _ = tokio::time::timeout(tokio::time::Duration::from_millis(200), ws_rx.next()).await;
+            let _ =
+                tokio::time::timeout(tokio::time::Duration::from_millis(200), ws_rx.next()).await;
         }
 
         // Re-send presence_connect (simulates voice reconnect after handover)
-        ws_tx.send(Message::Text(r#"{"t":"presence_connect","last_event_seq":0}"#.into()))
+        ws_tx
+            .send(Message::Text(
+                r#"{"t":"presence_connect","last_event_seq":0}"#.into(),
+            ))
             .await
             .unwrap();
 
@@ -11752,8 +12637,10 @@ mod tests {
                 Ok(Some(Ok(Message::Text(text)))) => {
                     if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) {
                         if json["t"] == "presence_welcome" {
-                            assert_eq!(json["is_active"], true,
-                                "already-active browser should still be active on re-connect");
+                            assert_eq!(
+                                json["is_active"], true,
+                                "already-active browser should still be active on re-connect"
+                            );
                             found_welcome = true;
                             break;
                         }
@@ -11765,12 +12652,11 @@ mod tests {
         assert!(found_welcome, "should receive presence_welcome");
 
         // Should NOT get a duplicate PresenceConnected on the bus
-        let result = tokio::time::timeout(
-            tokio::time::Duration::from_millis(500),
-            rx.recv(),
-        )
-        .await;
-        assert!(result.is_err(), "should not emit duplicate PresenceConnected for already-active browser");
+        let result = tokio::time::timeout(tokio::time::Duration::from_millis(500), rx.recv()).await;
+        assert!(
+            result.is_err(),
+            "should not emit duplicate PresenceConnected for already-active browser"
+        );
 
         handle.abort();
     }
@@ -11797,15 +12683,13 @@ mod tests {
         connection_id: &str,
     ) {
         let (tx, _rx) = mpsc::unbounded_channel::<String>();
-        map.write()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(
-                display_id,
-                DisplayInputHolder::LocalWs {
-                    connection_id: connection_id.to_string(),
-                    direct_tx: tx,
-                },
-            );
+        map.write().unwrap_or_else(|e| e.into_inner()).insert(
+            display_id,
+            DisplayInputHolder::LocalWs {
+                connection_id: connection_id.to_string(),
+                direct_tx: tx,
+            },
+        );
     }
 
     /// Closure semantics: unclaimed map → authorized.  Matches the
@@ -11877,16 +12761,9 @@ mod tests {
     #[test]
     fn apply_grant_emits_authority_change_with_holder() {
         let map = empty_authority_map();
-        let (auth_tx, mut auth_rx) =
-            broadcast::channel::<DisplayInputAuthorityChange>(8);
+        let (auth_tx, mut auth_rx) = broadcast::channel::<DisplayInputAuthorityChange>(8);
         let (direct_tx, _direct_rx) = mpsc::unbounded_channel::<String>();
-        let prior = apply_grant_input_authority(
-            7,
-            "conn-A".to_string(),
-            direct_tx,
-            &map,
-            &auth_tx,
-        );
+        let prior = apply_grant_input_authority(7, "conn-A".to_string(), direct_tx, &map, &auth_tx);
         assert!(prior.is_none(), "no prior holder on first grant");
         let change = auth_rx.try_recv().expect("authority change emitted");
         assert_eq!(change.display_id, 7);
@@ -11914,22 +12791,18 @@ mod tests {
     #[test]
     fn apply_grant_auto_revokes_prior_holder() {
         let map = empty_authority_map();
-        let (auth_tx, mut auth_rx) =
-            broadcast::channel::<DisplayInputAuthorityChange>(8);
+        let (auth_tx, mut auth_rx) = broadcast::channel::<DisplayInputAuthorityChange>(8);
         let (direct_tx_a, mut direct_rx_a) = mpsc::unbounded_channel::<String>();
         let (direct_tx_b, _direct_rx_b) = mpsc::unbounded_channel::<String>();
 
         // First grant to A.
-        apply_grant_input_authority(
-            7, "conn-A".to_string(), direct_tx_a.clone(), &map, &auth_tx,
-        );
+        apply_grant_input_authority(7, "conn-A".to_string(), direct_tx_a.clone(), &map, &auth_tx);
         // Drain the first authority change.
         let _ = auth_rx.try_recv().expect("first grant emitted");
 
         // Second grant to B → A is auto-revoked.
-        let prior = apply_grant_input_authority(
-            7, "conn-B".to_string(), direct_tx_b, &map, &auth_tx,
-        );
+        let prior =
+            apply_grant_input_authority(7, "conn-B".to_string(), direct_tx_b, &map, &auth_tx);
         let prior_entry = prior.expect("prior holder returned");
         assert!(
             prior_entry.matches_local_ws("conn-A"),
@@ -11962,14 +12835,17 @@ mod tests {
     fn apply_release_emits_authority_change_with_none() {
         let map = empty_authority_map();
         seed_holder(&map, 7, "conn-A");
-        let (auth_tx, mut auth_rx) =
-            broadcast::channel::<DisplayInputAuthorityChange>(8);
+        let (auth_tx, mut auth_rx) = broadcast::channel::<DisplayInputAuthorityChange>(8);
         let removed = apply_release_input_authority(7, "conn-A", &map, &auth_tx);
         assert!(removed, "holder's release should succeed");
         let change = auth_rx.try_recv().expect("authority change emitted");
         assert_eq!(change.display_id, 7);
         assert!(change.holder.is_none(), "release emits None holder");
-        assert!(map.read().unwrap_or_else(|e| e.into_inner()).get(&7).is_none());
+        assert!(map
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&7)
+            .is_none());
     }
 
     /// Release attempted by a non-holder is a no-op — prevents A from
@@ -11978,8 +12854,7 @@ mod tests {
     fn apply_release_is_noop_for_non_holder() {
         let map = empty_authority_map();
         seed_holder(&map, 7, "conn-A");
-        let (auth_tx, mut auth_rx) =
-            broadcast::channel::<DisplayInputAuthorityChange>(8);
+        let (auth_tx, mut auth_rx) = broadcast::channel::<DisplayInputAuthorityChange>(8);
         let removed = apply_release_input_authority(7, "conn-B", &map, &auth_tx);
         assert!(!removed, "non-holder cannot unclaim");
         // No change emitted.
@@ -12006,15 +12881,22 @@ mod tests {
         seed_holder(&map, 1, "conn-A");
         seed_holder(&map, 2, "conn-A");
         seed_holder(&map, 3, "conn-B");
-        let (auth_tx, mut auth_rx) =
-            broadcast::channel::<DisplayInputAuthorityChange>(8);
+        let (auth_tx, mut auth_rx) = broadcast::channel::<DisplayInputAuthorityChange>(8);
         let released = apply_ws_close_input_authority("conn-A", &map, &auth_tx);
         // A's two holdings released; B untouched.
         let mut released_sorted = released.clone();
         released_sorted.sort();
         assert_eq!(released_sorted, vec![1, 2]);
-        assert!(map.read().unwrap_or_else(|e| e.into_inner()).get(&1).is_none());
-        assert!(map.read().unwrap_or_else(|e| e.into_inner()).get(&2).is_none());
+        assert!(map
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&1)
+            .is_none());
+        assert!(map
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&2)
+            .is_none());
         let map_guard = map.read().unwrap_or_else(|e| e.into_inner());
         assert!(
             map_guard.get(&3).unwrap().matches_local_ws("conn-B"),
@@ -12039,14 +12921,10 @@ mod tests {
     fn apply_ws_close_is_noop_when_no_slots_held() {
         let map = empty_authority_map();
         seed_holder(&map, 1, "conn-other");
-        let (auth_tx, mut auth_rx) =
-            broadcast::channel::<DisplayInputAuthorityChange>(8);
+        let (auth_tx, mut auth_rx) = broadcast::channel::<DisplayInputAuthorityChange>(8);
         let released = apply_ws_close_input_authority("conn-A", &map, &auth_tx);
         assert!(released.is_empty(), "no slots held → no releases");
-        assert!(
-            auth_rx.try_recv().is_err(),
-            "no authority changes emitted"
-        );
+        assert!(auth_rx.try_recv().is_err(), "no authority changes emitted");
         // Other holder untouched.
         let map_guard = map.read().unwrap_or_else(|e| e.into_inner());
         assert!(
@@ -12068,15 +12946,13 @@ mod tests {
         federation_connection_id: &str,
         session_id: &str,
     ) {
-        map.write()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(
-                display_id,
-                DisplayInputHolder::FederatedWebRtc {
-                    federation_connection_id: federation_connection_id.to_string(),
-                    session_id: session_id.to_string(),
-                },
-            );
+        map.write().unwrap_or_else(|e| e.into_inner()).insert(
+            display_id,
+            DisplayInputHolder::FederatedWebRtc {
+                federation_connection_id: federation_connection_id.to_string(),
+                session_id: session_id.to_string(),
+            },
+        );
     }
 
     /// `matches_federated`: same `(federation_connection_id, session_id)`
@@ -12153,8 +13029,7 @@ mod tests {
     #[test]
     fn apply_grant_federated_first_grant_no_prior() {
         let map = empty_authority_map();
-        let (auth_tx, mut auth_rx) =
-            broadcast::channel::<DisplayInputAuthorityChange>(8);
+        let (auth_tx, mut auth_rx) = broadcast::channel::<DisplayInputAuthorityChange>(8);
         let prior = apply_grant_input_authority_federated(
             7,
             "fed-conn-1".to_string(),
@@ -12175,7 +13050,10 @@ mod tests {
         );
         let map_guard = map.read().unwrap_or_else(|e| e.into_inner());
         assert!(
-            map_guard.get(&7).unwrap().matches_federated("fed-conn-1", "sess-A"),
+            map_guard
+                .get(&7)
+                .unwrap()
+                .matches_federated("fed-conn-1", "sess-A"),
             "registry must record the federated holder"
         );
     }
@@ -12188,13 +13066,10 @@ mod tests {
     #[test]
     fn apply_grant_federated_takes_from_local_holder() {
         let map = empty_authority_map();
-        let (auth_tx, mut auth_rx) =
-            broadcast::channel::<DisplayInputAuthorityChange>(8);
+        let (auth_tx, mut auth_rx) = broadcast::channel::<DisplayInputAuthorityChange>(8);
         let (local_tx, mut local_rx) = mpsc::unbounded_channel::<String>();
         // Local holder.
-        apply_grant_input_authority(
-            7, "conn-LOCAL".to_string(), local_tx, &map, &auth_tx,
-        );
+        apply_grant_input_authority(7, "conn-LOCAL".to_string(), local_tx, &map, &auth_tx);
         let _ = auth_rx.try_recv().expect("local grant change");
 
         // Federated takes.
@@ -12237,8 +13112,7 @@ mod tests {
     #[test]
     fn apply_grant_local_takes_from_federated_holder_no_direct_revoke() {
         let map = empty_authority_map();
-        let (auth_tx, mut auth_rx) =
-            broadcast::channel::<DisplayInputAuthorityChange>(8);
+        let (auth_tx, mut auth_rx) = broadcast::channel::<DisplayInputAuthorityChange>(8);
         // Federated holder.
         apply_grant_input_authority_federated(
             7,
@@ -12251,9 +13125,8 @@ mod tests {
 
         // Local takes.
         let (local_tx, _local_rx) = mpsc::unbounded_channel::<String>();
-        let prior = apply_grant_input_authority(
-            7, "conn-LOCAL".to_string(), local_tx, &map, &auth_tx,
-        );
+        let prior =
+            apply_grant_input_authority(7, "conn-LOCAL".to_string(), local_tx, &map, &auth_tx);
         let prior_entry = prior.expect("prior holder returned");
         assert!(
             prior_entry.matches_federated("fed-conn-1", "sess-A"),
@@ -12282,40 +13155,42 @@ mod tests {
     fn apply_release_federated_only_on_matching_identity() {
         let map = empty_authority_map();
         seed_federated_holder(&map, 7, "fed-conn-1", "sess-A");
-        let (auth_tx, mut auth_rx) =
-            broadcast::channel::<DisplayInputAuthorityChange>(8);
+        let (auth_tx, mut auth_rx) = broadcast::channel::<DisplayInputAuthorityChange>(8);
 
         // Wrong session — no-op.
-        let removed = apply_release_input_authority_federated(
-            7, "fed-conn-1", "sess-B", &map, &auth_tx,
-        );
+        let removed =
+            apply_release_input_authority_federated(7, "fed-conn-1", "sess-B", &map, &auth_tx);
         assert!(!removed, "wrong session must not unclaim");
         assert!(auth_rx.try_recv().is_err(), "no change for no-op release");
 
         // Wrong connection — no-op.
-        let removed = apply_release_input_authority_federated(
-            7, "fed-conn-2", "sess-A", &map, &auth_tx,
-        );
+        let removed =
+            apply_release_input_authority_federated(7, "fed-conn-2", "sess-A", &map, &auth_tx);
         assert!(!removed, "wrong connection must not unclaim");
         assert!(auth_rx.try_recv().is_err(), "no change for no-op release");
 
         // Original holder still in map.
         let map_guard = map.read().unwrap_or_else(|e| e.into_inner());
         assert!(
-            map_guard.get(&7).unwrap().matches_federated("fed-conn-1", "sess-A"),
+            map_guard
+                .get(&7)
+                .unwrap()
+                .matches_federated("fed-conn-1", "sess-A"),
             "original federated holder still in registry"
         );
         drop(map_guard);
 
         // Correct identity — releases.
-        let removed = apply_release_input_authority_federated(
-            7, "fed-conn-1", "sess-A", &map, &auth_tx,
-        );
+        let removed =
+            apply_release_input_authority_federated(7, "fed-conn-1", "sess-A", &map, &auth_tx);
         assert!(removed, "matching identity must release");
         let change = auth_rx.try_recv().expect("change emitted on release");
         assert!(change.holder.is_none(), "release emits None");
         assert!(
-            map.read().unwrap_or_else(|e| e.into_inner()).get(&7).is_none(),
+            map.read()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&7)
+                .is_none(),
             "registry empty after release"
         );
     }
@@ -12327,12 +13202,13 @@ mod tests {
     fn apply_release_federated_noop_on_local_holder() {
         let map = empty_authority_map();
         seed_holder(&map, 7, "conn-A");
-        let (auth_tx, mut auth_rx) =
-            broadcast::channel::<DisplayInputAuthorityChange>(8);
-        let removed = apply_release_input_authority_federated(
-            7, "conn-A", "sess-X", &map, &auth_tx,
+        let (auth_tx, mut auth_rx) = broadcast::channel::<DisplayInputAuthorityChange>(8);
+        let removed =
+            apply_release_input_authority_federated(7, "conn-A", "sess-X", &map, &auth_tx);
+        assert!(
+            !removed,
+            "federated release must not unclaim a LocalWs holder"
         );
-        assert!(!removed, "federated release must not unclaim a LocalWs holder");
         assert!(auth_rx.try_recv().is_err(), "no change emitted");
         let map_guard = map.read().unwrap_or_else(|e| e.into_inner());
         assert!(
@@ -12354,11 +13230,8 @@ mod tests {
         seed_federated_holder(&map, 3, "fed-conn-2", "sess-C");
         seed_holder(&map, 4, "conn-LOCAL");
 
-        let (auth_tx, mut auth_rx) =
-            broadcast::channel::<DisplayInputAuthorityChange>(16);
-        let released = apply_federated_ws_close_input_authority(
-            "fed-conn-1", &map, &auth_tx,
-        );
+        let (auth_tx, mut auth_rx) = broadcast::channel::<DisplayInputAuthorityChange>(16);
+        let released = apply_federated_ws_close_input_authority("fed-conn-1", &map, &auth_tx);
         let mut released_sorted = released.clone();
         released_sorted.sort();
         assert_eq!(
@@ -12370,7 +13243,10 @@ mod tests {
         // Other federation connection's entry untouched.
         let map_guard = map.read().unwrap_or_else(|e| e.into_inner());
         assert!(
-            map_guard.get(&3).unwrap().matches_federated("fed-conn-2", "sess-C"),
+            map_guard
+                .get(&3)
+                .unwrap()
+                .matches_federated("fed-conn-2", "sess-C"),
             "other federation connection's entry untouched"
         );
         // Local entry untouched.
@@ -12399,11 +13275,8 @@ mod tests {
     fn apply_federated_ws_close_is_noop_with_no_matching_entries() {
         let map = empty_authority_map();
         seed_holder(&map, 1, "fed-conn-1");
-        let (auth_tx, mut auth_rx) =
-            broadcast::channel::<DisplayInputAuthorityChange>(8);
-        let released = apply_federated_ws_close_input_authority(
-            "fed-conn-1", &map, &auth_tx,
-        );
+        let (auth_tx, mut auth_rx) = broadcast::channel::<DisplayInputAuthorityChange>(8);
+        let released = apply_federated_ws_close_input_authority("fed-conn-1", &map, &auth_tx);
         assert!(
             released.is_empty(),
             "no FederatedWebRtc entries with this connection — no releases"
@@ -12454,12 +13327,8 @@ mod tests {
     #[test]
     fn federated_input_authorizer_returns_false_when_no_holder() {
         let map = empty_authority_map();
-        let authz = build_federated_input_authorizer(
-            0,
-            "fed-1".to_string(),
-            "sess-A".to_string(),
-            map,
-        );
+        let authz =
+            build_federated_input_authorizer(0, "fed-1".to_string(), "sess-A".to_string(), map);
         assert!(
             !authz(),
             "unclaimed display must drop federated input — different \
@@ -12474,12 +13343,8 @@ mod tests {
     fn federated_input_authorizer_returns_false_when_local_holder() {
         let map = empty_authority_map();
         seed_holder(&map, 0, "local-conn-A");
-        let authz = build_federated_input_authorizer(
-            0,
-            "fed-1".to_string(),
-            "sess-A".to_string(),
-            map,
-        );
+        let authz =
+            build_federated_input_authorizer(0, "fed-1".to_string(), "sess-A".to_string(), map);
         assert!(
             !authz(),
             "LocalWs holder must drop federated input even though the \
@@ -12500,12 +13365,8 @@ mod tests {
                 session_id: "sess-OTHER".to_string(),
             },
         );
-        let authz = build_federated_input_authorizer(
-            0,
-            "fed-1".to_string(),
-            "sess-A".to_string(),
-            map,
-        );
+        let authz =
+            build_federated_input_authorizer(0, "fed-1".to_string(), "sess-A".to_string(), map);
         assert!(
             !authz(),
             "same connection + different session must deny — distinct \
@@ -12527,12 +13388,8 @@ mod tests {
                 session_id: "sess-A".to_string(),
             },
         );
-        let authz = build_federated_input_authorizer(
-            0,
-            "fed-1".to_string(),
-            "sess-A".to_string(),
-            map,
-        );
+        let authz =
+            build_federated_input_authorizer(0, "fed-1".to_string(), "sess-A".to_string(), map);
         assert!(
             !authz(),
             "different federation_connection_id must deny even when \
@@ -12550,9 +13407,7 @@ mod tests {
     /// the returned peer will fail (its command_rx is dropped) but
     /// the registry-level tests below only inspect the subscriber
     /// map, never await on delivery.
-    fn make_test_peer(
-        peer_id: u64,
-    ) -> Arc<crate::display::webrtc::WebRtcPeer> {
+    fn make_test_peer(peer_id: u64) -> Arc<crate::display::webrtc::WebRtcPeer> {
         use crate::display::encode::pool::SimulcastRid;
         use crate::display::webrtc::WebRtcPeer;
         Arc::new(WebRtcPeer::new_for_test(
@@ -12576,12 +13431,11 @@ mod tests {
             federation_connection_id: "fed-1".to_string(),
             session_id: "sess-A".to_string(),
         };
-        let state = personalize_authority_for_federated(
-            Some(&holder),
-            "fed-1",
-            "sess-A",
+        let state = personalize_authority_for_federated(Some(&holder), "fed-1", "sess-A");
+        assert_eq!(
+            state,
+            crate::display::webrtc::DisplayInputAuthorityState::You
         );
-        assert_eq!(state, crate::display::webrtc::DisplayInputAuthorityState::You);
     }
 
     /// `personalize_authority_for_federated` returns `Other` when
@@ -12618,7 +13472,10 @@ mod tests {
     #[test]
     fn personalize_authority_for_federated_returns_unclaimed_when_no_holder() {
         let state = personalize_authority_for_federated(None, "fed-1", "sess-A");
-        assert_eq!(state, crate::display::webrtc::DisplayInputAuthorityState::Unclaimed);
+        assert_eq!(
+            state,
+            crate::display::webrtc::DisplayInputAuthorityState::Unclaimed
+        );
     }
 
     /// The handler closure built by `build_federated_authority_handler`
@@ -12630,8 +13487,7 @@ mod tests {
     fn build_federated_authority_handler_dispatches_request_to_grant() {
         use crate::display::webrtc::AuthorityChannelMessage;
         let map = empty_authority_map();
-        let (change_tx, _change_rx) =
-            broadcast::channel::<DisplayInputAuthorityChange>(8);
+        let (change_tx, _change_rx) = broadcast::channel::<DisplayInputAuthorityChange>(8);
         let handler = build_federated_authority_handler(
             0,
             "fed-1".to_string(),
@@ -12661,8 +13517,7 @@ mod tests {
     fn build_federated_authority_handler_dispatches_release_to_apply_release() {
         use crate::display::webrtc::AuthorityChannelMessage;
         let map = empty_authority_map();
-        let (change_tx, _change_rx) =
-            broadcast::channel::<DisplayInputAuthorityChange>(8);
+        let (change_tx, _change_rx) = broadcast::channel::<DisplayInputAuthorityChange>(8);
         // Seed a federated holder with the identity the handler was
         // built for.
         map.write().unwrap_or_else(|e| e.into_inner()).insert(
@@ -12683,7 +13538,10 @@ mod tests {
         handler(AuthorityChannelMessage::Release { display_id: 0 });
 
         assert!(
-            map.read().unwrap_or_else(|e| e.into_inner()).get(&0).is_none(),
+            map.read()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&0)
+                .is_none(),
             "release with matching identity must remove the holder"
         );
     }
@@ -12696,8 +13554,7 @@ mod tests {
     fn build_federated_authority_handler_release_noop_on_wrong_identity() {
         use crate::display::webrtc::AuthorityChannelMessage;
         let map = empty_authority_map();
-        let (change_tx, _change_rx) =
-            broadcast::channel::<DisplayInputAuthorityChange>(8);
+        let (change_tx, _change_rx) = broadcast::channel::<DisplayInputAuthorityChange>(8);
         // Seed with a holder of a DIFFERENT session id.
         map.write().unwrap_or_else(|e| e.into_inner()).insert(
             0,
@@ -12719,7 +13576,10 @@ mod tests {
         let guard = map.read().unwrap_or_else(|e| e.into_inner());
         match guard.get(&0) {
             Some(DisplayInputHolder::FederatedWebRtc { session_id, .. }) => {
-                assert_eq!(session_id, "sess-OTHER", "wrong-identity release must not remove the slot");
+                assert_eq!(
+                    session_id, "sess-OTHER",
+                    "wrong-identity release must not remove the slot"
+                );
             }
             other => panic!("expected slot to remain held by sess-OTHER, got {other:?}"),
         }
@@ -12732,8 +13592,7 @@ mod tests {
     fn build_federated_authority_handler_ignores_display_id_mismatch() {
         use crate::display::webrtc::AuthorityChannelMessage;
         let map = empty_authority_map();
-        let (change_tx, _change_rx) =
-            broadcast::channel::<DisplayInputAuthorityChange>(8);
+        let (change_tx, _change_rx) = broadcast::channel::<DisplayInputAuthorityChange>(8);
         let handler = build_federated_authority_handler(
             0,
             "fed-1".to_string(),
@@ -12761,8 +13620,7 @@ mod tests {
     async fn unregister_federated_authority_subscriber_removes_matching() {
         let subscribers = empty_subscribers();
         let map = empty_authority_map();
-        let (change_tx, _change_rx) =
-            broadcast::channel::<DisplayInputAuthorityChange>(8);
+        let (change_tx, _change_rx) = broadcast::channel::<DisplayInputAuthorityChange>(8);
         register_federated_authority_subscriber(
             "fed-1".to_string(),
             "sess-A".to_string(),
@@ -12778,16 +13636,14 @@ mod tests {
             "register must insert one entry"
         );
 
-        let removed = unregister_federated_authority_subscriber(
-            "fed-1",
-            "sess-A",
-            0,
-            &subscribers,
-        );
+        let removed = unregister_federated_authority_subscriber("fed-1", "sess-A", 0, &subscribers);
 
         assert!(removed, "matching unregister returns true");
         assert!(
-            subscribers.read().unwrap_or_else(|e| e.into_inner()).is_empty(),
+            subscribers
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty(),
             "registry must be empty after unregister"
         );
     }
@@ -12798,8 +13654,7 @@ mod tests {
     async fn unregister_federated_authority_subscriber_noop_on_miss() {
         let subscribers = empty_subscribers();
         let map = empty_authority_map();
-        let (change_tx, _change_rx) =
-            broadcast::channel::<DisplayInputAuthorityChange>(8);
+        let (change_tx, _change_rx) = broadcast::channel::<DisplayInputAuthorityChange>(8);
         register_federated_authority_subscriber(
             "fed-1".to_string(),
             "sess-A".to_string(),
@@ -12810,12 +13665,8 @@ mod tests {
             Arc::clone(&subscribers),
         );
 
-        let removed = unregister_federated_authority_subscriber(
-            "fed-1",
-            "sess-OTHER",
-            0,
-            &subscribers,
-        );
+        let removed =
+            unregister_federated_authority_subscriber("fed-1", "sess-OTHER", 0, &subscribers);
         assert!(!removed, "non-matching unregister returns false");
         assert_eq!(
             subscribers.read().unwrap_or_else(|e| e.into_inner()).len(),
@@ -12832,34 +13683,42 @@ mod tests {
     async fn unregister_all_federated_subscribers_for_connection_releases_matching() {
         let subscribers = empty_subscribers();
         let map = empty_authority_map();
-        let (change_tx, _change_rx) =
-            broadcast::channel::<DisplayInputAuthorityChange>(8);
+        let (change_tx, _change_rx) = broadcast::channel::<DisplayInputAuthorityChange>(8);
         // Three subscribers: two on fed-1 (different sessions, same
         // display), one on fed-2 (the survivor).
         register_federated_authority_subscriber(
-            "fed-1".to_string(), "sess-A".to_string(), 0,
+            "fed-1".to_string(),
+            "sess-A".to_string(),
+            0,
             make_test_peer(1),
-            Arc::clone(&map), change_tx.clone(), Arc::clone(&subscribers),
+            Arc::clone(&map),
+            change_tx.clone(),
+            Arc::clone(&subscribers),
         );
         register_federated_authority_subscriber(
-            "fed-1".to_string(), "sess-B".to_string(), 0,
+            "fed-1".to_string(),
+            "sess-B".to_string(),
+            0,
             make_test_peer(2),
-            Arc::clone(&map), change_tx.clone(), Arc::clone(&subscribers),
+            Arc::clone(&map),
+            change_tx.clone(),
+            Arc::clone(&subscribers),
         );
         register_federated_authority_subscriber(
-            "fed-2".to_string(), "sess-C".to_string(), 0,
+            "fed-2".to_string(),
+            "sess-C".to_string(),
+            0,
             make_test_peer(3),
-            Arc::clone(&map), change_tx.clone(), Arc::clone(&subscribers),
+            Arc::clone(&map),
+            change_tx.clone(),
+            Arc::clone(&subscribers),
         );
         assert_eq!(
             subscribers.read().unwrap_or_else(|e| e.into_inner()).len(),
             3
         );
 
-        let released = unregister_all_federated_subscribers_for_connection(
-            "fed-1",
-            &subscribers,
-        );
+        let released = unregister_all_federated_subscribers_for_connection("fed-1", &subscribers);
 
         assert_eq!(released.len(), 2, "two fed-1 entries released");
         let remaining: Vec<(String, String, u32)> = subscribers
@@ -12882,19 +13741,22 @@ mod tests {
     async fn unregister_all_federated_subscribers_for_connection_noop_on_no_match() {
         let subscribers = empty_subscribers();
         let map = empty_authority_map();
-        let (change_tx, _change_rx) =
-            broadcast::channel::<DisplayInputAuthorityChange>(8);
+        let (change_tx, _change_rx) = broadcast::channel::<DisplayInputAuthorityChange>(8);
         register_federated_authority_subscriber(
-            "fed-2".to_string(), "sess-C".to_string(), 0,
+            "fed-2".to_string(),
+            "sess-C".to_string(),
+            0,
             make_test_peer(1),
-            Arc::clone(&map), change_tx, Arc::clone(&subscribers),
+            Arc::clone(&map),
+            change_tx,
+            Arc::clone(&subscribers),
         );
 
-        let released = unregister_all_federated_subscribers_for_connection(
-            "fed-1",
-            &subscribers,
+        let released = unregister_all_federated_subscribers_for_connection("fed-1", &subscribers);
+        assert!(
+            released.is_empty(),
+            "no matching entries → empty release list"
         );
-        assert!(released.is_empty(), "no matching entries → empty release list");
         assert_eq!(
             subscribers.read().unwrap_or_else(|e| e.into_inner()).len(),
             1,
@@ -12910,17 +13772,24 @@ mod tests {
     async fn register_federated_authority_subscriber_replaces_on_collision() {
         let subscribers = empty_subscribers();
         let map = empty_authority_map();
-        let (change_tx, _change_rx) =
-            broadcast::channel::<DisplayInputAuthorityChange>(8);
+        let (change_tx, _change_rx) = broadcast::channel::<DisplayInputAuthorityChange>(8);
         register_federated_authority_subscriber(
-            "fed-1".to_string(), "sess-A".to_string(), 0,
+            "fed-1".to_string(),
+            "sess-A".to_string(),
+            0,
             make_test_peer(1),
-            Arc::clone(&map), change_tx.clone(), Arc::clone(&subscribers),
+            Arc::clone(&map),
+            change_tx.clone(),
+            Arc::clone(&subscribers),
         );
         register_federated_authority_subscriber(
-            "fed-1".to_string(), "sess-A".to_string(), 0,
+            "fed-1".to_string(),
+            "sess-A".to_string(),
+            0,
             make_test_peer(2),
-            Arc::clone(&map), change_tx, Arc::clone(&subscribers),
+            Arc::clone(&map),
+            change_tx,
+            Arc::clone(&subscribers),
         );
         assert_eq!(
             subscribers.read().unwrap_or_else(|e| e.into_inner()).len(),
@@ -12951,10 +13820,7 @@ mod tests {
     fn peer_id_for_federated_session_is_deterministic() {
         let a = peer_id_for_federated_session("sess-A");
         let b = peer_id_for_federated_session("sess-A");
-        assert_eq!(
-            a, b,
-            "the same session id must hash to the same peer id"
-        );
+        assert_eq!(a, b, "the same session id must hash to the same peer id");
     }
 
     /// Distinct `session_id`s map to distinct `PeerId`s in
@@ -12994,11 +13860,7 @@ mod tests {
     /// must not panic in that mode.
     #[tokio::test]
     async fn close_federated_peers_for_sessions_noop_on_no_registry() {
-        let count = close_federated_peers_for_sessions(
-            &[("sess-A".to_string(), 0)],
-            None,
-        )
-        .await;
+        let count = close_federated_peers_for_sessions(&[("sess-A".to_string(), 0)], None).await;
         assert_eq!(count, 0, "missing registry must short-circuit");
     }
 
@@ -13037,8 +13899,7 @@ mod tests {
     fn bootstrap_authority_snapshots_unclaimed_when_no_holder() {
         let map = empty_authority_map();
         let auth = map.read().unwrap_or_else(|e| e.into_inner());
-        let snaps =
-            compute_bootstrap_authority_snapshots([0u32], &auth, "conn-B");
+        let snaps = compute_bootstrap_authority_snapshots([0u32], &auth, "conn-B");
         assert_eq!(snaps, vec![(0, "unclaimed")]);
     }
 
@@ -13051,8 +13912,7 @@ mod tests {
         let map = empty_authority_map();
         seed_holder(&map, 0, "conn-A");
         let auth = map.read().unwrap_or_else(|e| e.into_inner());
-        let snaps =
-            compute_bootstrap_authority_snapshots([0u32], &auth, "conn-B");
+        let snaps = compute_bootstrap_authority_snapshots([0u32], &auth, "conn-B");
         assert_eq!(
             snaps,
             vec![(0, "other")],
@@ -13069,8 +13929,7 @@ mod tests {
         let map = empty_authority_map();
         seed_holder(&map, 0, "conn-A");
         let auth = map.read().unwrap_or_else(|e| e.into_inner());
-        let snaps =
-            compute_bootstrap_authority_snapshots([0u32], &auth, "conn-A");
+        let snaps = compute_bootstrap_authority_snapshots([0u32], &auth, "conn-A");
         assert_eq!(snaps, vec![(0, "you")]);
     }
 
@@ -13083,13 +13942,9 @@ mod tests {
         let map = empty_authority_map();
         seed_holder(&map, 0, "conn-A"); // you
         seed_holder(&map, 1, "conn-B"); // other
-        // display 2 unclaimed
+                                        // display 2 unclaimed
         let auth = map.read().unwrap_or_else(|e| e.into_inner());
-        let snaps = compute_bootstrap_authority_snapshots(
-            [0u32, 1, 2],
-            &auth,
-            "conn-A",
-        );
+        let snaps = compute_bootstrap_authority_snapshots([0u32, 1, 2], &auth, "conn-A");
         assert_eq!(
             snaps,
             vec![(0, "you"), (1, "other"), (2, "unclaimed")],
@@ -13104,8 +13959,7 @@ mod tests {
     fn bootstrap_authority_snapshots_empty_when_no_active_displays() {
         let map = empty_authority_map();
         let auth = map.read().unwrap_or_else(|e| e.into_inner());
-        let snaps =
-            compute_bootstrap_authority_snapshots([] as [u32; 0], &auth, "conn-A");
+        let snaps = compute_bootstrap_authority_snapshots([] as [u32; 0], &auth, "conn-A");
         assert!(snaps.is_empty());
     }
 }

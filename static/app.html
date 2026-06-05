@@ -284,6 +284,42 @@ html, body {
   display: flex;
 }
 
+/* ── Station Tab ── */
+.station-pane {
+  position: relative;
+  flex: 1;
+  overflow: hidden;
+  background:
+    radial-gradient(ellipse at center, var(--base) 0%, var(--crust) 72%, #07070d 100%);
+}
+.station-canvas {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  display: block;
+  touch-action: none;
+}
+#station-scene-canvas {
+  z-index: 1;
+}
+#station-hud-canvas {
+  z-index: 2;
+  cursor: grab;
+}
+#station-hud-canvas:active {
+  cursor: grabbing;
+}
+.station-status {
+  position: absolute;
+  left: 12px;
+  bottom: 10px;
+  z-index: 3;
+  color: var(--overlay1);
+  font-size: 10px;
+  pointer-events: none;
+}
+
 /* ── Settings ── */
 .settings-pane-body {
   padding: 20px;
@@ -3716,6 +3752,7 @@ html, body {
     <button class="tab-btn" data-tab="stats">Stats</button>
     <button class="tab-btn" data-tab="terminal">Terminal</button>
     <button class="tab-btn" data-tab="displays">Video</button>
+    <button class="tab-btn" data-tab="station">Station</button>
     <button class="tab-btn" data-tab="sessions">Sessions</button>
     <button class="tab-btn" data-tab="debug">Debug</button>
     <button class="tab-btn" data-tab="settings">Settings</button>
@@ -3723,6 +3760,16 @@ html, body {
 
   <!-- Tab Content -->
   <div class="tab-content">
+
+    <!-- Station Tab -->
+    <div id="tab-station" class="tab-pane">
+      <div class="station-pane">
+        <canvas id="station-scene-canvas" class="station-canvas"></canvas>
+        <canvas id="station-hud-canvas" class="station-canvas"></canvas>
+        <div id="station-status" class="station-status">Station initializing</div>
+        <div id="station-display-endpoints" aria-hidden="true" style="position:absolute;left:-10000px;top:-10000px;width:1px;height:1px;overflow:hidden"></div>
+      </div>
+    </div>
 
     <!-- Activity Tab -->
     <div id="tab-activity" class="tab-pane active">
@@ -4781,6 +4828,7 @@ html, body {
 'use strict';
 
 import init, { PresenceWeb } from '/wasm-web/presence_web.js';
+import stationInit, { StationWeb } from '/wasm-station/station_web.js';
 
 // ── Federation auth ──
 //
@@ -5015,6 +5063,387 @@ const displaySlots = new Map();
 // Replaced (not appended) on each frame so a stale state never wins
 // over a fresh one if multiple arrive while the slot is missing.
 const pendingAuthorityStates = new Map();
+
+// Station tab bridge. Rendering and interaction live in Rust/WASM; JS only
+// normalizes existing dashboard state and hands over live WebRTC video nodes.
+let station = null;
+let stationWasmReady = false;
+let stationInitStarted = false;
+let stationCurrentTask = '';
+let stationCurrentApproval = null;
+const stationLogEvents = [];
+const stationRegisteredSources = new Set();
+
+function stationStatus(text) {
+  const el = document.getElementById('station-status');
+  if (el) el.textContent = text;
+}
+
+async function ensureStation() {
+  if (station) return station;
+  if (stationInitStarted && !stationWasmReady) return null;
+  if (!stationWasmReady) {
+    stationInitStarted = true;
+    stationStatus('Loading Station WASM');
+    await stationInit('/wasm-station/station_web_bg.wasm');
+    stationWasmReady = true;
+  }
+  const scene = document.getElementById('station-scene-canvas');
+  const hud = document.getElementById('station-hud-canvas');
+  if (!scene || !hud) return null;
+  station = new StationWeb(scene, hud);
+  station.set_action_callback((action) => handleStationAction(action));
+  station.set_active(activeTab === 'station');
+  stationStatus('Station online');
+  stationUpdateSnapshot();
+  stationRegisterExistingSources();
+  return station;
+}
+
+function stationSetActive(active) {
+  if (station) {
+    station.set_active(active);
+    station.resize();
+    if (active) {
+      stationUpdateSnapshot();
+      stationRegisterExistingSources();
+    }
+  } else if (active) {
+    ensureStation().catch(err => {
+      console.error('Station init failed:', err);
+      stationStatus('Station failed: ' + (err && err.message ? err.message : err));
+    });
+  }
+}
+
+function stationScheduleUpdate() {
+  if (!station) return;
+  if (stationScheduleUpdate._pending) return;
+  stationScheduleUpdate._pending = true;
+  requestAnimationFrame(() => {
+    stationScheduleUpdate._pending = false;
+    stationUpdateSnapshot();
+  });
+}
+
+function stationUpdateSnapshot() {
+  if (!station) return;
+  try {
+    station.update_snapshot(buildStationSnapshot());
+    stationStatus(station.debug_state());
+  } catch (e) {
+    console.warn('station snapshot failed:', e);
+  }
+}
+
+function handleStationAction(action) {
+  if (!action || typeof action !== 'object') return;
+  if (action.type === 'approval') {
+    const hostId = action.host_id || selfPeerId;
+    const decision = action.decision || 'approve';
+    if (hostId === selfPeerId || hostId === 'local') {
+      const map = { approve: 'approve', skip: 'skip', deny: 'deny' };
+      if (app) processCommands(app.send_approval(map[decision] || 'approve'));
+    } else {
+      const map = { approve: 'accept', skip: 'cancel', deny: 'decline' };
+      resolvePeerApproval(hostId, action.approval_id, map[decision] || decision);
+    }
+  } else if (action.type === 'open_display') {
+    stationOpenDisplay(action.host_id);
+  }
+}
+
+function stationOpenDisplay(hostId) {
+  if (!hostId || hostId === selfPeerId || hostId === 'local') {
+    if (displaySlots.size === 0 && !userDisplayGranted) {
+      window.toggleUserDisplay();
+    }
+    return;
+  }
+  const d = daemons.find(x => x.host_id === hostId);
+  if (!d) return;
+  const tcpViaUrl = resolveBrowserTcpViaUrl(d);
+  openPeerDisplay(hostId, 0, tcpViaUrl).catch(err => {
+    console.error('Station openPeerDisplay failed:', err);
+    stationStatus('Display open failed: ' + (err && err.message ? err.message : err));
+  });
+}
+
+function buildStationSnapshot() {
+  const hosts = [];
+  const selfUsage = stationUsageForHost(selfPeerId);
+  hosts.push({
+    id: selfPeerId,
+    name: selfHostLabel || 'local',
+    platform: navigator.platform || 'local',
+    region: 'primary',
+    connected: true,
+    cpu: selfUsage.cpu,
+    mem: selfUsage.mem,
+  });
+  for (const d of daemons) {
+    const usage = stationUsageForHost(d.host_id);
+    hosts.push({
+      id: d.host_id,
+      name: d.label || d.host_id,
+      platform: daemonPlatformLabel(d),
+      region: d.url || 'peer',
+      connected: !!d.connected,
+      cpu: usage.cpu,
+      mem: usage.mem,
+    });
+  }
+
+  const agents = [stationAgentForSelf(selfUsage)];
+  for (const d of daemons) {
+    const usage = stationUsageForHost(d.host_id);
+    agents.push(stationAgentForPeer(d, usage));
+    const pending = peerPendingApprovals.get(d.host_id);
+    if (pending) {
+      for (const [approvalId, approval] of pending.entries()) {
+        agents.push(stationApprovalAgent(d.host_id, approvalId, approval));
+      }
+    }
+  }
+  if (stationCurrentApproval) {
+    agents.push(stationApprovalAgent(selfPeerId, stationCurrentApproval.id, stationCurrentApproval));
+  }
+
+  return {
+    hosts,
+    agents,
+    events: stationLogEvents.slice(-80),
+  };
+}
+
+function stationAgentForSelf(usage) {
+  const phase = normalizeStationPhase(currentPhase);
+  return {
+    id: 'primary-agent',
+    hostId: selfPeerId,
+    role: 'direct',
+    phase,
+    status: isAgentActivePhase(currentPhase) ? 'in_progress' : (phase === 'done' ? 'done' : 'idle'),
+    task: stationCurrentTask || 'primary daemon',
+    provider: usage.provider || document.getElementById('sb-provider')?.textContent || '',
+    model: usage.model || document.getElementById('sb-model')?.textContent || '',
+    tokens: usage.tokens,
+    tokenCap: usage.tokenCap,
+    prompt: usage.prompt,
+    completion: usage.completion,
+    cached: usage.cached,
+    cost: usage.cost,
+    turns: usage.turns,
+    turnCap: usage.turnCap,
+    autonomy: document.getElementById('sb-autonomy')?.textContent || '',
+    worktree: '',
+    parentId: null,
+    needsApproval: !!stationCurrentApproval,
+    approvalId: stationCurrentApproval && stationCurrentApproval.id,
+    approvalCommand: stationCurrentApproval && stationCurrentApproval.command || '',
+    approvalCategory: stationCurrentApproval && stationCurrentApproval.category || '',
+  };
+}
+
+function stationAgentForPeer(d, usage) {
+  const status = d.server_status || (d.connected ? 'idle' : 'error');
+  const needsApproval = status === 'needs_approval';
+  const phase = needsApproval ? 'waiting' : status === 'working' ? 'running' : d.connected ? 'idle' : 'waiting';
+  return {
+    id: 'peer-' + sanitizeStationId(d.host_id),
+    hostId: d.host_id,
+    role: 'orchestrator',
+    phase,
+    status: status === 'working' ? 'in_progress' : status,
+    task: needsApproval ? 'waiting for approval' : 'peer daemon',
+    provider: usage.provider || '',
+    model: usage.model || '',
+    tokens: usage.tokens,
+    tokenCap: usage.tokenCap,
+    prompt: usage.prompt,
+    completion: usage.completion,
+    cached: usage.cached,
+    cost: usage.cost,
+    turns: usage.turns,
+    turnCap: usage.turnCap,
+    autonomy: '',
+    worktree: '',
+    parentId: null,
+    needsApproval,
+    approvalId: null,
+    approvalCommand: '',
+    approvalCategory: '',
+  };
+}
+
+function stationApprovalAgent(hostId, approvalId, approval) {
+  return {
+    id: 'approval-' + sanitizeStationId(hostId) + '-' + sanitizeStationId(approvalId),
+    hostId,
+    role: 'sub-agent',
+    phase: 'waiting',
+    status: 'waiting_approval',
+    task: approval.command || 'approval required',
+    provider: '',
+    model: '',
+    tokens: 0,
+    tokenCap: 100000,
+    prompt: 0,
+    completion: 0,
+    cached: 0,
+    cost: 0,
+    turns: 0,
+    turnCap: 0,
+    autonomy: '',
+    worktree: '',
+    parentId: hostId === selfPeerId ? 'primary-agent' : 'peer-' + sanitizeStationId(hostId),
+    needsApproval: true,
+    approvalId: String(approvalId),
+    approvalCommand: approval.command || '',
+    approvalCategory: approval.category || '',
+  };
+}
+
+function stationUsageForHost(hostId) {
+  const c = hostStatsCache.get(hostId) || (hostId === selfPeerId ? hostStatsCache.get('local') : null) || {};
+  let main = {};
+  let cost = {};
+  try { main = c.main_json ? JSON.parse(c.main_json) : {}; } catch (_) {}
+  try { cost = c.cost_json ? JSON.parse(c.cost_json) : {}; } catch (_) {}
+  const tokens = num(main.total_tokens ?? main.tokens_used ?? main.tokens ?? 0);
+  return {
+    provider: main.provider || '',
+    model: main.model || '',
+    tokens,
+    tokenCap: num(main.context_window || main.token_cap || 200000),
+    prompt: num(main.prompt_tokens || main.input_tokens || 0),
+    completion: num(main.completion_tokens || main.output_tokens || 0),
+    cached: num(main.cached_tokens || 0),
+    cost: num(cost.total || c.cost_usd || 0),
+    turns: num(main.turn || main.turns || 0),
+    turnCap: num(main.turn_cap || 0),
+    cpu: num(main.cpu || main.cpu_pct || stableStationMetric(hostId, 18, 34)),
+    mem: num(main.mem || main.mem_pct || stableStationMetric(hostId + ':mem', 32, 28)),
+  };
+}
+
+function daemonPlatformLabel(d) {
+  const caps = Array.isArray(d.capabilities) ? d.capabilities.map(capabilityLabel).join(', ') : '';
+  return caps || d.version || 'peer';
+}
+
+function normalizeStationPhase(phase) {
+  const p = (phase || '').toLowerCase();
+  if (p.includes('thinking')) return 'thinking';
+  if (p.includes('running') || p.includes('orchestrating') || p.includes('interrupting')) return 'running';
+  if (p.includes('waiting')) return 'waiting';
+  if (p.includes('done')) return 'done';
+  return 'idle';
+}
+
+function sanitizeStationId(s) {
+  return String(s || 'id').replace(/[^a-zA-Z0-9_-]/g, '_');
+}
+
+function num(v) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : 0;
+}
+
+function stableStationMetric(seed, base, span) {
+  let h = 0;
+  const s = String(seed || '');
+  for (let i = 0; i < s.length; i++) h = ((h << 5) - h + s.charCodeAt(i)) | 0;
+  return base + Math.abs(h % span);
+}
+
+function stationPushLogEvent(c) {
+  const hostId = c.host_id || selfPeerId;
+  const eventId = `${hostId}:${stationLogEvents.length}:${Date.now()}`;
+  stationLogEvents.push({
+    id: eventId,
+    hostId,
+    agentId: hostId === selfPeerId ? 'primary-agent' : 'peer-' + sanitizeStationId(hostId),
+    ts: (c.ts || new Date().toTimeString()).substring(0, 8),
+    level: c.level || 'info',
+    msg: c.content || c.source || '',
+  });
+  if (stationLogEvents.length > 180) stationLogEvents.splice(0, stationLogEvents.length - 180);
+}
+
+function stationRegisterVideoSource(sourceId, hostId, displayId, label, kind, videoEl) {
+  if (!station || !videoEl || !sourceId) return;
+  try {
+    station.register_display_source(String(sourceId), String(hostId), String(displayId), String(label), String(kind || 'video'), videoEl);
+    stationRegisteredSources.add(String(sourceId));
+    stationUpdateSnapshot();
+  } catch (e) {
+    console.warn('station display registration failed:', e);
+  }
+}
+
+function stationUnregisterVideoSource(sourceId) {
+  if (!sourceId) return;
+  stationRegisteredSources.delete(String(sourceId));
+  if (station) station.unregister_display_source(String(sourceId));
+}
+
+function stationRegisterExistingSources() {
+  if (!station) return;
+  for (const slot of displaySlots.values()) {
+    if (slot.videoEl) {
+      stationRegisterVideoSource(
+        `local:${slot.displayId}`,
+        selfPeerId,
+        String(slot.displayId),
+        `${selfHostLabel || 'local'} :${slot.displayId}`,
+        'local',
+        slot.videoEl,
+      );
+    }
+  }
+  for (const conn of peerDisplayConnections.values()) {
+    const container = getPeerDisplayContainer(conn.hostId, false);
+    const video = container && container.querySelector('.peer-display-video');
+    if (video) {
+      stationRegisterVideoSource(
+        `peer:${conn.hostId}:${conn.displayId}:${conn.sessionId}`,
+        conn.hostId,
+        String(conn.displayId),
+        `${stationHostLabel(conn.hostId)} :${conn.displayId}`,
+        'peer',
+        video,
+      );
+    }
+  }
+}
+
+function stationHostLabel(hostId) {
+  if (hostId === selfPeerId) return selfHostLabel || 'local';
+  const d = daemons.find(x => x.host_id === hostId);
+  return d && (d.label || d.host_id) || hostId;
+}
+
+function getPeerDisplayContainer(hostId, createFallback) {
+  const id = `peer-display-${hostId}`;
+  const existing = document.getElementById(id);
+  const fallbackId = `station-peer-display-${hostId}`;
+  if (existing) {
+    const fallback = document.getElementById(fallbackId);
+    if (fallback) fallback.remove();
+    return existing;
+  }
+  let fallback = document.getElementById(fallbackId);
+  if (!fallback && createFallback) {
+    const root = document.getElementById('station-display-endpoints') || document.body;
+    fallback = document.createElement('div');
+    fallback.id = fallbackId;
+    fallback.className = 'peer-display-container station-peer-display-endpoint';
+    fallback.style.cssText = 'position:absolute;left:-10000px;top:-10000px;width:320px;height:180px;opacity:0;pointer-events:none;overflow:hidden;';
+    root.appendChild(fallback);
+  }
+  return fallback;
+}
 
 // Activity display strip
 const displayThumbs = new Map();
@@ -5892,13 +6321,35 @@ function processCommands(cmds) {
   if (!Array.isArray(cmds)) return;
   for (const c of cmds) {
     switch (c.cmd) {
-      case 'add_log_entry': renderLogEntry(c); break;
+      case 'add_log_entry':
+        stationPushLogEvent(c);
+        renderLogEntry(c);
+        stationScheduleUpdate();
+        break;
       case 'clear_logs': clearLogs(); break;
       case 'add_turn_separator': renderTurnSeparator(c.turn); break;
-      case 'update_status_bar': updateStatusBar(c); break;
-      case 'set_phase': setPhase(c.phase); break;
-      case 'show_approval': showApproval(c.id, c.command, c.category); break;
-      case 'hide_approval': hidePanel('approval-panel'); break;
+      case 'update_status_bar':
+        updateStatusBar(c);
+        stationScheduleUpdate();
+        break;
+      case 'set_phase':
+        setPhase(c.phase);
+        stationScheduleUpdate();
+        break;
+      case 'show_approval':
+        stationCurrentApproval = {
+          id: String(c.id || 'primary'),
+          command: c.command || '',
+          category: c.category || '',
+        };
+        showApproval(c.id, c.command, c.category);
+        stationScheduleUpdate();
+        break;
+      case 'hide_approval':
+        stationCurrentApproval = null;
+        hidePanel('approval-panel');
+        stationScheduleUpdate();
+        break;
       case 'show_human_input': showHumanInput(c.question); break;
       case 'hide_human_input': hidePanel('human-panel'); break;
       case 'hide_all_panels': hideAllPanels(); break;
@@ -5911,6 +6362,7 @@ function processCommands(cmds) {
         hostStatsCache.set(selfPeerId, c);
         if (isStatsShowingSelf()) renderUsageTab(c);
         updateTickerFromUsage(c);
+        stationScheduleUpdate();
         break;
       case 'add_display': addDisplaySlot(c.display_id, c.width, c.height); break;
       case 'add_recording': addRecordingStream(c.stream_name); break;
@@ -5956,12 +6408,24 @@ function processCommands(cmds) {
       // (same shape `refreshPeersFromApi` builds entries from), so we
       // funnel through the shared upsert/remove helpers — one code path
       // applies API entries and pushed deltas identically.
-      case 'peer_added': upsertDaemonFromSnapshot(c.peer); break;
+      case 'peer_added':
+        upsertDaemonFromSnapshot(c.peer);
+        stationScheduleUpdate();
+        break;
       // peer_state_changed must NOT insert an unknown id — see
       // updateDaemonSnapshot for why (race with remove_peer's
       // trailing observer events).
-      case 'peer_state_changed': updateDaemonSnapshot(c.peer); break;
-      case 'peer_removed': removeDaemonById(c.id); break;
+      case 'peer_state_changed':
+        updateDaemonSnapshot(c.peer);
+        stationScheduleUpdate();
+        break;
+      case 'peer_removed':
+        removeDaemonById(c.id);
+        stationScheduleUpdate();
+        break;
+      case 'peer_event_forwarded':
+        handlePeerEventForwarded(c);
+        break;
       // Mid-turn steer lifecycle: pending (just sent), queued (backend
       // couldn't deliver mid-turn), delivered (agent got it).
       case 'steer_status_update':
@@ -5972,14 +6436,17 @@ function processCommands(cmds) {
       // straight to the per-peer surfaces without the legacy
       // `c.host_id = hostId` mutation hack from the secondary path.
       case 'peer_log':
-        renderLogEntry({
+        const peerEntry = {
           cmd: 'add_log_entry',
           host_id: c.host_id,
           ts: c.ts,
           level: c.level,
           source: c.source,
           content: c.content,
-        });
+        };
+        stationPushLogEvent(peerEntry);
+        renderLogEntry(peerEntry);
+        stationScheduleUpdate();
         break;
       case 'peer_usage': {
         // Translate the lean PeerEvent::Usage snapshot into the
@@ -5992,13 +6459,16 @@ function processCommands(cmds) {
         const fakeUsage = peerSnapshotToUpdateUsage(c.snapshot);
         hostStatsCache.set(c.host_id, fakeUsage);
         if (activeStatsHost === c.host_id) renderUsageTab(fakeUsage);
+        stationScheduleUpdate();
         break;
       }
       case 'peer_approval_requested':
         addPendingApproval(c.host_id, c.id, c.command, c.category);
+        stationScheduleUpdate();
         break;
       case 'peer_approval_resolved':
         removePendingApproval(c.host_id, c.id);
+        stationScheduleUpdate();
         break;
       case 'peer_webrtc_signal':
         // Per-peer WebRTC signaling: route to the matching
@@ -6009,6 +6479,60 @@ function processCommands(cmds) {
         handlePeerWebRtcSignal(c.host_id, c.display_id, c.session_id, c.signal);
         break;
     }
+  }
+}
+
+function handlePeerEventForwarded(c) {
+  const hostId = c && c.peer_id;
+  const payload = c && c.payload;
+  if (!hostId || !payload || typeof payload !== 'object') return;
+  switch (payload.event) {
+    case 'log': {
+      const peerEntry = {
+        cmd: 'add_log_entry',
+        host_id: hostId,
+        ts: payload.ts,
+        level: payload.level,
+        source: payload.source,
+        content: payload.message || '',
+      };
+      stationPushLogEvent(peerEntry);
+      renderLogEntry(peerEntry);
+      stationScheduleUpdate();
+      break;
+    }
+    case 'usage':
+      hostStatsCache.set(hostId, peerSnapshotToUpdateUsage(payload.snapshot));
+      if (activeStatsHost === hostId) {
+        renderUsageTab(hostStatsCache.get(hostId));
+      }
+      stationScheduleUpdate();
+      break;
+    case 'approval_requested':
+      if (payload.request) {
+        addPendingApproval(
+          hostId,
+          payload.request.request_id,
+          payload.request.preview,
+          payload.request.category,
+        );
+        stationScheduleUpdate();
+      }
+      break;
+    case 'approval_resolved':
+      removePendingApproval(hostId, payload.request_id);
+      stationScheduleUpdate();
+      break;
+    case 'webrtc_signal':
+      handlePeerWebRtcSignal(
+        hostId,
+        payload.display_id,
+        payload.session_id,
+        payload.signal,
+      );
+      break;
+    default:
+      break;
   }
 }
 
@@ -6898,6 +7422,8 @@ function renderDiffLines(diffText) {
 function clearLogs() {
   document.getElementById('log-stream').innerHTML = '';
   logEntryCount = 0;
+  stationLogEvents.length = 0;
+  stationScheduleUpdate();
 }
 
 function renderTurnSeparator(turn) {
@@ -7913,6 +8439,15 @@ class DisplaySlot {
       const res = this.width > 0 ? ` ${this.width}x${this.height}` : '';
       this.statusEl.textContent = `Connected (view-only)${res}`;
       this.statusEl.className = 'display-status connected';
+      stationRegisterVideoSource(
+        `local:${this.displayId}`,
+        selfPeerId,
+        String(this.displayId),
+        `${selfHostLabel || 'local'} :${this.displayId}`,
+        'local',
+        this.videoEl,
+      );
+      stationScheduleUpdate();
     };
 
     // ICE candidates — send to server via WASM app
@@ -8558,6 +9093,7 @@ function removeDisplaySlot(displayId) {
   displayId = Number(displayId);
   const slot = displaySlots.get(displayId);
   if (!slot) return;
+  stationUnregisterVideoSource(`local:${displayId}`);
   // Mark as user-intent-closed BEFORE disconnect so any in-flight
   // reconnect timer short-circuits and any subsequent `failed` event
   // skips the retry path. See DisplaySlot._closedByUser.
@@ -8578,6 +9114,7 @@ function removeDisplaySlot(displayId) {
     if (placeholder) placeholder.style.display = '';
     if (container) container.classList.remove('has-displays');
   }
+  stationScheduleUpdate();
 }
 
 function addDisplaySlot(displayId, width, height) {
@@ -11171,7 +11708,7 @@ document.querySelectorAll('#activity-subtabs .subtab-btn[data-activity-tab]').fo
 // We still use localStorage for preferences that aren't navigation
 // (verbosity, direct-mode, host filter, sessions filters).
 
-const VALID_TABS = ['activity', 'stats', 'terminal', 'displays', 'sessions', 'settings'];
+const VALID_TABS = ['activity', 'stats', 'terminal', 'displays', 'station', 'sessions', 'settings', 'debug'];
 const VALID_ACTIVITY_SUBTABS = ['log', 'changes', 'control'];
 const VALID_TERM_SUBTABS = ['tui', 'shell'];
 const VALID_SETTINGS_SUBTABS = ['account', 'agent', 'network', 'debug'];
@@ -11248,6 +11785,7 @@ function switchTab(tabId) {
   document.querySelectorAll('.tab-btn').forEach(b => b.classList.toggle('active', b.dataset.tab === tabId));
   document.querySelectorAll('.tab-pane').forEach(p => p.classList.toggle('active', p.id === 'tab-' + tabId));
   if (app) processCommands(app.set_active_tab(tabId));
+  stationSetActive(tabId === 'station');
   if (tabId === 'terminal') {
     if (activeTermSubtab === 'tui') {
       if (!termInitialized) initTerminal();
@@ -13955,7 +14493,7 @@ class PeerDisplayConnection {
   // `peerAuthorityState`, not the default 'unknown' — so this
   // function calls `_renderAuthorityChip()` after binding handlers.
   attachToDom() {
-    const container = document.getElementById(`peer-display-${this.hostId}`);
+    const container = getPeerDisplayContainer(this.hostId, true);
     if (!container) return;
     if (!container.querySelector('.peer-display-pane')) {
       container.innerHTML = `
@@ -14026,7 +14564,7 @@ class PeerDisplayConnection {
   }
 
   setStatus(text, kind) {
-    const container = document.getElementById(`peer-display-${this.hostId}`);
+    const container = getPeerDisplayContainer(this.hostId, true);
     if (!container) return;
     const statusEl = container.querySelector('.peer-display-status');
     if (statusEl) {
@@ -14209,11 +14747,22 @@ class PeerDisplayConnection {
 
     this.pc.ontrack = (e) => {
       this.stream = e.streams[0];
-      const container = document.getElementById(`peer-display-${this.hostId}`);
+      const container = getPeerDisplayContainer(this.hostId, true);
       const videoEl = container && container.querySelector('.peer-display-video');
       if (videoEl) videoEl.srcObject = this.stream;
       this.setStatus('Connected (view-only)', 'connected');
       this._log('info', 'ontrack fired — video stream attached');
+      if (videoEl) {
+        stationRegisterVideoSource(
+          `peer:${this.hostId}:${this.displayId}:${this.sessionId}`,
+          this.hostId,
+          String(this.displayId),
+          `${stationHostLabel(this.hostId)} :${this.displayId}`,
+          'peer',
+          videoEl,
+        );
+      }
+      stationScheduleUpdate();
 
       // Phase 0 visual-freshness sampler. Wait one tick for videoWidth /
       // videoHeight to populate (rVFC fires once the first frame is
@@ -14416,7 +14965,7 @@ class PeerDisplayConnection {
           this._log('debug', `${label} tile frame before snapshot: ${parsed.type}`);
           return;
         }
-        const container = document.getElementById(`peer-display-${this.hostId}`);
+        const container = getPeerDisplayContainer(this.hostId, true);
         if (!container) return;
         this.tileCompositor = new TileCompositor(
           container.querySelector('.peer-display-pane') || container,
@@ -14465,7 +15014,7 @@ class PeerDisplayConnection {
 
   _startVideoDiagSampler() {
     if (!diagModeEnabled()) return;
-    const container = document.getElementById(`peer-display-${this.hostId}`);
+    const container = getPeerDisplayContainer(this.hostId, true);
     const videoEl = container && container.querySelector('.peer-display-video');
     if (!videoEl) return;
     this._stopDiagSampler();
@@ -14562,7 +15111,7 @@ class PeerDisplayConnection {
   // (federated clipboard is a follow-up).
   _enterInteractive() {
     if (this.interactive) return;
-    const container = document.getElementById(`peer-display-${this.hostId}`);
+    const container = getPeerDisplayContainer(this.hostId, true);
     const target = container && (
       container.querySelector('.tile-compositor-canvas') ||
       container.querySelector('.peer-display-video')
@@ -14720,7 +15269,7 @@ class PeerDisplayConnection {
   // behaves the same. Reuses the `display-input-authority` CSS
   // classes (.you/.other/.unclaimed) defined for local 5c.
   _renderAuthorityChip() {
-    const container = document.getElementById(`peer-display-${this.hostId}`);
+    const container = getPeerDisplayContainer(this.hostId, true);
     if (!container) return;
     const chip = container.querySelector('.peer-display-authority');
     const takeBtn = container.querySelector('.take-control-btn');
@@ -14843,6 +15392,8 @@ class PeerDisplayConnection {
   }
 
   async close() {
+    stationUnregisterVideoSource(`peer:${this.hostId}:${this.displayId}:${this.sessionId}`);
+    stationScheduleUpdate();
     // F-2: tear down input listeners FIRST. The `pc.close()` chain
     // below would close the data channels anyway, but uninstalling
     // listeners eagerly prevents a final mousemove from racing the
@@ -15859,6 +16410,9 @@ function renderDiskUsage(sessions) {
 // ── Session Lifecycle ──
 function onSessionStarted(sessionId, task) {
   document.getElementById('sb-session').textContent = sessionId ? sessionId.slice(0, 8) : '';
+  stationCurrentTask = task || '';
+  stationCurrentApproval = null;
+  stationScheduleUpdate();
   switchTab('activity');
   // New session: clear any stale timeline and let the first
   // `snapshot_created` event populate it, or populate from the current
@@ -15868,6 +16422,8 @@ function onSessionStarted(sessionId, task) {
 }
 
 function onSessionEnded(sessionId, reason) {
+  stationCurrentApproval = null;
+  stationScheduleUpdate();
   // Refresh sessions list if already loaded
   if (sessionsLoaded) loadSessions();
   // Switch to sessions tab so user sees past sessions + new session input

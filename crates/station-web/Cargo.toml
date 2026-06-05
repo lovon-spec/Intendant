@@ -1,0 +1,39 @@
+[package]
+name = "station-web"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+bytemuck = { version = "1", features = ["derive"] }
+console_error_panic_hook = "0.1"
+js-sys = "0.3"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde-wasm-bindgen = "0.6"
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+wgpu = "0.20"
+
+[dependencies.web-sys]
+version = "0.3"
+features = [
+  "CanvasRenderingContext2d",
+  "CanvasGradient",
+  "DeviceOrientationEvent",
+  "Document",
+  "DomRect",
+  "Element",
+  "Event",
+  "EventTarget",
+  "HtmlCanvasElement",
+  "HtmlVideoElement",
+  "KeyboardEvent",
+  "Performance",
+  "PointerEvent",
+  "WheelEvent",
+  "Window",
+  "console",
+]

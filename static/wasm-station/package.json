@@ -1,0 +1,15 @@
+{
+  "name": "station-web",
+  "type": "module",
+  "version": "0.1.0",
+  "files": [
+    "station_web_bg.wasm",
+    "station_web.js",
+    "station_web.d.ts"
+  ],
+  "main": "station_web.js",
+  "types": "station_web.d.ts",
+  "sideEffects": [
+    "./snippets/*"
+  ]
+}
