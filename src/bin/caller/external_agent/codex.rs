@@ -48,6 +48,17 @@ You may perform non-mutating inspection, including reading or searching files an
 
 Do not modify files, source, git state, permissions, configuration, or any other workspace state unless the user explicitly requests that mutation in this side conversation. Do not request escalated permissions or broader sandbox access unless the user explicitly requests a mutation that requires it. If the user explicitly requests a mutation, keep it minimal, local to the request, and avoid disrupting the main thread."#;
 
+const MANAGED_CONTEXT_DEVELOPER_INSTRUCTIONS: &str = r#"You are running as Codex inside Intendant with managed_context=managed.
+
+Intendant, not Codex automatic compaction, owns long-task context density. This is active throughout the task, not only when the context window is nearly full.
+
+Keep the live transcript informationally dense:
+- Prefer targeted reads and searches over dumping large files, logs, or generated artifacts.
+- After noisy or unexpectedly large tool output, failed exploration, broad research, or finishing a coherent subtask, crystallize durable facts and use Intendant managed-context tools before continuing broad ordinary-tool work.
+- Use list_rewind_anchors to choose an exact current catalog item_id, inspect_rewind_anchor when the compact row is ambiguous, then call rewind_context with a dense carry-forward primer.
+- The primer must preserve user constraints, current objective, completed work, changed files, important command results, remaining decisions, and the substance of any prior managed primer that would otherwise be overwritten.
+- Never synthesize anchor ids, never use anchors from failed examples, and never target managed-context maintenance calls unless explicitly auditing those internals."#;
+
 const GENERATION_STARVATION_NEAR_LIMIT_PCT: f64 = 85.0;
 const GENERATION_STARVATION_HINT: &str = "The previous Codex response appears to have been cut off near the backend context limit. Avoid regenerating the same long output; rewind context first or produce a much shorter recovery response.";
 const CODEX_INITIALIZE_TIMEOUT_SECS: u64 = 60;
@@ -334,6 +345,18 @@ impl CodexAgent {
             }
             Err(_) => side_developer_instructions(None),
         }
+    }
+
+    async fn effective_managed_context_developer_instructions(&mut self) -> Option<String> {
+        if !self.managed_context {
+            return None;
+        }
+        Some(match self.current_codex_developer_instructions().await {
+            Ok(existing_instructions) => {
+                managed_context_developer_instructions(existing_instructions.as_deref())
+            }
+            Err(_) => managed_context_developer_instructions(None),
+        })
     }
 
     async fn current_codex_developer_instructions(
@@ -794,6 +817,15 @@ fn side_developer_instructions(existing_instructions: Option<&str>) -> String {
     }
 }
 
+fn managed_context_developer_instructions(existing_instructions: Option<&str>) -> String {
+    match existing_instructions {
+        Some(existing_instructions) if !existing_instructions.trim().is_empty() => {
+            format!("{existing_instructions}\n\n{MANAGED_CONTEXT_DEVELOPER_INSTRUCTIONS}")
+        }
+        _ => MANAGED_CONTEXT_DEVELOPER_INSTRUCTIONS.to_string(),
+    }
+}
+
 fn side_boundary_prompt_item() -> serde_json::Value {
     serde_json::json!({
         "type": "message",
@@ -1211,6 +1243,13 @@ impl CodexAgent {
     }
 
     fn thread_lifecycle_params(&mut self) -> serde_json::Map<String, serde_json::Value> {
+        self.thread_lifecycle_params_with_developer_instructions(None)
+    }
+
+    fn thread_lifecycle_params_with_developer_instructions(
+        &mut self,
+        developer_instructions: Option<String>,
+    ) -> serde_json::Map<String, serde_json::Value> {
         let mut params = serde_json::Map::new();
         if let Some(ref model) = self.model {
             params.insert("model".into(), serde_json::Value::String(model.clone()));
@@ -1228,6 +1267,12 @@ impl CodexAgent {
             "sandbox".into(),
             serde_json::Value::String(self.sandbox.clone()),
         );
+        if let Some(developer_instructions) = developer_instructions {
+            params.insert(
+                "developerInstructions".into(),
+                serde_json::Value::String(developer_instructions),
+            );
+        }
         self.insert_working_dir_param(&mut params);
         self.insert_service_tier_override_consuming_clear(&mut params);
         params
@@ -4701,7 +4746,11 @@ impl ExternalAgent for CodexAgent {
     }
 
     async fn start_thread(&mut self) -> Result<AgentThread, CallerError> {
-        let mut params = self.thread_lifecycle_params();
+        let managed_developer_instructions = self
+            .effective_managed_context_developer_instructions()
+            .await;
+        let mut params = self
+            .thread_lifecycle_params_with_developer_instructions(managed_developer_instructions);
 
         let method = if let Some(ref thread_id) = self.resume_session {
             params.insert(
@@ -7600,6 +7649,33 @@ mod tests {
         assert_eq!(params["approvalPolicy"], "on-request");
         assert_eq!(params["sandbox"], "workspace-write");
         assert_eq!(params["cwd"], "/tmp/intendant-workspace");
+    }
+
+    #[test]
+    fn thread_lifecycle_params_leave_developer_instructions_unset_by_default() {
+        let mut agent = test_agent();
+        agent.managed_context = false;
+
+        let params = agent.thread_lifecycle_params();
+
+        assert!(params.get("developerInstructions").is_none());
+    }
+
+    #[test]
+    fn thread_lifecycle_params_can_include_managed_context_instructions() {
+        let mut agent = test_agent();
+        let instructions =
+            managed_context_developer_instructions(Some("Existing developer policy."));
+
+        let params = agent.thread_lifecycle_params_with_developer_instructions(Some(instructions));
+
+        let developer_instructions = params["developerInstructions"].as_str().unwrap();
+        assert!(developer_instructions.contains("Existing developer policy."));
+        assert!(developer_instructions.contains("managed_context=managed"));
+        assert!(developer_instructions.contains("Keep the live transcript informationally dense"));
+        assert!(developer_instructions.contains("list_rewind_anchors"));
+        assert!(developer_instructions.contains("inspect_rewind_anchor"));
+        assert!(developer_instructions.contains("rewind_context"));
     }
 
     #[test]
