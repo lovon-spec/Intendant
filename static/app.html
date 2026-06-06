@@ -11094,6 +11094,8 @@ let stationSessionConfigResult = { sessionId: '', text: '', kind: '' };
 let stationSessionRenameResult = { sessionId: '', text: '', kind: '' };
 const stationSessionRenameDrafts = new Map();
 const stationSessionConfigDrafts = new Map();
+let stationComputerUseStatus = '';
+let stationComputerUseSaving = false;
 let stationManagedDraft = {
   anchor: '',
   position: '',
@@ -15679,6 +15681,95 @@ function stationRenderGeminiDefaultsEditor(parent) {
   debug.addEventListener('change', ev => stationApplyDockCheckbox('control-gemini-debug', ev.target.checked, onControlGeminiDebugChange, 'launch'));
 }
 
+function stationComputerUseOptions(kind) {
+  if (kind === 'provider') {
+    return [
+      ['', 'Auto (gemini-3-flash-preview)'],
+      ['gemini', 'Gemini'],
+      ['openai', 'OpenAI'],
+      ['anthropic', 'Anthropic'],
+    ];
+  }
+  if (kind === 'backend') {
+    return [
+      ['auto', 'Auto-detect'],
+      ['x11', 'X11'],
+      ['wayland', 'Wayland'],
+      ['macos', 'macOS'],
+    ];
+  }
+  return [
+    ['', 'Default'],
+    ['gemini-3-flash-preview', 'gemini-3-flash-preview'],
+    ['gemini-3.1-pro-preview', 'gemini-3.1-pro-preview'],
+    ['gemini-2.5-flash', 'gemini-2.5-flash'],
+    ['gpt-5.4-mini', 'gpt-5.4-mini'],
+    ['gpt-5.4', 'gpt-5.4'],
+    ['computer-use-preview', 'computer-use-preview'],
+    ['claude-haiku-4-5-20251001', 'claude-haiku-4-5'],
+    ['claude-sonnet-4-6', 'claude-sonnet-4-6'],
+  ];
+}
+
+function stationComputerUseValue(id, fallback = '') {
+  return document.getElementById(id)?.value || fallback;
+}
+
+function stationSetComputerUseSetting(id, value) {
+  const select = document.getElementById(id);
+  if (select) select.value = value || '';
+  stationComputerUseStatus = 'Unsaved Computer Use settings.';
+  stationRenderControlsDock('cu');
+}
+
+async function stationSaveComputerUseFromDock() {
+  stationComputerUseSaving = true;
+  stationComputerUseStatus = 'Saving Computer Use settings...';
+  stationRenderControlsDock('cu');
+  try {
+    await saveSettings();
+    stationComputerUseStatus = 'Saved Computer Use settings.';
+    showControlToast?.('success', 'Computer Use settings saved');
+  } catch (err) {
+    stationComputerUseStatus = err?.message || 'Computer Use settings save failed.';
+    showControlToast?.('error', stationComputerUseStatus);
+  } finally {
+    stationComputerUseSaving = false;
+    stationRenderControlsDock('cu');
+  }
+}
+
+async function stationReloadComputerUseForDock() {
+  stationComputerUseStatus = 'Reloading Computer Use settings...';
+  stationRenderControlsDock('cu');
+  settingsLoaded = false;
+  await loadSettings();
+  stationComputerUseStatus = 'Reloaded Computer Use settings.';
+  stationRenderControlsDock('cu');
+}
+
+function stationRenderComputerUseDefaultsEditor(parent, controls) {
+  const section = stationDockSection(parent, 'Computer use defaults');
+  const providerValue = stationComputerUseValue('set-cu-provider', '');
+  const modelValue = stationComputerUseValue('set-cu-model', '');
+  const backendValue = stationComputerUseValue('set-cu-backend', 'auto');
+  stationDockRow(section, 'provider', providerValue || 'auto');
+  stationDockRow(section, 'model', modelValue || 'default');
+  stationDockRow(section, 'backend', backendValue || 'auto');
+  const provider = stationDockSelect(section, 'Provider', providerValue, stationComputerUseOptions('provider'), { id: 'station-cu-provider' });
+  provider.addEventListener('change', ev => stationSetComputerUseSetting('set-cu-provider', ev.target.value));
+  const model = stationDockSelect(section, 'Model', modelValue, stationComputerUseOptions('model'), { id: 'station-cu-model' });
+  model.addEventListener('change', ev => stationSetComputerUseSetting('set-cu-model', ev.target.value));
+  const backend = stationDockSelect(section, 'Backend', backendValue, stationComputerUseOptions('backend'), { id: 'station-cu-backend' });
+  backend.addEventListener('change', ev => stationSetComputerUseSetting('set-cu-backend', ev.target.value || 'auto'));
+  if (stationComputerUseStatus) stationDockEmpty(section, stationComputerUseStatus);
+  stationDockActions(section, [
+    { label: stationComputerUseSaving ? 'Saving...' : 'Save CU', primary: true, disabled: stationComputerUseSaving, onClick: stationSaveComputerUseFromDock },
+    { label: 'Reload', disabled: stationComputerUseSaving, onClick: stationReloadComputerUseForDock },
+    stationDockRouteAction('Route CU settings', 'settings', 'agent', () => document.getElementById('set-cu-provider')?.focus()),
+  ]);
+}
+
 function stationApprovalRuleLabel(category) {
   return String(category || '').replace(/_/g, ' ');
 }
@@ -15759,7 +15850,12 @@ function stationRenderControlsDock(sectionName = 'overview') {
   if (sectionName === 'browser' || sectionName === 'overview') stationRenderBrowserWorkspaceSection(body);
   if (sectionName === 'recordings' || sectionName === 'overview') stationRenderRecordingSection(body);
 
+  stationRenderComputerUseDefaultsEditor(body, controls);
+
   const debug = stationDockSection(body, 'Computer use / debug');
+  stationDockRow(debug, 'provider', controls.cuProvider || 'auto');
+  stationDockRow(debug, 'model', controls.cuModel || 'default');
+  stationDockRow(debug, 'backend', controls.cuBackend || 'auto');
   stationDockRow(debug, 'debug screen', controls.debugScreen ? 'active' : 'off');
   stationDockRow(debug, 'debug rec', controls.debugRecording ? 'recording' : 'off');
   stationDockActions(debug, [
@@ -16882,6 +16978,9 @@ function stationBuildControlsSummary() {
     browserWorkspaces: activeBrowserWorkspaces,
     recordings: recordingStreams.size,
     activeRecording: activeRecordingStream || '',
+    cuProvider: stationComputerUseValue('set-cu-provider', '') || 'auto',
+    cuModel: stationComputerUseValue('set-cu-model', '') || 'default',
+    cuBackend: stationComputerUseValue('set-cu-backend', 'auto') || 'auto',
     debugScreen: /^active$/i.test(debugStatus),
     debugRecording: !!debugRecordBtn && /stop/i.test(debugRecordBtn.textContent || ''),
     pendingAttachments: pendingAttachmentCount,
