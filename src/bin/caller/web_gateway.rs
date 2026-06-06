@@ -1531,14 +1531,21 @@ fn replay_jsonl_to_outbound_entries_inner(
         }
     }
 
+    let legacy_model_spans = validated_legacy_model_response_spans(contents, log_dir);
+    let mut legacy_model_indices: HashMap<String, usize> = HashMap::new();
     for line in contents.lines() {
         let line = line.trim();
         if line.is_empty() {
             continue;
         }
-        let Ok(entry_json) = serde_json::from_str::<serde_json::Value>(line) else {
+        let Ok(mut entry_json) = serde_json::from_str::<serde_json::Value>(line) else {
             continue;
         };
+        infer_legacy_model_response_span(
+            &mut entry_json,
+            &legacy_model_spans,
+            &mut legacy_model_indices,
+        );
         if compact_historical_context
             && entry_json.get("event").and_then(|v| v.as_str()) == Some("context_snapshot")
         {
@@ -1589,6 +1596,101 @@ fn replay_jsonl_to_outbound_entries_inner(
     }
 
     entries
+}
+
+fn legacy_model_response_file_and_len(entry_json: &serde_json::Value) -> Option<(String, u64)> {
+    if entry_json.get("event").and_then(|v| v.as_str()) != Some("model_response") {
+        return None;
+    }
+    let rel = entry_json.get("file")?.as_str()?.to_string();
+    let data = entry_json.get("data")?;
+    if data
+        .get("model_offset")
+        .and_then(|value| value.as_u64())
+        .is_some()
+        || data
+            .get("model_bytes")
+            .and_then(|value| value.as_u64())
+            .is_some()
+    {
+        return None;
+    }
+    let len = data.get("content_length")?.as_u64()?;
+    Some((rel, len))
+}
+
+fn validated_legacy_model_response_spans(
+    contents: &str,
+    log_dir: &std::path::Path,
+) -> HashMap<String, Vec<(u64, u64)>> {
+    let mut lengths_by_file: HashMap<String, Vec<u64>> = HashMap::new();
+    for line in contents
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
+        let Ok(entry_json) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if let Some((rel, len)) = legacy_model_response_file_and_len(&entry_json) {
+            lengths_by_file.entry(rel).or_default().push(len);
+        }
+    }
+
+    let mut spans_by_file: HashMap<String, Vec<(u64, u64)>> = HashMap::new();
+    for (rel, lengths) in lengths_by_file {
+        let Ok(meta) = std::fs::metadata(log_dir.join(&rel)) else {
+            continue;
+        };
+        let mut expected_len = lengths.len().saturating_sub(1) as u64;
+        let mut overflowed = false;
+        for len in &lengths {
+            let Some(next) = expected_len.checked_add(*len) else {
+                overflowed = true;
+                break;
+            };
+            expected_len = next;
+        }
+        if overflowed || expected_len != meta.len() {
+            continue;
+        }
+
+        let mut offset = 0_u64;
+        let mut spans = Vec::with_capacity(lengths.len());
+        for len in lengths {
+            spans.push((offset, len));
+            offset = offset.saturating_add(len).saturating_add(1);
+        }
+        spans_by_file.insert(rel, spans);
+    }
+    spans_by_file
+}
+
+fn infer_legacy_model_response_span(
+    entry_json: &mut serde_json::Value,
+    spans_by_file: &HashMap<String, Vec<(u64, u64)>>,
+    indices: &mut HashMap<String, usize>,
+) {
+    let Some((rel, _len)) = legacy_model_response_file_and_len(entry_json) else {
+        return;
+    };
+    let index = indices.entry(rel.clone()).or_insert(0);
+    let Some((offset, len)) = spans_by_file
+        .get(&rel)
+        .and_then(|spans| spans.get(*index))
+        .copied()
+    else {
+        return;
+    };
+    *index += 1;
+    let Some(data) = entry_json
+        .get_mut("data")
+        .and_then(|value| value.as_object_mut())
+    else {
+        return;
+    };
+    data.insert("model_offset".to_string(), serde_json::Value::from(offset));
+    data.insert("model_bytes".to_string(), serde_json::Value::from(len));
 }
 
 fn inject_replay_entry_metadata(
@@ -24191,6 +24293,59 @@ mod tests {
         assert!(replay["entries"].as_array().unwrap().iter().any(|entry| {
             entry["event"] == "model_response" && entry["summary"] == "still here after refresh"
         }));
+    }
+
+    #[test]
+    fn session_log_replay_infers_legacy_model_response_spans() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        std::fs::create_dir_all(log_dir.join("turns")).unwrap();
+        std::fs::write(
+            log_dir.join("turns/turn_000_model.txt"),
+            "first response\nsecond response",
+        )
+        .unwrap();
+        let first = serde_json::json!({
+            "ts": "01:00:00.000",
+            "turn": 0,
+            "event": "model_response",
+            "level": "info",
+            "message": "first response",
+            "file": "turns/turn_000_model.txt",
+            "data": {
+                "content_length": "first response".len(),
+                "tokens": {"prompt": 1, "completion": 2, "total": 3, "cached": 0}
+            },
+        });
+        let second = serde_json::json!({
+            "ts": "01:00:01.000",
+            "turn": 0,
+            "event": "model_response",
+            "level": "info",
+            "message": "second response",
+            "file": "turns/turn_000_model.txt",
+            "data": {
+                "content_length": "second response".len(),
+                "tokens": {"prompt": 4, "completion": 5, "total": 6, "cached": 0}
+            },
+        });
+        std::fs::write(
+            log_dir.join("session.jsonl"),
+            format!("{first}\n{second}\n"),
+        )
+        .unwrap();
+
+        let replay = session_log_replay_from_dir(&log_dir).expect("session log should replay");
+        let replay: serde_json::Value = serde_json::from_str(&replay).unwrap();
+        let summaries: Vec<&str> = replay["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|entry| entry["event"] == "model_response")
+            .filter_map(|entry| entry["summary"].as_str())
+            .collect();
+
+        assert_eq!(summaries, vec!["first response", "second response"]);
     }
 
     #[test]

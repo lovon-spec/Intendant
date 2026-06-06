@@ -2204,7 +2204,8 @@ impl SessionLog {
         // assistant message in the same turn). Appending keeps the full
         // sequence; truncating would leave only the last chunk on disk
         // while session.jsonl's event stream references all of them.
-        let file = self.append_turn_file("model.txt", content);
+        let span = self.append_turn_file_span("model.txt", content);
+        let file = span.as_ref().map(|span| span.relative.clone());
         let preview: String = content.chars().take(200).collect();
         let mut data = serde_json::json!({
             "tokens": {
@@ -2215,6 +2216,10 @@ impl SessionLog {
             },
             "content_length": content.len(),
         });
+        if let Some(span) = span.as_ref() {
+            data["model_offset"] = serde_json::Value::from(span.offset);
+            data["model_bytes"] = serde_json::Value::from(span.len);
+        }
         if let Some(src) = source {
             data["source"] = serde_json::Value::String(src.to_string());
         }
@@ -2553,6 +2558,45 @@ fn read_event_file_span(
     }
 }
 
+fn read_model_response_content(entry: &serde_json::Value, log_dir: &Path, message: &str) -> String {
+    let data = entry.get("data");
+    let has_span = data
+        .and_then(|d| d.get("model_offset"))
+        .and_then(|v| v.as_u64())
+        .is_some()
+        && data
+            .and_then(|d| d.get("model_bytes"))
+            .and_then(|v| v.as_u64())
+            .is_some();
+    if has_span {
+        if let Some(content) = read_event_file_span(
+            entry,
+            log_dir,
+            "file",
+            Some("model_offset"),
+            Some("model_bytes"),
+        ) {
+            return content;
+        }
+    }
+
+    let Some(rel) = entry.get("file").and_then(|v| v.as_str()) else {
+        return message.to_string();
+    };
+    let path = log_dir.join(rel);
+    let content_length = data
+        .and_then(|d| d.get("content_length"))
+        .and_then(|v| v.as_u64());
+
+    if let (Some(expected), Ok(meta)) = (content_length, fs::metadata(&path)) {
+        if meta.len() != expected {
+            return message.to_string();
+        }
+    }
+
+    fs::read_to_string(path).unwrap_or_else(|_| message.to_string())
+}
+
 pub fn agent_output_chunks_by_id(log_dir: &Path, ids: &[String]) -> Vec<AgentOutputChunk> {
     let wanted: std::collections::HashSet<&str> = ids.iter().map(String::as_str).collect();
     if wanted.is_empty() {
@@ -2634,7 +2678,10 @@ pub fn agent_output_chunks_by_id(log_dir: &Path, ids: &[String]) -> Vec<AgentOut
 ///
 /// For events with a `file` field (`model_response`, `agent_output`,
 /// `reasoning`), reads the full content from the turn file under `log_dir`
-/// and substitutes it for the 200-char `message` preview.
+/// and substitutes it for the 200-char `message` preview. New appended
+/// model/output files carry byte spans; legacy appended model files without
+/// spans fall back to the preview when the file size differs from the row's
+/// recorded content length.
 fn parse_session_attached_message(message: &str) -> Option<(String, String)> {
     let rest = message.strip_prefix("Session attached: ")?;
     let (session_id, source) = rest.rsplit_once(" (")?;
@@ -2795,7 +2842,7 @@ pub fn session_log_entry_to_app_event(
 
         // ── Model response ──
         "model_response" => {
-            let content = read_file("file").unwrap_or_else(|| message.to_string());
+            let content = read_model_response_content(entry, log_dir, message);
             let tokens = data.and_then(|d| d.get("tokens"));
             let usage = TokenUsage {
                 prompt_tokens: tokens
@@ -4484,12 +4531,18 @@ mod tests {
 
     /// Helper: drop `log`, read session.jsonl, and return the last entry
     /// whose `event` field matches `event_type`.
-    fn read_last_event(log_dir: &std::path::Path, event_type: &str) -> serde_json::Value {
+    fn read_events(log_dir: &std::path::Path, event_type: &str) -> Vec<serde_json::Value> {
         let content = fs::read_to_string(log_dir.join("session.jsonl")).unwrap();
         content
             .lines()
             .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
             .filter(|v| v.get("event").and_then(|e| e.as_str()) == Some(event_type))
+            .collect()
+    }
+
+    fn read_last_event(log_dir: &std::path::Path, event_type: &str) -> serde_json::Value {
+        read_events(log_dir, event_type)
+            .into_iter()
             .last()
             .unwrap_or_else(|| panic!("no {} event found", event_type))
     }
@@ -4531,6 +4584,70 @@ mod tests {
                 assert_eq!(usage.cached_tokens, 10);
                 assert!(reasoning.is_none());
                 assert_eq!(source.as_deref(), Some("Codex"));
+            }
+            other => panic!("expected ModelResponse, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn rt_model_response_uses_byte_spans_for_appended_turn_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        let mut log = SessionLog::open(log_dir.clone()).unwrap();
+        log.turn_start(7, 0.5, 100_000);
+        log.model_response("first response", 1, 2, 3, 0, Some("Codex"));
+        log.model_response("second response", 4, 5, 6, 0, Some("Codex"));
+        drop(log);
+
+        let entries = read_events(&log_dir, "model_response");
+        assert_eq!(entries.len(), 2);
+        assert!(entries[0]["data"]["model_offset"].is_u64());
+        assert!(entries[0]["data"]["model_bytes"].is_u64());
+        assert!(entries[1]["data"]["model_offset"].is_u64());
+        assert!(entries[1]["data"]["model_bytes"].is_u64());
+
+        let first = session_log_entry_to_app_event(&entries[0], &log_dir).unwrap();
+        let second = session_log_entry_to_app_event(&entries[1], &log_dir).unwrap();
+        match (first, second) {
+            (
+                AppEvent::ModelResponse { content: first, .. },
+                AppEvent::ModelResponse {
+                    content: second, ..
+                },
+            ) => {
+                assert_eq!(first, "first response");
+                assert_eq!(second, "second response");
+            }
+            other => panic!("expected ModelResponse pair, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn rt_legacy_appended_model_response_file_falls_back_to_preview() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        fs::create_dir_all(log_dir.join("turns")).unwrap();
+        fs::write(
+            log_dir.join("turns/turn_000_model.txt"),
+            "first response\nsecond response",
+        )
+        .unwrap();
+        let entry = serde_json::json!({
+            "ts": "01:00:00.000",
+            "turn": 0,
+            "event": "model_response",
+            "level": "info",
+            "message": "first response",
+            "file": "turns/turn_000_model.txt",
+            "data": {
+                "content_length": "first response".len(),
+                "tokens": {"prompt": 1, "completion": 2, "total": 3, "cached": 0}
+            },
+        });
+
+        match session_log_entry_to_app_event(&entry, &log_dir).unwrap() {
+            AppEvent::ModelResponse { content, .. } => {
+                assert_eq!(content, "first response");
             }
             other => panic!("expected ModelResponse, got {:?}", other),
         }
