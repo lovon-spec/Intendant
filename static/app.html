@@ -11986,6 +11986,61 @@ function stationPeerCapabilityLabels(peer) {
     .filter(Boolean);
 }
 
+function stationPeerDisplayStatusPayload() {
+  return {
+    generated_at: new Date().toISOString(),
+    self: {
+      host_id: selfPeerId || 'local',
+      label: selfHostLabel || '',
+      display_access: document.getElementById('sb-display-access')?.textContent || 'off',
+      shared_display: userDisplayGranted ? Number(grantedDisplayId) : null,
+      local_streams: displaySlots.size,
+      remote_streams: peerDisplayConnections.size,
+    },
+    selected: {
+      peer_id: stationPeerDraft.selectedHostId || stationSelectedPeerHost || '',
+      display_id: stationPeerDisplayId(),
+    },
+    peers: daemons.map(peer => ({
+      host_id: peer.host_id || peer.id || '',
+      label: peer.label || '',
+      url: peer.url || '',
+      connected: !!peer.connected,
+      capabilities: stationPeerCapabilityLabels(peer),
+    })),
+    local_displays: stationLocalDisplayRows().map(display => ({
+      id: Number(display?.id ?? 0),
+      label: stationLocalDisplayLabel(display),
+      width: display?.width || 0,
+      height: display?.height || 0,
+      primary: !!display?.is_primary,
+    })),
+    local_streams: Array.from(displaySlots.values()).map(slot => ({
+      display_id: slot.displayId,
+      connected: !!slot.connected,
+      input: slot.authorityState || 'unknown',
+      width: slot.width || 0,
+      height: slot.height || 0,
+      interactive: !!slot.interactive,
+      recording: !!slot.recording,
+    })),
+    remote_streams: Array.from(peerDisplayConnections.values()).map(conn => ({
+      host_id: conn.hostId || '',
+      display_id: conn.displayId,
+      session_id: conn.sessionId || '',
+      status: conn.displayStatusText || 'Connecting...',
+      input: conn.peerAuthorityState || 'unknown',
+      via: conn.advertiseTcpViaUrl || '',
+    })),
+  };
+}
+
+async function stationCopyPeerDisplayStatusFromDock() {
+  await copyTextToClipboard(JSON.stringify(stationPeerDisplayStatusPayload(), null, 2));
+  stationSetPeerStatus('Peer/display status JSON copied', 'ok');
+  stationRenderPeersDock();
+}
+
 function stationSelectedPeer() {
   const selected = String(stationPeerDraft.selectedHostId || stationSelectedPeerHost || '').trim();
   return daemons.find(d => d.host_id === selected) || daemons[0] || null;
@@ -12344,6 +12399,7 @@ function stationRenderPeersDock() {
         detail,
         actions: [
           { label: 'Focus', onClick: () => { stationSetPeerTarget(conn.hostId, conn.displayId); stationOpenDisplay(conn.hostId, conn.displayId); } },
+          { label: 'Copy status', onClick: stationCopyPeerDisplayStatusFromDock },
           authority === 'you'
             ? { label: 'Release input', onClick: () => conn.releaseControl?.() }
             : { label: 'Take input', primary: true, onClick: () => conn.takeControl?.() },
@@ -12360,6 +12416,7 @@ function stationRenderPeersDock() {
   stationDockActions(overview, [
     { label: userDisplayGranted ? 'Revoke local' : 'Share local', primary: true, onClick: () => window.toggleUserDisplay?.() },
     { label: 'Refresh peers', onClick: async () => { await refreshPeersFromApi(); stationSetPeerStatus('Peer registry refreshed', 'ok'); stationRenderPeersDock(); } },
+    { label: 'Copy status', onClick: stationCopyPeerDisplayStatusFromDock },
     stationDockRouteAction('Route video tab', 'displays', ''),
     stationDockRouteAction('Route network', 'settings', 'network'),
   ]);
@@ -12380,6 +12437,7 @@ function stationRenderPeersDock() {
     for (const slot of displaySlots.values()) {
       const authority = slot.authorityState || 'unknown';
       const actions = [
+        { label: 'Copy status', onClick: stationCopyPeerDisplayStatusFromDock },
         authority === 'you'
           ? { label: 'Release input', onClick: () => slot.releaseBtn?.click() }
           : { label: 'Take input', primary: true, onClick: () => slot.takeBtn?.click() },
