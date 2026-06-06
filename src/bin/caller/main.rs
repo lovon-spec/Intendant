@@ -1437,7 +1437,11 @@ const EXTERNAL_TOOL_OUTPUT_ACTIVITY_INLINE_LIMIT: usize = 4 * 1024;
 const EXTERNAL_TOOL_OUTPUT_ACTIVITY_HEAD_LIMIT: usize = 2 * 1024;
 const EXTERNAL_TOOL_OUTPUT_ACTIVITY_TAIL_LIMIT: usize = 2 * 1024;
 const EXTERNAL_TOOL_OUTPUT_ACTIVITY_TOTAL_LIMIT: usize = 24 * 1024;
-const EXTERNAL_TOOL_SOURCE_OUTPUT_ACTIVITY_TOTAL_LIMIT: usize = 6 * 1024;
+const EXTERNAL_TOOL_SOURCE_OUTPUT_ACTIVITY_HEAD_LIMIT: usize = 1024;
+const EXTERNAL_TOOL_SOURCE_OUTPUT_ACTIVITY_TAIL_LIMIT: usize = 1024;
+const EXTERNAL_TOOL_SOURCE_OUTPUT_ACTIVITY_TOTAL_LIMIT: usize = 4 * 1024;
+const EXTERNAL_TOOL_SOURCE_OUTPUT_DETECTION_MIN_BYTES: usize = 2 * 1024;
+const EXTERNAL_TOOL_SOURCE_OUTPUT_DETECTION_LINE_LIMIT: usize = 200;
 const EXTERNAL_TOOL_PREVIEW_ACTIVITY_LIMIT: usize = 512;
 const EXTERNAL_TOOL_FAILURE_REPEAT_LIMIT: usize = 2;
 
@@ -1464,6 +1468,18 @@ struct ExternalToolOutputState {
     omitting: bool,
     omission_notice_emitted: bool,
     source_like: bool,
+    source_signals: ExternalToolSourceSignals,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ExternalToolSourceSignals {
+    observed_lines: usize,
+    non_empty_lines: usize,
+    code_like_lines: usize,
+    markup_like_lines: usize,
+    style_like_lines: usize,
+    structural_lines: usize,
+    source_hint_lines: usize,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1498,17 +1514,32 @@ impl ExternalToolOutputLimiter {
         } else {
             item_id.to_string()
         };
-        let source_like = external_tool_output_looks_like_large_source(&text);
+        let item_source_like;
+        let mut source_backcharge_bytes = 0usize;
         let emit = {
             let state = self.items.entry(key).or_default();
+            let was_source_like = state.source_like;
+            let previously_emitted_head_bytes = state.emitted_head_bytes;
             state.seen_bytes = state.seen_bytes.saturating_add(text.len());
-            state.source_like |= source_like;
+            state.source_signals.observe(&text);
+            if state
+                .source_signals
+                .looks_like_large_source(state.seen_bytes)
+            {
+                state.source_like = true;
+            }
+            if !was_source_like && state.source_like {
+                source_backcharge_bytes = previously_emitted_head_bytes;
+            }
+            item_source_like = state.source_like;
 
             if state.omitting {
                 state.push_tail(&text);
                 None
             } else {
-                let head_limit = if state.emitted_head_bytes == 0
+                let head_limit = if state.source_like {
+                    EXTERNAL_TOOL_SOURCE_OUTPUT_ACTIVITY_HEAD_LIMIT
+                } else if state.emitted_head_bytes == 0
                     && text.len() > EXTERNAL_TOOL_OUTPUT_ACTIVITY_INLINE_LIMIT
                 {
                     EXTERNAL_TOOL_OUTPUT_ACTIVITY_HEAD_LIMIT
@@ -1533,15 +1564,7 @@ impl ExternalToolOutputLimiter {
                 }
             }
         };
-        let item_source_like = self
-            .items
-            .get(if item_id.is_empty() {
-                "<unknown>"
-            } else {
-                item_id
-            })
-            .map(|state| state.source_like)
-            .unwrap_or(source_like);
+        self.charge_prior_source_output(source_backcharge_bytes);
         emit.and_then(|out| self.emit_with_caps(out, item_source_like))
     }
 
@@ -1578,6 +1601,18 @@ impl ExternalToolOutputLimiter {
         } else {
             self.emit_with_total_cap(text)
         }
+    }
+
+    fn charge_prior_source_output(&mut self, bytes: usize) {
+        if bytes == 0
+            || self.source_emitted_bytes >= EXTERNAL_TOOL_SOURCE_OUTPUT_ACTIVITY_TOTAL_LIMIT
+        {
+            return;
+        }
+        self.source_emitted_bytes = self
+            .source_emitted_bytes
+            .saturating_add(bytes)
+            .min(EXTERNAL_TOOL_SOURCE_OUTPUT_ACTIVITY_TOTAL_LIMIT);
     }
 
     fn emit_with_source_cap(&mut self, text: String) -> Option<String> {
@@ -1640,15 +1675,77 @@ impl ExternalToolOutputState {
             return;
         }
         self.tail.push_str(text);
-        if self.tail.len() <= EXTERNAL_TOOL_OUTPUT_ACTIVITY_TAIL_LIMIT {
+        let tail_limit = if self.source_like {
+            EXTERNAL_TOOL_SOURCE_OUTPUT_ACTIVITY_TAIL_LIMIT
+        } else {
+            EXTERNAL_TOOL_OUTPUT_ACTIVITY_TAIL_LIMIT
+        };
+        if self.tail.len() <= tail_limit {
             return;
         }
-        let trim_to = self
-            .tail
-            .len()
-            .saturating_sub(EXTERNAL_TOOL_OUTPUT_ACTIVITY_TAIL_LIMIT);
+        let trim_to = self.tail.len().saturating_sub(tail_limit);
         let split_at = char_boundary_at_or_after(&self.tail, trim_to);
         self.tail.drain(..split_at);
+    }
+}
+
+impl ExternalToolSourceSignals {
+    fn observe(&mut self, text: &str) {
+        if text.is_empty()
+            || self.observed_lines >= EXTERNAL_TOOL_SOURCE_OUTPUT_DETECTION_LINE_LIMIT
+        {
+            return;
+        }
+
+        for line in text.lines() {
+            if self.observed_lines >= EXTERNAL_TOOL_SOURCE_OUTPUT_DETECTION_LINE_LIMIT {
+                break;
+            }
+            self.observed_lines += 1;
+            let trimmed = external_tool_output_strip_source_line_prefix(line.trim());
+            if trimmed.is_empty() {
+                continue;
+            }
+
+            self.non_empty_lines += 1;
+            let code_like = external_tool_source_line_has_code_token(trimmed);
+            let markup_like = external_tool_source_line_has_markup_token(trimmed);
+            let style_like = external_tool_source_line_has_style_token(trimmed);
+            if code_like {
+                self.code_like_lines += 1;
+            }
+            if markup_like {
+                self.markup_like_lines += 1;
+            }
+            if style_like {
+                self.style_like_lines += 1;
+            }
+            if code_like || markup_like || style_like {
+                self.source_hint_lines += 1;
+            }
+            if external_tool_source_line_has_structural_token(trimmed) {
+                self.structural_lines += 1;
+            }
+        }
+    }
+
+    fn looks_like_large_source(&self, seen_bytes: usize) -> bool {
+        if seen_bytes <= EXTERNAL_TOOL_SOURCE_OUTPUT_DETECTION_MIN_BYTES
+            || self.non_empty_lines < 24
+        {
+            return false;
+        }
+
+        let code_density = self.code_like_lines * 100 / self.non_empty_lines;
+        let hint_density = self.source_hint_lines * 100 / self.non_empty_lines;
+        let structural_density = self.structural_lines * 100 / self.non_empty_lines;
+        (self.code_like_lines >= 8 && self.structural_lines >= 8 && code_density >= 20)
+            || (self.markup_like_lines >= 8 && self.structural_lines >= 8)
+            || (self.style_like_lines >= 8 && self.structural_lines >= 16)
+            || (self.source_hint_lines >= 16
+                && self.structural_lines >= 16
+                && hint_density >= 35
+                && structural_density >= 35)
     }
 }
 
@@ -1702,37 +1799,38 @@ fn external_tool_source_output_total_truncation_notice() -> String {
 }
 
 fn external_tool_output_looks_like_large_source(text: &str) -> bool {
-    if text.len() <= EXTERNAL_TOOL_OUTPUT_ACTIVITY_INLINE_LIMIT {
-        return false;
+    let mut signals = ExternalToolSourceSignals::default();
+    signals.observe(text);
+    signals.looks_like_large_source(text.len())
+}
+
+fn external_tool_output_strip_source_line_prefix(line: &str) -> &str {
+    let Some(rest) = external_tool_output_strip_numeric_line_prefix(line) else {
+        return external_tool_output_strip_path_line_prefix(line).unwrap_or(line);
+    };
+    rest
+}
+
+fn external_tool_output_strip_path_line_prefix(line: &str) -> Option<&str> {
+    let colon = line.find(':')?;
+    let prefix = &line[..colon];
+    if !(prefix.contains('/') || prefix.contains('.') || prefix.contains('\\')) {
+        return None;
     }
+    let rest = &line[colon + 1..];
+    external_tool_output_strip_numeric_line_prefix(rest)
+}
 
-    let mut non_empty_lines = 0usize;
-    let mut code_like_lines = 0usize;
-    let mut structural_lines = 0usize;
-
-    for line in text.lines().take(200) {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        non_empty_lines += 1;
-        if external_tool_source_line_has_code_token(trimmed) {
-            code_like_lines += 1;
-        }
-        if trimmed.contains('{')
-            || trimmed.contains('}')
-            || trimmed.ends_with(';')
-            || trimmed.ends_with(',')
-            || trimmed.contains("=>")
-        {
-            structural_lines += 1;
-        }
+fn external_tool_output_strip_numeric_line_prefix(line: &str) -> Option<&str> {
+    let digit_count = line.bytes().take_while(u8::is_ascii_digit).count();
+    if digit_count == 0 || digit_count > 8 || digit_count >= line.len() {
+        return None;
     }
-
-    non_empty_lines >= 24
-        && code_like_lines >= 8
-        && structural_lines >= 8
-        && code_like_lines * 100 / non_empty_lines >= 20
+    let separator = line.as_bytes()[digit_count];
+    if !matches!(separator, b':' | b'\t' | b' ') {
+        return None;
+    }
+    Some(line[digit_count + 1..].trim_start())
 }
 
 fn external_tool_source_line_has_code_token(line: &str) -> bool {
@@ -1765,6 +1863,43 @@ fn external_tool_source_line_has_code_token(line: &str) -> bool {
         "var ",
     ];
     TOKENS.iter().any(|token| line.contains(token))
+}
+
+fn external_tool_source_line_has_markup_token(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    if trimmed.starts_with('<') && trimmed.contains('>') {
+        return true;
+    }
+    trimmed.contains("</")
+        || trimmed.contains("<div")
+        || trimmed.contains("<span")
+        || trimmed.contains("<button")
+        || trimmed.contains("<script")
+        || trimmed.contains("<style")
+        || trimmed.contains("class=")
+        || trimmed.contains(" id=")
+}
+
+fn external_tool_source_line_has_style_token(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    (trimmed.contains(':') && trimmed.ends_with(';'))
+        || (trimmed.ends_with('{')
+            && (trimmed.starts_with('.')
+                || trimmed.starts_with('#')
+                || trimmed.starts_with('@')
+                || trimmed.starts_with(":root")
+                || trimmed.contains(" .")
+                || trimmed.contains(" #")
+                || trimmed.contains(" {")))
+}
+
+fn external_tool_source_line_has_structural_token(line: &str) -> bool {
+    line.contains('{')
+        || line.contains('}')
+        || line.ends_with(';')
+        || line.ends_with(',')
+        || line.contains("=>")
+        || (line.contains('<') && line.contains('>'))
 }
 
 fn char_boundary_at_or_before(text: &str, max_bytes: usize) -> usize {
@@ -12894,21 +13029,67 @@ Also: {"source": "bare"}"#;
 
         let first_head = limiter.filter("item-1", source.clone()).unwrap();
         assert!(first_head.contains("fn generated_function_0"));
+        assert!(first_head.contains("shown first 1024 bytes"));
         assert!(!first_head.contains("source-output cap"));
         let first_tail = limiter.complete("item-1").unwrap();
         assert!(first_tail.contains("Intendant omitted"));
+        assert!(first_tail.contains("final tail 1024 bytes"));
         assert!(!first_tail.contains("source-output cap"));
 
         let second_head = limiter.filter("item-2", source.clone()).unwrap();
         assert!(second_head.contains("fn generated_function_0"));
-        assert!(second_head.contains("source-output cap"));
-        assert!(
-            limiter.complete("item-2").is_none(),
-            "source cap should suppress later tail re-emission"
-        );
+        let second_tail = limiter.complete("item-2").unwrap();
+        assert!(second_tail.contains("source-output cap"));
         assert!(
             limiter.filter("item-3", source).is_none(),
             "source cap should suppress further repeated source dumps"
+        );
+    }
+
+    #[test]
+    fn external_tool_output_limiter_caps_repeated_html_css_source_output() {
+        let mut limiter = ExternalToolOutputLimiter::default();
+        let source = large_html_css_source_output();
+        assert!(external_tool_output_looks_like_large_source(&source));
+
+        let first_head = limiter.filter("item-1", source.clone()).unwrap();
+        assert!(first_head.contains("<style>"));
+        assert!(first_head.contains("shown first 1024 bytes"));
+        assert!(!first_head.contains("source-output cap"));
+        let first_tail = limiter.complete("item-1").unwrap();
+        assert!(first_tail.contains("Intendant omitted"));
+        assert!(first_tail.contains("final tail 1024 bytes"));
+        assert!(!first_tail.contains("source-output cap"));
+
+        let second_head = limiter.filter("item-2", source).unwrap();
+        assert!(second_head.contains("<style>"));
+        let second_tail = limiter.complete("item-2").unwrap();
+        assert!(second_tail.contains("source-output cap"));
+    }
+
+    #[test]
+    fn external_tool_output_limiter_uses_source_head_limit_for_streamed_source_chunks() {
+        let mut limiter = ExternalToolOutputLimiter::default();
+        let source = large_html_css_source_output();
+        let first_chunk = source.lines().take(120).collect::<Vec<_>>().join("\n") + "\n";
+        assert!(
+            first_chunk.len() > EXTERNAL_TOOL_OUTPUT_ACTIVITY_HEAD_LIMIT,
+            "test chunk should exceed source head limit"
+        );
+        assert!(
+            first_chunk.len() < EXTERNAL_TOOL_OUTPUT_ACTIVITY_INLINE_LIMIT,
+            "test chunk should stay below the generic inline limit"
+        );
+        assert!(external_tool_output_looks_like_large_source(&first_chunk));
+
+        let head = limiter.filter("item-1", first_chunk).unwrap();
+
+        assert!(head.contains("<style>"));
+        assert!(head.contains("omitting additional external tool output"));
+        assert!(head.contains("shown first 1024 bytes"));
+        assert!(
+            head.len() < EXTERNAL_TOOL_OUTPUT_ACTIVITY_INLINE_LIMIT,
+            "source-like streamed chunks should not consume the full generic inline limit"
         );
     }
 
@@ -12941,6 +13122,17 @@ Also: {"source": "bare"}"#;
                 )
             })
             .collect()
+    }
+
+    fn large_html_css_source_output() -> String {
+        let mut out = String::from("<style>\n");
+        for i in 0..120 {
+            out.push_str(&format!(
+                "{i}: .generated-card-{i} {{\n  display: grid;\n  grid-template-columns: 1fr auto;\n  color: var(--text);\n  border: 1px solid var(--surface0);\n}}\n"
+            ));
+        }
+        out.push_str("</style>\n<div class=\"generated-card-119\" id=\"tail-marker\"></div>\n");
+        out
     }
 
     #[test]
