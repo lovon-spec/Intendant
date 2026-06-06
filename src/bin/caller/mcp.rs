@@ -1481,6 +1481,7 @@ fn request_loop_halt_marker(loop_dir: &std::path::Path, persistent: bool) -> Res
 fn clear_loop_halt_markers(loop_dir: &std::path::Path) -> Result<(), String> {
     std::fs::remove_file(loop_dir.join("request_halt")).ok();
     std::fs::remove_file(loop_dir.join("request_halt_after_cycle")).ok();
+    std::fs::remove_file(loop_dir.join("request_stop")).ok();
     Ok(())
 }
 
@@ -9620,6 +9621,33 @@ mod tests {
         clear_loop_halt_markers(&loop_dir).expect("clear halt should succeed");
         assert!(!loop_dir.join("request_halt").exists());
         assert!(!loop_dir.join("request_halt_after_cycle").exists());
+    }
+
+    #[test]
+    fn controller_loop_clear_halt_resets_stop_marker_status() {
+        let dir = tempdir().unwrap();
+        let loop_dir = dir.path().join(".intendant/controller-loop");
+        let intervention =
+            request_loop_intervention_marker_for_root(&loop_dir, "stop", u32::MAX).unwrap();
+        assert_eq!(intervention.mode, ControllerLoopInterventionMode::Stop);
+        assert_eq!(
+            collect_controller_loop_status(&loop_dir)
+                .get("flags")
+                .and_then(|v| v.get("stop_requested"))
+                .and_then(|v| v.as_bool()),
+            Some(true)
+        );
+
+        clear_loop_halt_markers(&loop_dir).expect("clear halt should succeed");
+
+        assert!(!loop_dir.join("request_stop").exists());
+        assert_eq!(
+            collect_controller_loop_status(&loop_dir)
+                .get("flags")
+                .and_then(|v| v.get("stop_requested"))
+                .and_then(|v| v.as_bool()),
+            Some(false)
+        );
     }
 
     #[test]
