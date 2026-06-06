@@ -3351,11 +3351,13 @@ struct ExternalContextRewindResume<'a, 'b> {
     side_sessions: Option<&'a mut ExternalSideSessionState<'b>>,
 }
 
+const MAX_CHAINED_CONTEXT_REWIND_RESUMES: usize = 8;
+
 async fn send_external_context_rewind_resume_turn(
     agent: &mut Box<dyn external_agent::ExternalAgent>,
     thread: &external_agent::AgentThread,
     followup: FollowUpMessage,
-    resume: ExternalContextRewindResume<'_, '_>,
+    resume: &mut ExternalContextRewindResume<'_, '_>,
 ) -> Result<DrainOutcome, String> {
     agent
         .send_message(thread, &followup.text)
@@ -3371,9 +3373,72 @@ async fn send_external_context_rewind_resume_turn(
         resume.pending_runtime_steers,
         resume.handled_steer_ids,
         resume.codex_thread_action_dedupe,
-        resume.side_sessions,
+        resume.side_sessions.as_deref_mut(),
     )
     .await)
+}
+
+fn emit_context_rewind_resume_round_complete(
+    resume: &mut ExternalContextRewindResume<'_, '_>,
+    message: Option<String>,
+    turns_in_round: usize,
+) {
+    resume.stats.turns += 1;
+    resume.stats.rounds += 1;
+    resume.config.bus.send(AppEvent::DoneSignal {
+        session_id: resume.config.session_id.clone(),
+        message,
+    });
+    resume.config.bus.send(AppEvent::RoundComplete {
+        session_id: resume.config.session_id.clone(),
+        round: resume.stats.rounds,
+        turns_in_round,
+        native_message_count: None,
+    });
+}
+
+async fn apply_chained_context_rewind_resume_turns(
+    agent: &mut Box<dyn external_agent::ExternalAgent>,
+    thread: &external_agent::AgentThread,
+    initial_request: ExternalContextRewindRequest,
+    resume: &mut ExternalContextRewindResume<'_, '_>,
+) -> Result<Option<DrainOutcome>, (ExternalContextRewindRequest, String)> {
+    let mut request = initial_request;
+    for _ in 0..MAX_CHAINED_CONTEXT_REWIND_RESUMES {
+        let followup =
+            match apply_external_context_rewind(agent, &thread.thread_id, &request, resume.config)
+                .await
+            {
+                Ok(followup) => followup,
+                Err(message) => return Err((request, message)),
+            };
+        let Some(followup) = followup else {
+            return Ok(None);
+        };
+        let outcome =
+            match send_external_context_rewind_resume_turn(agent, thread, followup, resume).await {
+                Ok(outcome) => outcome,
+                Err(message) => return Err((request, message)),
+            };
+        match outcome {
+            DrainOutcome::ContextRewindRequested {
+                request: next_request,
+                message,
+                turns_in_round,
+            } => {
+                emit_context_rewind_resume_round_complete(resume, message, turns_in_round);
+                request = next_request;
+            }
+            other => return Ok(Some(other)),
+        }
+    }
+    Err((
+        request,
+        format!(
+            "too many consecutive context rewinds in a single resumed turn chain (limit {})",
+            MAX_CHAINED_CONTEXT_REWIND_RESUMES
+        ),
+    ))
 }
 
 struct ExternalSideSessionState<'a> {
@@ -14737,22 +14802,22 @@ async fn run_with_presence(
                                     side_rounds: &mut persistent_side_rounds,
                                     side_turn_revisions: &mut persistent_side_turn_revisions,
                                 };
+                                let mut resume = ExternalContextRewindResume {
+                                    event_rx,
+                                    turn_bus_rx: &mut turn_bus_rx,
+                                    config: &drain_config,
+                                    stats: &mut cumulative_stats,
+                                    diff_tracker: &mut persistent_diff_tracker,
+                                    pending_runtime_steers: &mut persistent_pending_runtime_steers,
+                                    handled_steer_ids: &mut persistent_handled_steer_ids,
+                                    codex_thread_action_dedupe: &mut codex_thread_action_dedupe,
+                                    side_sessions: Some(&mut side_session_state),
+                                };
                                 match send_external_context_rewind_resume_turn(
                                     agent,
                                     thread,
                                     followup,
-                                    ExternalContextRewindResume {
-                                        event_rx,
-                                        turn_bus_rx: &mut turn_bus_rx,
-                                        config: &drain_config,
-                                        stats: &mut cumulative_stats,
-                                        diff_tracker: &mut persistent_diff_tracker,
-                                        pending_runtime_steers:
-                                            &mut persistent_pending_runtime_steers,
-                                        handled_steer_ids: &mut persistent_handled_steer_ids,
-                                        codex_thread_action_dedupe: &mut codex_thread_action_dedupe,
-                                        side_sessions: Some(&mut side_session_state),
-                                    },
+                                    &mut resume,
                                 )
                                 .await
                                 {
@@ -14776,12 +14841,116 @@ async fn run_with_presence(
                                     Ok(DrainOutcome::ContextRewindRequested {
                                         request, ..
                                     }) => {
-                                        emit_context_rewind_failure(
-                                            &request,
-                                            "nested context rewind during resumed turn is not supported yet"
-                                                .to_string(),
-                                            &drain_config,
-                                        );
+                                        match apply_chained_context_rewind_resume_turns(
+                                            agent,
+                                            thread,
+                                            request,
+                                            &mut resume,
+                                        )
+                                        .await
+                                        {
+                                            Ok(Some(DrainOutcome::TurnCompleted {
+                                                message,
+                                                turns_in_round,
+                                            })) => {
+                                                cumulative_stats.turns += 1;
+                                                cumulative_stats.rounds += 1;
+                                                bus.send(AppEvent::DoneSignal {
+                                                    session_id: session_log_id(&session_log),
+                                                    message: message.clone(),
+                                                });
+                                                bus.send(AppEvent::RoundComplete {
+                                                    session_id: session_log_id(&session_log),
+                                                    round: cumulative_stats.rounds,
+                                                    turns_in_round,
+                                                    native_message_count: None,
+                                                });
+                                            }
+                                            Ok(Some(DrainOutcome::RecoveryRequired {
+                                                message,
+                                                recovery_hint,
+                                                turns_in_round,
+                                            })) => {
+                                                cumulative_stats.rounds += 1;
+                                                bus.send(AppEvent::RoundComplete {
+                                                    session_id: session_log_id(&session_log),
+                                                    round: cumulative_stats.rounds,
+                                                    turns_in_round,
+                                                    native_message_count: None,
+                                                });
+                                                bus.send(AppEvent::PresenceLog {
+                                                    message: recovery_required_message(
+                                                        &message,
+                                                        recovery_hint.as_deref(),
+                                                    ),
+                                                    level: Some(types::LogLevel::Warn),
+                                                    turn: None,
+                                                });
+                                            }
+                                            Ok(Some(DrainOutcome::Interrupted { reason })) => {
+                                                bus.send(AppEvent::PresenceLog {
+                                                    message: format!(
+                                                        "External agent interrupted during resumed context-rewind turn: {}",
+                                                        reason
+                                                    ),
+                                                    level: None,
+                                                    turn: None,
+                                                });
+                                            }
+                                            Ok(Some(DrainOutcome::Terminated {
+                                                reason, ..
+                                            })) => {
+                                                bus.send(AppEvent::PresenceLog {
+                                                    message: format!(
+                                                        "External agent terminated: {}",
+                                                        reason
+                                                    ),
+                                                    level: Some(types::LogLevel::Error),
+                                                    turn: None,
+                                                });
+                                                persistent_agent = None;
+                                                persistent_thread = None;
+                                                persistent_event_rx = None;
+                                                persistent_diff_tracker =
+                                                    ExternalDiffDeltaTracker::default();
+                                                persistent_pending_runtime_steers.clear();
+                                                persistent_handled_steer_ids.clear();
+                                                persistent_open_side_threads.clear();
+                                                persistent_side_rounds.clear();
+                                                persistent_side_turn_revisions.clear();
+                                            }
+                                            Ok(Some(DrainOutcome::ChannelClosed)) => {
+                                                persistent_agent = None;
+                                                persistent_thread = None;
+                                                persistent_event_rx = None;
+                                                persistent_diff_tracker =
+                                                    ExternalDiffDeltaTracker::default();
+                                                persistent_pending_runtime_steers.clear();
+                                                persistent_handled_steer_ids.clear();
+                                                persistent_open_side_threads.clear();
+                                                persistent_side_rounds.clear();
+                                                persistent_side_turn_revisions.clear();
+                                            }
+                                            Ok(Some(DrainOutcome::ContextRewindRequested {
+                                                request,
+                                                ..
+                                            })) => {
+                                                emit_context_rewind_failure(
+                                                    &request,
+                                                    "chained context rewind returned an unexpected pending rewind"
+                                                        .to_string(),
+                                                    &drain_config,
+                                                );
+                                            }
+                                            Ok(None) => {}
+                                            Err((request, message)) => {
+                                                emit_context_rewind_failure(
+                                                    &request,
+                                                    message,
+                                                    &drain_config,
+                                                );
+                                            }
+                                        }
                                     }
                                     Ok(DrainOutcome::RecoveryRequired {
                                         message,
@@ -15690,21 +15859,22 @@ async fn run_with_presence(
                                 side_rounds: &mut persistent_side_rounds,
                                 side_turn_revisions: &mut persistent_side_turn_revisions,
                             };
+                            let mut resume = ExternalContextRewindResume {
+                                event_rx,
+                                turn_bus_rx: &mut turn_bus_rx,
+                                config: &drain_config,
+                                stats: &mut cumulative_stats,
+                                diff_tracker: &mut persistent_diff_tracker,
+                                pending_runtime_steers: &mut persistent_pending_runtime_steers,
+                                handled_steer_ids: &mut persistent_handled_steer_ids,
+                                codex_thread_action_dedupe: &mut codex_thread_action_dedupe,
+                                side_sessions: Some(&mut resume_side_state),
+                            };
                             match send_external_context_rewind_resume_turn(
                                 agent,
                                 thread,
                                 followup,
-                                ExternalContextRewindResume {
-                                    event_rx,
-                                    turn_bus_rx: &mut turn_bus_rx,
-                                    config: &drain_config,
-                                    stats: &mut cumulative_stats,
-                                    diff_tracker: &mut persistent_diff_tracker,
-                                    pending_runtime_steers: &mut persistent_pending_runtime_steers,
-                                    handled_steer_ids: &mut persistent_handled_steer_ids,
-                                    codex_thread_action_dedupe: &mut codex_thread_action_dedupe,
-                                    side_sessions: Some(&mut resume_side_state),
-                                },
+                                &mut resume,
                             )
                             .await
                             {
@@ -15726,12 +15896,115 @@ async fn run_with_presence(
                                     });
                                 }
                                 Ok(DrainOutcome::ContextRewindRequested { request, .. }) => {
-                                    emit_context_rewind_failure(
-                                        &request,
-                                        "nested context rewind during resumed turn is not supported yet"
-                                            .to_string(),
-                                        &drain_config,
-                                    );
+                                    match apply_chained_context_rewind_resume_turns(
+                                        agent,
+                                        thread,
+                                        request,
+                                        &mut resume,
+                                    )
+                                    .await
+                                    {
+                                        Ok(Some(DrainOutcome::TurnCompleted {
+                                            message,
+                                            turns_in_round,
+                                        })) => {
+                                            cumulative_stats.turns += 1;
+                                            cumulative_stats.rounds += 1;
+                                            bus.send(AppEvent::DoneSignal {
+                                                session_id: session_log_id(&session_log),
+                                                message: message.clone(),
+                                            });
+                                            bus.send(AppEvent::RoundComplete {
+                                                session_id: session_log_id(&session_log),
+                                                round: cumulative_stats.rounds,
+                                                turns_in_round,
+                                                native_message_count: None,
+                                            });
+                                        }
+                                        Ok(Some(DrainOutcome::RecoveryRequired {
+                                            message,
+                                            recovery_hint,
+                                            turns_in_round,
+                                        })) => {
+                                            cumulative_stats.rounds += 1;
+                                            bus.send(AppEvent::RoundComplete {
+                                                session_id: session_log_id(&session_log),
+                                                round: cumulative_stats.rounds,
+                                                turns_in_round,
+                                                native_message_count: None,
+                                            });
+                                            bus.send(AppEvent::PresenceLog {
+                                                message: recovery_required_message(
+                                                    &message,
+                                                    recovery_hint.as_deref(),
+                                                ),
+                                                level: Some(types::LogLevel::Warn),
+                                                turn: None,
+                                            });
+                                        }
+                                        Ok(Some(DrainOutcome::Interrupted { reason })) => {
+                                            bus.send(AppEvent::PresenceLog {
+                                                message: format!(
+                                                    "External agent interrupted during resumed context-rewind turn: {}",
+                                                    reason
+                                                ),
+                                                level: None,
+                                                turn: None,
+                                            });
+                                            cumulative_stats.rounds += 1;
+                                        }
+                                        Ok(Some(DrainOutcome::Terminated { reason, .. })) => {
+                                            bus.send(AppEvent::PresenceLog {
+                                                message: format!(
+                                                    "External agent terminated: {}",
+                                                    reason
+                                                ),
+                                                level: Some(types::LogLevel::Error),
+                                                turn: None,
+                                            });
+                                            persistent_agent = None;
+                                            persistent_thread = None;
+                                            persistent_event_rx = None;
+                                            persistent_diff_tracker =
+                                                ExternalDiffDeltaTracker::default();
+                                            persistent_pending_runtime_steers.clear();
+                                            persistent_handled_steer_ids.clear();
+                                            persistent_open_side_threads.clear();
+                                            persistent_side_rounds.clear();
+                                            persistent_side_turn_revisions.clear();
+                                        }
+                                        Ok(Some(DrainOutcome::ChannelClosed)) => {
+                                            persistent_agent = None;
+                                            persistent_thread = None;
+                                            persistent_event_rx = None;
+                                            persistent_diff_tracker =
+                                                ExternalDiffDeltaTracker::default();
+                                            persistent_pending_runtime_steers.clear();
+                                            persistent_handled_steer_ids.clear();
+                                            persistent_open_side_threads.clear();
+                                            persistent_side_rounds.clear();
+                                            persistent_side_turn_revisions.clear();
+                                        }
+                                        Ok(Some(DrainOutcome::ContextRewindRequested {
+                                            request,
+                                            ..
+                                        })) => {
+                                            emit_context_rewind_failure(
+                                                &request,
+                                                "chained context rewind returned an unexpected pending rewind"
+                                                    .to_string(),
+                                                &drain_config,
+                                            );
+                                        }
+                                        Ok(None) => {}
+                                        Err((request, message)) => {
+                                            emit_context_rewind_failure(
+                                                &request,
+                                                message,
+                                                &drain_config,
+                                            );
+                                        }
+                                    }
                                 }
                                 Ok(DrainOutcome::RecoveryRequired {
                                     message,
