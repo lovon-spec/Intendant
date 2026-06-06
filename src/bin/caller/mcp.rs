@@ -717,6 +717,24 @@ impl McpAppState {
         Some((used_tokens, rewind_only_limit, status))
     }
 
+    fn rewind_anchor_recovery_candidates_only_for(
+        &self,
+        session_id: Option<&str>,
+        requested: Option<bool>,
+        include_non_recovery: bool,
+    ) -> bool {
+        let requested = requested.unwrap_or(true);
+        if include_non_recovery {
+            return requested;
+        }
+        if self.active_codex_managed_context_enabled_for(session_id, None)
+            && self.context_pressure_rewind_only_for(session_id).is_some()
+        {
+            return true;
+        }
+        requested
+    }
+
     fn rewind_only_gate_message(&self, tool_name: &str) -> Option<String> {
         self.rewind_only_gate_message_for(tool_name, None, None)
     }
@@ -5429,13 +5447,19 @@ impl IntendantServer {
     }
 
     #[tool(
-        description = "List valid exact Codex rewind anchors for the current managed session. Supports pagination and query so the model can choose any valid non-management anchor from the rollout, from start to finish. The default catalog hides managed-context maintenance calls such as list_rewind_anchors, inspect_rewind_anchor, rewind_context, and rewind_backout so recovery does not target its own tool calls; pass include_management_tools=true only when intentionally targeting those internals. During rewind-only recovery, Intendant defaults recovery_candidates_only=true, hiding anchors known to remain at/above the rewind-only limit unless include_non_recovery=true. Use inspect_rewind_anchor on a candidate when the compact summary is ambiguous, then copy the chosen item_id into rewind_context."
+        description = "List valid exact Codex rewind anchors for the current managed session. Supports pagination and query so the model can choose any valid non-management anchor from the rollout, from start to finish. The default catalog hides managed-context maintenance calls such as list_rewind_anchors, inspect_rewind_anchor, rewind_context, and rewind_backout so recovery does not target its own tool calls; pass include_management_tools=true only when intentionally targeting those internals. During rewind-only recovery, Intendant forces recovery_candidates_only=true, hiding anchors known to remain at/above the rewind-only limit unless include_non_recovery=true is explicitly set for audit. Use inspect_rewind_anchor on a candidate when the compact summary is ambiguous, then copy the chosen item_id into rewind_context."
     )]
     async fn list_rewind_anchors(
         &self,
         Parameters(params): Parameters<ListRewindAnchorsParams>,
     ) -> String {
-        let recovery_candidates_only = params.recovery_candidates_only.unwrap_or(true);
+        let state = self.state.read().await;
+        let recovery_candidates_only = state.rewind_anchor_recovery_candidates_only_for(
+            params.session_id.as_deref(),
+            params.recovery_candidates_only,
+            params.include_non_recovery,
+        );
+        drop(state);
         let mut payload = serde_json::json!({
             "offset": params.offset.unwrap_or(0),
             "limit": params.limit.unwrap_or(100),
@@ -7413,6 +7437,62 @@ mod tests {
             let pressure = s.context_pressure_snapshot();
             assert_eq!(pressure["rewind_only"], true);
             assert_eq!(pressure["managed_context"], "managed");
+        });
+    }
+
+    #[test]
+    fn rewind_anchor_catalog_forces_recovery_filter_under_managed_pressure() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let state = test_state();
+            let mut s = state.write().await;
+            s.active_session_source = Some("codex".to_string());
+            s.codex_managed_context = true;
+            s.apply_main_usage_snapshot(frontend::ModelUsageSnapshot {
+                provider: "openai".to_string(),
+                model: "gpt-5.2-codex".to_string(),
+                tokens_used: 100_001,
+                context_window: 100_000,
+                hard_context_window: Some(120_000),
+                usage_pct: 100.0,
+                prompt_tokens: 100_001,
+                completion_tokens: 0,
+                cached_tokens: 0,
+            });
+
+            assert!(s.rewind_anchor_recovery_candidates_only_for(None, Some(false), false));
+            assert!(!s.rewind_anchor_recovery_candidates_only_for(None, Some(false), true));
+        });
+    }
+
+    #[test]
+    fn rewind_anchor_catalog_honors_requested_filter_outside_rewind_only_pressure() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let state = test_state();
+            let mut s = state.write().await;
+            s.active_session_source = Some("codex".to_string());
+            s.codex_managed_context = true;
+            s.apply_main_usage_snapshot(frontend::ModelUsageSnapshot {
+                provider: "openai".to_string(),
+                model: "gpt-5.2-codex".to_string(),
+                tokens_used: 99_999,
+                context_window: 100_000,
+                hard_context_window: Some(120_000),
+                usage_pct: 99.9,
+                prompt_tokens: 99_999,
+                completion_tokens: 0,
+                cached_tokens: 0,
+            });
+
+            assert!(!s.rewind_anchor_recovery_candidates_only_for(None, Some(false), false));
+            assert!(s.rewind_anchor_recovery_candidates_only_for(None, None, false));
         });
     }
 
