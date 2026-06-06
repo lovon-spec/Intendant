@@ -10893,9 +10893,11 @@ function stationLogEntryEvent(entry, index, options = {}) {
     id: eventId,
     action: 'log',
     hostId,
+    sessionId,
     agentId: hostId === selfPeerId ? 'primary-agent' : 'peer-' + sanitizeStationId(hostId),
     ts,
     level,
+    source,
     msg: msg || source || level,
     editable: !!editButton,
     historical: editButton?.dataset?.historical === 'true',
@@ -10947,9 +10949,11 @@ function stationSessionWindowHistoryEvent(item, win, index) {
     id: eventId,
     action: 'log',
     hostId,
+    sessionId,
     agentId: hostId === selfPeerId ? 'primary-agent' : 'peer-' + sanitizeStationId(hostId),
     ts: formatLogTimestampLabel(record.ts || record.timestamp || ''),
     level: record.level || 'info',
+    source,
     msg: msg || source,
   };
 }
@@ -11075,6 +11079,8 @@ let stationSessionDeepDraft = {
 let stationWorktreeDockFilter = '';
 let stationActivityDockFilter = '';
 let stationActivityDockHost = activeHostFilter || '';
+let stationActivityDockLevel = '';
+let stationActivityDockSource = '';
 let stationCommandQuery = '';
 let stationHumanDraft = '';
 let stationSelectedContextPart = '';
@@ -12655,6 +12661,36 @@ function stationActivityHostOptions() {
   return options;
 }
 
+function stationActivityLevelFor(ev) {
+  return String(ev?.level || 'info').trim().toLowerCase() || 'info';
+}
+
+function stationActivitySourceFor(ev) {
+  return compactSessionText(ev?.source || ev?.event || ev?.level || 'info') || 'info';
+}
+
+function stationActivityCountOptions(events, accessor, allLabel) {
+  const counts = new Map();
+  for (const ev of events || []) {
+    const value = String(accessor(ev) || '').trim();
+    if (!value) continue;
+    counts.set(value, (counts.get(value) || 0) + 1);
+  }
+  return [[ '', allLabel ]].concat(
+    [...counts.entries()]
+      .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+      .slice(0, 18)
+      .map(([value, count]) => [value, `${value} (${count})`])
+  );
+}
+
+function stationActivityTopSummary(events, accessor) {
+  return stationActivityCountOptions(events, accessor, '')
+    .slice(1, 6)
+    .map(([, label]) => label)
+    .join(' / ') || '--';
+}
+
 function stationActivityLogEntryForEventId(eventId) {
   const id = String(eventId || '').trim();
   if (!id) return null;
@@ -12723,14 +12759,28 @@ function stationApplyActivityHostFilter(hostId) {
   applyHostFilter();
 }
 
+function stationActivityEventIsManaged(ev) {
+  return /\b(managed|context|rewind|backout|anchor|lineage|fission)\b/i
+    .test([ev?.source, ev?.msg, ev?.level].filter(Boolean).join(' '));
+}
+
+function stationOpenManagedFromActivity(ev) {
+  if (ev?.sessionId) stationSetManagedSession(ev.sessionId);
+  stationRenderManagedDock(/\b(backout|record)\b/i.test(ev?.msg || ev?.source || '') ? 'backout' : '');
+}
+
 function stationRenderActivityDock(focusId = '') {
   const allEvents = stationLastSnapshotForFallback().events || [];
   const hostFilter = String(stationActivityDockHost || activeHostFilter || '').trim();
+  const levelFilter = String(stationActivityDockLevel || '').trim();
+  const sourceFilter = String(stationActivityDockSource || '').trim();
   const query = stationActivityDockFilter.trim().toLowerCase();
   const events = allEvents.filter(ev => {
     if (hostFilter && String(ev.hostId || ev.host_id || '') !== hostFilter) return false;
+    if (levelFilter && stationActivityLevelFor(ev) !== levelFilter) return false;
+    if (sourceFilter && stationActivitySourceFor(ev) !== sourceFilter) return false;
     if (!query) return true;
-    return [ev.id, ev.hostId, ev.host_id, ev.level, ev.ts, ev.msg]
+    return [ev.id, ev.hostId, ev.host_id, ev.sessionId, ev.source, ev.level, ev.ts, ev.msg]
       .join(' ')
       .toLowerCase()
       .includes(query);
@@ -12749,18 +12799,32 @@ function stationRenderActivityDock(focusId = '') {
     stationApplyActivityHostFilter(ev.target.value);
     stationRenderActivityDock(focusId);
   });
+  const levelSelect = stationDockSelect(controls, 'Level', levelFilter, stationActivityCountOptions(allEvents, stationActivityLevelFor, 'All levels'), { id: 'station-activity-level' });
+  levelSelect.addEventListener('change', ev => {
+    stationActivityDockLevel = ev.target.value;
+    stationRenderActivityDock(focusId);
+  });
+  const sourceSelect = stationDockSelect(controls, 'Source', sourceFilter, stationActivityCountOptions(allEvents, stationActivitySourceFor, 'All sources'), { id: 'station-activity-source' });
+  sourceSelect.addEventListener('change', ev => {
+    stationActivityDockSource = ev.target.value;
+    stationRenderActivityDock(focusId);
+  });
   stationDockRow(controls, 'verbosity', document.getElementById('verbosity-select')?.value || 'normal');
   stationDockActions(controls, [
     { label: 'Normal', onClick: () => stationSetActivityVerbosity('normal') },
     { label: 'Verbose', onClick: () => stationSetActivityVerbosity('verbose') },
     { label: 'Debug', onClick: () => stationSetActivityVerbosity('debug') },
     { label: 'All hosts', onClick: () => { stationClearActivityHostFilter(); stationActivityDockHost = ''; stationRenderActivityDock(focusId); } },
-    { label: 'Clear filter', onClick: () => { stationActivityDockFilter = ''; stationRenderActivityDock(focusId); } },
+    { label: 'Clear triage', onClick: () => { stationActivityDockFilter = ''; stationActivityDockLevel = ''; stationActivityDockSource = ''; stationRenderActivityDock(focusId); } },
     { label: 'Copy visible', onClick: () => stationCopyActivityEvents(events) },
     { label: 'Bottom', onClick: () => { document.getElementById('scroll-bottom')?.click(); stationRenderActivityDock(events.at(-1)?.id || focusId); } },
     { label: 'Clear log', danger: true, onClick: () => stationClearActivityLog() },
     stationDockRouteAction('Route log tab', 'activity', 'log', () => document.getElementById('scroll-bottom')?.click()),
   ]);
+  const triage = stationDockSection(body, 'Triage');
+  stationDockRow(triage, 'levels', stationActivityTopSummary(events, stationActivityLevelFor));
+  stationDockRow(triage, 'sources', stationActivityTopSummary(events, stationActivitySourceFor));
+  stationDockRow(triage, 'host', hostFilter || 'all');
   const list = stationDockSection(body, 'Recent events');
   if (!events.length) {
     stationDockEmpty(list, allEvents.length ? 'No events match the Station filters.' : 'Waiting for dashboard events.');
@@ -12769,12 +12833,14 @@ function stationRenderActivityDock(focusId = '') {
   for (const ev of events.slice(-14).reverse()) {
     stationDockCard(list, {
       title: `${ev.ts || '--'}  ${ev.level || 'info'}`,
-      meta: ev.hostId || ev.host_id || selfPeerId || 'local',
+      meta: [ev.hostId || ev.host_id || selfPeerId || 'local', stationActivitySourceFor(ev), ev.sessionId || ''].filter(Boolean).join(' / '),
       detail: ev.msg || '',
       active: focusId && ev.id === focusId,
       actions: [
         ev.id ? { label: 'Pin', onClick: () => stationRenderActivityDock(ev.id) } : null,
         ev.id ? { label: 'Show', primary: true, onClick: () => focusActivityLogEvent(ev.id) } : null,
+        ev.sessionId ? { label: 'Session', onClick: () => stationRenderSessionsDock(ev.sessionId) } : null,
+        stationActivityEventIsManaged(ev) ? { label: 'Managed', onClick: () => stationOpenManagedFromActivity(ev) } : null,
         ev.editable ? { label: ev.historical ? 'Branch' : 'Edit', onClick: () => stationEditActivityEvent(ev.id) } : null,
         { label: 'Copy text', onClick: () => copyTextToClipboard(stationActivityEventCopyText(ev)) },
         ev.id ? { label: 'Copy id', onClick: () => copyTextToClipboard(ev.id) } : null,
@@ -16652,9 +16718,11 @@ function stationPushLogEvent(c) {
     id: eventId,
     action: 'log',
     hostId,
+    sessionId: c.session_id || c.sessionId || '',
     agentId: hostId === selfPeerId ? 'primary-agent' : 'peer-' + sanitizeStationId(hostId),
     ts: (c.ts || new Date().toTimeString()).substring(0, 8),
     level: c.level || 'info',
+    source: c.source || c.event || c.level || 'info',
     msg: c.content || c.source || c.event || '',
   });
   if (stationLogEvents.length > 180) stationLogEvents.splice(0, stationLogEvents.length - 180);
