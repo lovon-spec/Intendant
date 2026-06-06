@@ -3927,6 +3927,8 @@ struct CodexNotificationState {
 }
 
 const CODEX_WARNING_DIAGNOSTIC_INLINE_LIMIT: usize = 3;
+const CODEX_COMMAND_PREVIEW_LIMIT: usize = 700;
+const CODEX_COMMAND_OUTPUT_LINE_LIMIT: usize = 1200;
 
 #[derive(Default)]
 struct CodexCommandOutputHygiene {
@@ -3990,7 +3992,7 @@ impl CodexCommandOutputHygiene {
                 return;
             }
             self.suppressing_warning_diagnostic = false;
-            out.push_str(line);
+            push_compact_codex_output_line(out, line);
             return;
         }
 
@@ -4004,8 +4006,71 @@ impl CodexCommandOutputHygiene {
             self.suppressing_warning_diagnostic = false;
         }
 
-        out.push_str(line);
+        push_compact_codex_output_line(out, line);
     }
+}
+
+fn compact_codex_command_preview(command: &str) -> String {
+    let compact = command.split_whitespace().collect::<Vec<_>>().join(" ");
+    truncate_middle_chars_with_notice(
+        &compact,
+        CODEX_COMMAND_PREVIEW_LIMIT,
+        "long command preview",
+    )
+}
+
+fn push_compact_codex_output_line(out: &mut String, line: &str) {
+    out.push_str(&compact_codex_output_line(line));
+}
+
+fn compact_codex_output_line(line: &str) -> String {
+    let (body, ending) = if let Some(body) = line.strip_suffix("\r\n") {
+        (body, "\r\n")
+    } else if let Some(body) = line.strip_suffix('\n') {
+        (body, "\n")
+    } else {
+        (line, "")
+    };
+    let compact = truncate_middle_chars_with_notice(
+        body,
+        CODEX_COMMAND_OUTPUT_LINE_LIMIT,
+        "long command-output line",
+    );
+    if ending.is_empty() {
+        compact
+    } else {
+        format!("{compact}{ending}")
+    }
+}
+
+fn truncate_middle_chars_with_notice(text: &str, max_chars: usize, label: &str) -> String {
+    let total = text.chars().count();
+    if total <= max_chars {
+        return text.to_string();
+    }
+
+    let mut omitted = total.saturating_sub(max_chars);
+    let mut marker = String::new();
+    let mut head = 0;
+    let mut tail = 0;
+    for _ in 0..4 {
+        marker = format!(" ...[Intendant truncated {label}; {omitted} chars omitted]... ");
+        let available = max_chars.saturating_sub(marker.chars().count());
+        if available == 0 {
+            return text.chars().take(max_chars).collect();
+        }
+        head = available.saturating_mul(3) / 5;
+        tail = available.saturating_sub(head);
+        let next_omitted = total.saturating_sub(head + tail);
+        if next_omitted == omitted {
+            break;
+        }
+        omitted = next_omitted;
+    }
+
+    let prefix: String = text.chars().take(head).collect();
+    let suffix: String = text.chars().skip(total.saturating_sub(tail)).collect();
+    format!("{prefix}{marker}{suffix}")
 }
 
 fn codex_command_output_hygiene_key(item_id: &str) -> String {
@@ -4312,7 +4377,7 @@ fn translate_notification_with_scope(
                         AgentEvent::ToolStarted {
                             item_id,
                             tool_name: "command".to_string(),
-                            preview: command,
+                            preview: compact_codex_command_preview(&command),
                         },
                     );
                 }
@@ -6520,6 +6585,30 @@ mod tests {
     }
 
     #[test]
+    fn translate_item_started_command_compacts_long_preview() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let command = format!(
+            "node scripts/validate-dashboard.cjs --wait-for-function '{}' --selector .target-button",
+            "document.body && ".repeat(120)
+        );
+        let params = serde_json::json!({
+            "itemId": "item-1",
+            "item": {"type": "commandExecution", "command": command}
+        });
+        translate_notification("item/started", &params, &tx);
+        let event = rx.try_recv().unwrap();
+        match event {
+            AgentEvent::ToolStarted { preview, .. } => {
+                assert!(preview.contains("node scripts/validate-dashboard.cjs"));
+                assert!(preview.contains(".target-button"));
+                assert!(preview.contains("truncated long command preview"));
+                assert!(preview.chars().count() <= CODEX_COMMAND_PREVIEW_LIMIT);
+            }
+            other => panic!("expected ToolStarted, got {:?}", other),
+        }
+    }
+
+    #[test]
     fn translate_item_started_collab_spawn_agent() {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let params = serde_json::json!({
@@ -6896,6 +6985,22 @@ error: could not compile `demo`
         assert!(!filtered.contains("warning: unused variable: `e`"));
         assert!(filtered.contains("suppressed additional repeated warning diagnostics"));
         assert!(filtered.contains("error: could not compile `demo`"));
+    }
+
+    #[test]
+    fn codex_command_output_hygiene_truncates_long_lines() {
+        let mut hygiene = CodexCommandOutputHygiene::default();
+        let input = format!(
+            "chromium --type=renderer --headless=new {} --last-important-flag\n",
+            "--very-long-arg=".repeat(300)
+        );
+
+        let filtered = hygiene.filter(&input, true).unwrap();
+
+        assert!(filtered.contains("chromium --type=renderer"));
+        assert!(filtered.contains("--last-important-flag"));
+        assert!(filtered.contains("truncated long command-output line"));
+        assert!(filtered.chars().count() <= CODEX_COMMAND_OUTPUT_LINE_LIMIT + 1);
     }
 
     #[test]
