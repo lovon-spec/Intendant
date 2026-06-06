@@ -1419,20 +1419,20 @@ struct ExternalContextSnapshotState {
     last_error: Option<String>,
 }
 
-#[derive(Default)]
+#[derive(Debug, Clone, Default)]
 struct ExternalToolOutputLimiter {
     items: std::collections::HashMap<String, ExternalToolOutputState>,
     total_emitted_bytes: usize,
     total_truncated: bool,
 }
 
-#[derive(Default)]
+#[derive(Debug, Clone, Default)]
 struct ExternalToolOutputState {
     emitted_bytes: usize,
     truncated: bool,
 }
 
-#[derive(Default)]
+#[derive(Debug, Clone, Default)]
 struct ExternalToolFailureLogLimiter {
     counts: std::collections::HashMap<String, usize>,
 }
@@ -5911,7 +5911,10 @@ fn handle_idle_codex_subagent_event(
             });
         }
         external_agent::AgentEvent::ToolOutputDelta { item_id, text } => {
-            let mut tool_output_limiter = ExternalToolOutputLimiter::default();
+            let tool_output_limiter = stats
+                .codex_subagent_tool_output_limiters
+                .entry(child_thread_id.clone())
+                .or_default();
             let Some(stdout) = tool_output_limiter.filter(&item_id, text) else {
                 return;
             };
@@ -5934,8 +5937,21 @@ fn handle_idle_codex_subagent_event(
             });
         }
         external_agent::AgentEvent::ToolCompleted { item_id, status } => {
+            if let Some(limiter) = stats
+                .codex_subagent_tool_output_limiters
+                .get_mut(&child_thread_id)
+            {
+                limiter.complete(&item_id);
+            }
             if let external_agent::ToolCompletionStatus::Failed { message } = status {
                 let content = external_tool_failure_content(&item_id, &message, None);
+                let limiter = stats
+                    .codex_subagent_tool_failure_limiters
+                    .entry(child_thread_id.clone())
+                    .or_default();
+                let Some(content) = limiter.filter(content) else {
+                    return;
+                };
                 config.bus.send(AppEvent::LogEntry {
                     session_id,
                     level: "warn".to_string(),
@@ -5946,6 +5962,12 @@ fn handle_idle_codex_subagent_event(
             }
         }
         external_agent::AgentEvent::TurnCompleted { message } => {
+            stats
+                .codex_subagent_tool_output_limiters
+                .remove(&child_thread_id);
+            stats
+                .codex_subagent_tool_failure_limiters
+                .remove(&child_thread_id);
             emit_child_turn_complete_for_session(config.bus, session_id, "subagent", message);
         }
         external_agent::AgentEvent::SubAgentToolCall {
@@ -7670,6 +7692,10 @@ struct LoopStats {
     codex_subagent_rounds: std::collections::HashMap<String, usize>,
     codex_subagent_terminal_sessions: std::collections::HashSet<String>,
     codex_subagent_transcript_offsets: std::collections::HashMap<String, usize>,
+    codex_subagent_tool_output_limiters:
+        std::collections::HashMap<String, ExternalToolOutputLimiter>,
+    codex_subagent_tool_failure_limiters:
+        std::collections::HashMap<String, ExternalToolFailureLogLimiter>,
     /// Last model response content (for sub-agent result summaries).
     last_response: Option<String>,
 }
@@ -9490,6 +9516,73 @@ mod tests {
             }
             other => panic!("expected child completion LogEntry, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn idle_codex_subagent_tool_output_is_capped_across_deltas() {
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        let session_log: SharedSessionLog = Arc::new(Mutex::new(
+            session_log::SessionLog::open(log_dir.clone()).unwrap(),
+        ));
+        let approval_registry: event::ApprovalRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let context_injection: event::ContextInjectionQueue = Arc::new(Mutex::new(Vec::new()));
+        let autonomy = autonomy::shared_autonomy(AutonomyState::default());
+        let config = DrainConfig {
+            bus: &bus,
+            web_port: None,
+            session_id: Some("parent-thread".to_string()),
+            alias_session_id: None,
+            autonomy,
+            session_log: &session_log,
+            project_root: dir.path(),
+            log_dir: &log_dir,
+            approval_registry: &approval_registry,
+            json_approval: None,
+            agent_source: Some("Codex".to_string()),
+            suppress_agent_started: false,
+            persist_model_responses_inline: true,
+            headless: true,
+            context_injection: &context_injection,
+        };
+        let mut stats = LoopStats::default();
+
+        handle_idle_codex_subagent_event(
+            &config,
+            &mut stats,
+            "child-thread".to_string(),
+            external_agent::AgentEvent::ToolOutputDelta {
+                item_id: "call-1".to_string(),
+                text: "a".repeat(EXTERNAL_TOOL_OUTPUT_ACTIVITY_LIMIT + 10),
+            },
+        );
+
+        match rx.try_recv().expect("first capped output") {
+            AppEvent::AgentOutput {
+                session_id, stdout, ..
+            } => {
+                assert_eq!(session_id.as_deref(), Some("child-thread"));
+                assert!(stdout.contains("output truncated by Intendant"));
+            }
+            other => panic!("expected child AgentOutput, got {:?}", other),
+        }
+
+        handle_idle_codex_subagent_event(
+            &config,
+            &mut stats,
+            "child-thread".to_string(),
+            external_agent::AgentEvent::ToolOutputDelta {
+                item_id: "call-1".to_string(),
+                text: "more".to_string(),
+            },
+        );
+
+        assert!(
+            rx.try_recv().is_err(),
+            "second delta after per-tool cap should be suppressed"
+        );
     }
 
     #[test]
