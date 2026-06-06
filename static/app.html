@@ -12971,7 +12971,10 @@ function stationRenderContextDock(focusId = stationSelectedContextPart) {
   if (!ctx.topItems.length) {
     stationDockEmpty(items, 'No item details in this snapshot.');
   } else {
+    const snapshot = stationSnapshotForContext();
+    const needsExact = snapshot && typeof contextSnapshotNeedsExact === 'function' && contextSnapshotNeedsExact(snapshot);
     for (const item of ctx.topItems) {
+      const part = item.id ? stationSelectedContextPartDetail(item.id) : null;
       stationDockCard(items, {
         title: item.label || item.id || 'context item',
         meta: item.value || '',
@@ -12979,7 +12982,9 @@ function stationRenderContextDock(focusId = stationSelectedContextPart) {
         active: focusId && item.id === focusId,
         actions: [
           item.id ? { label: 'Focus', primary: true, onClick: () => { stationApplyContextAction('part', item.id); stationRenderContextDock(item.id); } } : null,
+          part ? { label: 'Copy text', onClick: () => stationCopyContextPart(part) } : null,
           item.id ? { label: 'Copy id', onClick: () => copyTextToClipboard(item.id) } : null,
+          item.id && needsExact ? { label: 'Load exact', onClick: async () => stationLoadExactContextSnapshot(item.id) } : null,
         ],
       });
     }
