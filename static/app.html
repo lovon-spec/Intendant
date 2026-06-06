@@ -11692,6 +11692,54 @@ function stationActivityHostOptions() {
   return options;
 }
 
+function stationActivityLogEntryForEventId(eventId) {
+  const id = String(eventId || '').trim();
+  if (!id) return null;
+  const escaped = stationCssEscape(id);
+  return document.querySelector(`.log-entry[data-station-event-id="${escaped}"]`) ||
+    document.querySelector(`.log-entry[data-item-id="${escaped}"]`);
+}
+
+function stationActivityEventCopyText(ev) {
+  const entry = stationActivityLogEntryForEventId(ev?.id || '');
+  if (entry && typeof getLogEntryCopyText === 'function') {
+    const text = getLogEntryCopyText(entry);
+    if (text) return text;
+  }
+  return [
+    ev?.ts || '',
+    ev?.level || 'info',
+    ev?.hostId || ev?.host_id || selfPeerId || 'local',
+    ev?.msg || '',
+  ].filter(Boolean).join('  ');
+}
+
+function stationActivityVisibleText(events) {
+  return (events || [])
+    .map(stationActivityEventCopyText)
+    .filter(Boolean)
+    .join('\n');
+}
+
+async function stationCopyActivityEvents(events) {
+  const text = stationActivityVisibleText(events);
+  if (!text) {
+    showControlToast?.('error', 'No Station activity rows to copy');
+    return;
+  }
+  await copyTextToClipboard(text);
+  showControlToast?.('success', 'Copied Station activity rows');
+}
+
+function stationClearActivityLog() {
+  clearLogs();
+  stationLogEvents.length = 0;
+  stationLastFallbackSnapshot = null;
+  stationScheduleUpdate();
+  stationRenderActivityDock();
+  showControlToast?.('success', 'Activity log cleared');
+}
+
 function stationApplyActivityHostFilter(hostId) {
   stationActivityDockHost = String(hostId || '').trim();
   activeHostFilter = stationActivityDockHost;
@@ -11733,7 +11781,10 @@ function stationRenderActivityDock(focusId = '') {
     { label: 'Verbose', onClick: () => stationSetActivityVerbosity('verbose') },
     { label: 'Debug', onClick: () => stationSetActivityVerbosity('debug') },
     { label: 'All hosts', onClick: () => { stationClearActivityHostFilter(); stationActivityDockHost = ''; stationRenderActivityDock(focusId); } },
+    { label: 'Clear filter', onClick: () => { stationActivityDockFilter = ''; stationRenderActivityDock(focusId); } },
+    { label: 'Copy visible', onClick: () => stationCopyActivityEvents(events) },
     { label: 'Bottom', onClick: () => { document.getElementById('scroll-bottom')?.click(); stationRenderActivityDock(events.at(-1)?.id || focusId); } },
+    { label: 'Clear log', danger: true, onClick: () => stationClearActivityLog() },
     stationDockRouteAction('Route log tab', 'activity', 'log', () => document.getElementById('scroll-bottom')?.click()),
   ]);
   const list = stationDockSection(body, 'Recent events');
@@ -11750,6 +11801,7 @@ function stationRenderActivityDock(focusId = '') {
       actions: [
         ev.id ? { label: 'Pin', onClick: () => stationRenderActivityDock(ev.id) } : null,
         ev.id ? { label: 'Show', primary: true, onClick: () => focusActivityLogEvent(ev.id) } : null,
+        { label: 'Copy text', onClick: () => copyTextToClipboard(stationActivityEventCopyText(ev)) },
         ev.id ? { label: 'Copy id', onClick: () => copyTextToClipboard(ev.id) } : null,
       ],
     });
