@@ -18,6 +18,14 @@ const DEFAULT_CDP_TIMEOUT_MS = 10000;
 const DEFAULT_LOG_LINES = 8;
 const LOG_BUFFER_LIMIT = 80;
 const LOG_TEXT_LIMIT = 260;
+const RESULT_REASON_LIMIT = 520;
+const RESULT_LOG_LIMIT = 320;
+const DIAGNOSTIC_TEXT_LIMIT = 260;
+const DIAGNOSTIC_BODY_LIMIT = 360;
+const DIAGNOSTIC_SELECTOR_LIMIT = 220;
+const DIAGNOSTIC_LIST_LIMIT = 8;
+const DIAGNOSTIC_SELECTOR_MATCH_LIMIT = 8;
+const FORMATTED_DIAGNOSTIC_LINE_LIMIT = 520;
 
 const BROWSER_EXECUTABLE_ENVS = [
   'INTENDANT_BROWSER_WORKSPACE_EXECUTABLE',
@@ -274,24 +282,28 @@ async function main() {
 }
 
 function printResult(opts, result) {
+  const displayResult = compactResultForOutput(opts, result);
   if (opts.json) {
-    console.log(JSON.stringify(result));
+    console.log(JSON.stringify(displayResult));
     return;
   }
-  if (result.status === 'pass') {
+  if (displayResult.status === 'pass') {
     console.log(
-      `PASS dashboard-validation url=${quote(result.url)} selectors=${result.selectors} functions=${result.functions} ms=${result.ms} websocket=${result.websocket || 'unknown'}`,
+      `PASS dashboard-validation url=${quote(displayResult.url)} selectors=${displayResult.selectors} functions=${displayResult.functions} ms=${displayResult.ms} websocket=${displayResult.websocket || 'unknown'}`,
     );
     return;
   }
   console.error(
-    `FAIL dashboard-validation url=${quote(result.url)} reason=${quote(result.reason)} ms=${result.ms}`,
+    `FAIL dashboard-validation url=${quote(displayResult.url)} reason=${quote(displayResult.reason)} ms=${displayResult.ms}`,
   );
-  for (const line of result.logs || []) {
+  for (const line of displayResult.logs || []) {
     console.error(`  ${line}`);
   }
-  for (const line of formatDiagnostics(result.diagnostics)) {
+  for (const line of formatDiagnostics(displayResult.diagnostics)) {
     console.error(`  ${line}`);
+  }
+  if (displayResult.next) {
+    console.error(`  next=${quote(displayResult.next)}`);
   }
 }
 
@@ -1119,6 +1131,101 @@ function pageDiagnosticsSource() {
   }.toString();
 }
 
+function compactResultForOutput(opts, result) {
+  const compact = { ...result };
+  if (compact.reason) {
+    compact.reason = truncateMiddle(compact.reason, RESULT_REASON_LIMIT);
+  }
+  if (Array.isArray(compact.logs)) {
+    compact.logs = compact.logs.map((line) => truncateMiddle(line, RESULT_LOG_LIMIT));
+  }
+  if (compact.diagnostics) {
+    compact.diagnostics = compactDiagnostics(compact.diagnostics);
+  }
+  if (compact.status === 'fail') {
+    compact.next = validationFailureNextStep(opts);
+  }
+  return compact;
+}
+
+function validationFailureNextStep(opts) {
+  if (opts.diagnostics) {
+    return 'fix from these targeted facts or report partial validation; avoid further broad selector/source dumps';
+  }
+  return 'retry at most once with --diagnostics --json and a targeted selector/function';
+}
+
+function compactDiagnostics(diagnostics) {
+  if (!diagnostics || typeof diagnostics !== 'object') {
+    return diagnostics;
+  }
+  if (diagnostics.error) {
+    return { error: truncateMiddle(diagnostics.error, RESULT_REASON_LIMIT) };
+  }
+
+  const compact = {
+    readyState: truncateMiddle(diagnostics.readyState || '', DIAGNOSTIC_TEXT_LIMIT),
+    title: truncateMiddle(diagnostics.title || '', DIAGNOSTIC_TEXT_LIMIT),
+    location: truncateMiddle(diagnostics.location || '', DIAGNOSTIC_TEXT_LIMIT),
+  };
+  if (diagnostics.activeElement) {
+    compact.activeElement = truncateMiddle(diagnostics.activeElement, DIAGNOSTIC_TEXT_LIMIT);
+  }
+  if (diagnostics.bodyText) {
+    compact.bodyText = truncateMiddle(diagnostics.bodyText, DIAGNOSTIC_BODY_LIMIT);
+  }
+
+  const headings = compactStringArray(diagnostics.headings, DIAGNOSTIC_LIST_LIMIT, DIAGNOSTIC_TEXT_LIMIT);
+  if (headings.values.length) {
+    compact.headings = headings.values;
+  }
+  if (headings.omitted) {
+    compact.headingsOmitted = headings.omitted;
+  }
+
+  const controls = compactStringArray(diagnostics.controls, DIAGNOSTIC_LIST_LIMIT, DIAGNOSTIC_TEXT_LIMIT);
+  if (controls.values.length) {
+    compact.controls = controls.values;
+  }
+  if (controls.omitted) {
+    compact.controlsOmitted = controls.omitted;
+  }
+
+  if (Array.isArray(diagnostics.selectorMatches)) {
+    const matches = diagnostics.selectorMatches.slice(0, DIAGNOSTIC_SELECTOR_MATCH_LIMIT);
+    compact.selectorMatches = matches.map((match) => {
+      const item = {
+        selector: truncateMiddle(match.selector || '', DIAGNOSTIC_SELECTOR_LIMIT),
+      };
+      if (match.error) {
+        item.error = truncateMiddle(match.error, RESULT_REASON_LIMIT);
+      } else {
+        item.count = Number(match.count) || 0;
+        if (match.first) {
+          item.first = truncateMiddle(match.first, DIAGNOSTIC_TEXT_LIMIT);
+        }
+      }
+      return item;
+    });
+    if (diagnostics.selectorMatches.length > matches.length) {
+      compact.selectorMatchesOmitted = diagnostics.selectorMatches.length - matches.length;
+    }
+  }
+
+  return compact;
+}
+
+function compactStringArray(values, limit, textLimit) {
+  if (!Array.isArray(values)) {
+    return { values: [], omitted: 0 };
+  }
+  const kept = values.slice(0, limit).map((value) => truncateMiddle(value, textLimit));
+  return {
+    values: kept,
+    omitted: Math.max(0, values.length - kept.length),
+  };
+}
+
 function formatDiagnostics(diagnostics) {
   if (!diagnostics) {
     return [];
@@ -1150,7 +1257,16 @@ function formatDiagnostics(diagnostics) {
   if (diagnostics.controls && diagnostics.controls.length) {
     lines.push(`diagnostics controls=${quote(diagnostics.controls.join(' | '))}`);
   }
-  return lines.map((line) => truncate(line, 520));
+  if (diagnostics.headingsOmitted) {
+    lines.push(`diagnostics headingsOmitted=${diagnostics.headingsOmitted}`);
+  }
+  if (diagnostics.controlsOmitted) {
+    lines.push(`diagnostics controlsOmitted=${diagnostics.controlsOmitted}`);
+  }
+  if (diagnostics.selectorMatchesOmitted) {
+    lines.push(`diagnostics selectorMatchesOmitted=${diagnostics.selectorMatchesOmitted}`);
+  }
+  return lines.map((line) => truncateMiddle(line, FORMATTED_DIAGNOSTIC_LINE_LIMIT));
 }
 
 function quote(value) {
@@ -1160,6 +1276,31 @@ function quote(value) {
 function truncate(value, limit) {
   const text = String(value);
   return text.length <= limit ? text : `${text.slice(0, limit - 1)}...`;
+}
+
+function truncateMiddle(value, limit) {
+  const text = String(value || '');
+  if (text.length <= limit) {
+    return text;
+  }
+  let marker = ' ...[truncated]... ';
+  let available = limit - marker.length;
+  if (available <= 0) {
+    return text.slice(0, limit);
+  }
+  let head = Math.ceil(available * 0.6);
+  let tail = available - head;
+  let omitted = text.length - head - tail;
+  marker = ` ...[${omitted} chars omitted]... `;
+  available = limit - marker.length;
+  if (available <= 0) {
+    return text.slice(0, limit);
+  }
+  head = Math.ceil(available * 0.6);
+  tail = available - head;
+  omitted = text.length - head - tail;
+  marker = ` ...[${omitted} chars omitted]... `;
+  return `${text.slice(0, head)}${marker}${text.slice(text.length - tail)}`;
 }
 
 function delay(ms) {
@@ -1219,6 +1360,36 @@ function runSelfTest() {
       selectorMatches: [{ selector: '#root', count: 0, first: '' }],
     }).some((line) => line.includes('selector="#root" count=0')),
   );
+  const compactedFailure = compactResultForOutput(
+    { diagnostics: true },
+    {
+      status: 'fail',
+      reason: `selector not found: ${'x'.repeat(1200)}`,
+      diagnostics: {
+        readyState: 'complete',
+        title: 'Dashboard',
+        location: 'http://127.0.0.1:1234/',
+        bodyText: 'body '.repeat(300),
+        controls: Array.from({ length: 12 }, (_, idx) => `button ${idx} ${'y'.repeat(120)}`),
+        selectorMatches: Array.from({ length: 10 }, (_, idx) => ({
+          selector: `.target-${idx}-${'z'.repeat(500)}`,
+          count: 0,
+          first: '',
+        })),
+      },
+    },
+  );
+  assert.ok(compactedFailure.reason.includes('chars omitted'));
+  assert.ok(compactedFailure.next.includes('avoid further broad selector/source dumps'));
+  assert.ok(compactedFailure.diagnostics.bodyText.includes('chars omitted'));
+  assert.strictEqual(compactedFailure.diagnostics.controls.length, DIAGNOSTIC_LIST_LIMIT);
+  assert.strictEqual(compactedFailure.diagnostics.controlsOmitted, 4);
+  assert.strictEqual(
+    compactedFailure.diagnostics.selectorMatches.length,
+    DIAGNOSTIC_SELECTOR_MATCH_LIMIT,
+  );
+  assert.strictEqual(compactedFailure.diagnostics.selectorMatchesOmitted, 2);
+  assert.ok(compactedFailure.diagnostics.selectorMatches[0].selector.includes('chars omitted'));
   const log = new BoundedLog(2);
   log.push('a', 'first');
   log.push('b', 'second');

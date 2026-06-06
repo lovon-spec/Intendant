@@ -1370,11 +1370,7 @@ fn collect_controller_loop_status(loop_dir: &std::path::Path) -> serde_json::Val
 
     let latest_run_id = read_trimmed(&loop_dir.join("latest.run_id"));
     let latest_status_file = read_json_file(&loop_dir.join("latest.status.json"));
-    let latest_status = if latest_status_file.is_null() {
-        latest_status_from_active_wrappers(&active_wrappers).unwrap_or(serde_json::Value::Null)
-    } else {
-        latest_status_file
-    };
+    let latest_status = controller_loop_latest_status(latest_status_file, &active_wrappers);
     let latest_target_path = std::fs::read_link(loop_dir.join("latest")).ok().map(|p| {
         if p.is_absolute() {
             p
@@ -1440,6 +1436,22 @@ fn active_external_wrappers_from_index_homes<'a, I>(
 where
     I: IntoIterator<Item = &'a std::path::PathBuf>,
 {
+    active_external_wrappers_from_index_homes_with_probe(
+        candidate_homes,
+        live_codex_pids,
+        codex_app_server_process_tree_active,
+    )
+}
+
+fn active_external_wrappers_from_index_homes_with_probe<'a, I, F>(
+    candidate_homes: I,
+    live_codex_pids: &[u32],
+    mut process_tree_active: F,
+) -> Vec<serde_json::Value>
+where
+    I: IntoIterator<Item = &'a std::path::PathBuf>,
+    F: FnMut(u32) -> bool,
+{
     if live_codex_pids.is_empty() {
         return Vec::new();
     }
@@ -1458,6 +1470,11 @@ where
                 continue;
             }
             let codex_pid = live_codex_pids.get(wrappers.len()).copied();
+            let process_tree_active = codex_pid
+                .map(|pid| process_tree_active(pid))
+                .unwrap_or(false);
+            let effective_status =
+                effective_external_wrapper_status(status.as_deref(), process_tree_active);
             wrappers.push(serde_json::json!({
                 "run_id": serde_json::Value::Null,
                 "pid": serde_json::Value::Null,
@@ -1468,7 +1485,9 @@ where
                 "intendant_session_id": record.intendant_session_id,
                 "log_path": record.log_path,
                 "project_root": record.project_root,
-                "status": status.unwrap_or_else(|| "active".to_string()),
+                "status": effective_status,
+                "session_meta_status": status,
+                "process_tree_active": process_tree_active,
                 "updated_at_secs": record.updated_at_secs,
             }));
         }
@@ -1477,6 +1496,24 @@ where
         }
     }
     wrappers
+}
+
+fn controller_loop_latest_status(
+    latest_status_file: serde_json::Value,
+    wrappers: &[serde_json::Value],
+) -> serde_json::Value {
+    let active_wrapper_status = latest_status_from_active_wrappers(wrappers);
+    if latest_status_file.is_null() {
+        return active_wrapper_status.unwrap_or(serde_json::Value::Null);
+    }
+    if controller_loop_status_state_is_idle(&latest_status_file) {
+        if let Some(status) = active_wrapper_status {
+            if !controller_loop_status_state_is_idle(&status) {
+                return status;
+            }
+        }
+    }
+    latest_status_file
 }
 
 fn latest_status_from_active_wrappers(wrappers: &[serde_json::Value]) -> Option<serde_json::Value> {
@@ -1496,6 +1533,8 @@ fn latest_status_from_active_wrappers(wrappers: &[serde_json::Value]) -> Option<
         "backend_session_id": wrapper.get("backend_session_id").cloned().unwrap_or(serde_json::Value::Null),
         "intendant_session_id": wrapper.get("intendant_session_id").cloned().unwrap_or(serde_json::Value::Null),
         "log_path": wrapper.get("log_path").cloned().unwrap_or(serde_json::Value::Null),
+        "session_meta_status": wrapper.get("session_meta_status").cloned().unwrap_or(serde_json::Value::Null),
+        "process_tree_active": wrapper.get("process_tree_active").cloned().unwrap_or(serde_json::Value::Null),
     }))
 }
 
@@ -1536,6 +1575,56 @@ fn external_wrapper_status_is_terminal(status: Option<&str>) -> bool {
         status,
         Some("completed" | "abandoned" | "interrupted" | "deleted")
     )
+}
+
+fn effective_external_wrapper_status(status: Option<&str>, process_tree_active: bool) -> String {
+    let status = status.map(str::trim).filter(|status| !status.is_empty());
+    if process_tree_active && status.map(controller_loop_state_is_idle).unwrap_or(true) {
+        return "unknown_running".to_string();
+    }
+    status.unwrap_or("active").to_string()
+}
+
+fn controller_loop_status_state_is_idle(status: &serde_json::Value) -> bool {
+    status
+        .get("state")
+        .or_else(|| status.get("status"))
+        .and_then(|value| value.as_str())
+        .map(controller_loop_state_is_idle)
+        .unwrap_or(false)
+}
+
+fn controller_loop_state_is_idle(status: &str) -> bool {
+    matches!(
+        status.trim(),
+        "" | "idle" | "waiting_follow_up" | "waiting_followup" | "waiting_for_task"
+    )
+}
+
+fn codex_app_server_process_tree_active(pid: u32) -> bool {
+    codex_app_server_process_tree_active_from_descendants(
+        super::platform::process_descendants(pid),
+        super::platform::process_alive,
+        super::platform::process_cmdline,
+    )
+}
+
+fn codex_app_server_process_tree_active_from_descendants<I, A, C>(
+    descendants: I,
+    mut process_alive: A,
+    mut process_cmdline: C,
+) -> bool
+where
+    I: IntoIterator<Item = u32>,
+    A: FnMut(u32) -> bool,
+    C: FnMut(u32) -> Option<String>,
+{
+    descendants.into_iter().any(|pid| {
+        process_alive(pid)
+            && process_cmdline(pid)
+                .map(|cmdline| !cmdline.trim().is_empty())
+                .unwrap_or(false)
+    })
 }
 
 fn live_codex_app_server_processes(
@@ -9872,6 +9961,167 @@ mod tests {
         assert_eq!(
             latest.get("state").and_then(|value| value.as_str()),
             Some("running")
+        );
+    }
+
+    #[test]
+    fn controller_loop_status_does_not_report_idle_for_active_codex_process_tree() {
+        let dir = tempdir().unwrap();
+        let home = dir.path();
+        let loop_dir = home.join(".intendant/controller-loop");
+        let log_dir = home.join(".intendant/logs/wrapper-session");
+        std::fs::create_dir_all(&loop_dir).unwrap();
+        std::fs::create_dir_all(&log_dir).unwrap();
+        std::fs::write(
+            log_dir.join("session_meta.json"),
+            serde_json::json!({
+                "session_id": "wrapper-session",
+                "created_at": "2026-01-01T00:00:00Z",
+                "status": "idle"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        crate::external_wrapper_index::upsert(
+            home,
+            "codex",
+            "019e9b9a-8557-7b01-99ef-187e8840327f",
+            "wrapper-session",
+            &log_dir,
+            None,
+        )
+        .unwrap();
+
+        let wrappers = active_external_wrappers_from_index_homes_with_probe(
+            [home.to_path_buf()].iter(),
+            &[8892],
+            |pid| pid == 8892,
+        );
+
+        assert_eq!(wrappers.len(), 1);
+        assert_eq!(
+            wrappers[0].get("status").and_then(|value| value.as_str()),
+            Some("unknown_running")
+        );
+        assert_eq!(
+            wrappers[0]
+                .get("session_meta_status")
+                .and_then(|value| value.as_str()),
+            Some("idle")
+        );
+        assert_eq!(
+            wrappers[0]
+                .get("process_tree_active")
+                .and_then(|value| value.as_bool()),
+            Some(true)
+        );
+
+        let latest = controller_loop_latest_status(
+            serde_json::json!({
+                "run_id": "stale-run",
+                "state": "idle"
+            }),
+            &wrappers,
+        );
+        assert_eq!(
+            latest.get("state").and_then(|value| value.as_str()),
+            Some("unknown_running")
+        );
+        assert_eq!(
+            latest.get("source").and_then(|value| value.as_str()),
+            Some("external_wrapper_index")
+        );
+        assert_eq!(
+            latest
+                .get("session_meta_status")
+                .and_then(|value| value.as_str()),
+            Some("idle")
+        );
+        assert_eq!(
+            latest
+                .get("process_tree_active")
+                .and_then(|value| value.as_bool()),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn codex_app_server_process_tree_active_requires_live_descendant_cmdline() {
+        let cmdlines = std::collections::HashMap::from([
+            (101, "cargo build --release".to_string()),
+            (102, String::new()),
+            (103, "sleep 60".to_string()),
+        ]);
+
+        assert!(codex_app_server_process_tree_active_from_descendants(
+            [101],
+            |_| true,
+            |pid| cmdlines.get(&pid).cloned(),
+        ));
+        assert!(!codex_app_server_process_tree_active_from_descendants(
+            [101],
+            |_| false,
+            |pid| cmdlines.get(&pid).cloned(),
+        ));
+        assert!(!codex_app_server_process_tree_active_from_descendants(
+            [102],
+            |_| true,
+            |pid| cmdlines.get(&pid).cloned(),
+        ));
+    }
+
+    #[test]
+    fn controller_loop_status_normalizes_stale_wrapper_index_identity_from_log_path() {
+        let dir = tempdir().unwrap();
+        let home = dir.path();
+        let loop_dir = home.join(".intendant/controller-loop");
+        let log_dir = home.join(".intendant/logs/resumed-wrapper-session");
+        std::fs::create_dir_all(&loop_dir).unwrap();
+        std::fs::create_dir_all(&log_dir).unwrap();
+        std::fs::write(
+            log_dir.join("session_meta.json"),
+            serde_json::json!({
+                "session_id": "resumed-wrapper-session",
+                "created_at": "2026-01-01T00:00:00Z",
+                "status": "running"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            crate::external_wrapper_index::index_path(home),
+            serde_json::json!({
+                "version": 1,
+                "wrappers": [{
+                    "source": "codex",
+                    "backend_session_id": "8b008615-9bf6-44a6-9d26-751e4fd7d87f",
+                    "intendant_session_id": "5f979c8d-65e7-4210-be22-e4012242b745",
+                    "log_path": log_dir,
+                    "updated_at_secs": 1
+                }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let wrappers = active_external_wrappers_from_index(&loop_dir, &[1084559]);
+        assert_eq!(wrappers.len(), 1);
+        assert_eq!(
+            wrappers[0]
+                .get("intendant_session_id")
+                .and_then(|value| value.as_str()),
+            Some("resumed-wrapper-session")
+        );
+        assert_eq!(
+            wrappers[0].get("log_path").and_then(|value| value.as_str()),
+            Some(log_dir.to_string_lossy().as_ref())
+        );
+        let latest = latest_status_from_active_wrappers(&wrappers).unwrap();
+        assert_eq!(
+            latest
+                .get("intendant_session_id")
+                .and_then(|value| value.as_str()),
+            Some("resumed-wrapper-session")
         );
     }
 
