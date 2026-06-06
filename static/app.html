@@ -10976,6 +10976,19 @@ const STATION_SYSTEM_TARGETS = Object.freeze([
   ['system:view', 'View'],
 ]);
 
+const STATION_DASHBOARD_ROUTES = Object.freeze([
+  Object.freeze({ label: 'Stats', detail: 'Usage, tokens, cost, and model activity', tab: 'stats', subtab: '', tokens: 'stats usage token cost provider model' }),
+  Object.freeze({ label: 'Terminal TUI', detail: 'Live terminal frontend', tab: 'terminal', subtab: 'tui', tokens: 'terminal tui live frontend' }),
+  Object.freeze({ label: 'Shell', detail: 'Standalone shell session', tab: 'terminal', subtab: 'shell', tokens: 'terminal shell pty command line' }),
+  Object.freeze({ label: 'Video', detail: 'Local display streams and recordings', tab: 'displays', subtab: '', tokens: 'video display stream recording screen' }),
+  Object.freeze({ label: 'Sessions', detail: 'Recent sessions and launch history', tab: 'sessions', subtab: 'recent', tokens: 'sessions recent history resume' }),
+  Object.freeze({ label: 'Agent Settings', detail: 'Provider, backend, approval, and runtime defaults', tab: 'settings', subtab: 'agent', tokens: 'settings agent backend provider approval codex gemini' }),
+  Object.freeze({ label: 'Network', detail: 'Peers, federation, coordinator, and auth', tab: 'settings', subtab: 'network', tokens: 'settings network peers federation coordinator auth' }),
+  Object.freeze({ label: 'Debug', detail: 'Diagnostics and controller tools', tab: 'debug', subtab: '', tokens: 'debug diagnostics controller tools' }),
+  Object.freeze({ label: 'Settings Debug', detail: 'Debug configuration and support data', tab: 'settings', subtab: 'debug', tokens: 'settings debug support diagnostics config' }),
+  Object.freeze({ label: 'Account', detail: 'API keys and account configuration', tab: 'settings', subtab: 'account', tokens: 'settings account api keys credentials' }),
+]);
+
 // Mirrors crates/station-web/src/lib.rs StationInner::draw_toolbar and
 // StationInner::draw_systems_panel. Keep these constants byte-close to Rust.
 const STATION_HUD_GEOMETRY = Object.freeze({
@@ -11010,8 +11023,15 @@ function stationCommandEntries() {
     tokens: `${label} panel surface dock station ${target}`,
     run: () => stationHandleHotspot(target),
   }));
+  const routeEntries = STATION_DASHBOARD_ROUTES.map(route => ({
+    label: `Go to ${route.label}`,
+    detail: route.detail,
+    tokens: `route open ${route.tab} ${route.subtab || ''} ${route.tokens}`,
+    run: () => stationForceRouteTo(route.tab, route.subtab || undefined),
+  }));
   return [
     ...surfaceEntries,
+    ...routeEntries,
     {
       label: 'Refresh Station',
       detail: 'Reload shared state and redraw current panel',
@@ -14405,6 +14425,57 @@ function stationRenderLiveStatusSection(parent, controls) {
   ]);
 }
 
+function stationRouteByLabel(label) {
+  return STATION_DASHBOARD_ROUTES.find(route => route.label === label) || null;
+}
+
+function stationDashboardRouteAction(label, opts = {}) {
+  const route = stationRouteByLabel(label);
+  if (!route) return null;
+  return {
+    label: opts.label || route.label,
+    primary: !!opts.primary,
+    title: route.detail,
+    onClick: () => stationForceRouteTo(route.tab, route.subtab || undefined),
+  };
+}
+
+function stationRenderDashboardRoutesSection(parent) {
+  const section = stationDockSection(parent, 'Dashboard routes');
+  stationDockRow(section, 'routes', String(STATION_DASHBOARD_ROUTES.length));
+  stationDockCard(section, {
+    title: 'Telemetry and terminals',
+    meta: 'observe and operate',
+    detail: 'Open usage, the live terminal frontend, or a standalone shell without leaving Station first.',
+    actions: [
+      stationDashboardRouteAction('Stats', { primary: true }),
+      stationDashboardRouteAction('Terminal TUI'),
+      stationDashboardRouteAction('Shell'),
+    ],
+  });
+  stationDockCard(section, {
+    title: 'Sessions and display',
+    meta: 'work surfaces',
+    detail: 'Jump to video streams, recordings, and the full session browser when Station needs a wider view.',
+    actions: [
+      stationDashboardRouteAction('Video', { primary: true }),
+      stationDashboardRouteAction('Sessions'),
+    ],
+  });
+  stationDockCard(section, {
+    title: 'Configuration',
+    meta: 'settings and support',
+    detail: 'Route to backend settings, federation, diagnostics, account keys, or the dedicated Debug tab.',
+    actions: [
+      stationDashboardRouteAction('Agent Settings', { primary: true }),
+      stationDashboardRouteAction('Network'),
+      stationDashboardRouteAction('Debug'),
+      stationDashboardRouteAction('Settings Debug'),
+      stationDashboardRouteAction('Account'),
+    ],
+  });
+}
+
 function stationApplyDockSelect(controlId, value, handler, rerenderSection = 'overview') {
   const target = stationDockSetSelectValue(controlId, value);
   handler({ target });
@@ -14616,6 +14687,7 @@ function stationRenderControlsDock(sectionName = 'overview') {
   ]);
 
   stationRenderLiveStatusSection(body, controls);
+  stationRenderDashboardRoutesSection(body);
   stationRenderExternalBackendEditor(body, controls);
   stationRenderLaunchReadinessSection(body, {
     title: 'Next launch',
