@@ -9876,6 +9876,61 @@ mod tests {
     }
 
     #[test]
+    fn controller_loop_status_normalizes_stale_wrapper_index_identity_from_log_path() {
+        let dir = tempdir().unwrap();
+        let home = dir.path();
+        let loop_dir = home.join(".intendant/controller-loop");
+        let log_dir = home.join(".intendant/logs/resumed-wrapper-session");
+        std::fs::create_dir_all(&loop_dir).unwrap();
+        std::fs::create_dir_all(&log_dir).unwrap();
+        std::fs::write(
+            log_dir.join("session_meta.json"),
+            serde_json::json!({
+                "session_id": "resumed-wrapper-session",
+                "created_at": "2026-01-01T00:00:00Z",
+                "status": "running"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            crate::external_wrapper_index::index_path(home),
+            serde_json::json!({
+                "version": 1,
+                "wrappers": [{
+                    "source": "codex",
+                    "backend_session_id": "8b008615-9bf6-44a6-9d26-751e4fd7d87f",
+                    "intendant_session_id": "5f979c8d-65e7-4210-be22-e4012242b745",
+                    "log_path": log_dir,
+                    "updated_at_secs": 1
+                }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let wrappers = active_external_wrappers_from_index(&loop_dir, &[1084559]);
+        assert_eq!(wrappers.len(), 1);
+        assert_eq!(
+            wrappers[0]
+                .get("intendant_session_id")
+                .and_then(|value| value.as_str()),
+            Some("resumed-wrapper-session")
+        );
+        assert_eq!(
+            wrappers[0].get("log_path").and_then(|value| value.as_str()),
+            Some(log_dir.to_string_lossy().as_ref())
+        );
+        let latest = latest_status_from_active_wrappers(&wrappers).unwrap();
+        assert_eq!(
+            latest
+                .get("intendant_session_id")
+                .and_then(|value| value.as_str()),
+            Some("resumed-wrapper-session")
+        );
+    }
+
+    #[test]
     fn controller_loop_status_searches_user_home_wrapper_index_for_project_local_loop_dir() {
         let dir = tempdir().unwrap();
         let project_home = dir.path().join("project");

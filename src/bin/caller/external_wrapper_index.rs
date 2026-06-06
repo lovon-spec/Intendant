@@ -83,11 +83,17 @@ pub fn upsert(
     let source = crate::session_names::normalize_source(source);
     let backend_session_id = backend_session_id.trim();
     let intendant_session_id = intendant_session_id.trim();
+    let log_dir_session_id = log_dir_session_id(log_dir);
+    let stored_intendant_session_id = log_dir_session_id
+        .as_deref()
+        .unwrap_or(intendant_session_id)
+        .trim();
     if source.is_empty()
         || source == "intendant"
         || backend_session_id.is_empty()
         || intendant_session_id.is_empty()
-        || backend_session_id == intendant_session_id
+        || stored_intendant_session_id.is_empty()
+        || backend_session_id == stored_intendant_session_id
         || !crate::external_agent::source_session_id_is_canonical(&source, backend_session_id)
     {
         return Ok(());
@@ -106,7 +112,7 @@ pub fn upsert(
     if let Some(existing) = index.wrappers.iter_mut().find(|record| {
         record.source == source
             && record.backend_session_id == backend_session_id
-            && record.intendant_session_id == intendant_session_id
+            && record.intendant_session_id == stored_intendant_session_id
     }) {
         existing.log_path = log_path;
         existing.project_root = project_root;
@@ -115,7 +121,7 @@ pub fn upsert(
         index.wrappers.push(ExternalWrapperRecord {
             source,
             backend_session_id: backend_session_id.to_string(),
-            intendant_session_id: intendant_session_id.to_string(),
+            intendant_session_id: stored_intendant_session_id.to_string(),
             log_path,
             project_root,
             updated_at_secs,
@@ -142,10 +148,12 @@ pub fn wrappers_for(
     let mut records: Vec<_> = read_index_unlocked(home)
         .wrappers
         .into_iter()
-        .filter(|record| {
-            record.source == source
+        .filter_map(|record| {
+            (record.source == source
                 && record.backend_session_id == backend_session_id
-                && Path::new(&record.log_path).is_dir()
+                && Path::new(&record.log_path).is_dir())
+            .then(|| normalize_log_identity(record))
+            .flatten()
         })
         .collect();
     records.sort_by(|a, b| {
@@ -168,7 +176,11 @@ pub fn wrappers_for_source(home: &Path, source: &str) -> Vec<ExternalWrapperReco
     let mut records: Vec<_> = read_index_unlocked(home)
         .wrappers
         .into_iter()
-        .filter(|record| record.source == source && Path::new(&record.log_path).is_dir())
+        .filter_map(|record| {
+            (record.source == source && Path::new(&record.log_path).is_dir())
+                .then(|| normalize_log_identity(record))
+                .flatten()
+        })
         .collect();
     records.sort_by(|a, b| {
         b.updated_at_secs
@@ -215,6 +227,20 @@ fn project_root_from_log_dir(log_dir: &Path) -> Option<PathBuf> {
         .ok()
         .and_then(|meta| meta.project_root)
         .map(PathBuf::from)
+}
+
+fn normalize_log_identity(mut record: ExternalWrapperRecord) -> Option<ExternalWrapperRecord> {
+    record.intendant_session_id = log_dir_session_id(Path::new(&record.log_path))?;
+    Some(record)
+}
+
+fn log_dir_session_id(log_dir: &Path) -> Option<String> {
+    log_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
 }
 
 fn file_mtime_secs(path: &Path) -> u64 {
