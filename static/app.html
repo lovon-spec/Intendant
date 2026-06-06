@@ -11119,6 +11119,16 @@ let stationSessionLogState = {
   entries: null,
   verbosity: 'normal',
 };
+let stationSessionMediaState = {
+  sessionId: '',
+  mediaId: '',
+  source: '',
+  loading: false,
+  error: '',
+  recordingError: '',
+  frames: null,
+  recordings: null,
+};
 let stationSessionDeepDraft = {
   query: '',
   mode: 'all_keywords',
@@ -14675,6 +14685,221 @@ async function stationCopySessionLogFromDock(session) {
   showControlToast?.('success', `Copied ${rows.length} Station log row${rows.length === 1 ? '' : 's'}`);
 }
 
+function stationSessionMediaTarget(session) {
+  const sid = stationSessionId(session);
+  const mediaId = stationSessionReportId(session) || sid;
+  const source = mediaId && mediaId !== sid ? 'intendant' : (stationSessionLogSource(session) || 'intendant');
+  return {
+    sessionId: sid,
+    mediaId,
+    source,
+  };
+}
+
+function stationSessionMediaStateFor(session) {
+  const target = stationSessionMediaTarget(session);
+  if (stationSessionMediaState.sessionId === target.sessionId &&
+      stationSessionMediaState.mediaId === target.mediaId &&
+      stationSessionMediaState.source === target.source) {
+    return stationSessionMediaState;
+  }
+  return {
+    ...target,
+    loading: false,
+    error: '',
+    recordingError: '',
+    frames: null,
+    recordings: null,
+  };
+}
+
+function stationSessionFrameGroups(frames = []) {
+  const annotations = [];
+  const clips = new Map();
+  const raw = [];
+  for (const name of frames) {
+    const value = String(name || '');
+    if (!value) continue;
+    if (value.startsWith('ann-')) {
+      annotations.push(value);
+      continue;
+    }
+    if (value.startsWith('clip-')) {
+      const match = value.match(/^(clip-.+-\d+)-f\d+/);
+      const key = match ? match[1] : 'Clip frames';
+      if (!clips.has(key)) clips.set(key, []);
+      clips.get(key).push(value);
+      continue;
+    }
+    raw.push(value);
+  }
+  const groups = [];
+  if (annotations.length) groups.push({ label: 'Annotations', frames: annotations });
+  for (const [label, clipFrames] of clips) groups.push({ label, frames: clipFrames });
+  if (raw.length) groups.push({ label: 'Raw frames', frames: raw });
+  return groups;
+}
+
+function stationSessionMediaUrl(mediaId, path = '') {
+  if (!mediaId) return '';
+  return `/api/session/${encodeURIComponent(mediaId)}${path}`;
+}
+
+function stationOpenSessionMediaUrl(url) {
+  if (!url) return;
+  window.open(url, '_blank', 'noopener');
+}
+
+async function stationCopySessionMediaUrl(url, label = 'media URL') {
+  if (!url) return;
+  await copyTextToClipboard(new URL(url, window.location.href).toString());
+  showControlToast?.('success', `Copied ${label}`);
+}
+
+async function stationLoadSessionMediaForDock(sessionOrId) {
+  const session = typeof sessionOrId === 'object' ? sessionOrId : stationFindSessionById(sessionOrId);
+  const target = stationSessionMediaTarget(session || { session_id: String(sessionOrId || '') });
+  if (!target.mediaId) {
+    showControlToast?.('error', 'No local session media id is available');
+    return;
+  }
+  stationSessionMediaState = {
+    ...target,
+    loading: true,
+    error: '',
+    recordingError: '',
+    frames: stationSessionMediaState.mediaId === target.mediaId ? stationSessionMediaState.frames : null,
+    recordings: stationSessionMediaState.mediaId === target.mediaId ? stationSessionMediaState.recordings : null,
+  };
+  stationRenderSessionsDock(target.sessionId);
+  try {
+    const detailUrl = `${stationSessionMediaUrl(target.mediaId)}?source=${encodeURIComponent(target.source || 'intendant')}`;
+    const detailResp = await fetch(detailUrl);
+    const detail = await detailResp.json();
+    if (!detailResp.ok || detail.error) throw new Error(detail.error || detailResp.statusText || 'session media fetch failed');
+    let recordings = [];
+    let recordingError = '';
+    try {
+      const recResp = await fetch(stationSessionMediaUrl(target.mediaId, '/recordings'));
+      const recData = await recResp.json();
+      if (recResp.ok && Array.isArray(recData)) {
+        recordings = recData;
+      } else if (!recResp.ok) {
+        recordingError = recResp.statusText || 'recording manifest fetch failed';
+      }
+    } catch (err) {
+      recordingError = err?.message || String(err);
+    }
+    stationSessionMediaState = {
+      ...target,
+      loading: false,
+      error: '',
+      recordingError,
+      frames: Array.isArray(detail.frames) ? detail.frames : [],
+      recordings,
+    };
+  } catch (err) {
+    stationSessionMediaState = {
+      ...target,
+      loading: false,
+      error: err?.message || String(err),
+      recordingError: '',
+      frames: stationSessionMediaState.frames || [],
+      recordings: stationSessionMediaState.recordings || [],
+    };
+  }
+  stationRenderSessionsDock(target.sessionId);
+}
+
+async function stationCopySessionMediaManifest(session) {
+  const state = stationSessionMediaStateFor(session);
+  const loaded = Array.isArray(state.frames) || Array.isArray(state.recordings);
+  if (!loaded) {
+    showControlToast?.('info', 'Load Station media before copying the manifest');
+    return;
+  }
+  await copyTextToClipboard(JSON.stringify({
+    session_id: state.sessionId,
+    media_id: state.mediaId,
+    source: state.source,
+    frames: state.frames || [],
+    recordings: state.recordings || [],
+  }, null, 2));
+  showControlToast?.('success', 'Copied Station media manifest');
+}
+
+function stationRenderSessionMediaSection(parent, session) {
+  const sid = stationSessionId(session);
+  if (!sid) return;
+  const target = stationSessionMediaTarget(session);
+  const state = stationSessionMediaStateFor(session);
+  const loaded = Array.isArray(state.frames) || Array.isArray(state.recordings);
+  const frames = Array.isArray(state.frames) ? state.frames : [];
+  const recordings = Array.isArray(state.recordings) ? state.recordings : [];
+  const section = stationDockSection(parent, 'Session media');
+  stationDockRow(section, 'media id', target.mediaId ? shortSessionId(target.mediaId) : '--');
+  stationDockRow(section, 'frames', loaded ? `${frames.length} file${frames.length === 1 ? '' : 's'}` : _fmtBytes(session?.frames_bytes || session?.framesBytes || 0));
+  stationDockRow(section, 'recordings', loaded ? `${recordings.length} stream${recordings.length === 1 ? '' : 's'}` : String(session?.recordings || 0));
+  stationDockActions(section, [
+    { label: state.loading ? 'Loading...' : (loaded ? 'Refresh media' : 'Load media'), primary: !loaded, disabled: state.loading || !target.mediaId, onClick: () => stationLoadSessionMediaForDock(session) },
+    { label: 'Copy manifest', disabled: !loaded || state.loading, onClick: () => stationCopySessionMediaManifest(session) },
+    { label: 'Legacy detail', route: true, onClick: () => stationRouteLegacySessionDetail(session) },
+  ]);
+  if (!target.mediaId) {
+    stationDockEmpty(section, 'No local Intendant media directory is available for this session.');
+    return;
+  }
+  if (state.error) stationDockEmpty(section, state.error).classList.add('error');
+  if (state.loading) {
+    stationDockEmpty(section, 'Loading frame and recording manifests...');
+    return;
+  }
+  if (!loaded) {
+    stationDockEmpty(section, 'Load frame names and recording stream manifests without leaving Station.');
+    return;
+  }
+  if (state.recordingError) stationDockEmpty(section, `Recordings: ${state.recordingError}`).classList.add('error');
+  if (!frames.length && !recordings.length) {
+    stationDockEmpty(section, 'No frames or recording streams were found for this session.');
+    return;
+  }
+  recordings.slice(0, 4).forEach(stream => {
+    const name = String(stream?.stream_name || '');
+    const segments = Array.isArray(stream?.segments) ? stream.segments : [];
+    const duration = Number(stream?.total_duration_secs || 0);
+    const playlist = name ? stationSessionMediaUrl(target.mediaId, `/recordings/${encodeURIComponent(name)}/playlist.m3u8`) : '';
+    stationDockCard(section, {
+      title: name.startsWith('display_') ? `Display ${name.slice(8)}` : (name || 'Recording stream'),
+      meta: `${segments.length} segment${segments.length === 1 ? '' : 's'}${duration > 0 ? ` / ${fmtTime(duration)}` : ''}`,
+      detail: name,
+      actions: [
+        playlist ? { label: 'Open playlist', onClick: () => stationOpenSessionMediaUrl(playlist) } : null,
+        playlist ? { label: 'Copy URL', onClick: () => stationCopySessionMediaUrl(playlist, 'recording playlist URL') } : null,
+      ],
+    });
+  });
+  if (recordings.length > 4) {
+    stationDockEmpty(section, `Showing 4 of ${recordings.length} recording streams. Copy the manifest for the full list.`);
+  }
+  const frameGroups = stationSessionFrameGroups(frames);
+  frameGroups.slice(0, 5).forEach(group => {
+    const latest = group.frames[group.frames.length - 1] || '';
+    const frameUrl = latest ? stationSessionMediaUrl(target.mediaId, `/frames/${encodeURIComponent(latest)}`) : '';
+    stationDockCard(section, {
+      title: group.label,
+      meta: `${group.frames.length} frame${group.frames.length === 1 ? '' : 's'}`,
+      detail: group.frames.slice(0, 3).join(', '),
+      actions: [
+        frameUrl ? { label: 'Open latest', onClick: () => stationOpenSessionMediaUrl(frameUrl) } : null,
+        frameUrl ? { label: 'Copy URL', onClick: () => stationCopySessionMediaUrl(frameUrl, 'frame URL') } : null,
+      ],
+    });
+  });
+  if (frameGroups.length > 5) {
+    stationDockEmpty(section, `Showing 5 of ${frameGroups.length} frame groups. Copy the manifest for the full list.`);
+  }
+}
+
 function stationRouteLegacySessionDetail(session) {
   stationForceRouteTo('sessions', 'recent', () => openSessionDetail(session));
 }
@@ -15183,6 +15408,7 @@ function stationRenderSessionDetailSection(parent, sessionId) {
   stationDockActions(section, stationSessionActionsForDock(session, { omitDetail: true }));
   stationRenderSessionRenameSection(parent, session);
   stationRenderSessionCleanupSection(parent, session);
+  stationRenderSessionMediaSection(parent, session);
   stationRenderSessionLogSection(parent, session);
   const live = stationRenderExternalLiveThreadSection(parent, session);
   stationRenderSessionConfigSection(parent, session);

@@ -3261,6 +3261,24 @@ fn list_recording_streams(recordings_dir: &std::path::Path) -> Vec<serde_json::V
     entries
 }
 
+fn recording_playlist_m3u8(segments: &[crate::recording::SegmentInfo]) -> String {
+    let mut m3u8 = String::from("#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-MEDIA-SEQUENCE:0\n");
+    let max_dur = segments
+        .iter()
+        .map(|s| s.end_secs - s.start_secs)
+        .fold(0.0f64, f64::max);
+    m3u8.push_str(&format!(
+        "#EXT-X-TARGETDURATION:{}\n",
+        max_dur.ceil() as u64
+    ));
+    for s in segments {
+        let dur = s.end_secs - s.start_secs;
+        m3u8.push_str(&format!("#EXTINF:{:.3},\n{}\n", dur, s.filename));
+    }
+    m3u8.push_str("#EXT-X-ENDLIST\n");
+    m3u8
+}
+
 fn session_relationships_from_log_dir(session_dir: &Path) -> Vec<serde_json::Value> {
     let Ok(contents) = std::fs::read_to_string(session_dir.join("session.jsonl")) else {
         return Vec::new();
@@ -15628,25 +15646,7 @@ pub fn spawn_web_gateway(
                                         &stream_dir,
                                     );
                                 }
-                                let mut m3u8 = String::from(
-                                    "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-MEDIA-SEQUENCE:0\n",
-                                );
-                                let max_dur = segments
-                                    .iter()
-                                    .map(|s| s.end_secs - s.start_secs)
-                                    .fold(0.0f64, f64::max);
-                                m3u8.push_str(&format!(
-                                    "#EXT-X-TARGETDURATION:{}\n",
-                                    max_dur.ceil() as u64
-                                ));
-                                for s in &segments {
-                                    let dur = s.end_secs - s.start_secs;
-                                    m3u8.push_str(&format!(
-                                        "#EXTINF:{:.3},\n{}\n",
-                                        dur, s.filename
-                                    ));
-                                }
-                                m3u8.push_str("#EXT-X-ENDLIST\n");
+                                let m3u8 = recording_playlist_m3u8(&segments);
                                 let response = format!(
                                     "HTTP/1.1 200 OK\r\n\
                                      Content-Type: application/vnd.apple.mpegurl\r\n\
@@ -16427,6 +16427,32 @@ pub fn spawn_web_gateway(
                                      {}",
                                     body.len(),
                                     body
+                                );
+                                let _ = stream.write_all(response.as_bytes()).await;
+                            } else if rec_rest.len() == 2 && rec_rest[1] == "playlist.m3u8" {
+                                // GET /api/session/{id}/recordings/{stream}/playlist.m3u8
+                                let stream_name = rec_rest[0];
+                                let segments = resolve_session_dir(session_id)
+                                    .map(|session_dir| {
+                                        let stream_dir =
+                                            session_dir.join("recordings").join(stream_name);
+                                        crate::recording::parse_segment_csv_pub(
+                                            &stream_dir.join("segments.csv"),
+                                            &stream_dir,
+                                        )
+                                    })
+                                    .unwrap_or_default();
+                                let m3u8 = recording_playlist_m3u8(&segments);
+                                let response = format!(
+                                    "HTTP/1.1 200 OK\r\n\
+                                     Content-Type: application/vnd.apple.mpegurl\r\n\
+                                     Content-Length: {}\r\n\
+                                     Cache-Control: no-cache\r\n\
+                                     Connection: close\r\n\
+                                     \r\n\
+                                     {}",
+                                    m3u8.len(),
+                                    m3u8
                                 );
                                 let _ = stream.write_all(response.as_bytes()).await;
                             } else if rec_rest.len() == 2 {
@@ -19176,6 +19202,39 @@ mod tests {
                 None => std::env::remove_var(self.key),
             }
         }
+    }
+
+    #[test]
+    fn recording_playlist_m3u8_formats_segments_for_hls() {
+        let segments = vec![
+            crate::recording::SegmentInfo {
+                filename: "seg_00000.mp4".to_string(),
+                start_secs: 0.0,
+                end_secs: 1.25,
+                path: std::path::PathBuf::from("seg_00000.mp4"),
+            },
+            crate::recording::SegmentInfo {
+                filename: "seg_00001.mp4".to_string(),
+                start_secs: 1.25,
+                end_secs: 3.0,
+                path: std::path::PathBuf::from("seg_00001.mp4"),
+            },
+        ];
+
+        assert_eq!(
+            recording_playlist_m3u8(&segments),
+            concat!(
+                "#EXTM3U\n",
+                "#EXT-X-VERSION:3\n",
+                "#EXT-X-MEDIA-SEQUENCE:0\n",
+                "#EXT-X-TARGETDURATION:2\n",
+                "#EXTINF:1.250,\n",
+                "seg_00000.mp4\n",
+                "#EXTINF:1.750,\n",
+                "seg_00001.mp4\n",
+                "#EXT-X-ENDLIST\n",
+            )
+        );
     }
 
     async fn next_ws_json_matching<S, F>(ws_rx: &mut S, mut matches: F) -> serde_json::Value
