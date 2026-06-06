@@ -3923,6 +3923,147 @@ fn codex_plan_entries(params: &serde_json::Value) -> Vec<(String, String, String
 struct CodexNotificationState {
     goal_known_active: bool,
     latest_usage: Option<AgentUsageSnapshot>,
+    command_output_hygiene: HashMap<String, CodexCommandOutputHygiene>,
+}
+
+const CODEX_WARNING_DIAGNOSTIC_INLINE_LIMIT: usize = 3;
+
+#[derive(Default)]
+struct CodexCommandOutputHygiene {
+    pending: String,
+    warning_diagnostics_seen: usize,
+    suppressing_warning_diagnostic: bool,
+    suppression_notice_emitted: bool,
+}
+
+impl CodexCommandOutputHygiene {
+    fn filter(&mut self, text: &str, flush: bool) -> Option<String> {
+        if text.is_empty() && !(flush && !self.pending.is_empty()) {
+            return None;
+        }
+
+        let mut combined = String::new();
+        if !self.pending.is_empty() {
+            combined.push_str(&self.pending);
+            self.pending.clear();
+        }
+        combined.push_str(text);
+
+        let mut out = String::new();
+        let mut start = 0;
+        for (idx, ch) in combined.char_indices() {
+            if ch == '\n' {
+                let end = idx + ch.len_utf8();
+                self.push_filtered_line(&combined[start..end], &mut out);
+                start = end;
+            }
+        }
+
+        if start < combined.len() {
+            let tail = &combined[start..];
+            if flush || !is_potential_codex_warning_prefix(tail) {
+                self.push_filtered_line(tail, &mut out);
+            } else {
+                self.pending.push_str(tail);
+            }
+        }
+
+        if out.is_empty() {
+            None
+        } else {
+            Some(out)
+        }
+    }
+
+    fn push_filtered_line(&mut self, line: &str, out: &mut String) {
+        if is_codex_warning_diagnostic_start(line) {
+            self.warning_diagnostics_seen += 1;
+            if self.warning_diagnostics_seen > CODEX_WARNING_DIAGNOSTIC_INLINE_LIMIT {
+                self.suppressing_warning_diagnostic = true;
+                if !self.suppression_notice_emitted {
+                    if !out.ends_with('\n') && !out.is_empty() {
+                        out.push('\n');
+                    }
+                    out.push_str("[Intendant suppressed additional repeated warning diagnostics from Codex command output]\n");
+                    self.suppression_notice_emitted = true;
+                }
+                return;
+            }
+            self.suppressing_warning_diagnostic = false;
+            out.push_str(line);
+            return;
+        }
+
+        if self.suppressing_warning_diagnostic {
+            if is_codex_warning_diagnostic_continuation(line) {
+                if line.trim().is_empty() {
+                    self.suppressing_warning_diagnostic = false;
+                }
+                return;
+            }
+            self.suppressing_warning_diagnostic = false;
+        }
+
+        out.push_str(line);
+    }
+}
+
+fn codex_command_output_hygiene_key(item_id: &str) -> String {
+    if item_id.is_empty() {
+        "<unknown>".to_string()
+    } else {
+        item_id.to_string()
+    }
+}
+
+fn filter_codex_command_output(
+    state: &mut CodexNotificationState,
+    item_id: &str,
+    text: &str,
+    flush: bool,
+) -> Option<String> {
+    let key = codex_command_output_hygiene_key(item_id);
+    state
+        .command_output_hygiene
+        .entry(key)
+        .or_default()
+        .filter(text, flush)
+}
+
+fn finish_codex_command_output(
+    state: &mut CodexNotificationState,
+    item_id: &str,
+) -> Option<String> {
+    let key = codex_command_output_hygiene_key(item_id);
+    let mut hygiene = state.command_output_hygiene.remove(&key)?;
+    hygiene.filter("", true)
+}
+
+fn is_codex_warning_diagnostic_start(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    let lower = trimmed.to_ascii_lowercase();
+    lower.starts_with("warning:") || lower.starts_with("warn:")
+}
+
+fn is_potential_codex_warning_prefix(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    if trimmed.len() >= "warning:".len() {
+        return false;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    "warning:".starts_with(&lower) || "warn:".starts_with(&lower)
+}
+
+fn is_codex_warning_diagnostic_continuation(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    trimmed.is_empty()
+        || trimmed.starts_with("-->")
+        || trimmed.starts_with('|')
+        || trimmed.starts_with('=')
+        || trimmed.starts_with("...")
+        || trimmed.starts_with(":::")
+        || trimmed.to_ascii_lowercase().starts_with("note:")
+        || trimmed.to_ascii_lowercase().starts_with("help:")
 }
 
 fn codex_backend_error_event(
@@ -4275,17 +4416,15 @@ fn translate_notification_with_scope(
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
-            let text = params
-                .get("delta")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            send_scoped_agent_event(
-                event_tx,
-                thread_id,
-                turn_id,
-                AgentEvent::ToolOutputDelta { item_id, text },
-            );
+            let raw_text = params.get("delta").and_then(|v| v.as_str()).unwrap_or("");
+            if let Some(text) = filter_codex_command_output(state, &item_id, raw_text, false) {
+                send_scoped_agent_event(
+                    event_tx,
+                    thread_id,
+                    turn_id,
+                    AgentEvent::ToolOutputDelta { item_id, text },
+                );
+            }
         }
 
         "item/completed" => {
@@ -4387,17 +4526,30 @@ fn translate_notification_with_scope(
             // Extract command output from commandExecution items
             if item_type == "commandExecution" {
                 if let Some(output) = item.get("aggregatedOutput").and_then(|v| v.as_str()) {
-                    if !output.is_empty() {
+                    if let Some(text) = filter_codex_command_output(state, &item_id, output, true) {
                         send_scoped_agent_event(
                             event_tx,
                             thread_id,
                             turn_id,
                             AgentEvent::ToolOutputDelta {
                                 item_id: item_id.clone(),
-                                text: output.to_string(),
+                                text,
                             },
                         );
                     }
+                    state
+                        .command_output_hygiene
+                        .remove(&codex_command_output_hygiene_key(&item_id));
+                } else if let Some(text) = finish_codex_command_output(state, &item_id) {
+                    send_scoped_agent_event(
+                        event_tx,
+                        thread_id,
+                        turn_id,
+                        AgentEvent::ToolOutputDelta {
+                            item_id: item_id.clone(),
+                            text,
+                        },
+                    );
                 }
             }
 
@@ -4436,6 +4588,11 @@ fn translate_notification_with_scope(
                 "cancelled" => ToolCompletionStatus::Cancelled,
                 _ => ToolCompletionStatus::Success,
             };
+            if item_type == "commandExecution" {
+                state
+                    .command_output_hygiene
+                    .remove(&codex_command_output_hygiene_key(&item_id));
+            }
             send_scoped_agent_event(
                 event_tx,
                 thread_id,
@@ -6701,6 +6858,85 @@ mod tests {
             }
             other => panic!("expected ToolOutputDelta, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn codex_command_output_hygiene_suppresses_repeated_warning_blocks() {
+        let mut hygiene = CodexCommandOutputHygiene::default();
+        let input = "\
+warning: unused import: `a`
+ --> src/a.rs:1:1
+  |
+
+warning: unused variable: `b`
+ --> src/b.rs:2:1
+  |
+
+warning: dead code
+ --> src/c.rs:3:1
+  |
+
+warning: unused import: `d`
+ --> src/d.rs:4:1
+  |
+
+warning: unused variable: `e`
+ --> src/e.rs:5:1
+  |
+
+error: could not compile `demo`
+";
+
+        let filtered = hygiene.filter(input, true).unwrap();
+        assert!(filtered.contains("warning: unused import: `a`"));
+        assert!(filtered.contains("warning: unused variable: `b`"));
+        assert!(filtered.contains("warning: dead code"));
+        assert!(!filtered.contains("warning: unused import: `d`"));
+        assert!(!filtered.contains("src/d.rs"));
+        assert!(!filtered.contains("warning: unused variable: `e`"));
+        assert!(filtered.contains("suppressed additional repeated warning diagnostics"));
+        assert!(filtered.contains("error: could not compile `demo`"));
+    }
+
+    #[test]
+    fn translate_output_delta_suppresses_warning_flood_but_keeps_errors() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut state = CodexNotificationState::default();
+        for idx in 0..5 {
+            let params = serde_json::json!({
+                "itemId": "item-1",
+                "delta": format!("warning: noisy diagnostic {idx}\n")
+            });
+            translate_notification_with_state(
+                "item/commandExecution/outputDelta",
+                &params,
+                &tx,
+                &mut state,
+            );
+        }
+        let params = serde_json::json!({"itemId": "item-1", "delta": "error: build failed\n"});
+        translate_notification_with_state(
+            "item/commandExecution/outputDelta",
+            &params,
+            &tx,
+            &mut state,
+        );
+
+        let mut texts = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            match event {
+                AgentEvent::ToolOutputDelta { text, .. } => texts.push(text),
+                other => panic!("expected ToolOutputDelta, got {:?}", other),
+            }
+        }
+        let joined = texts.join("");
+        assert!(joined.contains("warning: noisy diagnostic 0"));
+        assert!(joined.contains("warning: noisy diagnostic 1"));
+        assert!(joined.contains("warning: noisy diagnostic 2"));
+        assert!(!joined.contains("warning: noisy diagnostic 3"));
+        assert!(!joined.contains("warning: noisy diagnostic 4"));
+        assert!(joined.contains("suppressed additional repeated warning diagnostics"));
+        assert!(joined.contains("error: build failed"));
     }
 
     #[test]
