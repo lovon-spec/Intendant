@@ -345,19 +345,306 @@ html, body {
 }
 #station-hud-canvas {
   z-index: 2;
-  cursor: grab;
+  pointer-events: auto;
 }
-#station-hud-canvas:active {
-  cursor: grabbing;
+.station-hotspots {
+  position: absolute;
+  inset: 0;
+  z-index: 3;
+  pointer-events: none;
+}
+.station-hotspot {
+  position: absolute;
+  border: 0;
+  padding: 0;
+  margin: 0;
+  background: transparent;
+  color: transparent;
+  cursor: pointer;
+  pointer-events: auto;
+}
+.station-pane.station-dom-fallback .station-hotspot {
+  display: grid;
+  align-content: center;
+  justify-items: start;
+  padding: 5px 8px;
+  border: 1px solid rgba(49, 50, 68, 0.78);
+  border-radius: 4px;
+  background: rgba(17, 17, 27, 0.72);
+  color: var(--text);
+  font-size: 10px;
+  line-height: 1.2;
+  text-align: left;
+  white-space: pre-line;
+}
+.station-pane.station-dom-fallback .station-hotspot[data-station-hotspot^="layout:"] {
+  display: block;
+  padding: 4px 8px;
+  border-color: rgba(137, 180, 250, 0.54);
+  background: rgba(24, 24, 37, 0.88);
+  color: var(--blue);
+  font-weight: 700;
+  text-align: center;
+  white-space: nowrap;
+}
+.station-pane.station-dom-fallback .station-hotspot[data-station-hotspot^="system:"]::first-line {
+  color: var(--overlay1);
+  font-weight: 700;
 }
 .station-status {
   position: absolute;
   left: 12px;
   bottom: 10px;
-  z-index: 3;
+  z-index: 4;
   color: var(--overlay1);
   font-size: 10px;
   pointer-events: none;
+}
+.station-dock {
+  position: absolute;
+  top: 52px;
+  right: 14px;
+  bottom: 16px;
+  z-index: 6;
+  width: min(440px, calc(100vw - 28px));
+  display: flex;
+  flex-direction: column;
+  border: 1px solid rgba(127, 132, 156, 0.55);
+  border-radius: 8px;
+  background: rgba(24, 24, 37, 0.96);
+  box-shadow: 0 18px 50px rgba(0, 0, 0, 0.38);
+  color: var(--text);
+  overflow: hidden;
+}
+.station-dock.hidden {
+  display: none;
+}
+.station-dock-header {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: start;
+  padding: 11px 12px 10px;
+  border-bottom: 1px solid rgba(69, 71, 90, 0.9);
+  background: rgba(17, 17, 27, 0.78);
+}
+.station-dock-kicker {
+  color: var(--overlay1);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+.station-dock-title {
+  margin-top: 2px;
+  color: var(--text);
+  font-size: 14px;
+  font-weight: 700;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.station-dock-subtitle {
+  margin-top: 4px;
+  color: var(--subtext0);
+  font-size: 11px;
+  line-height: 1.35;
+}
+.station-dock-nav {
+  grid-column: 1 / -1;
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 6px;
+  margin-top: 2px;
+}
+.station-dock-nav button {
+  min-width: 0;
+  min-height: 24px;
+  border: 1px solid var(--surface1);
+  border-radius: 5px;
+  background: rgba(24, 24, 37, 0.74);
+  color: var(--subtext0);
+  font-size: 11px;
+  cursor: pointer;
+}
+.station-dock-nav button.active {
+  border-color: var(--blue);
+  background: rgba(137, 180, 250, 0.16);
+  color: var(--text);
+  font-weight: 700;
+}
+.station-dock-close {
+  width: 26px;
+  height: 26px;
+  border: 1px solid var(--surface1);
+  border-radius: 5px;
+  background: var(--surface0);
+  color: var(--overlay1);
+  cursor: pointer;
+}
+.station-dock-body {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: 12px;
+}
+.station-dock-section {
+  margin-bottom: 15px;
+}
+.station-dock-section-title {
+  margin-bottom: 8px;
+  color: var(--blue);
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+.station-dock-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 7px;
+}
+.station-dock-row,
+.station-dock-card {
+  border: 1px solid rgba(69, 71, 90, 0.86);
+  border-radius: 6px;
+  background: rgba(17, 17, 27, 0.72);
+}
+.station-dock-row {
+  display: grid;
+  grid-template-columns: 96px minmax(0, 1fr);
+  gap: 8px;
+  padding: 7px 9px;
+  font-size: 12px;
+}
+.station-dock-key {
+  color: var(--overlay1);
+  font-weight: 700;
+}
+.station-dock-value {
+  color: var(--text);
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.station-dock-card {
+  padding: 9px;
+}
+.station-dock-card.active {
+  border-color: var(--blue);
+  box-shadow: inset 3px 0 0 var(--blue);
+}
+.station-dock-card-title {
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 700;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.station-dock-card-meta,
+.station-dock-card-detail {
+  margin-top: 4px;
+  color: var(--subtext0);
+  font-size: 11px;
+  line-height: 1.35;
+}
+.station-dock-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+  margin-top: 9px;
+}
+.station-dock-btn {
+  min-height: 26px;
+  padding: 5px 9px;
+  border: 1px solid var(--surface1);
+  border-radius: 5px;
+  background: var(--surface0);
+  color: var(--text);
+  font-size: 12px;
+  cursor: pointer;
+}
+.station-dock-btn.primary {
+  border-color: var(--blue);
+  background: var(--blue);
+  color: var(--crust);
+  font-weight: 700;
+}
+.station-dock-btn.danger {
+  border-color: var(--red);
+  color: var(--red);
+}
+.station-dock-btn.route {
+  border-style: dashed;
+  color: var(--peach);
+}
+.station-dock-field {
+  display: grid;
+  gap: 5px;
+  margin-bottom: 9px;
+  color: var(--overlay1);
+  font-size: 11px;
+  font-weight: 700;
+}
+.station-dock-field input,
+.station-dock-field textarea,
+.station-dock-field select {
+  width: 100%;
+  box-sizing: border-box;
+  border: 1px solid var(--surface1);
+  border-radius: 5px;
+  background: var(--mantle);
+  color: var(--text);
+  padding: 7px 8px;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 400;
+}
+.station-dock-field.check {
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+}
+.station-dock-field.check input {
+  width: 18px;
+  height: 18px;
+  justify-self: end;
+  padding: 0;
+}
+.station-dock-field textarea {
+  min-height: 76px;
+  resize: vertical;
+}
+.station-dock-empty {
+  padding: 10px;
+  border: 1px dashed var(--surface1);
+  border-radius: 6px;
+  color: var(--subtext0);
+  font-size: 12px;
+  background: rgba(17, 17, 27, 0.55);
+}
+.station-dock-diff {
+  max-height: 270px;
+  overflow: auto;
+  border: 1px solid rgba(69, 71, 90, 0.86);
+  border-radius: 6px;
+  background: rgba(17, 17, 27, 0.78);
+  padding: 8px;
+  font-size: 11px;
+}
+
+@media (max-width: 760px) {
+  .station-dock {
+    left: 10px;
+    right: 10px;
+    top: auto;
+    bottom: 10px;
+    width: auto;
+    max-height: 58vh;
+  }
+  .station-dock-nav {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
 }
 
 /* ── Settings ── */
@@ -2450,6 +2737,9 @@ body.context-focus-active {
 .log-entry.station-focus {
   background: rgba(137, 180, 250, 0.16);
   box-shadow: inset 0 0 0 1px rgba(137, 180, 250, 0.34);
+}
+.worktree-card.station-focus {
+  box-shadow: 0 0 0 2px rgba(137, 180, 250, 0.64), 0 0 18px rgba(137, 180, 250, 0.18);
 }
 .log-entry.level-model { border-left-color: rgba(137, 180, 250, 0.55); }
 .log-entry.level-agent { border-left-color: rgba(148, 226, 213, 0.55); }
@@ -7761,6 +8051,37 @@ body.display-fullscreen-open {
         <canvas id="station-scene-canvas" class="station-canvas"></canvas>
         <canvas id="station-hud-canvas" class="station-canvas"></canvas>
         <div id="station-status" class="station-status">Station initializing</div>
+        <div id="station-hotspots" class="station-hotspots" aria-label="Station controls">
+          <button class="station-hotspot" type="button" data-station-hotspot="layout:orbital" title="Orbital layout"></button>
+          <button class="station-hotspot" type="button" data-station-hotspot="layout:constellation" title="Constellation layout"></button>
+          <button class="station-hotspot" type="button" data-station-hotspot="system:activity" title="Activity"></button>
+          <button class="station-hotspot" type="button" data-station-hotspot="system:context" title="Context"></button>
+          <button class="station-hotspot" type="button" data-station-hotspot="system:managed" title="Managed context"></button>
+          <button class="station-hotspot" type="button" data-station-hotspot="system:changes" title="Changes"></button>
+          <button class="station-hotspot" type="button" data-station-hotspot="system:sessions" title="Sessions"></button>
+          <button class="station-hotspot" type="button" data-station-hotspot="system:peers" title="Peers and displays"></button>
+          <button class="station-hotspot" type="button" data-station-hotspot="system:controls" title="Control surfaces"></button>
+        </div>
+        <aside id="station-dock" class="station-dock hidden" aria-live="polite">
+          <div class="station-dock-header">
+            <div>
+              <div class="station-dock-kicker">Station panel</div>
+              <div id="station-dock-title" class="station-dock-title">Control Center</div>
+              <div id="station-dock-subtitle" class="station-dock-subtitle"></div>
+            </div>
+            <button id="station-dock-close" class="station-dock-close" type="button" title="Close Station panel">&times;</button>
+            <nav id="station-dock-nav" class="station-dock-nav" aria-label="Station dock panels">
+              <button type="button" data-station-dock-nav="system:activity">Activity</button>
+              <button type="button" data-station-dock-nav="system:context">Context</button>
+              <button type="button" data-station-dock-nav="system:managed">Managed</button>
+              <button type="button" data-station-dock-nav="system:changes">Changes</button>
+              <button type="button" data-station-dock-nav="system:sessions">Sessions</button>
+              <button type="button" data-station-dock-nav="system:peers">Peers</button>
+              <button type="button" data-station-dock-nav="system:controls">Controls</button>
+            </nav>
+          </div>
+          <div id="station-dock-body" class="station-dock-body"></div>
+        </aside>
         <div id="station-display-endpoints" aria-hidden="true" style="position:absolute;left:-10000px;top:-10000px;width:1px;height:1px;overflow:hidden"></div>
       </div>
     </div>
@@ -9888,10 +10209,13 @@ const pendingAuthorityStates = new Map();
 let station = null;
 let stationWasmReady = false;
 let stationInitPromise = null;
+let stationDomFallback = false;
 let stationCurrentTask = '';
 let stationCurrentApproval = null;
 const stationLogEvents = [];
 const stationRegisteredSources = new Set();
+let stationLastSnapshotJson = '';
+let stationLastFallbackSnapshot = null;
 let stationSessionsIndexLoading = false;
 let stationSessionsIndexError = '';
 
@@ -9900,7 +10224,27 @@ function stationStatus(text) {
   if (el) el.textContent = text;
 }
 
+function stationShouldUseWebgpu() {
+  return window.location.href.includes('station_gpu=webgpu');
+}
+
+function stationSetFallbackClass(enabled) {
+  const pane = document.querySelector('.station-pane');
+  pane?.classList.toggle('station-dom-fallback', !!enabled);
+}
+
 async function ensureStation() {
+  if (!stationShouldUseWebgpu()) {
+    stationDomFallback = true;
+    stationInitPromise = null;
+    stationSetFallbackClass(true);
+    stationSyncHotspots();
+    stationUpdateSnapshot();
+    if (activeTab === 'station') stationRefreshSharedCaches();
+    return null;
+  }
+  stationDomFallback = false;
+  stationSetFallbackClass(false);
   if (station) return station;
   if (stationInitPromise) return stationInitPromise;
   stationInitPromise = (async () => {
@@ -9913,10 +10257,14 @@ async function ensureStation() {
     const hud = document.getElementById('station-hud-canvas');
     if (!scene || !hud) return null;
     station = new StationWeb(scene, hud);
+    stationLastSnapshotJson = '';
     station.set_action_callback((action) => handleStationAction(action));
     const active = activeTab === 'station';
     station.set_active(active);
     stationStatus('Station online');
+    window.setTimeout(() => stationStatus(station?.debug_state?.() || 'Station online'), 1500);
+    window.setTimeout(() => stationStatus(station?.debug_state?.() || 'Station online'), 4000);
+    stationSyncHotspots();
     stationUpdateSnapshot();
     stationRegisterExistingSources();
     if (active) stationRefreshSharedCaches();
@@ -9934,9 +10282,17 @@ function stationSetActive(active) {
     station.set_active(active);
     station.resize();
     if (active) {
+      stationSyncHotspots();
       stationRefreshSharedCaches();
       stationUpdateSnapshot();
       stationRegisterExistingSources();
+    }
+  } else if (stationDomFallback && !stationShouldUseWebgpu()) {
+    stationSetFallbackClass(active);
+    if (active) {
+      stationSyncHotspots();
+      stationRefreshSharedCaches();
+      stationUpdateSnapshot();
     }
   } else if (active) {
     ensureStation().catch(err => {
@@ -9947,7 +10303,7 @@ function stationSetActive(active) {
 }
 
 function stationRefreshSharedCaches() {
-  if (!station) return;
+  if (!station && !stationDomFallback) return;
   if (!sessionsLoaded) {
     stationSessionsIndexLoading = true;
     stationSessionsIndexError = '';
@@ -9974,7 +10330,7 @@ function stationRefreshSharedCaches() {
 }
 
 function stationScheduleUpdate() {
-  if (!station) return;
+  if (!station && !stationDomFallback) return;
   if (stationScheduleUpdate._pending) return;
   stationScheduleUpdate._pending = true;
   requestAnimationFrame(() => {
@@ -9984,13 +10340,37 @@ function stationScheduleUpdate() {
 }
 
 function stationUpdateSnapshot() {
-  if (!station) return;
+  if (!station && !stationDomFallback) return;
   try {
-    station.update_snapshot(buildStationSnapshot());
+    const snapshot = buildStationSnapshot();
+    stationLastFallbackSnapshot = snapshot;
+    if (stationDomFallback && !station) {
+      stationStatus(`station hosts=${snapshot.hosts.length} agents=${snapshot.agents.length} events=${snapshot.events.length} displays=${displaySlots.size + peerDisplayConnections.size} gpu=false`);
+      stationSyncHotspots();
+      return;
+    }
+    const snapshotJson = JSON.stringify(snapshot);
+    if (snapshotJson !== stationLastSnapshotJson) {
+      station.update_snapshot(snapshot);
+      stationLastSnapshotJson = snapshotJson;
+    }
     stationStatus(station.debug_state());
   } catch (e) {
     console.warn('station snapshot failed:', e);
   }
+}
+
+function stationLastSnapshotForFallback() {
+  return stationLastFallbackSnapshot || {
+    hosts: [],
+    agents: [],
+    events: [],
+    context: { available: false, tokens: 0 },
+    managed: { mode: 'managed', status: 'unknown' },
+    changes: { count: 0, status: 'clean' },
+    sessions: { total: 0, active: 0 },
+    controls: { backend: 'agent', sandbox: 'sandbox' },
+  };
 }
 
 function stationLogEventId(c, fallbackIndex = '') {
@@ -10149,10 +10529,10 @@ function handleStationAction(action) {
     const hostId = action.host_id || selfPeerId;
     const decision = action.decision || 'approve';
     if (hostId === selfPeerId || hostId === 'local') {
-      const map = { approve: 'approve', skip: 'skip', deny: 'deny' };
+      const map = { approve: 'approve', skip: 'skip', approve_all: 'approve_all', deny: 'deny' };
       if (app) processCommands(app.send_approval(map[decision] || 'approve'));
     } else {
-      const map = { approve: 'accept', skip: 'cancel', deny: 'decline' };
+      const map = { approve: 'accept', skip: 'cancel', approve_all: 'accept', deny: 'decline' };
       resolvePeerApproval(hostId, action.approval_id, map[decision] || decision);
     }
   } else if (action.type === 'open_display') {
@@ -10167,6 +10547,8 @@ function handleStationAction(action) {
     stationHandleContextAction(action);
   } else if (action.type === 'activity_action') {
     stationHandleActivityAction(action);
+  } else if (action.type === 'controls_action') {
+    stationHandleControlsAction(action);
   } else if (action.type === 'changes_action') {
     stationHandleChangesAction(action);
   } else if (action.type === 'navigate') {
@@ -10201,6 +10583,1573 @@ function stationForceRouteTo(tab, subtab, after) {
   if (typeof after === 'function') {
     setTimeout(after, 0);
   }
+}
+
+let stationSessionDockFilter = '';
+let stationWorktreeDockFilter = '';
+let stationSelectedContextPart = '';
+let stationSelectedChangePath = '';
+let stationLaunchDraft = {
+  task: '',
+  name: '',
+  project: '',
+  agent: '',
+  command: '',
+  managed: '',
+  archive: '',
+  fast: false,
+  direct: false,
+};
+
+const STATION_SYSTEM_TARGETS = Object.freeze([
+  ['system:activity', 'Activity'],
+  ['system:context', 'Context'],
+  ['system:managed', 'Managed'],
+  ['system:changes', 'Changes'],
+  ['system:sessions', 'Sessions'],
+  ['system:peers', 'Peers'],
+  ['system:controls', 'Controls'],
+]);
+
+// Mirrors crates/station-web/src/lib.rs StationInner::draw_toolbar and
+// StationInner::draw_systems_panel. Keep these constants byte-close to Rust.
+const STATION_HUD_GEOMETRY = Object.freeze({
+  layoutButtons: Object.freeze([
+    Object.freeze({ name: 'layout:orbital', x: 86, y: 9, w: 66, h: 22 }),
+    Object.freeze({ name: 'layout:constellation', x: 158, y: 9, w: 102, h: 22 }),
+  ]),
+  compactWidthMin: 760,
+  compactHeightMax: 620,
+  fullPanel: Object.freeze({ x: 12, y: 242, w: 222 }),
+  compactPanel: Object.freeze({ x: 246, y: 52, w: 390 }),
+  panelInsetX: 10,
+  cardTopOffset: 34,
+  panelHeaderHeight: 45,
+  fullCardGap: 4,
+  compactCardGap: 6,
+  compactCardColGap: 6,
+  fullCardMinH: 38,
+  fullCardMaxH: 47,
+  compactCardH: 44,
+  bottomInset: 14,
+});
+
+function stationDockBegin(kind, title, subtitle = '') {
+  const dock = document.getElementById('station-dock');
+  const titleEl = document.getElementById('station-dock-title');
+  const subtitleEl = document.getElementById('station-dock-subtitle');
+  const body = document.getElementById('station-dock-body');
+  if (!dock || !body) return null;
+  dock.dataset.kind = kind || '';
+  dock.classList.remove('hidden');
+  if (titleEl) titleEl.textContent = title || 'Station';
+  if (subtitleEl) subtitleEl.textContent = subtitle || '';
+  body.innerHTML = '';
+  stationSyncDockNav(kind);
+  return body;
+}
+
+function stationCloseDock() {
+  document.getElementById('station-dock')?.classList.add('hidden');
+  stationSyncDockNav('');
+}
+
+document.getElementById('station-dock-close')?.addEventListener('click', stationCloseDock);
+
+function stationDockSystemTarget(kind) {
+  const value = String(kind || '').trim();
+  if (value === 'worktrees') return 'system:sessions';
+  return STATION_SYSTEM_TARGETS.some(([target]) => target === `system:${value}`)
+    ? `system:${value}`
+    : '';
+}
+
+function stationSyncDockNav(kind = document.getElementById('station-dock')?.dataset.kind || '') {
+  const activeTarget = stationDockSystemTarget(kind);
+  document.querySelectorAll('#station-dock-nav [data-station-dock-nav]').forEach(button => {
+    button.classList.toggle('active', !!activeTarget && button.dataset.stationDockNav === activeTarget);
+  });
+}
+
+document.getElementById('station-dock-nav')?.addEventListener('click', ev => {
+  const button = ev.target?.closest?.('[data-station-dock-nav]');
+  if (!button) return;
+  ev.preventDefault();
+  ev.stopPropagation();
+  stationHandleHotspot(button.dataset.stationDockNav);
+});
+
+function stationHudRect() {
+  return document.getElementById('station-hud-canvas')?.getBoundingClientRect()
+    || document.querySelector('.station-pane')?.getBoundingClientRect()
+    || new DOMRect(0, 0, 1, 1);
+}
+
+function stationSystemsGeometry(cssW, cssH) {
+  const g = STATION_HUD_GEOMETRY;
+  const compactGrid = cssH < g.compactHeightMax && cssW > g.compactWidthMin;
+  const panel = compactGrid ? g.compactPanel : g.fullPanel;
+  const cardCount = STATION_SYSTEM_TARGETS.length;
+  const rows = compactGrid ? Math.ceil(cardCount / 2) : cardCount;
+  const cardGap = compactGrid ? g.compactCardGap : g.fullCardGap;
+  const cardColGap = compactGrid ? g.compactCardColGap : 0;
+  const innerW = panel.w - (g.panelInsetX * 2);
+  const cardW = compactGrid ? (innerW - cardColGap) / 2 : innerW;
+  const availableH = Math.max(0, cssH - panel.y - g.bottomInset);
+  const cardH = compactGrid
+    ? g.compactCardH
+    : Math.max(
+      g.fullCardMinH,
+      Math.min(
+        g.fullCardMaxH,
+        (availableH - g.panelHeaderHeight - (cardGap * (cardCount - 1))) / cardCount,
+      ),
+    );
+  return {
+    compactGrid,
+    panel,
+    rows,
+    cardGap,
+    cardColGap,
+    cardW,
+    cardH,
+    panelH: g.panelHeaderHeight + (cardH * rows) + (cardGap * (rows - 1)),
+  };
+}
+
+function stationHotspotBoxes(cssW, cssH) {
+  const boxes = [];
+  const add = (name, x, y, w, h) => boxes.push({ name, x, y, w, h });
+  for (const box of STATION_HUD_GEOMETRY.layoutButtons) {
+    add(box.name, box.x, box.y, box.w, box.h);
+  }
+  const geom = stationSystemsGeometry(cssW, cssH);
+  STATION_SYSTEM_TARGETS.forEach(([name], idx) => {
+    const col = geom.compactGrid ? idx % 2 : 0;
+    const row = geom.compactGrid ? Math.floor(idx / 2) : idx;
+    add(
+      name,
+      geom.panel.x + STATION_HUD_GEOMETRY.panelInsetX + col * (geom.cardW + geom.cardColGap),
+      geom.panel.y + STATION_HUD_GEOMETRY.cardTopOffset + row * (geom.cardH + geom.cardGap),
+      geom.cardW,
+      geom.cardH,
+    );
+  });
+  return boxes;
+}
+
+function stationSyncHotspots() {
+  const layer = document.getElementById('station-hotspots');
+  if (!layer) return;
+  const rect = stationHudRect();
+  const boxes = stationHotspotBoxes(rect.width || 1, rect.height || 1);
+  const fallbackLabels = new Map(STATION_SYSTEM_TARGETS);
+  for (const box of boxes) {
+    const el = layer.querySelector(`[data-station-hotspot="${box.name}"]`);
+    if (!el) continue;
+    el.style.left = `${box.x}px`;
+    el.style.top = `${box.y}px`;
+    el.style.width = `${box.w}px`;
+    el.style.height = `${box.h}px`;
+    if (stationDomFallback) {
+      if (box.name.startsWith('layout:')) {
+        el.textContent = box.name.slice('layout:'.length);
+      } else {
+        const label = fallbackLabels.get(box.name) || el.title || box.name;
+        el.textContent = `${label}\n${stationFallbackHotspotDetail(box.name)}`;
+      }
+    } else {
+      el.textContent = '';
+    }
+  }
+}
+
+function stationFallbackHotspotDetail(name) {
+  const snapshot = stationLastSnapshotForFallback();
+  if (name === 'system:activity') return `${snapshot.events.length} events`;
+  if (name === 'system:context') return snapshot.context.available ? `${stationCompactNumber(snapshot.context.tokens)} tokens` : 'waiting';
+  if (name === 'system:managed') return `${snapshot.managed.mode || 'managed'} · ${snapshot.managed.status || 'unknown'}`;
+  if (name === 'system:changes') return snapshot.changes.count ? `${snapshot.changes.count} files` : (snapshot.changes.status || 'clean');
+  if (name === 'system:sessions') return `${snapshot.sessions.total} total · ${snapshot.sessions.active} active`;
+  if (name === 'system:peers') return `${Math.max(0, snapshot.hosts.length - 1)} peers · ${displaySlots.size + peerDisplayConnections.size} displays`;
+  if (name === 'system:controls') return `${snapshot.controls.backend || 'agent'} · ${snapshot.controls.sandbox || 'sandbox'}`;
+  return '';
+}
+
+function stationHotspotAt(clientX, clientY) {
+  const rect = stationHudRect();
+  const x = clientX - rect.left;
+  const y = clientY - rect.top;
+  const boxes = stationHotspotBoxes(rect.width || 1, rect.height || 1);
+  for (let i = boxes.length - 1; i >= 0; i -= 1) {
+    const box = boxes[i];
+    if (x >= box.x && x <= box.x + box.w && y >= box.y && y <= box.y + box.h) {
+      return box.name;
+    }
+  }
+  return '';
+}
+
+function stationRenderPeersDock() {
+  const body = stationDockBegin('peers', 'Peers and Displays', `${daemons.length} peers / ${displaySlots.size + peerDisplayConnections.size} displays`);
+  if (!body) return;
+  const overview = stationDockSection(body, 'Local display');
+  stationDockRow(overview, 'host', selfHostLabel || selfPeerId || 'local');
+  stationDockRow(overview, 'access', document.getElementById('sb-display-access')?.textContent || 'off');
+  stationDockRow(overview, 'streams', String(displaySlots.size));
+  stationDockActions(overview, [
+    { label: userDisplayGranted ? 'Revoke local' : 'Share local', primary: true, onClick: () => window.toggleUserDisplay?.() },
+    stationDockRouteAction('Route video tab', 'displays', ''),
+    stationDockRouteAction('Route network', 'settings', 'network'),
+  ]);
+  const localDisplays = stationDockSection(body, 'Local streams');
+  if (!displaySlots.size) {
+    stationDockEmpty(localDisplays, 'No local display stream is active.');
+  } else {
+    for (const slot of displaySlots.values()) {
+      const authority = slot.authorityState || 'unknown';
+      const actions = [
+        authority === 'you'
+          ? { label: 'Release input', onClick: () => slot.releaseBtn?.click() }
+          : { label: 'Take input', primary: true, onClick: () => slot.takeBtn?.click() },
+        { label: slot.streamBtn?.classList.contains('active') ? 'Stop stream' : 'Stream', onClick: () => slot.streamBtn?.click() },
+        { label: 'Attach frame', onClick: () => slot.attachBtn?.click() },
+        { label: slot.annotateBtn?.classList.contains('active') ? 'Stop annotate' : 'Annotate', onClick: () => slot.annotateBtn?.click() },
+        { label: slot.recording ? 'Stop rec' : 'Record', onClick: () => slot.recordBtn?.click() },
+        { label: 'Fullscreen', onClick: () => slot.fullscreenBtn?.click() },
+        slot.deleteRecBtn && slot.deleteRecBtn.style.display !== 'none'
+          ? { label: 'Delete rec', danger: true, onClick: () => slot.deleteRecBtn?.click() }
+          : null,
+        { label: 'Close', danger: true, onClick: () => slot.closeBtn?.click() },
+      ];
+      stationDockCard(localDisplays, {
+        title: `Display ${slot.displayId}`,
+        meta: `${slot.connected ? 'connected' : 'connecting'} / input ${authority}`,
+        detail: `${slot.width || 0}x${slot.height || 0} / ${slot.interactive ? 'interactive' : 'view only'}`,
+        actions,
+      });
+    }
+  }
+  const peers = stationDockSection(body, 'Peers');
+  if (!daemons.length) {
+    stationDockEmpty(peers, 'No configured peer daemons.');
+  } else {
+    for (const d of daemons) {
+      stationDockCard(peers, {
+        title: d.label || d.host_id,
+        meta: d.connected ? 'connected' : 'offline',
+        detail: d.url || daemonPlatformLabel(d) || '',
+        actions: [
+          { label: 'Open display', onClick: () => stationOpenDisplay(d.host_id) },
+        ],
+      });
+    }
+  }
+  const remote = stationDockSection(body, 'Remote streams');
+  if (!peerDisplayConnections.size) {
+    stationDockEmpty(remote, 'No peer display streams are active.');
+  } else {
+    for (const conn of peerDisplayConnections.values()) {
+      const authority = conn.peerAuthorityState || 'unknown';
+      stationDockCard(remote, {
+        title: stationHostLabel(conn.hostId),
+        meta: `display ${conn.displayId} / input ${authority}`,
+        detail: conn.sessionId || '',
+        actions: [
+          { label: 'Focus', onClick: () => stationOpenDisplay(conn.hostId) },
+          authority === 'you'
+            ? { label: 'Release input', onClick: () => conn.releaseControl?.() }
+            : { label: 'Take input', primary: true, onClick: () => conn.takeControl?.() },
+          { label: 'Close', danger: true, onClick: () => closePeerDisplaysForHost(conn.hostId) },
+        ],
+      });
+    }
+  }
+}
+
+function stationHandleHotspot(name) {
+  const target = String(name || '');
+  if (!target) return;
+  if (target.startsWith('layout:')) {
+    const layout = target.slice('layout:'.length);
+    station?.set_layout?.(layout);
+    stationStatus(station?.debug_state?.() || 'Station online');
+    return;
+  }
+  const renderers = {
+    'system:activity': stationRenderActivityDock,
+    'system:context': stationRenderContextDock,
+    'system:managed': stationRenderManagedDock,
+    'system:changes': stationRenderChangesDock,
+    'system:sessions': stationRenderSessionsDock,
+    'system:peers': stationRenderPeersDock,
+    'system:controls': stationRenderControlsDock,
+  };
+  const render = renderers[target];
+  if (render) {
+    station?.select_by_id?.(target);
+    stationStatus(`Opening ${target.replace('system:', '')}`);
+    render();
+  }
+}
+
+let stationLastHotspotDispatch = { target: '', at: 0 };
+
+function stationDispatchHotspot(target, ev) {
+  const name = String(target || '');
+  if (!name) return;
+  const at = performance.now();
+  if (stationLastHotspotDispatch.target === name && at - stationLastHotspotDispatch.at < 220) {
+    ev?.preventDefault?.();
+    ev?.stopPropagation?.();
+    return;
+  }
+  stationLastHotspotDispatch = { target: name, at };
+  ev?.preventDefault?.();
+  ev?.stopPropagation?.();
+  stationHandleHotspot(name);
+}
+
+function stationHotspotLayerEvent(ev) {
+  const button = ev.target?.closest?.('[data-station-hotspot]');
+  if (button) {
+    stationDispatchHotspot(button.dataset.stationHotspot, ev);
+    return;
+  }
+  const target = stationHotspotAt(ev.clientX, ev.clientY);
+  if (!target) return;
+  stationDispatchHotspot(target, ev);
+}
+
+document.getElementById('station-hotspots')?.addEventListener('click', stationHotspotLayerEvent);
+window.addEventListener('resize', stationSyncHotspots);
+if ('ResizeObserver' in window) {
+  const stationHotspotResizeObserver = new ResizeObserver(() => stationSyncHotspots());
+  const stationPaneForHotspots = document.querySelector('.station-pane');
+  if (stationPaneForHotspots) stationHotspotResizeObserver.observe(stationPaneForHotspots);
+}
+
+function stationDockSection(parent, title = '') {
+  const section = document.createElement('section');
+  section.className = 'station-dock-section';
+  if (title) {
+    const heading = document.createElement('div');
+    heading.className = 'station-dock-section-title';
+    heading.textContent = title;
+    section.appendChild(heading);
+  }
+  parent.appendChild(section);
+  return section;
+}
+
+function stationDockEmpty(parent, text) {
+  const empty = document.createElement('div');
+  empty.className = 'station-dock-empty';
+  empty.textContent = text;
+  parent.appendChild(empty);
+  return empty;
+}
+
+function stationDockButton(label, onClick, opts = {}) {
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.className = 'station-dock-btn' +
+    (opts.primary ? ' primary' : '') +
+    (opts.danger ? ' danger' : '') +
+    (opts.route ? ' route' : '');
+  button.textContent = label;
+  if (opts.title) button.title = opts.title;
+  if (opts.disabled) button.disabled = true;
+  button.addEventListener('click', ev => {
+    ev.stopPropagation();
+    if (typeof onClick !== 'function') return;
+    Promise.resolve(onClick(ev, button)).catch(err => {
+      console.warn('Station dock action failed:', err);
+      showControlToast?.('error', err?.message || String(err));
+    });
+  });
+  return button;
+}
+
+function stationDockActions(parent, actions) {
+  const wrap = document.createElement('div');
+  wrap.className = 'station-dock-actions';
+  for (const action of actions.filter(Boolean)) {
+    wrap.appendChild(stationDockButton(action.label, action.onClick, action));
+  }
+  parent.appendChild(wrap);
+  return wrap;
+}
+
+function stationDockRouteAction(label, tab, subtab, after) {
+  return {
+    label,
+    route: true,
+    onClick: () => stationForceRouteTo(tab, subtab, after),
+  };
+}
+
+function stationDockRow(parent, key, value) {
+  const row = document.createElement('div');
+  row.className = 'station-dock-row';
+  const k = document.createElement('div');
+  k.className = 'station-dock-key';
+  k.textContent = key;
+  const v = document.createElement('div');
+  v.className = 'station-dock-value';
+  v.textContent = value || '--';
+  row.appendChild(k);
+  row.appendChild(v);
+  parent.appendChild(row);
+  return row;
+}
+
+function stationDockCard(parent, item) {
+  const card = document.createElement('div');
+  card.className = 'station-dock-card' + (item.active ? ' active' : '');
+  if (item.onClick) {
+    card.style.cursor = 'pointer';
+    card.addEventListener('click', item.onClick);
+  }
+  const title = document.createElement('div');
+  title.className = 'station-dock-card-title';
+  title.textContent = item.title || '';
+  card.appendChild(title);
+  if (item.meta) {
+    const meta = document.createElement('div');
+    meta.className = 'station-dock-card-meta';
+    meta.textContent = item.meta;
+    card.appendChild(meta);
+  }
+  if (item.detail) {
+    const detail = document.createElement('div');
+    detail.className = 'station-dock-card-detail';
+    detail.textContent = item.detail;
+    card.appendChild(detail);
+  }
+  if (Array.isArray(item.actions) && item.actions.length) {
+    stationDockActions(card, item.actions);
+  }
+  parent.appendChild(card);
+  return card;
+}
+
+function stationDockField(parent, label, control) {
+  const wrap = document.createElement('label');
+  wrap.className = 'station-dock-field';
+  const span = document.createElement('span');
+  span.textContent = label;
+  wrap.appendChild(span);
+  wrap.appendChild(control);
+  parent.appendChild(wrap);
+  return control;
+}
+
+function stationDockInput(parent, label, value = '', attrs = {}) {
+  const input = document.createElement(attrs.multiline ? 'textarea' : 'input');
+  input.value = value || '';
+  if (attrs.id) input.id = attrs.id;
+  if (attrs.placeholder) input.placeholder = attrs.placeholder;
+  if (attrs.type) input.type = attrs.type;
+  if (attrs.rows) input.rows = attrs.rows;
+  return stationDockField(parent, label, input);
+}
+
+function stationDockSelect(parent, label, value, options, attrs = {}) {
+  const select = document.createElement('select');
+  if (attrs.id) select.id = attrs.id;
+  for (const [optValue, optLabel] of options) {
+    const opt = document.createElement('option');
+    opt.value = optValue;
+    opt.textContent = optLabel;
+    select.appendChild(opt);
+  }
+  select.value = value || '';
+  return stationDockField(parent, label, select);
+}
+
+function stationDockCheckbox(parent, label, checked = false, attrs = {}) {
+  const input = document.createElement('input');
+  input.type = 'checkbox';
+  input.checked = !!checked;
+  if (attrs.id) input.id = attrs.id;
+  const field = stationDockField(parent, label, input);
+  field.classList.add('check');
+  return input;
+}
+
+function stationDockCommitOnEnter(control, handler) {
+  if (!control || typeof handler !== 'function') return control;
+  control.addEventListener('change', handler);
+  control.addEventListener('blur', handler);
+  control.addEventListener('keydown', ev => {
+    if (ev.key !== 'Enter') return;
+    ev.preventDefault();
+    handler(ev);
+  });
+  return control;
+}
+
+function stationDockSetSelectValue(controlId, value, fallback = '') {
+  const el = document.getElementById(controlId);
+  if (el) el.value = value ?? fallback;
+  return el || { value: value ?? fallback };
+}
+
+function stationDockSetCheckboxValue(controlId, checked) {
+  const el = document.getElementById(controlId);
+  if (el) el.checked = !!checked;
+  return el || { checked: !!checked };
+}
+
+function stationDockSetTextValue(controlId, value) {
+  const el = document.getElementById(controlId);
+  if (el) el.value = value || '';
+  return el || { value: value || '' };
+}
+
+function stationRenderActivityDock(focusId = '') {
+  const events = stationLastSnapshotForFallback().events || [];
+  const body = stationDockBegin('activity', 'Activity Log', `${events.length} retained events`);
+  if (!body) return;
+  const controls = stationDockSection(body, 'Log controls');
+  stationDockActions(controls, [
+    { label: 'Normal', onClick: () => stationSetActivityVerbosity('normal') },
+    { label: 'Verbose', onClick: () => stationSetActivityVerbosity('verbose') },
+    { label: 'Debug', onClick: () => stationSetActivityVerbosity('debug') },
+    { label: 'All hosts', onClick: () => stationClearActivityHostFilter() },
+    stationDockRouteAction('Route log tab', 'activity', 'log', () => document.getElementById('scroll-bottom')?.click()),
+  ]);
+  const list = stationDockSection(body, 'Recent events');
+  if (!events.length) {
+    stationDockEmpty(list, 'Waiting for dashboard events.');
+    return;
+  }
+  for (const ev of events.slice(-14).reverse()) {
+    stationDockCard(list, {
+      title: `${ev.ts || '--'}  ${ev.level || 'info'}`,
+      meta: ev.hostId || ev.host_id || selfPeerId || 'local',
+      detail: ev.msg || '',
+      active: focusId && ev.id === focusId,
+      actions: [
+        ev.id ? { label: 'Pin', onClick: () => stationRenderActivityDock(ev.id) } : null,
+        ev.id ? { label: 'Copy id', onClick: () => copyTextToClipboard(ev.id) } : null,
+      ],
+    });
+  }
+}
+
+function stationApplyContextAction(op, id = '') {
+  const actionButtonByOp = {
+    live: 'context-live-btn',
+    replay: 'context-replay-btn',
+    reset: 'context-reset-view-btn',
+    focus: 'context-open-focus-btn',
+    raw: 'context-raw-toggle-btn',
+  };
+  if (typeof renderContextPane === 'function') renderContextPane();
+  if (op === 'part') {
+    stationSelectedContextPart = id;
+    if (id && typeof focusContextPart === 'function') focusContextPart(id);
+    return;
+  }
+  const buttonId = actionButtonByOp[op];
+  if (buttonId) document.getElementById(buttonId)?.click();
+}
+
+function stationRenderContextDock(focusId = stationSelectedContextPart) {
+  const ctx = stationBuildContextSummary();
+  const body = stationDockBegin(
+    'context',
+    'Context',
+    ctx.available ? `${stationCompactNumber(ctx.tokens)} tokens across ${ctx.itemCount} items` : 'No context snapshot yet'
+  );
+  if (!body) return;
+  const overview = stationDockSection(body, 'Model window');
+  stationDockRow(overview, 'source', ctx.source || '--');
+  stationDockRow(overview, 'session', ctx.sessionId || '--');
+  stationDockRow(overview, 'turn', ctx.turn || '--');
+  stationDockRow(overview, 'effective', `${stationCompactNumber(ctx.tokens)} / ${stationCompactNumber(ctx.effectiveWindow)}`);
+  stationDockRow(overview, 'pressure', ctx.effectiveWindow ? `${Math.round((ctx.tokens / ctx.effectiveWindow) * 100)}% effective` : '--');
+  stationDockActions(overview, [
+    { label: 'Live', onClick: () => { stationApplyContextAction('live'); stationRenderContextDock(focusId); } },
+    { label: 'Replay', onClick: () => { stationApplyContextAction('replay'); stationRenderContextDock(focusId); } },
+    { label: 'Focus', onClick: () => { stationApplyContextAction('focus'); stationRenderContextDock(focusId); } },
+    { label: 'Raw', onClick: () => { stationApplyContextAction('raw'); stationRenderContextDock(focusId); } },
+    { label: 'Reset', onClick: () => { stationApplyContextAction('reset'); stationRenderContextDock(''); } },
+    stationDockRouteAction('Route context tab', 'activity', 'context'),
+  ]);
+
+  const lanes = stationDockSection(body, 'Top lanes');
+  if (!ctx.topCategories.length) {
+    stationDockEmpty(lanes, 'No context lanes in this snapshot.');
+  } else {
+    for (const item of ctx.topCategories) {
+      stationDockRow(lanes, item.label, `${stationCompactNumber(item.value)} tokens`);
+    }
+  }
+
+  const items = stationDockSection(body, 'Largest items');
+  if (!ctx.topItems.length) {
+    stationDockEmpty(items, 'No item details in this snapshot.');
+  } else {
+    for (const item of ctx.topItems) {
+      stationDockCard(items, {
+        title: item.label || item.id || 'context item',
+        meta: item.value || '',
+        detail: item.detail || '',
+        active: focusId && item.id === focusId,
+        actions: [
+          item.id ? { label: 'Focus', primary: true, onClick: () => { stationApplyContextAction('part', item.id); stationRenderContextDock(item.id); } } : null,
+          item.id ? { label: 'Copy id', onClick: () => copyTextToClipboard(item.id) } : null,
+        ],
+      });
+    }
+  }
+}
+
+function stationSetManagedSession(sessionId) {
+  if (!sessionId) return;
+  if (typeof renderManagedContextSessionSelect === 'function') renderManagedContextSessionSelect();
+  const sel = managedContextEl?.('managed-context-session');
+  if (sel && Array.from(sel.options).some(option => option.value === sessionId)) {
+    sel.value = sessionId;
+    managedContextSessionManuallySelected = true;
+    if (typeof syncManagedContextActiveSession === 'function') syncManagedContextActiveSession();
+  }
+}
+
+function stationCopyManagedFormToLegacy() {
+  const copyValue = (from, to) => {
+    const source = document.getElementById(from);
+    const target = managedContextEl?.(to);
+    if (source && target) target.value = source.value;
+  };
+  copyValue('station-managed-anchor', 'managed-context-anchor');
+  copyValue('station-managed-position', 'managed-context-position');
+  copyValue('station-managed-reason', 'managed-context-reason');
+  copyValue('station-managed-primer', 'managed-context-primer');
+  copyValue('station-managed-record', 'managed-context-record-id');
+  copyValue('station-managed-backout-mode', 'managed-context-backout-mode');
+  copyValue('station-managed-backout-name', 'managed-context-backout-name');
+}
+
+function stationManagedResultText() {
+  return managedContextEl?.('managed-context-action-result')?.textContent || '';
+}
+
+async function stationApplyManagedAction(op, id = '', sessionId = '') {
+  if (sessionId) stationSetManagedSession(sessionId);
+  if (op === 'refresh') {
+    await refreshManagedContextPane({ force: true });
+    return;
+  }
+  if (op === 'anchor') {
+    fillManagedContextAnchor(id, sessionId);
+    return;
+  }
+  if (op === 'record') {
+    const record = (managedContextRecords || []).find(candidate => candidate && candidate.record_id === id);
+    if (record) selectManagedContextRecord(record);
+    else {
+      const input = managedContextEl?.('managed-context-record-id');
+      if (input) input.value = id;
+    }
+    return;
+  }
+  if (op === 'branch') {
+    const [groupId, branchId, expectedId] = id.split('\u001f');
+    if (groupId && branchId && typeof claimManagedContextFissionCanonical === 'function') {
+      await claimManagedContextFissionCanonical(groupId, branchId, expectedId || '');
+    }
+  }
+}
+
+function stationRenderManagedDock(mode = '') {
+  const context = stationBuildContextSummary();
+  const managed = stationBuildManagedSummary(context);
+  const body = stationDockBegin(
+    'managed',
+    'Managed Context',
+    `${managed.mode || 'unknown'} / ${managed.status || 'unknown'}`
+  );
+  if (!body) return;
+  const overview = stationDockSection(body, 'Pressure');
+  stationDockRow(overview, 'session', managed.sessionId || '--');
+  stationDockRow(overview, 'effective', `${stationCompactNumber(managed.usedTokens)} / ${stationCompactNumber(managed.effectiveWindow)}`);
+  stationDockRow(overview, 'hard', `${stationCompactNumber(managed.usedTokens)} / ${stationCompactNumber(managed.hardWindow)}`);
+  stationDockRow(overview, 'pressure', managed.effectiveWindow ? `${Math.round((managed.usedTokens / managed.effectiveWindow) * 100)}% effective${managed.rewindOnly ? ' / rewind only' : ''}` : (managed.rewindOnly ? 'rewind only' : '--'));
+  stationDockRow(overview, 'history', `${managed.records} records / ${managed.anchors} anchors`);
+  stationDockRow(overview, 'branches', `${managed.lineageGroups} lineage / ${managed.fissionGroups} fission / ${managed.branches} branches`);
+  const sessionOptions = managedContextSessionOptions();
+  if (sessionOptions.length) {
+    const selector = stationDockSelect(overview, 'Session', managed.sessionId || sessionOptions[0][0], sessionOptions, { id: 'station-managed-session' });
+    selector.addEventListener('change', ev => {
+      stationSetManagedSession(ev.target.value);
+      stationRenderManagedDock(mode);
+    });
+  }
+  if (managed.error) stationDockEmpty(overview, managed.error);
+  stationDockActions(overview, [
+    { label: 'Refresh', primary: mode === 'refresh', onClick: async () => { await stationApplyManagedAction('refresh', '', managed.sessionId); stationRenderManagedDock('refresh'); } },
+    { label: 'Prepare rewind', primary: mode === 'rewind', onClick: () => stationRenderManagedDock('rewind') },
+    { label: 'Backout', primary: mode === 'backout', onClick: () => stationRenderManagedDock('backout') },
+    stationDockRouteAction('Route managed tab', 'activity', 'managed'),
+  ]);
+
+  const form = stationDockSection(body, mode === 'backout' ? 'Backout' : 'Rewind');
+  const anchorDefault = managedContextEl?.('managed-context-anchor')?.value || managed.recentAnchors?.[0]?.id || '';
+  const recordDefault = managedContextEl?.('managed-context-record-id')?.value || managed.recentRecords?.[0]?.id || '';
+  if (mode === 'backout') {
+    stationDockInput(form, 'Record id', recordDefault, { id: 'station-managed-record', placeholder: 'rewind record id' });
+    stationDockSelect(form, 'Mode', managedContextEl?.('managed-context-backout-mode')?.value || 'inspect', [
+      ['inspect', 'inspect'],
+      ['restore', 'restore active thread'],
+      ['fork', 'fork'],
+      ['backout', 'backout'],
+    ], { id: 'station-managed-backout-mode' });
+    stationDockInput(form, 'Fork name', managedContextEl?.('managed-context-backout-name')?.value || '', { id: 'station-managed-backout-name', placeholder: 'optional' });
+    stationDockActions(form, [
+      { label: 'Run backout', primary: true, onClick: async () => { stationCopyManagedFormToLegacy(); await submitManagedContextBackout(); stationRenderManagedDock('backout'); } },
+    ]);
+  } else {
+    stationDockInput(form, 'Anchor item id', anchorDefault, { id: 'station-managed-anchor', placeholder: 'exact rewind anchor item_id' });
+    stationDockSelect(form, 'Position', managedContextEl?.('managed-context-position')?.value || 'after', [
+      ['after', 'after anchor'],
+      ['before', 'before anchor'],
+    ], { id: 'station-managed-position' });
+    stationDockInput(form, 'Reason', managedContextEl?.('managed-context-reason')?.value || '', { id: 'station-managed-reason', placeholder: 'why this rewind is needed' });
+    stationDockInput(form, 'Primer', managedContextEl?.('managed-context-primer')?.value || '', { id: 'station-managed-primer', placeholder: 'dense carry-forward context', multiline: true, rows: 4 });
+    stationDockActions(form, [
+      { label: 'Inspect anchor', onClick: async () => { stationCopyManagedFormToLegacy(); await inspectManagedContextAnchor(); stationRenderManagedDock('rewind'); } },
+      { label: 'Dispatch rewind', primary: true, onClick: async () => { stationCopyManagedFormToLegacy(); await submitManagedContextRewind(); stationRenderManagedDock('rewind'); } },
+    ]);
+  }
+  const result = stationManagedResultText();
+  if (result) stationDockEmpty(form, result);
+
+  const anchors = stationDockSection(body, 'Anchor catalog');
+  if (!managed.recentAnchors.length) {
+    stationDockEmpty(anchors, 'No anchors discovered for this session.');
+  } else {
+    for (const row of managed.recentAnchors) {
+      stationDockCard(anchors, {
+        title: row.label || row.id,
+        meta: row.value || 'anchor',
+        detail: row.detail || '',
+        actions: [
+          { label: 'Use', primary: true, onClick: async () => { await stationApplyManagedAction('anchor', row.id, row.sessionId); stationRenderManagedDock('rewind'); } },
+          { label: 'Copy', onClick: () => copyTextToClipboard(row.id) },
+        ],
+      });
+    }
+  }
+  const records = stationDockSection(body, 'Recent records');
+  if (!managed.recentRecords.length) {
+    stationDockEmpty(records, 'No rewind records for this session.');
+  } else {
+    for (const row of managed.recentRecords) {
+      stationDockCard(records, {
+        title: row.label || row.id,
+        meta: row.value || 'record',
+        detail: row.detail || '',
+        actions: [
+          { label: 'Select', onClick: async () => { await stationApplyManagedAction('record', row.id, row.sessionId); stationRenderManagedDock('backout'); } },
+          { label: 'Copy', onClick: () => copyTextToClipboard(row.id) },
+        ],
+      });
+    }
+  }
+  const branches = stationDockSection(body, 'Edit branches');
+  if (!managed.recentBranches.length) {
+    stationDockEmpty(branches, 'No claimable fission branches.');
+  } else {
+    for (const row of managed.recentBranches) {
+      stationDockCard(branches, {
+        title: row.label || row.id,
+        meta: row.value || 'branch',
+        detail: row.detail || '',
+        actions: [
+          { label: 'Claim', primary: true, onClick: async () => { await stationApplyManagedAction('branch', row.id, row.sessionId); stationRenderManagedDock(); } },
+        ],
+      });
+    }
+  }
+}
+
+async function stationSelectChange(path) {
+  stationSelectedChangePath = path || stationSelectedChangePath || activeChangesFile || '';
+  if (stationSelectedChangePath) {
+    await selectChangesFile(stationSelectedChangePath);
+  }
+  stationRenderChangesDock(stationSelectedChangePath);
+}
+
+function stationRenderChangesDock(selectedPath = stationSelectedChangePath || activeChangesFile || '') {
+  stationSelectedChangePath = selectedPath || '';
+  const changes = stationBuildChangesSummary();
+  const body = stationDockBegin('changes', 'Changes', `${changes.count} files / ${changes.status || 'clean'}`);
+  if (!body) return;
+  const overview = stationDockSection(body, 'Working tree');
+  stationDockRow(overview, 'state', changes.status || 'clean');
+  stationDockRow(overview, 'files', String(changes.count));
+  stationDockRow(overview, 'lines', `+${stationCompactNumber(changes.totalAdded)} / -${stationCompactNumber(changes.totalRemoved)}`);
+  stationDockActions(overview, [
+    { label: 'Refresh', primary: true, onClick: async () => { await refreshChangesList({ refreshActive: !!activeChangesFile, quiet: true }); stationRenderChangesDock(activeChangesFile || selectedPath); } },
+    { label: 'Redo', onClick: () => { document.getElementById('redo-btn')?.click(); stationRenderChangesDock(selectedPath); } },
+    { label: 'Prune', danger: true, onClick: () => { document.getElementById('prune-btn')?.click(); stationRenderChangesDock(selectedPath); } },
+    stationDockRouteAction('Route changes tab', 'activity', 'changes'),
+  ]);
+
+  const files = stationDockSection(body, 'Changed files');
+  if (!changes.recent.length) {
+    stationDockEmpty(files, changes.status === 'mismatch' ? changes.latestPath : 'No file changes yet.');
+  } else {
+    for (const row of changes.recent) {
+      stationDockCard(files, {
+        title: row.label || row.id,
+        meta: row.value || '',
+        detail: row.detail || row.id,
+        active: row.id && row.id === selectedPath,
+        actions: [
+          row.id ? { label: 'View', primary: true, onClick: () => stationSelectChange(row.id) } : null,
+          row.id ? { label: 'Copy path', onClick: () => copyTextToClipboard(row.id) } : null,
+        ],
+      });
+    }
+  }
+
+  const diff = stationDockSection(body, 'Selected diff');
+  if (!selectedPath) {
+    stationDockEmpty(diff, 'Select a changed file to view its diff in Station.');
+  } else {
+    stationDockRow(diff, 'file', selectedPath);
+    const legacy = document.getElementById('changes-diff-content');
+    const box = document.createElement('div');
+    box.className = 'station-dock-diff';
+    box.innerHTML = legacy?.innerHTML || '<span class="changes-empty">Diff not loaded yet.</span>';
+    diff.appendChild(box);
+  }
+}
+
+function stationSessionRowsForDock() {
+  return stationBuildSessionsSummary().recent || [];
+}
+
+function stationLaunchDraftValue(key, fallback = '') {
+  const value = stationLaunchDraft[key];
+  return value === undefined || value === null || value === '' ? fallback : value;
+}
+
+function stationAgentOptions() {
+  return [
+    ['', newSessionConfiguredAgent ? `Current (${prettyAgentName(newSessionConfiguredAgent)})` : 'Current setting'],
+    ['internal', 'Internal agent'],
+    ['codex', 'Codex'],
+    ['claude-code', 'Claude Code'],
+    ['gemini', 'Gemini CLI'],
+  ];
+}
+
+function stationRememberLaunchDraft() {
+  const task = document.getElementById('station-launch-task');
+  if (task) stationLaunchDraft.task = task.value || '';
+  const name = document.getElementById('station-launch-name');
+  if (name) stationLaunchDraft.name = name.value || '';
+  const project = document.getElementById('station-launch-project');
+  if (project) stationLaunchDraft.project = project.value || '';
+  const agent = document.getElementById('station-launch-agent');
+  if (agent) stationLaunchDraft.agent = agent.value || '';
+  const command = document.getElementById('station-launch-command');
+  if (command) stationLaunchDraft.command = command.value || '';
+  const managed = document.getElementById('station-launch-managed');
+  if (managed) stationLaunchDraft.managed = managed.value || '';
+  const archive = document.getElementById('station-launch-archive');
+  if (archive) stationLaunchDraft.archive = archive.value || '';
+  const fast = document.getElementById('station-launch-fast');
+  if (fast) stationLaunchDraft.fast = !!fast.checked;
+  const direct = document.getElementById('station-launch-direct');
+  if (direct) stationLaunchDraft.direct = !!direct.checked;
+}
+
+function stationEffectiveLaunchAgent() {
+  const selected = stationLaunchDraft.agent;
+  if (selected === 'internal') return 'internal';
+  return normalizeAgentId(selected) || newSessionConfiguredAgent || '';
+}
+
+async function stationStartSessionFromDock() {
+  stationRememberLaunchDraft();
+  const task = String(stationLaunchDraft.task || '').trim();
+  if (!task) {
+    showControlToast?.('error', 'Enter a task before starting a Station session');
+    document.getElementById('station-launch-task')?.focus();
+    return;
+  }
+  if (newSessionSpawnPending) {
+    showControlToast?.('info', 'A new session is already spawning.');
+    return;
+  }
+  if (!app) {
+    failNewSessionSpawnNotice?.('Dashboard is not connected to the server.');
+    return;
+  }
+  const name = String(stationLaunchDraft.name || '').trim();
+  const requestedProjectRoot = String(stationLaunchDraft.project || '').trim();
+  beginNewSessionSpawnNotice(
+    task,
+    requestedProjectRoot ? 'Checking project directory...' : 'Spawning new session...',
+    name
+  );
+  let projectRoot = '';
+  try {
+    projectRoot = await ensureNewSessionProjectDirectory(requestedProjectRoot);
+  } catch (e) {
+    failNewSessionSpawnNotice(e?.message || 'Project directory check failed.');
+    return;
+  }
+  if (requestedProjectRoot && !projectRoot) {
+    failNewSessionSpawnNotice('Project directory needs attention before the session can start.');
+    return;
+  }
+
+  const msg = { action: 'create_session', task };
+  if (name) msg.name = name;
+  if (projectRoot) msg.project_root = projectRoot;
+  const selectedAgent = normalizeAgentId(stationLaunchDraft.agent);
+  if (stationLaunchDraft.agent === 'internal') {
+    msg.agent = 'internal';
+  } else if (selectedAgent) {
+    msg.agent = selectedAgent;
+    const command = String(stationLaunchDraft.command || '').trim();
+    if (command) msg.agent_command = command;
+  }
+  if (stationEffectiveLaunchAgent() === 'codex') {
+    msg.codex_managed_context = stationLaunchDraft.managed === 'managed' ? 'managed' : 'vanilla';
+    msg.codex_context_archive = normalizeContextArchiveMode(stationLaunchDraft.archive || newSessionCodexContextArchive);
+    if (stationLaunchDraft.fast) {
+      msg.codex_service_tier = 'priority';
+    } else if (codexServiceTierIsFast(newSessionCodexDefaultServiceTier)) {
+      msg.codex_service_tier = 'standard';
+    }
+  }
+  if (stationLaunchDraft.direct) msg.direct = true;
+  if (Array.isArray(pendingAttachments) && pendingAttachments.length > 0) {
+    msg.attachments = pendingAttachments.map(a => a.frameId).filter(Boolean);
+  }
+  try {
+    app.send_server_action(msg);
+  } catch (e) {
+    failNewSessionSpawnNotice(e?.message || 'Failed to send new-session request.');
+    return;
+  }
+  updateNewSessionSpawnNotice('pending', 'Spawning new session...');
+  showControlToast?.('info', 'Spawning new session...');
+  if (Array.isArray(pendingAttachments) && pendingAttachments.length > 0) {
+    renderAttachmentReceipt?.(task, pendingAttachments.slice(), 'Sent');
+    clearPendingAttachments?.();
+  }
+}
+
+function stationRenderSessionLaunchSection(parent) {
+  const section = stationDockSection(parent, 'Launch session');
+  const task = stationDockInput(section, 'Task', stationLaunchDraftValue('task', document.getElementById('activity-task-input')?.value || ''), { id: 'station-launch-task', placeholder: 'What should the agent do?', multiline: true, rows: 3 });
+  const name = stationDockInput(section, 'Name', stationLaunchDraftValue('name'), { id: 'station-launch-name', placeholder: 'optional' });
+  const project = stationDockInput(section, 'Project', stationLaunchDraftValue('project', newSessionProjectInputValue?.() || dashboardProjectRoot || ''), { id: 'station-launch-project', placeholder: 'optional project path' });
+  const agent = stationDockSelect(section, 'Agent', stationLaunchDraftValue('agent'), stationAgentOptions(), { id: 'station-launch-agent' });
+  const onDraftInput = () => stationRememberLaunchDraft();
+  task.addEventListener('input', onDraftInput);
+  name.addEventListener('input', onDraftInput);
+  project.addEventListener('input', onDraftInput);
+  agent.addEventListener('change', () => {
+    stationRememberLaunchDraft();
+    stationRenderSessionsDock();
+  });
+  const effectiveAgent = stationEffectiveLaunchAgent();
+  if (effectiveAgent && effectiveAgent !== 'internal') {
+    const command = stationDockInput(section, 'Binary', stationLaunchDraftValue('command', commandDefaultForNewSessionAgent(effectiveAgent)), { id: 'station-launch-command', placeholder: commandDefaultForNewSessionAgent(effectiveAgent) || 'agent binary' });
+    command.addEventListener('input', onDraftInput);
+  }
+  if (effectiveAgent === 'codex') {
+    const managed = stationDockSelect(section, 'Managed context', stationLaunchDraftValue('managed', newSessionCodexManagedContext || 'vanilla'), [
+      ['vanilla', 'vanilla'],
+      ['managed', 'managed'],
+    ], { id: 'station-launch-managed' });
+    const archive = stationDockSelect(section, 'Context replay', stationLaunchDraftValue('archive', newSessionCodexContextArchive || 'summary'), [
+      ['summary', 'summary'],
+      ['exact', 'exact'],
+      ['off', 'off'],
+    ], { id: 'station-launch-archive' });
+    const fast = stationDockCheckbox(section, 'Fast service tier', !!stationLaunchDraft.fast || codexServiceTierIsFast(newSessionCodexDefaultServiceTier), { id: 'station-launch-fast' });
+    managed.addEventListener('change', onDraftInput);
+    archive.addEventListener('change', onDraftInput);
+    fast.addEventListener('change', onDraftInput);
+  }
+  const direct = stationDockCheckbox(section, 'Direct mode', !!stationLaunchDraft.direct || !!document.getElementById('direct-mode-toggle')?.checked, { id: 'station-launch-direct' });
+  direct.addEventListener('change', onDraftInput);
+  stationDockActions(section, [
+    { label: 'Start', primary: true, onClick: stationStartSessionFromDock },
+    stationDockRouteAction('Route new-session tab', 'sessions', 'new'),
+  ]);
+}
+
+function stationSessionActionsForDock(sessionOrId, opts = {}) {
+  const session = typeof sessionOrId === 'object' ? sessionOrId : stationFindSessionById(sessionOrId);
+  const sid = stationSessionId(session) || String(sessionOrId || '').trim();
+  if (!sid) return [];
+  const meta = sessionConfigMetadata(session || sid);
+  const source = sessionConfigSource(meta) || stationSessionSource(session) || '';
+  const actions = [];
+  if (!opts.omitDetail) actions.push({ label: 'Details', primary: true, onClick: () => stationRenderSessionsDock(sid) });
+  if (sessionWindows.has(sid)) actions.push({ label: 'Focus', onClick: () => stationHandleSessionAction({ action: 'focus', session_id: sid }) });
+  if (canAttachSessionWindow(sid)) actions.push({ label: 'Attach', onClick: () => stationHandleSessionAction({ action: 'attach', session_id: sid }) });
+  if (!session || session.can_resume !== false) actions.push({ label: 'Resume', onClick: () => stationHandleSessionAction({ action: 'resume', session_id: sid }) });
+  if (source && source !== 'intendant') {
+    actions.push({ label: 'Config', onClick: () => stationHandleSessionAction({ action: 'config', session_id: sid }) });
+    actions.push({ label: 'Restart', onClick: () => stationHandleSessionAction({ action: 'restart', session_id: sid }) });
+  }
+  actions.push({ label: 'Rename', onClick: () => stationHandleSessionAction({ action: 'rename', session_id: sid }) });
+  if (sessionWindows.has(sid)) actions.push({ label: 'Hide', onClick: () => stationHandleSessionAction({ action: 'hide', session_id: sid }) });
+  if (sessionWindowStopAvailability(sid).ok) actions.push({ label: 'Stop', danger: true, onClick: () => stationHandleSessionAction({ action: 'stop', session_id: sid }) });
+  actions.push({ label: 'Copy id', onClick: () => copyTextToClipboard(sid) });
+  return actions;
+}
+
+function stationRenderCodexThreadActionsSection(parent, sessionId) {
+  const sid = String(sessionId || '').trim();
+  if (!sid || !sessionWindowIsCodex(sid)) return;
+  const meta = sessionConfigMetadata(sid);
+  const goal = normalizeSessionGoal(meta.goal || meta.session_goal || meta.sessionGoal || null);
+  const capabilities = stationSessionCapabilities(sid) || meta.capabilities || {};
+  const serviceTier = normalizeCodexServiceTier(
+    capabilities.codexServiceTier ||
+    capabilities.codex_service_tier ||
+    (capabilities.codexFastMode === true ? 'priority' : '') ||
+    controlCodexConfig.service_tier ||
+    ''
+  );
+  const section = stationDockSection(parent, 'Codex thread');
+  stationDockRow(section, 'service tier', serviceTier || 'default');
+  stationDockRow(section, 'goal status', goal?.status || '--');
+  stationDockRow(section, 'goal tokens', goal?.tokenBudget ? `${goal.tokensUsed || 0} / ${goal.tokenBudget}` : (goal?.tokensUsed ? String(goal.tokensUsed) : '--'));
+  const specs = [
+    ['new', 'New thread'],
+    ['fast', 'Fast'],
+    ['compact', 'Compact'],
+    ['undo', 'Undo'],
+    ['fork', 'Fork...'],
+    ['side', 'Side...'],
+    ['review', 'Review...'],
+    ['rename', 'Rename thread...'],
+    ['goal', 'Set goal...'],
+    ['goal-get', 'Goal status'],
+    ['goal-pause', 'Pause goal'],
+    ['goal-resume', 'Resume goal'],
+    ['goal-complete', 'Complete goal'],
+    ['goal-clear', 'Clear goal'],
+  ];
+  stationDockActions(section, specs.map(([op, label]) => {
+    const state = codexThreadActionStateForSession(sid, op);
+    return {
+      label,
+      danger: op === 'goal-clear',
+      disabled: !state.allowed,
+      title: state.allowed ? `/${op}` : state.reason,
+      onClick: () => stationHandleThreadAction({ op, session_id: sid }),
+    };
+  }));
+}
+
+function stationRenderSessionDetailSection(parent, sessionId) {
+  const sid = String(sessionId || '').trim();
+  if (!sid) return;
+  const session = stationFindSessionById(sid) || { session_id: sid };
+  const meta = sessionConfigMetadata(session);
+  const source = sessionConfigSource(meta) || stationSessionSource(session) || '';
+  const section = stationDockSection(parent, 'Selected session');
+  stationDockRow(section, 'id', sid);
+  stationDockRow(section, 'source', source || session?.source || '--');
+  stationDockRow(section, 'command', sessionConfigCommand(meta) || '--');
+  stationDockRow(section, 'managed', source === 'codex' ? sessionConfigManagedMode(meta) : '--');
+  stationDockRow(section, 'archive', source === 'codex' ? sessionConfigArchiveMode(meta) : '--');
+  stationDockRow(section, 'status', session?.status || meta.phase || '--');
+  stationDockRow(section, 'tokens', stationCompactNumber(session?.total_tokens || meta.totalTokens || meta.total_tokens || 0));
+  stationDockActions(section, stationSessionActionsForDock(session, { omitDetail: true }));
+  stationRenderCodexThreadActionsSection(parent, sid);
+}
+
+function stationRenderSessionsDock(focusId = '') {
+  const sessions = stationBuildSessionsSummary();
+  const body = stationDockBegin('sessions', 'Sessions', `${sessions.total} known / ${sessions.active} active`);
+  if (!body) return;
+  const overview = stationDockSection(body, 'Session index');
+  stationDockRow(overview, 'external', String(sessions.external));
+  stationDockRow(overview, 'tokens', stationCompactNumber(sessions.totalTokens));
+  stationDockRow(overview, 'disk', _fmtBytes(sessions.diskBytes || 0));
+  stationDockRow(overview, 'index', sessions.indexStatus || 'cold');
+  const search = stationDockInput(overview, 'Filter', stationSessionDockFilter, { id: 'station-session-search', placeholder: 'name, id, backend, status' });
+  search.addEventListener('input', () => {
+    stationSessionDockFilter = search.value.toLowerCase();
+    stationRenderSessionsDock(focusId);
+    document.getElementById('station-session-search')?.focus();
+  });
+  stationDockActions(overview, [
+    { label: 'Refresh', primary: true, onClick: async () => { await loadSessions({ force: true }); stationRenderSessionsDock(focusId); } },
+    { label: 'New session', onClick: () => { if (typeof openNewSessionFromPrompt === 'function') openNewSessionFromPrompt(); else stationForceRouteTo('sessions', 'new'); } },
+    { label: 'Worktrees', onClick: () => stationRenderWorktreesDock() },
+    stationDockRouteAction('Route sessions tab', 'sessions', 'recent'),
+    stationDockRouteAction('Route deep search', 'sessions', 'deep', () => document.getElementById('sessions-deep-result-search')?.focus()),
+  ]);
+  stationRenderSessionLaunchSection(body);
+  if (focusId) stationRenderSessionDetailSection(body, focusId);
+
+  const list = stationDockSection(body, 'Recent sessions');
+  const query = stationSessionDockFilter.trim();
+  const rows = stationSessionRowsForDock().filter(row => {
+    if (!query) return true;
+    return [row.id, row.label, row.value, row.detail].join(' ').toLowerCase().includes(query);
+  });
+  if (!rows.length) {
+    stationDockEmpty(list, query ? 'No sessions match the Station filter.' : 'No cached sessions yet.');
+  } else {
+    for (const row of rows) {
+      stationDockCard(list, {
+        title: row.label || row.id || 'session',
+        meta: row.value || '',
+        detail: row.detail || row.id,
+        active: focusId && row.id === focusId,
+        actions: stationSessionActionsForDock(row.id),
+      });
+    }
+  }
+}
+
+function stationWorktreeRowsForDock() {
+  const scan = _cachedWorktreeScan || {};
+  return Array.isArray(scan.worktrees) ? scan.worktrees : [];
+}
+
+async function stationLoadWorktreesForDock(forceScan = false) {
+  await loadWorktrees({ forceScan });
+  stationRenderWorktreesDock();
+}
+
+function stationRenderWorktreesDock(focusPath = '') {
+  const rows = stationWorktreeRowsForDock();
+  const summary = stationBuildWorktreesSummary();
+  const body = stationDockBegin('worktrees', 'Worktrees', `${summary.worktrees} scanned / ${summary.worktreeCleanup} cleanup candidates`);
+  if (!body) return;
+  const overview = stationDockSection(body, 'Scan controls');
+  stationDockRow(overview, 'dirty', String(summary.worktreeDirty));
+  stationDockRow(overview, 'unmerged', String(summary.worktreeUnmerged));
+  stationDockRow(overview, 'active', String(summary.worktreeActive));
+  stationDockRow(overview, 'disk', _fmtBytes(summary.worktreeBytes || 0));
+  stationDockRow(overview, 'scan', summary.worktreeScanStatus || 'cold');
+  const search = stationDockInput(overview, 'Filter', stationWorktreeDockFilter, { id: 'station-worktree-search', placeholder: 'path, branch, repo, status' });
+  search.addEventListener('input', () => {
+    stationWorktreeDockFilter = search.value.toLowerCase();
+    stationRenderWorktreesDock(focusPath);
+    document.getElementById('station-worktree-search')?.focus();
+  });
+  stationDockActions(overview, [
+    { label: 'Scan', primary: true, onClick: () => stationLoadWorktreesForDock(true) },
+    { label: 'Cached', onClick: () => stationLoadWorktreesForDock(false) },
+    stationDockRouteAction('Route worktrees tab', 'sessions', 'worktrees'),
+  ]);
+
+  const list = stationDockSection(body, 'Watchlist');
+  const query = stationWorktreeDockFilter.trim();
+  const filtered = rows
+    .filter(wt => {
+      if (!query) return true;
+      return [wt.path, wt.branch, wt.head_short, wt.repo_name, wt.merge_status, wt.recommended_action]
+        .join(' ')
+        .toLowerCase()
+        .includes(query);
+    })
+    .sort((a, b) => worktreeRiskRank(b) - worktreeRiskRank(a) || stationNum(b?.size_bytes) - stationNum(a?.size_bytes))
+    .slice(0, 20);
+  if (!filtered.length) {
+    stationDockEmpty(list, rows.length ? 'No worktrees match the Station filter.' : 'No worktree scan yet.');
+  } else {
+    for (const wt of filtered) {
+      const path = String(wt.path || '');
+      const branch = wt.branch || wt.head_short || '(unknown ref)';
+      const status = wt.safe_to_remove
+        ? 'cleanup candidate'
+        : ((wt.active_sessions || 0) > 0 ? `${wt.active_sessions} active` : (wt.recommended_action || wt.merge_status || 'review'));
+      const actions = [
+        { label: 'Copy path', onClick: () => copyTextToClipboard(path) },
+      ];
+      if (wt.safe_to_remove) {
+        actions.push({ label: 'Remove...', danger: true, onClick: (_, button) => removeWorktree(wt, button).then(() => stationRenderWorktreesDock()) });
+      }
+      stationDockCard(list, {
+        title: branch,
+        meta: status,
+        detail: [wt.repo_name, _fmtBytes(stationNum(wt.size_bytes || 0)), wt.merge_status, path].filter(Boolean).join(' / '),
+        active: focusPath && focusPath === path,
+        actions,
+      });
+    }
+  }
+}
+
+function stationRenderBrowserWorkspaceSection(parent) {
+  const section = stationDockSection(parent, 'Browser workspaces');
+  stationDockInput(section, 'URL', document.getElementById('browser-workspace-url')?.value || '', { id: 'station-browser-url', placeholder: 'https://example.com or blank' });
+  stationDockInput(section, 'Label', document.getElementById('browser-workspace-label')?.value || '', { id: 'station-browser-label', placeholder: 'optional' });
+  stationDockSelect(section, 'Provider', document.getElementById('browser-workspace-provider')?.value || 'auto', [
+    ['auto', 'auto'],
+    ['cdp', 'cdp'],
+    ['system_cdp', 'system CDP'],
+    ['playwright', 'playwright'],
+    ['agent_browser', 'agent browser'],
+  ], { id: 'station-browser-provider' });
+  stationDockActions(section, [
+    {
+      label: 'Create workspace',
+      primary: true,
+      onClick: () => {
+        const url = document.getElementById('station-browser-url')?.value || '';
+        const label = document.getElementById('station-browser-label')?.value || '';
+        const provider = document.getElementById('station-browser-provider')?.value || 'auto';
+        if (app) {
+          app.send_server_action({
+            action: 'create_browser_workspace',
+            url: url.trim() || undefined,
+            provider,
+            label: label.trim() || undefined,
+            owner_session_id: currentSessionId || undefined,
+          });
+        }
+      },
+    },
+    stationDockRouteAction('Route debug tab', 'debug', ''),
+  ]);
+  const rows = Array.from(browserWorkspaces.values())
+    .filter(w => (w.status || '') !== 'closed')
+    .sort((a, b) => String(b.updated_at || '').localeCompare(String(a.updated_at || '')));
+  if (!rows.length) {
+    stationDockEmpty(section, 'No active browser workspaces.');
+  } else {
+    for (const w of rows) {
+      stationDockCard(section, {
+        title: w.label || w.id,
+        meta: `${w.provider || 'browser'} / ${w.status || 'unknown'}`,
+        detail: w.url || 'about:blank',
+        actions: [
+          { label: w.lease ? 'Take' : 'Acquire', onClick: () => acquireBrowserWorkspace(w.id, true) },
+          { label: 'Close', danger: true, onClick: () => closeBrowserWorkspace(w.id) },
+        ],
+      });
+    }
+  }
+}
+
+function stationRenderRecordingSection(parent) {
+  const section = stationDockSection(parent, 'Recordings');
+  stationDockRow(section, 'streams', String(recordingStreams.size));
+  stationDockRow(section, 'active', activeRecordingStream || '--');
+  stationDockActions(section, [
+    stationDockRouteAction('Route video tab', 'displays', '', () => document.getElementById('recording-stream-select')?.focus()),
+  ]);
+  if (!recordingStreams.size) {
+    stationDockEmpty(section, 'No recordings available.');
+    return;
+  }
+  for (const [name, info] of recordingStreams) {
+    stationDockCard(section, {
+      title: _streamLabel(name),
+      meta: info?.active ? 'recording' : 'stopped',
+      detail: name,
+      active: name === activeRecordingStream,
+      actions: [
+        { label: 'Select', primary: true, onClick: () => { switchRecordingStream(name); stationRenderControlsDock('recordings'); } },
+      ],
+    });
+  }
+}
+
+function stationPendingApprovalRows() {
+  const rows = [];
+  if (stationCurrentApproval?.id) {
+    rows.push({
+      hostId: selfPeerId || 'local',
+      approvalId: String(stationCurrentApproval.id),
+      command: stationCurrentApproval.command || 'approval required',
+      category: stationCurrentApproval.category || '',
+      local: true,
+    });
+  }
+  for (const [hostId, pending] of peerPendingApprovals.entries()) {
+    for (const [approvalId, approval] of pending.entries()) {
+      rows.push({
+        hostId,
+        approvalId: String(approvalId),
+        command: approval.command || 'approval required',
+        category: approval.category || '',
+        local: false,
+      });
+    }
+  }
+  return rows;
+}
+
+function stationResolveDockApproval(row, decision) {
+  if (!row?.approvalId) return;
+  if (row.local || row.hostId === selfPeerId || row.hostId === 'local') {
+    window.sendApproval?.(decision);
+    stationRenderControlsDock('approvals');
+    return;
+  }
+  const peerDecision = {
+    approve: 'accept',
+    approve_all: 'accept',
+    skip: 'cancel',
+    deny: 'decline',
+  }[decision] || decision;
+  resolvePeerApproval(row.hostId, row.approvalId, peerDecision)
+    .finally(() => stationRenderControlsDock('approvals'));
+}
+
+function stationRenderApprovalsSection(parent) {
+  const approvals = stationPendingApprovalRows();
+  const section = stationDockSection(parent, 'Approvals');
+  stationDockRow(section, 'pending', String(approvals.length));
+  if (!approvals.length) {
+    stationDockEmpty(section, 'No pending approval requests.');
+    return;
+  }
+  for (const row of approvals) {
+    stationDockCard(section, {
+      title: row.command || 'approval required',
+      meta: [row.local ? 'local' : stationHostLabel(row.hostId), row.category].filter(Boolean).join(' / '),
+      detail: row.approvalId,
+      actions: [
+        { label: 'Approve', primary: true, onClick: () => stationResolveDockApproval(row, 'approve') },
+        row.local ? { label: 'All', onClick: () => stationResolveDockApproval(row, 'approve_all') } : null,
+        { label: 'Skip', onClick: () => stationResolveDockApproval(row, 'skip') },
+        { label: 'Deny', danger: true, onClick: () => stationResolveDockApproval(row, 'deny') },
+      ],
+    });
+  }
+}
+
+function stationApplyDockSelect(controlId, value, handler, rerenderSection = 'overview') {
+  const target = stationDockSetSelectValue(controlId, value);
+  handler({ target });
+  stationRenderControlsDock(rerenderSection);
+}
+
+function stationApplyDockCheckbox(controlId, checked, handler, rerenderSection = 'overview') {
+  const target = stationDockSetCheckboxValue(controlId, checked);
+  handler({ target });
+  stationRenderControlsDock(rerenderSection);
+}
+
+function stationApplyDockText(controlId, value, handler, rerenderSection = 'overview') {
+  const target = stationDockSetTextValue(controlId, value);
+  handler({ target });
+  stationRenderControlsDock(rerenderSection);
+}
+
+function stationRenderCodexDefaultsEditor(parent) {
+  const section = stationDockSection(parent, 'Codex defaults');
+  const sandbox = stationDockSelect(section, 'Sandbox', controlCodexConfig.sandbox || 'workspace-write', [
+    ['read-only', 'read-only'],
+    ['workspace-write', 'workspace-write'],
+    ['danger-full-access', 'danger-full-access'],
+  ], { id: 'station-codex-sandbox' });
+  sandbox.addEventListener('change', ev => stationApplyDockSelect('control-codex-sandbox', ev.target.value, onControlSandboxChange, 'launch'));
+
+  const approval = stationDockSelect(section, 'Approval policy', controlCodexConfig.approval_policy || 'on-request', [
+    ['untrusted', 'untrusted'],
+    ['on-request', 'on-request'],
+    ['never', 'never'],
+  ], { id: 'station-codex-approval' });
+  approval.addEventListener('change', ev => stationApplyDockSelect('control-codex-approval', ev.target.value, onControlApprovalChange, 'launch'));
+
+  const model = stationDockInput(section, 'Model', controlCodexConfig.model || '', { id: 'station-codex-model', placeholder: 'Codex default' });
+  stationDockCommitOnEnter(model, ev => stationApplyDockText('control-codex-model', ev.target.value, onControlModelCommit, 'launch'));
+
+  const reasoning = stationDockSelect(section, 'Reasoning', controlCodexConfig.reasoning_effort || '', [
+    ['', '(default)'],
+    ['minimal', 'minimal'],
+    ['low', 'low'],
+    ['medium', 'medium'],
+    ['high', 'high'],
+    ['xhigh', 'xhigh'],
+  ], { id: 'station-codex-reasoning' });
+  reasoning.addEventListener('change', ev => stationApplyDockSelect('control-codex-reasoning', ev.target.value, onControlReasoningChange, 'launch'));
+
+  const tier = stationDockSelect(section, 'Service tier', normalizeCodexServiceTier(controlCodexConfig.service_tier || ''), [
+    ['', 'inherit'],
+    ['standard', 'normal'],
+    ['priority', 'fast'],
+    ['flex', 'flex'],
+  ], { id: 'station-codex-service-tier' });
+  tier.addEventListener('change', ev => stationApplyDockSelect('control-codex-service-tier', ev.target.value, onControlServiceTierChange, 'launch'));
+
+  const managed = stationDockSelect(section, 'Managed context', controlCodexConfig.managed_context || 'vanilla', [
+    ['vanilla', 'vanilla'],
+    ['managed', 'managed'],
+  ], { id: 'station-codex-managed' });
+  managed.addEventListener('change', ev => stationApplyDockSelect('control-codex-managed-context', ev.target.value, onControlManagedContextChange, 'launch'));
+
+  const archive = stationDockSelect(section, 'Context replay', controlCodexConfig.context_archive || 'summary', [
+    ['summary', 'summary'],
+    ['exact', 'exact'],
+    ['off', 'off'],
+  ], { id: 'station-codex-archive' });
+  archive.addEventListener('change', ev => stationApplyDockSelect('control-codex-context-archive', ev.target.value, onControlContextArchiveChange, 'launch'));
+
+  const web = stationDockCheckbox(section, 'Web search', !!controlCodexConfig.web_search, { id: 'station-codex-web-search' });
+  web.addEventListener('change', ev => stationApplyDockCheckbox('control-codex-web-search', ev.target.checked, onControlWebSearchChange, 'launch'));
+
+  const network = stationDockCheckbox(section, 'Sandbox network', !!controlCodexConfig.network_access, { id: 'station-codex-network' });
+  network.disabled = controlCodexConfig.sandbox !== 'workspace-write';
+  network.title = network.disabled ? 'Network applies only to workspace-write sandbox' : '';
+  network.addEventListener('change', ev => stationApplyDockCheckbox('control-codex-network', ev.target.checked, onControlNetworkChange, 'launch'));
+
+  const roots = stationDockInput(section, 'Writable roots', (controlCodexConfig.writable_roots || []).join('\n'), { id: 'station-codex-roots', placeholder: '/absolute/path per line', multiline: true, rows: 3 });
+  roots.addEventListener('change', ev => stationApplyDockText('control-codex-writable-roots', ev.target.value, onControlWritableRootsCommit, 'launch'));
+  roots.addEventListener('blur', ev => stationApplyDockText('control-codex-writable-roots', ev.target.value, onControlWritableRootsCommit, 'launch'));
+}
+
+function stationRenderGeminiDefaultsEditor(parent) {
+  if (controlCurrentBackend !== 'gemini') return;
+  const section = stationDockSection(parent, 'Gemini defaults');
+  const approval = stationDockSelect(section, 'Approval mode', controlGeminiConfig.approval_mode || 'default', [
+    ['default', 'default'],
+    ['auto_edit', 'auto_edit'],
+    ['yolo', 'yolo'],
+    ['plan', 'plan'],
+  ], { id: 'station-gemini-approval' });
+  approval.addEventListener('change', ev => stationApplyDockSelect('control-gemini-approval', ev.target.value, onControlGeminiApprovalChange, 'launch'));
+
+  const sandbox = stationDockCheckbox(section, 'Sandbox', !!controlGeminiConfig.sandbox, { id: 'station-gemini-sandbox' });
+  sandbox.addEventListener('change', ev => stationApplyDockCheckbox('control-gemini-sandbox', ev.target.checked, onControlGeminiSandboxChange, 'launch'));
+
+  const model = stationDockInput(section, 'Model', controlGeminiConfig.model || '', { id: 'station-gemini-model', placeholder: 'Gemini default' });
+  stationDockCommitOnEnter(model, ev => stationApplyDockText('control-gemini-model', ev.target.value, onControlGeminiModelCommit, 'launch'));
+
+  const extensions = stationDockInput(section, 'Extensions', (controlGeminiConfig.extensions || []).join('\n'), { id: 'station-gemini-extensions', placeholder: 'one per line', multiline: true, rows: 3 });
+  extensions.addEventListener('change', ev => stationApplyDockText('control-gemini-extensions', ev.target.value, onControlGeminiExtensionsCommit, 'launch'));
+  extensions.addEventListener('blur', ev => stationApplyDockText('control-gemini-extensions', ev.target.value, onControlGeminiExtensionsCommit, 'launch'));
+
+  const servers = stationDockInput(section, 'MCP servers', (controlGeminiConfig.allowed_mcp_servers || []).join('\n'), { id: 'station-gemini-mcp', placeholder: 'one per line', multiline: true, rows: 3 });
+  servers.addEventListener('change', ev => stationApplyDockText('control-gemini-mcp', ev.target.value, onControlGeminiMcpCommit, 'launch'));
+  servers.addEventListener('blur', ev => stationApplyDockText('control-gemini-mcp', ev.target.value, onControlGeminiMcpCommit, 'launch'));
+
+  const include = stationDockInput(section, 'Include dirs', (controlGeminiConfig.include_directories || []).join('\n'), { id: 'station-gemini-include', placeholder: '/absolute/path per line', multiline: true, rows: 3 });
+  include.addEventListener('change', ev => stationApplyDockText('control-gemini-include-dirs', ev.target.value, onControlGeminiIncludeDirsCommit, 'launch'));
+  include.addEventListener('blur', ev => stationApplyDockText('control-gemini-include-dirs', ev.target.value, onControlGeminiIncludeDirsCommit, 'launch'));
+
+  const debug = stationDockCheckbox(section, 'DevTools', !!controlGeminiConfig.debug, { id: 'station-gemini-debug' });
+  debug.addEventListener('change', ev => stationApplyDockCheckbox('control-gemini-debug', ev.target.checked, onControlGeminiDebugChange, 'launch'));
+}
+
+function stationApprovalRuleLabel(category) {
+  return String(category || '').replace(/_/g, ' ');
+}
+
+function stationRenderApprovalRulesEditor(parent) {
+  const section = stationDockSection(parent, 'Internal approval gates');
+  for (const category of CONTROL_APPROVAL_CATEGORIES) {
+    const select = stationDockSelect(section, stationApprovalRuleLabel(category), controlApprovalRules[category] || 'ask', [
+      ['auto', 'auto'],
+      ['ask', 'ask'],
+      ['deny', 'deny'],
+    ], { id: `station-approval-${category}` });
+    select.addEventListener('change', ev => {
+      const target = stationDockSetSelectValue(`control-approval-${category}`, ev.target.value);
+      if (target.dataset) target.dataset.approvalCategory = category;
+      else target.dataset = { approvalCategory: category };
+      onControlApprovalRuleChange({ target });
+      stationRenderControlsDock('approvals');
+    });
+  }
+}
+
+function stationRenderControlsDock(sectionName = 'overview') {
+  const controls = stationBuildControlsSummary();
+  const body = stationDockBegin('controls', 'Control Surfaces', `${controls.backend || 'agent'} / ${controls.sandbox || 'sandbox'}`);
+  if (!body) return;
+  const operator = stationDockSection(body, 'Operator');
+  stationDockRow(operator, 'draft', `${controls.draftChars} chars / ${controls.directMode ? 'direct' : 'presence'}`);
+  stationDockRow(operator, 'target', controls.sessionLabel || controls.sessionSelection || '--');
+  stationDockRow(operator, 'state', controls.sessionActive ? 'active' : (controls.sessionDetached ? 'detached' : 'idle'));
+  stationDockActions(operator, [
+    { label: controls.promptMode === 'steer' ? 'Steer' : 'Send', primary: true, onClick: () => stationHandleActivityAction({ action: 'send' }) },
+    { label: 'New session', onClick: () => stationHandleActivityAction({ action: 'new-session' }) },
+    controls.sessionCanFocus ? { label: 'Focus target', onClick: () => stationHandleActivityAction({ action: 'target' }) } : null,
+    controls.sessionCanInterrupt ? { label: 'Stop', danger: true, onClick: () => stationHandleActivityAction({ action: 'stop' }) } : null,
+  ]);
+
+  const launch = stationDockSection(body, 'Launch defaults');
+  stationDockRow(launch, 'binary', controls.command || '--');
+  stationDockRow(launch, 'model', controls.model || '--');
+  stationDockRow(launch, 'approval', controls.approvalPolicy || '--');
+  stationDockRow(launch, 'managed', controls.managedContext || '--');
+  stationDockRow(launch, 'archive', controls.contextArchive || '--');
+  stationDockRow(launch, 'web/net', `${controls.webSearch ? 'web on' : 'web off'} / ${controls.networkAccess ? 'net on' : 'net off'}`);
+  stationDockActions(launch, [
+    stationDockRouteAction('Route agent settings', 'settings', 'agent'),
+  ]);
+  stationRenderCodexDefaultsEditor(body);
+  stationRenderGeminiDefaultsEditor(body);
+  stationRenderApprovalRulesEditor(body);
+
+  stationRenderApprovalsSection(body);
+
+  const live = stationDockSection(body, 'Live surfaces');
+  stationDockRow(live, 'display', controls.displayAccess || '--');
+  stationDockRow(live, 'voice', `${controls.voiceState || 'idle'}${controls.micActive ? ' / mic' : ''}${controls.videoActive ? ' / video' : ''}`);
+  stationDockRow(live, 'browser', `${controls.browserWorkspaces} workspaces`);
+  stationDockRow(live, 'recording', `${controls.recordings} streams${controls.activeRecording ? ` / ${controls.activeRecording}` : ''}`);
+  stationDockRow(live, 'attach', `${controls.pendingAttachments} pending`);
+  stationDockActions(live, [
+    { label: controls.displayAccess.startsWith('on') ? 'Revoke display' : 'Share display', onClick: () => window.toggleUserDisplay?.() },
+    !controls.activeBrowser ? { label: 'Make active', onClick: () => document.getElementById('makeActiveBtn')?.click() } : null,
+    { label: controls.micActive ? 'Mic off' : 'Mic', onClick: () => document.getElementById('micBtn')?.click() },
+    { label: controls.videoActive ? 'Video off' : 'Video', onClick: () => document.getElementById('videoBtn')?.click() },
+    controls.pendingAttachments > 0 ? { label: 'Clear attach', danger: true, onClick: () => document.querySelector('[data-pending-attachments-clear]')?.click() } : null,
+  ]);
+
+  if (sectionName === 'browser' || sectionName === 'overview') stationRenderBrowserWorkspaceSection(body);
+  if (sectionName === 'recordings' || sectionName === 'overview') stationRenderRecordingSection(body);
+
+  const debug = stationDockSection(body, 'Computer use / debug');
+  stationDockRow(debug, 'debug screen', controls.debugScreen ? 'active' : 'off');
+  stationDockRow(debug, 'debug rec', controls.debugRecording ? 'recording' : 'off');
+  stationDockActions(debug, [
+    { label: controls.debugScreen ? 'Hide debug' : 'Debug screen', onClick: () => { window.toggleDebugScreen?.(); stationRenderControlsDock('overview'); } },
+    controls.debugScreen ? { label: controls.debugRecording ? 'Stop rec' : 'Debug rec', danger: controls.debugRecording, onClick: () => { window.toggleDebugRecording?.(); stationRenderControlsDock('overview'); } } : null,
+    stationDockRouteAction('Route CU settings', 'settings', 'agent', () => document.getElementById('set-cu-provider')?.focus()),
+  ]);
+
+  const codex = stationDockSection(body, 'External Codex state');
+  stationDockRow(codex, 'source', controls.sessionSource || '--');
+  stationDockRow(codex, 'command', controls.sessionCommand || '--');
+  stationDockRow(codex, 'managed', controls.sessionManagedContext || '--');
+  stationDockRow(codex, 'archive', controls.sessionContextArchive || '--');
+  stationDockRow(codex, 'tier', controls.sessionServiceTier || 'default');
+  stationDockRow(codex, 'goal status', controls.sessionGoalStatus || '--');
+  stationDockRow(codex, 'goal', controls.sessionGoalObjective || '--');
+  if (controls.sessionGoalTokens) stationDockRow(codex, 'goal tokens', controls.sessionGoalTokens);
+  if (controls.sessionId) {
+    const targetActions = [];
+    if (controls.sessionCanFocus) targetActions.push({ label: 'Focus', onClick: () => stationHandleSessionAction({ action: 'focus', session_id: controls.sessionId }) });
+    if (controls.sessionCanAttach) targetActions.push({ label: 'Attach', onClick: () => stationHandleSessionAction({ action: 'attach', session_id: controls.sessionId }) });
+    if (controls.sessionCanConfig) targetActions.push({ label: 'Launch config', onClick: () => stationHandleSessionAction({ action: 'config', session_id: controls.sessionId }) });
+    if (controls.sessionCanConfig) targetActions.push({ label: 'Restart', onClick: () => stationHandleSessionAction({ action: 'restart', session_id: controls.sessionId }) });
+    if (controls.sessionCanRename) targetActions.push({ label: 'Rename', onClick: () => stationHandleSessionAction({ action: 'rename', session_id: controls.sessionId }) });
+    if (controls.sessionCanStop) targetActions.push({ label: 'Stop', danger: true, onClick: () => stationHandleSessionAction({ action: 'stop', session_id: controls.sessionId }) });
+    targetActions.push({ label: 'Copy id', onClick: () => copyTextToClipboard(controls.sessionId) });
+    stationDockActions(codex, targetActions);
+  }
+  if (controls.sessionIsCodex && controls.sessionId) stationRenderCodexThreadActionsSection(body, controls.sessionId);
 }
 
 function stationFindSessionById(sessionId) {
@@ -10239,13 +12188,65 @@ function stationHandleSessionAction(action) {
   const sessionId = String(action.session_id || '').trim();
   const op = String(action.action || 'detail').trim();
   if (op === 'refresh') {
-    stationForceRouteTo('sessions', 'recent', () => loadSessions({ force: true }));
+    loadSessions({ force: true }).finally(() => stationRenderSessionsDock(sessionId));
+    return;
+  }
+  if (op === 'search') {
+    stationRenderSessionsDock(sessionId);
+    setTimeout(() => document.getElementById('station-session-search')?.focus(), 0);
+    return;
+  }
+  if (op === 'deep-search') {
+    stationRenderSessionsDock(sessionId);
+    return;
+  }
+  if (op === 'worktrees') {
+    stationLoadWorktreesForDock(false);
+    return;
+  }
+  if (op === 'worktrees-scan') {
+    stationLoadWorktreesForDock(true);
+    return;
+  }
+  if (op === 'worktrees-cache') {
+    stationLoadWorktreesForDock(false);
+    return;
+  }
+  if (op === 'worktree-search') {
+    stationRenderWorktreesDock();
+    setTimeout(() => document.getElementById('station-worktree-search')?.focus(), 0);
+    return;
+  }
+  if (op === 'new-session') {
+    if (typeof openNewSessionFromPrompt === 'function') {
+      openNewSessionFromPrompt();
+    } else {
+      stationForceRouteTo('sessions', 'new');
+    }
+    return;
+  }
+  if (op === 'worktree') {
+    stationFocusWorktree(sessionId);
     return;
   }
   if (!sessionId) return;
   const session = stationFindSessionById(sessionId) || { session_id: sessionId };
+  if (op === 'focus' || op === 'target') {
+    focusSessionWindow(sessionId);
+    return;
+  }
+  if (op === 'copy') {
+    copyTextToClipboard(sessionId)
+      .then(() => showControlToast('success', `Copied session ID ${shortSessionId(sessionId)}`))
+      .catch(err => showControlToast('error', `Copy session ID failed: ${err?.message || err}`));
+    return;
+  }
   if (op === 'resume') {
     resumeSession(session);
+    return;
+  }
+  if (op === 'attach') {
+    attachSessionWindowAction(sessionId);
     return;
   }
   if (op === 'config') {
@@ -10256,7 +12257,26 @@ function stationHandleSessionAction(action) {
     restartSessionWindowAction(sessionId);
     return;
   }
-  stationForceRouteTo('sessions', 'recent', () => openSessionDetail(session));
+  if (op === 'stop') {
+    stopSessionWindowAction(sessionId);
+    return;
+  }
+  if (op === 'rename') {
+    requestSessionRename(session);
+    return;
+  }
+  if (op === 'hide') {
+    hideSessionWindowAction(sessionId);
+    return;
+  }
+  stationRenderSessionsDock(stationSessionId(session) || sessionId);
+}
+
+function stationFocusWorktree(path) {
+  const target = String(path || '').trim();
+  stationWorktreeDockFilter = target.toLowerCase();
+  stationRenderWorktreesDock(target);
+  setTimeout(() => document.getElementById('station-worktree-search')?.focus(), 0);
 }
 
 async function stationHandleThreadAction(action) {
@@ -10291,46 +12311,13 @@ function stationHandleManagedAction(action) {
   const sessionId = String(action.session_id || '').trim();
   const idOptionalOps = new Set(['rewind', 'backout', 'refresh']);
   if (!id && !idOptionalOps.has(op)) return;
-  stationForceRouteTo('activity', 'managed', () => {
-    if (sessionId) {
-      renderManagedContextSessionSelect();
-      const sel = managedContextEl('managed-context-session');
-      if (sel && Array.from(sel.options).some(option => option.value === sessionId)) {
-        sel.value = sessionId;
-        managedContextSessionManuallySelected = true;
-        syncManagedContextActiveSession();
-      }
-    }
-    if (op === 'rewind') {
-      managedContextEl('managed-context-anchor')?.focus();
-      return;
-    }
-    if (op === 'backout') {
-      managedContextEl('managed-context-record-id')?.focus();
-      return;
-    }
-    if (op === 'refresh') {
-      refreshManagedContextPane({ force: true });
-      return;
-    }
-    if (op === 'anchor') {
-      fillManagedContextAnchor(id, sessionId);
-      managedContextEl('managed-context-anchor')?.focus();
-      return;
-    }
-    if (op === 'record') {
-      const record = (managedContextRecords || []).find(candidate => candidate && candidate.record_id === id);
-      if (record) {
-        selectManagedContextRecord(record);
-      } else {
-        const input = managedContextEl('managed-context-record-id');
-        if (input) input.value = id;
-        const result = managedContextEl('managed-context-action-result');
-        if (result) result.textContent = `Selected record ${id}`;
-      }
-      managedContextEl('managed-context-record-id')?.focus();
-    }
-  });
+  if (sessionId) stationSetManagedSession(sessionId);
+  if (op === 'rewind' || op === 'backout') {
+    stationRenderManagedDock(op);
+    return;
+  }
+  stationApplyManagedAction(op, id, sessionId)
+    .finally(() => stationRenderManagedDock(op === 'record' ? 'backout' : 'rewind'));
 }
 
 function stationHandleContextAction(action) {
@@ -10345,14 +12332,8 @@ function stationHandleContextAction(action) {
   };
   if (op === 'part' && !id) return;
   if (op !== 'part' && !actionButtonByOp[op]) return;
-  stationForceRouteTo('activity', 'context', () => {
-    if (typeof renderContextPane === 'function') renderContextPane();
-    if (op === 'part') {
-      if (typeof focusContextPart === 'function') focusContextPart(id);
-      return;
-    }
-    document.getElementById(actionButtonByOp[op])?.click();
-  });
+  stationApplyContextAction(op, id);
+  stationRenderContextDock(op === 'part' ? id : stationSelectedContextPart);
 }
 
 function stationCssEscape(value) {
@@ -10368,16 +12349,93 @@ function stationHandleActivityAction(action) {
     stationSetActivityVerbosity(op.slice('verbosity:'.length));
     return;
   }
+  if (op === 'send') {
+    const input = document.getElementById('activity-task-input');
+    if (input && input.value.trim()) {
+      window.submitActivityOrSteer?.();
+    } else {
+      input?.focus();
+    }
+    return;
+  }
+  if (op === 'stop') {
+    window.sendInterrupt?.();
+    return;
+  }
+  if (op === 'target') {
+    window.focusForegroundSessionWindow?.();
+    return;
+  }
+  if (op === 'new-session') {
+    if (typeof openNewSessionFromPrompt === 'function') {
+      openNewSessionFromPrompt();
+    } else {
+      stationForceRouteTo('sessions', 'new');
+    }
+    return;
+  }
   if (op === 'host:all') {
     stationClearActivityHostFilter();
     return;
   }
   if (op === 'bottom') {
-    stationForceRouteTo('activity', 'log', () => document.getElementById('scroll-bottom')?.click());
+    stationRenderActivityDock(stationActivityEvents().at(-1)?.id || '');
     return;
   }
   if (op !== 'log' || !id) return;
-  stationForceRouteTo('activity', 'log', () => focusActivityLogEvent(id));
+  stationRenderActivityDock(id);
+}
+
+function stationHandleControlsAction(action) {
+  const op = String(action.action || '').trim();
+  if (!op) return;
+  if (op === 'display-toggle') {
+    window.toggleUserDisplay?.();
+    return;
+  }
+  if (op === 'voice-active') {
+    document.getElementById('makeActiveBtn')?.click();
+    return;
+  }
+  if (op === 'voice-toggle') {
+    document.getElementById('micBtn')?.click();
+    return;
+  }
+  if (op === 'video-toggle') {
+    document.getElementById('videoBtn')?.click();
+    return;
+  }
+  if (op === 'browser-open') {
+    stationRenderControlsDock('browser');
+    setTimeout(() => document.getElementById('station-browser-url')?.focus(), 0);
+    return;
+  }
+  if (op === 'browser-new') {
+    stationRenderControlsDock('browser');
+    setTimeout(() => document.getElementById('station-browser-url')?.focus(), 0);
+    return;
+  }
+  if (op === 'recordings') {
+    stationRenderControlsDock('recordings');
+    return;
+  }
+  if (op === 'debug-screen') {
+    window.toggleDebugScreen?.();
+    stationRenderControlsDock('overview');
+    return;
+  }
+  if (op === 'debug-record') {
+    window.toggleDebugRecording?.();
+    stationRenderControlsDock('overview');
+    return;
+  }
+  if (op === 'attachments-clear') {
+    document.querySelector('[data-pending-attachments-clear]')?.click();
+    return;
+  }
+  if (op === 'cu-settings') {
+    stationRenderControlsDock('overview');
+  }
 }
 
 function stationSetActivityVerbosity(level) {
@@ -10406,27 +12464,28 @@ function stationClearActivityHostFilter() {
 function stationHandleChangesAction(action) {
   const op = String(action.action || 'file').trim();
   const path = String(action.path || action.id || '').trim();
-  stationForceRouteTo('activity', 'changes', () => {
-    if (op === 'refresh') {
-      if (typeof refreshHistory === 'function') refreshHistory();
-      refreshChangesList({ selectFirst: true, refreshActive: true, quiet: true });
-      return;
-    }
-    if (op === 'redo') {
-      document.getElementById('redo-btn')?.click();
-      return;
-    }
-    if (op === 'prune') {
-      document.getElementById('prune-btn')?.click();
-      return;
-    }
-    if (op !== 'file' || !path) {
-      refreshChangesList({ selectFirst: true, refreshActive: true, quiet: true });
-      return;
-    }
-    selectChangesFile(path);
-    refreshChangesList({ selectFirst: false, refreshActive: true, quiet: true });
-  });
+  if (op === 'refresh') {
+    if (typeof refreshHistory === 'function') refreshHistory();
+    refreshChangesList({ selectFirst: true, refreshActive: true, quiet: true })
+      .finally(() => stationRenderChangesDock(activeChangesFile || path));
+    return;
+  }
+  if (op === 'redo') {
+    document.getElementById('redo-btn')?.click();
+    stationRenderChangesDock(activeChangesFile || path);
+    return;
+  }
+  if (op === 'prune') {
+    document.getElementById('prune-btn')?.click();
+    stationRenderChangesDock(activeChangesFile || path);
+    return;
+  }
+  if (op !== 'file' || !path) {
+    refreshChangesList({ selectFirst: true, refreshActive: true, quiet: true })
+      .finally(() => stationRenderChangesDock(activeChangesFile || path));
+    return;
+  }
+  stationSelectChange(path);
 }
 
 function focusActivityLogEvent(id) {
@@ -10609,11 +12668,51 @@ function stationManagedRecordRows() {
     }));
 }
 
+function stationManagedLedgerSummary() {
+  const lineage = Array.isArray(managedContextStatus?.lineage_ledger?.groups)
+    ? managedContextStatus.lineage_ledger.groups
+    : [];
+  const fission = Array.isArray(managedContextStatus?.fission_ledger?.groups)
+    ? managedContextStatus.fission_ledger.groups
+    : [];
+  const rows = [];
+  let branches = 0;
+  for (const group of [...lineage, ...fission]) {
+    const groupBranches = Array.isArray(group?.branches) ? group.branches : [];
+    branches += groupBranches.length;
+  }
+  for (const group of fission) {
+    const groupId = String(group?.group_id || '').trim();
+    const expectedId = String(group?.canonical_session_id || '').trim();
+    const groupBranches = Array.isArray(group?.branches) ? group.branches : [];
+    for (const branch of groupBranches) {
+      const branchId = String(branch?.session_id || '').trim();
+      if (!groupId || !branchId) continue;
+      rows.push({
+        id: [groupId, branchId, expectedId].join('\u001f'),
+        sessionId: branchId,
+        action: 'branch',
+        label: shortSessionId(branchId),
+        value: branch.relationship || branch.status || 'branch',
+        detail: compactSessionText(branch.summary || branch.task || `canonical ${shortSessionId(expectedId)}`),
+        tone: 'managed',
+      });
+    }
+  }
+  return {
+    lineageGroups: lineage.length,
+    fissionGroups: fission.length,
+    branches,
+    recentBranches: rows.slice(0, 6),
+  };
+}
+
 function stationBuildManagedSummary(contextSummary) {
   const sessionId = stationManagedSessionCandidate();
   const meta = managedContextSessionMeta(sessionId);
   const live = managedContextSessionIsLive(sessionId, meta);
   const pressure = live ? (managedContextStatus?.context_pressure || {}) : {};
+  const ledgers = stationManagedLedgerSummary();
   const effectiveWindow = stationNum(
     pressure.effective_context_window ||
     pressure.context_window ||
@@ -10638,9 +12737,13 @@ function stationBuildManagedSummary(contextSummary) {
     rewindOnly: !!pressure.rewind_only,
     records: Array.isArray(managedContextRecords) ? managedContextRecords.length : 0,
     anchors: stationManagedAnchorCount(sessionId),
+    lineageGroups: ledgers.lineageGroups,
+    fissionGroups: ledgers.fissionGroups,
+    branches: ledgers.branches,
     error: managedContextLastError || '',
     recentRecords: stationManagedRecordRows(),
     recentAnchors: stationManagedAnchorRows(sessionId),
+    recentBranches: ledgers.recentBranches,
   };
 }
 
@@ -10829,6 +12932,48 @@ function stationSessionWindowSummaries() {
   return rows;
 }
 
+function stationBuildWorktreesSummary() {
+  const scan = _cachedWorktreeScan || {};
+  const summary = scan.summary || {};
+  const rows = Array.isArray(scan.worktrees) ? scan.worktrees : [];
+  const recent = [...rows]
+    .sort((a, b) => worktreeRiskRank(b) - worktreeRiskRank(a) || stationNum(b?.size_bytes) - stationNum(a?.size_bytes))
+    .slice(0, 5)
+    .map(wt => {
+      const path = String(wt?.path || '').trim();
+      const branch = wt?.branch || wt?.head_short || '(unknown ref)';
+      const status = wt?.safe_to_remove
+        ? 'cleanup candidate'
+        : ((wt?.active_sessions || 0) > 0
+          ? `${wt.active_sessions} active`
+          : (wt?.recommended_action || wt?.merge_status || 'review'));
+      return {
+        id: path,
+        action: 'worktree',
+        label: branch,
+        value: status,
+        detail: [
+          wt?.repo_name || '',
+          _fmtBytes(stationNum(wt?.size_bytes || 0)),
+          wt?.merge_status || '',
+        ].filter(Boolean).join(' · ') || path,
+        tone: wt?.safe_to_remove ? 'ok' : (wt?.dirty || wt?.merge_status === 'unmerged' ? 'red' : 'warning'),
+      };
+    });
+  return {
+    worktrees: stationNum(summary.worktrees || rows.length),
+    worktreeDirty: stationNum(summary.dirty),
+    worktreeUnmerged: stationNum(summary.unmerged),
+    worktreeActive: stationNum(summary.active),
+    worktreeCleanup: stationNum(summary.cleanup_candidates),
+    worktreeBytes: stationNum(summary.total_bytes),
+    worktreeScanStatus: worktreesLoadInFlight
+      ? worktreesLoadInFlight
+      : (scan.scanned_at ? formatContextTimestamp(scan.scanned_at) : (worktreesLoaded ? 'empty' : 'cold')),
+    recentWorktrees: recent,
+  };
+}
+
 function stationSessionMetadataSummaries() {
   const rows = [];
   for (const [sid, meta] of sessionMetadataById) {
@@ -10901,6 +13046,7 @@ function stationCurrentDaemonSessionSummary() {
 }
 
 function stationBuildSessionsSummary() {
+  const worktrees = stationBuildWorktreesSummary();
   const indexedSessions = Array.isArray(_cachedSessions) && _cachedSessions.length
     ? _cachedSessions
     : (sessionsListCache.get(selfPeerId) || []);
@@ -10953,15 +13099,19 @@ function stationBuildSessionsSummary() {
       const configMeta = sessionConfigMetadata(session);
       const configSource = sessionConfigSource(configMeta);
       const source = configSource || stationSessionSource(session) || session?.source || '';
+      const rowId = String(id || '').trim();
       return {
-        id: String(id || '').trim(),
+        id: rowId,
         action: indexedIds.has(String(id)) ? 'detail' : '',
         label: stationSessionTask(session) || 'Untitled session',
         value: [status, source].filter(Boolean).join(' · '),
         detail: [String(id).slice(0, 8), formatContextTimestamp(session?.updated_at || session?.updatedAt || session?.changed_at || session?.changedAt || session?.created_at || session?.createdAt)].filter(Boolean).join(' · '),
         tone: 'session',
-        canResume: !!id && session?.can_resume !== false,
-        canConfig: !!id && !!configSource && configSource !== 'intendant',
+        canResume: !!rowId && session?.can_resume !== false,
+        canConfig: !!rowId && !!configSource && configSource !== 'intendant',
+        canRename: !!rowId,
+        canAttach: !!rowId && canAttachSessionWindow(rowId),
+        canStop: !!rowId && sessionWindowStopAvailability(rowId).ok,
       };
     });
   return {
@@ -10979,12 +13129,16 @@ function stationBuildSessionsSummary() {
       ? 'loaded'
       : (stationSessionsIndexLoading ? 'indexing' : (stationSessionsIndexError ? 'error' : 'cold')),
     recent,
+    ...worktrees,
   };
 }
 
 function stationBuildControlsSummary() {
   const backend = controlCurrentBackend || currentExternalAgent || newSessionConfiguredAgent || '';
   const isGemini = backend === 'gemini';
+  const command = backend === 'codex'
+    ? (controlCodexConfig.command || commandDefaultForNewSessionAgent('codex') || 'codex')
+    : (backend ? (commandDefaultForNewSessionAgent(backend) || backend) : '');
   const promptTargetId = String(resolvePromptTargetSessionId() || '').trim();
   const rawWindowTargetId = String(currentSessionFullId || foregroundSessionFullId || '').trim();
   const windowTargetId = rawWindowTargetId && rawWindowTargetId !== daemonSessionFullId
@@ -11016,8 +13170,43 @@ function stationBuildControlsSummary() {
   const sessionManagedContext = sessionSource === 'codex' ? sessionConfigManagedMode(sessionMeta) : '';
   const sessionContextArchive = sessionSource === 'codex' ? sessionConfigArchiveMode(sessionMeta) : '';
   const sessionCanConfig = !!sessionId && !!rawSessionSource && rawSessionSource !== 'intendant';
+  const sessionCapabilities = stationSessionCapabilities(sessionId) || {};
+  const sessionGoal = normalizeSessionGoal(sessionMeta.goal || sessionMeta.session_goal || sessionMeta.sessionGoal || null);
+  const sessionActive = sessionId
+    ? isSessionWindowEffectivelyActive(sessionId)
+    : isAgentActivePhase(currentPhase);
+  const sessionDetached = sessionId ? sessionWindowIsDetached(sessionId) : false;
+  const sessionCanSteer = sessionId ? sessionSupportsSteer(sessionId) : true;
+  const sessionCanInterrupt = sessionId
+    ? sessionActive && sessionSupportsInterrupt(sessionId) && !sessionDetached
+    : isAgentActivePhase(currentPhase);
+  const sessionCanAttach = sessionId ? canAttachSessionWindow(sessionId) : false;
+  const sessionCanStop = sessionId ? sessionWindowStopAvailability(sessionId).ok : false;
+  const sessionCanFocus = !!(sessionId && sessionWindows.has(sessionId));
+  const sessionIsCodex = sessionId ? sessionWindowIsCodex(sessionId) : backend === 'codex';
+  const sessionServiceTier = sessionSource === 'codex'
+    ? normalizeCodexServiceTier(
+      sessionCapabilities.codexServiceTier ||
+      (sessionCapabilities.codexFastMode === true ? 'priority' : '') ||
+      controlCodexConfig.service_tier ||
+      ''
+    )
+    : '';
+  const draftChars = stationNum(document.getElementById('activity-task-input')?.value?.trim()?.length || 0);
+  const promptMode = sessionActive && sessionCanSteer ? 'steer' : 'send';
+  const voiceState = !isActiveBrowser
+    ? 'passive'
+    : (voiceConnecting ? 'connecting' : (modelConnected ? 'connected' : 'idle'));
+  const displayAccessText = compactSessionText(document.getElementById('sb-display-access')?.textContent || 'off') || 'off';
+  const debugStatus = compactSessionText(document.getElementById('debug-status')?.textContent || '');
+  const debugRecordBtn = document.getElementById('debug-record-btn');
+  const globalAttachmentChips = document.querySelectorAll('#global-pending-attachments .pending-attachment-chip').length;
+  const pendingAttachmentText = document.getElementById('pending-attachments-count')?.textContent || '';
+  const pendingAttachmentCount = globalAttachmentChips || stationNum(pendingAttachmentText);
+  const activeBrowserWorkspaces = stationNum(window.__stationBrowserWorkspaceCount || 0);
   return {
     backend: backend || 'none',
+    command,
     sandbox: isGemini
       ? (controlGeminiConfig.sandbox ? 'on' : 'off')
       : (controlCodexConfig.sandbox || 'workspace-write'),
@@ -11038,12 +13227,42 @@ function stationBuildControlsSummary() {
       : 0,
     newSessionAgent: newSessionConfiguredAgent || backend || '',
     sessionId,
+    sessionLabel: stationSessionShortLabel(sessionId),
     sessionSelection,
     sessionSource,
     sessionCommand,
     sessionManagedContext,
     sessionContextArchive,
     sessionCanConfig,
+    sessionCanFocus,
+    sessionCanAttach,
+    sessionCanStop,
+    sessionCanRename: !!sessionId,
+    sessionCanInterrupt,
+    sessionCanSteer,
+    sessionDetached,
+    sessionActive,
+    sessionIsCodex,
+    sessionServiceTier,
+    sessionGoalStatus: sessionGoal?.status || '',
+    sessionGoalObjective: sessionGoal?.objective || '',
+    sessionGoalTokens: sessionGoal?.tokensUsed !== null && sessionGoal?.tokensUsed !== undefined
+      ? String(sessionGoal.tokensUsed)
+      : '',
+    promptMode,
+    directMode: !!document.getElementById('direct-mode-toggle')?.checked,
+    draftChars,
+    displayAccess: displayAccessText,
+    voiceState,
+    micActive: !!micActive,
+    videoActive: !!videoActive,
+    activeBrowser: !!isActiveBrowser,
+    browserWorkspaces: activeBrowserWorkspaces,
+    recordings: recordingStreams.size,
+    activeRecording: activeRecordingStream || '',
+    debugScreen: /^active$/i.test(debugStatus),
+    debugRecording: !!debugRecordBtn && /stop/i.test(debugRecordBtn.textContent || ''),
+    pendingAttachments: pendingAttachmentCount,
   };
 }
 
@@ -11100,6 +13319,20 @@ function stationLatestConfigurableExternalSessionId() {
   }
   candidates.sort((a, b) => Number(b.liveDaemon) - Number(a.liveDaemon) || b.updated - a.updated);
   return candidates[0]?.id || '';
+}
+
+function stationSessionShortLabel(sessionId) {
+  const sid = String(sessionId || '').trim();
+  if (!sid) return '';
+  const parts = typeof sessionIdentityParts === 'function' ? sessionIdentityParts(sid) : null;
+  return compactSessionText(parts?.name)
+    ? `${parts.shortId} · ${parts.name}`
+    : shortSessionId(sid);
+}
+
+function stationSessionCapabilities(sessionId) {
+  if (!sessionId || typeof getSessionCapabilities !== 'function') return null;
+  return getSessionCapabilities(sessionId);
 }
 
 function buildStationSnapshot() {
@@ -34741,6 +36974,7 @@ function renderBrowserWorkspaces() {
   const rows = Array.from(browserWorkspaces.values())
     .filter(w => (w.status || '') !== 'closed')
     .sort((a, b) => String(b.updated_at || '').localeCompare(String(a.updated_at || '')));
+  window.__stationBrowserWorkspaceCount = rows.length;
   if (status) status.textContent = rows.length ? `${rows.length} active workspace${rows.length === 1 ? '' : 's'}` : 'No active browser workspaces';
   if (!rows.length) {
     list.innerHTML = '<div style="color:var(--subtext0);font-size:12px;padding:10px;border:1px solid var(--surface0);border-radius:4px;background:var(--mantle)">No browser workspace yet</div>';
@@ -34905,10 +37139,11 @@ function loadSessions(options = {}) {
   }
 
   const token = ++_sessionsLoadToken;
-  fetchSessionsForHost(selfPeerId, { force: options.force !== false })
+  return fetchSessionsForHost(selfPeerId, { force: options.force !== false })
     .then(sessions => {
       if (token !== _sessionsLoadToken) return;
       applyLoadedSessions(sessions, aggEl);
+      return sessions;
     })
     .catch(() => {
       if (!cached && listEl) {
@@ -36293,10 +38528,10 @@ function setWorktreesLoadPending(pending, mode = '') {
 function loadWorktrees(options = {}) {
   const forceScan = !!options.forceScan;
   const listEl = document.getElementById('worktrees-list');
-  if (!listEl) return;
+  if (!listEl) return Promise.resolve(null);
   if (worktreesLoadInFlight === 'scan' && forceScan) {
     setWorktreesActivityNotice('pending', 'Scanning worktrees...');
-    return;
+    return Promise.resolve(null);
   }
   const browserCachedScan = worktreeHasScannedData(_cachedWorktreeScan) ? _cachedWorktreeScan : null;
   const requestSerial = ++worktreesRequestSerial;
@@ -36317,7 +38552,7 @@ function loadWorktrees(options = {}) {
     }
   }
   const url = forceScan ? '/api/worktrees/scan' : '/api/worktrees';
-  authedFetch(url, { method: forceScan ? 'POST' : 'GET' })
+  return authedFetch(url, { method: forceScan ? 'POST' : 'GET' })
     .then(r => r.ok ? r.json() : Promise.reject(new Error(`${url} returned ${r.status}`)))
     .then(scan => {
       if (requestSerial !== worktreesRequestSerial) return;
@@ -36333,6 +38568,7 @@ function loadWorktrees(options = {}) {
         const count = Number(scan?.summary?.worktrees || scan?.worktrees?.length || 0).toLocaleString();
         setWorktreesActivityNotice('ok', `Scan complete. Found ${count} worktree${count === '1' ? '' : 's'}.`, 2500);
       }
+      return scan;
     })
     .catch(err => {
       if (requestSerial !== worktreesRequestSerial) return;
@@ -36356,6 +38592,7 @@ function loadWorktrees(options = {}) {
 function renderWorktrees(scan) {
   renderWorktreesAggregate(scan, document.getElementById('worktrees-aggregate'));
   renderWorktreesList(scan, document.getElementById('worktrees-list'));
+  stationScheduleUpdate();
   const scannedAt = scan && scan.scanned_at;
   if (!scannedAt) {
     setWorktreesStatus('No worktree scan yet.');
@@ -36621,6 +38858,7 @@ function renderWorktreesList(scan, el) {
     const removing = pendingWorktreeRemovals.has(pathKey);
     const card = document.createElement('div');
     card.className = 'session-card worktree-card';
+    card.dataset.worktreePath = pathKey;
     if (removing) card.classList.add('removing');
     if (wt.safe_to_remove) card.classList.add('safe');
     else if (wt.dirty || wt.merge_status === 'unmerged' || (wt.active_sessions || 0) > 0 || wt.conflicted > 0) card.classList.add('danger');

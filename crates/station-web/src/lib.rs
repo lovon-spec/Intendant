@@ -44,13 +44,24 @@ impl StationWeb {
             scene_ctx,
         )));
         StationInner::install_events(inner.clone())?;
-        StationInner::start_gpu(inner.clone());
+        if station_enable_webgpu() {
+            StationInner::start_gpu(inner.clone());
+        } else {
+            web_sys::console::warn_1(&JsValue::from_str(
+                "Station WebGPU disabled; add station_gpu=webgpu to enable it",
+            ));
+        }
         StationInner::start_loop(inner.clone());
         Ok(Self { inner })
     }
 
     pub fn set_active(&self, active: bool) {
-        self.inner.borrow_mut().active = active;
+        {
+            let mut inner = self.inner.borrow_mut();
+            inner.active = active;
+            inner.last_render_ms = 0.0;
+        }
+        StationInner::schedule_next_loop(&self.inner);
     }
 
     pub fn set_action_callback(&self, callback: js_sys::Function) {
@@ -58,12 +69,18 @@ impl StationWeb {
     }
 
     pub fn resize(&self) {
-        self.inner.borrow_mut().resize();
+        {
+            let mut inner = self.inner.borrow_mut();
+            inner.resize();
+            inner.last_render_ms = 0.0;
+        }
+        StationInner::schedule_next_loop(&self.inner);
     }
 
     pub fn update_snapshot(&self, snapshot: JsValue) -> Result<(), JsValue> {
         let snapshot: StationSnapshot = serde_wasm_bindgen::from_value(snapshot)?;
         self.inner.borrow_mut().apply_snapshot(snapshot);
+        StationInner::schedule_next_loop(&self.inner);
         Ok(())
     }
 
@@ -76,34 +93,58 @@ impl StationWeb {
         kind: String,
         video: HtmlVideoElement,
     ) {
-        self.inner.borrow_mut().display_sources.insert(
-            source_id,
-            DisplaySource {
-                host_id,
-                display_id,
-                label,
-                kind,
-                video,
-            },
-        );
+        {
+            let mut inner = self.inner.borrow_mut();
+            inner.display_sources.insert(
+                source_id,
+                DisplaySource {
+                    host_id,
+                    display_id,
+                    label,
+                    kind,
+                    video,
+                },
+            );
+            inner.last_render_ms = 0.0;
+        }
+        StationInner::schedule_next_loop(&self.inner);
     }
 
     pub fn unregister_display_source(&self, source_id: String) {
-        self.inner.borrow_mut().display_sources.remove(&source_id);
+        {
+            let mut inner = self.inner.borrow_mut();
+            inner.display_sources.remove(&source_id);
+            inner.last_render_ms = 0.0;
+        }
+        StationInner::schedule_next_loop(&self.inner);
     }
 
     pub fn set_layout(&self, layout: String) {
-        self.inner.borrow_mut().layout = LayoutName::from_str(&layout);
+        {
+            let mut inner = self.inner.borrow_mut();
+            inner.layout = LayoutName::from_str(&layout);
+            inner.last_render_ms = 0.0;
+        }
+        StationInner::schedule_next_loop(&self.inner);
     }
 
     pub fn select_by_id(&self, id: Option<String>) {
-        let mut inner = self.inner.borrow_mut();
-        inner.selected_id = id;
-        inner.panel_scroll = 0.0;
+        {
+            let mut inner = self.inner.borrow_mut();
+            inner.selected_id = id;
+            inner.panel_scroll = 0.0;
+            inner.last_render_ms = 0.0;
+        }
+        StationInner::schedule_next_loop(&self.inner);
     }
 
     pub fn focus_on(&self, id: String) {
-        self.inner.borrow_mut().focus_id = Some(id);
+        {
+            let mut inner = self.inner.borrow_mut();
+            inner.focus_id = Some(id);
+            inner.last_render_ms = 0.0;
+        }
+        StationInner::schedule_next_loop(&self.inner);
     }
 
     pub fn debug_state(&self) -> String {
@@ -158,7 +199,9 @@ struct StationInner {
     action_callback: Option<js_sys::Function>,
     _events: Vec<Closure<dyn FnMut(Event)>>,
     _raf: Option<Closure<dyn FnMut(f64)>>,
+    loop_pending: bool,
     boot_started_ms: f64,
+    last_render_ms: f64,
 }
 
 impl StationInner {
@@ -223,7 +266,9 @@ impl StationInner {
             action_callback: None,
             _events: Vec::new(),
             _raf: None,
+            loop_pending: false,
             boot_started_ms: now_ms(),
+            last_render_ms: 0.0,
         };
         inner.resize();
         inner
@@ -289,7 +334,12 @@ impl StationInner {
                 let dy = y - drag.last_y;
                 drag.last_x = x;
                 drag.last_y = y;
-                if (x - drag.x).abs() + (y - drag.y).abs() > 4.0 {
+                let travel = (x - drag.x).abs() + (y - drag.y).abs();
+                if drag.pending_action.is_some() && travel <= 12.0 {
+                    s.mark_input();
+                    return;
+                }
+                if travel > 4.0 {
                     drag.moved = true;
                     drag.pending_action = None;
                 }
@@ -323,6 +373,7 @@ impl StationInner {
                         } else {
                             s.selected_id = s.pick_node(x, y);
                             s.panel_scroll = 0.0;
+                            s.last_render_ms = 0.0;
                             None
                         }
                     } else {
@@ -408,7 +459,12 @@ impl StationInner {
 
         let resize_inner = inner.clone();
         let resize = Closure::wrap(Box::new(move |_event: Event| {
-            resize_inner.borrow_mut().resize();
+            {
+                let mut s = resize_inner.borrow_mut();
+                s.resize();
+                s.last_render_ms = 0.0;
+            }
+            StationInner::schedule_next_loop(&resize_inner);
         }) as Box<dyn FnMut(_)>);
         window.add_event_listener_with_callback("resize", resize.as_ref().unchecked_ref())?;
         inner.borrow_mut()._events.push(resize);
@@ -422,7 +478,13 @@ impl StationInner {
         spawn_local(async move {
             match GpuState::new(canvas).await {
                 Ok(gpu) => {
-                    inner.borrow_mut().gpu = Some(gpu);
+                    {
+                        let mut s = inner.borrow_mut();
+                        s.gpu = Some(gpu);
+                        s.last_render_ms = 0.0;
+                        s.resize();
+                    }
+                    StationInner::schedule_next_loop(&inner);
                 }
                 Err(err) => {
                     web_sys::console::warn_1(&JsValue::from_str(&format!(
@@ -441,22 +503,58 @@ impl StationInner {
         let cb = Closure::wrap(Box::new(move |time_ms: f64| {
             {
                 let mut s = loop_inner.borrow_mut();
+                s.loop_pending = false;
                 s.render(time_ms);
             }
-            let next = loop_inner
-                .borrow()
-                ._raf
-                .as_ref()
-                .map(|cb| cb.as_ref().unchecked_ref::<js_sys::Function>().clone());
-            if let Some(next) = next {
-                if let Some(window) = web_sys::window() {
-                    let _ = window.request_animation_frame(&next);
-                }
-            }
+            StationInner::schedule_next_loop(&loop_inner);
         }) as Box<dyn FnMut(f64)>);
 
-        request_animation_frame(&cb);
         inner.borrow_mut()._raf = Some(cb);
+        StationInner::schedule_next_loop(&inner);
+    }
+
+    fn schedule_next_loop(inner: &Rc<RefCell<Self>>) {
+        let (next, has_gpu) = {
+            let mut s = inner.borrow_mut();
+            let Some(next) = s
+                ._raf
+                .as_ref()
+                .map(|cb| cb.as_ref().unchecked_ref::<js_sys::Function>().clone())
+            else {
+                return;
+            };
+            let has_gpu = s.gpu.is_some();
+            let should_schedule = if has_gpu {
+                s.active
+            } else {
+                s.active
+                    && (s.last_render_ms == 0.0
+                        || s.last_input_ms > s.last_render_ms
+                        || now_ms() - s.boot_started_ms < 1300.0)
+            };
+            if !should_schedule || s.loop_pending {
+                return;
+            }
+            s.loop_pending = true;
+            (next, has_gpu)
+        };
+        let Some(window) = web_sys::window() else {
+            inner.borrow_mut().loop_pending = false;
+            return;
+        };
+        let callback = Closure::once_into_js(move || {
+            let _ = next.call1(&JsValue::NULL, &JsValue::from_f64(now_ms()));
+        });
+        let delay_ms = if has_gpu { 250 } else { 180 };
+        if window
+            .set_timeout_with_callback_and_timeout_and_arguments_0(
+                callback.as_ref().unchecked_ref(),
+                delay_ms,
+            )
+            .is_err()
+        {
+            inner.borrow_mut().loop_pending = false;
+        }
     }
 
     fn apply_snapshot(&mut self, snapshot: StationSnapshot) {
@@ -493,6 +591,7 @@ impl StationInner {
         {
             self.selected_id = None;
         }
+        self.last_render_ms = 0.0;
     }
 
     fn node_exists(&self, id: &str) -> bool {
@@ -502,6 +601,7 @@ impl StationInner {
                 "system:activity"
                     | "system:context"
                     | "system:managed"
+                    | "system:changes"
                     | "system:sessions"
                     | "system:peers"
                     | "system:controls"
@@ -515,10 +615,11 @@ impl StationInner {
     }
 
     fn resize(&mut self) {
+        let max_dpr = if self.gpu.is_some() { 2.0 } else { 1.0 };
         let dpr = web_sys::window()
             .and_then(|w| Some(w.device_pixel_ratio()))
             .unwrap_or(1.0)
-            .clamp(1.0, 2.0);
+            .clamp(1.0, max_dpr);
         let css_w = self.hud_canvas.client_width().max(1) as f64;
         let css_h = self.hud_canvas.client_height().max(1) as f64;
         let width = (css_w * dpr).round().max(1.0) as u32;
@@ -539,10 +640,21 @@ impl StationInner {
     }
 
     fn render(&mut self, time_ms: f64) {
-        self.resize();
         if !self.active {
             return;
         }
+        if self.gpu.is_none()
+            && self.last_render_ms > 0.0
+            && self.last_input_ms <= self.last_render_ms
+        {
+            return;
+        }
+        self.resize();
+        let min_frame_ms = if self.gpu.is_some() { 120.0 } else { 250.0 };
+        if self.last_render_ms > 0.0 && time_ms - self.last_render_ms < min_frame_ms {
+            return;
+        }
+        self.last_render_ms = time_ms;
         let idle_ms = time_ms - self.last_input_ms;
         if self.auto_orbit && idle_ms > 2400.0 {
             self.yaw -= 0.000055 * self.motion * (idle_ms.min(5000.0) as f32 / 1000.0);
@@ -1915,7 +2027,7 @@ impl StationInner {
                 self.approval_button(
                     x + 12.0,
                     yy,
-                    82.0,
+                    76.0,
                     "Approve",
                     &agent.host_id,
                     &approval_id,
@@ -1923,19 +2035,40 @@ impl StationInner {
                     C_GREEN_CSS,
                 );
                 self.approval_button(
-                    x + 102.0,
+                    x + 96.0,
                     yy,
-                    62.0,
+                    52.0,
                     "Skip",
                     &agent.host_id,
                     &approval_id,
                     "skip",
                     C_OVERLAY1_CSS,
                 );
+                let local_host_id = self
+                    .snapshot
+                    .hosts
+                    .first()
+                    .map(|host| host.id.as_str())
+                    .unwrap_or("local");
+                let deny_x = if agent.host_id == local_host_id || agent.host_id == "local" {
+                    self.approval_button(
+                        x + 156.0,
+                        yy,
+                        48.0,
+                        "All",
+                        &agent.host_id,
+                        &approval_id,
+                        "approve_all",
+                        C_YELLOW_CSS,
+                    );
+                    x + 212.0
+                } else {
+                    x + 156.0
+                };
                 self.approval_button(
-                    x + 172.0,
+                    deny_x,
                     yy,
-                    62.0,
+                    54.0,
                     "Deny",
                     &agent.host_id,
                     &approval_id,
@@ -1961,7 +2094,7 @@ impl StationInner {
             x + 14.0,
             y + 38.0,
             86.0,
-            "open log",
+            "route log",
             "activity",
             Some("log"),
             C_TEAL_CSS,
@@ -2093,7 +2226,7 @@ impl StationInner {
             x + 14.0,
             y + 38.0,
             94.0,
-            "open context",
+            "route context",
             "activity",
             Some("context"),
             C_BLUE_CSS,
@@ -2222,7 +2355,7 @@ impl StationInner {
             x + 14.0,
             y + 38.0,
             94.0,
-            "open managed",
+            "route managed",
             "activity",
             Some("managed"),
             C_MAUVE_CSS,
@@ -2272,6 +2405,16 @@ impl StationInner {
             yy,
             "history",
             &format!("{} records · {} anchors", managed.records, managed.anchors),
+        );
+        yy += 22.0;
+        self.panel_row(
+            x,
+            yy,
+            "branches",
+            &format!(
+                "{} lineage · {} fission · {} branches",
+                managed.lineage_groups, managed.fission_groups, managed.branches
+            ),
         );
         yy += 30.0;
         self.section_title_color(x, yy, "Actions", C_MAUVE_CSS);
@@ -2347,13 +2490,24 @@ impl StationInner {
         yy += 10.0;
         self.section_title_color(x, yy, "Anchor catalog", C_PEACH_CSS);
         yy += 18.0;
-        self.managed_detail_rows(
+        yy = self.managed_detail_rows(
             x,
             yy,
             panel_w,
             &managed.recent_anchors,
             "No anchors discovered for this session",
             5,
+        );
+        yy += 10.0;
+        self.section_title_color(x, yy, "Edit branches", C_BLUE_CSS);
+        yy += 18.0;
+        self.managed_detail_rows(
+            x,
+            yy,
+            panel_w,
+            &managed.recent_branches,
+            "No claimable fission branches",
+            3,
         );
     }
 
@@ -2372,7 +2526,7 @@ impl StationInner {
             x + 14.0,
             y + 38.0,
             94.0,
-            "open changes",
+            "route changes",
             "activity",
             Some("changes"),
             C_YELLOW_CSS,
@@ -2487,7 +2641,7 @@ impl StationInner {
             x + 14.0,
             y + 38.0,
             96.0,
-            "open sessions",
+            "route sessions",
             "sessions",
             Some("recent"),
             C_TEAL_CSS,
@@ -2507,45 +2661,123 @@ impl StationInner {
         self.panel_row(x, yy, "disk", &format_bytes(sessions.disk_bytes));
         yy += 22.0;
         self.panel_row(x, yy, "index", &nonempty(&sessions.index_status, "cold"));
+        yy += 22.0;
+        self.panel_row(
+            x,
+            yy,
+            "worktrees",
+            &format!(
+                "{} · {} cleanup",
+                sessions.worktrees, sessions.worktree_cleanup
+            ),
+        );
+        yy += 22.0;
+        self.panel_row_color(
+            x,
+            yy,
+            "wt risk",
+            &format!(
+                "{} dirty · {} unmerged · {} active",
+                sessions.worktree_dirty, sessions.worktree_unmerged, sessions.worktree_active
+            ),
+            if sessions.worktree_dirty > 0
+                || sessions.worktree_unmerged > 0
+                || sessions.worktree_active > 0
+            {
+                C_YELLOW_CSS
+            } else {
+                C_TEXT_CSS
+            },
+        );
+        yy += 22.0;
+        self.panel_row(
+            x,
+            yy,
+            "wt disk",
+            &format!(
+                "{} · {}",
+                format_bytes(sessions.worktree_bytes),
+                nonempty(&sessions.worktree_scan_status, "cold")
+            ),
+        );
         yy += 30.0;
         self.section_title_color(x, yy, "Shortcuts", C_TEAL_CSS);
         yy += 22.0;
-        self.nav_button(
-            x + 14.0,
-            yy - 14.0,
-            98.0,
-            "new session",
-            "sessions",
-            Some("new"),
-            C_TEAL_CSS,
-        );
-        self.nav_button(
-            x + 122.0,
-            yy - 14.0,
-            98.0,
-            "deep search",
-            "sessions",
-            Some("deep"),
-            C_MAUVE_CSS,
-        );
-        yy += 25.0;
-        self.nav_button(
-            x + 14.0,
-            yy - 14.0,
-            88.0,
-            "worktrees",
-            "sessions",
-            Some("worktrees"),
-            C_BLUE_CSS,
-        );
-        self.pill_at(x + 112.0, yy - 14.0, 66.0, 21.0, "refresh", C_TEAL_CSS);
+        self.pill_at(x + 14.0, yy - 14.0, 98.0, 21.0, "new session", C_TEAL_CSS);
         self.hit_zones.push(HitZone::new(
-            x + 112.0,
+            x + 14.0,
             yy - 14.0,
-            66.0,
+            98.0,
             21.0,
             HitAction::SessionAction {
-                action: "refresh".to_string(),
+                action: "new-session".to_string(),
+                session_id: String::new(),
+            },
+        ));
+        self.pill_at(x + 122.0, yy - 14.0, 68.0, 21.0, "search", C_TEAL_CSS);
+        self.hit_zones.push(HitZone::new(
+            x + 122.0,
+            yy - 14.0,
+            68.0,
+            21.0,
+            HitAction::SessionAction {
+                action: "search".to_string(),
+                session_id: String::new(),
+            },
+        ));
+        self.pill_at(x + 198.0, yy - 14.0, 98.0, 21.0, "deep search", C_MAUVE_CSS);
+        self.hit_zones.push(HitZone::new(
+            x + 198.0,
+            yy - 14.0,
+            98.0,
+            21.0,
+            HitAction::SessionAction {
+                action: "deep-search".to_string(),
+                session_id: String::new(),
+            },
+        ));
+        yy += 25.0;
+        self.pill_at(x + 14.0, yy - 14.0, 86.0, 21.0, "worktrees", C_BLUE_CSS);
+        self.hit_zones.push(HitZone::new(
+            x + 14.0,
+            yy - 14.0,
+            86.0,
+            21.0,
+            HitAction::SessionAction {
+                action: "worktrees".to_string(),
+                session_id: String::new(),
+            },
+        ));
+        self.pill_at(x + 108.0, yy - 14.0, 78.0, 21.0, "wt search", C_TEAL_CSS);
+        self.hit_zones.push(HitZone::new(
+            x + 108.0,
+            yy - 14.0,
+            78.0,
+            21.0,
+            HitAction::SessionAction {
+                action: "worktree-search".to_string(),
+                session_id: String::new(),
+            },
+        ));
+        self.pill_at(x + 196.0, yy - 14.0, 52.0, 21.0, "scan", C_PEACH_CSS);
+        self.hit_zones.push(HitZone::new(
+            x + 196.0,
+            yy - 14.0,
+            52.0,
+            21.0,
+            HitAction::SessionAction {
+                action: "worktrees-scan".to_string(),
+                session_id: String::new(),
+            },
+        ));
+        self.pill_at(x + 258.0, yy - 14.0, 62.0, 21.0, "cached", C_BLUE_CSS);
+        self.hit_zones.push(HitZone::new(
+            x + 258.0,
+            yy - 14.0,
+            62.0,
+            21.0,
+            HitAction::SessionAction {
+                action: "worktrees-cache".to_string(),
                 session_id: String::new(),
             },
         ));
@@ -2590,13 +2822,24 @@ impl StationInner {
         yy += 78.0;
         self.section_title_color(x, yy, "Recent sessions", C_MAUVE_CSS);
         yy += 18.0;
-        self.session_detail_rows(
+        yy = self.session_detail_rows(
             x,
             yy,
             panel_w,
             &sessions.recent,
             "No cached sessions yet",
             5,
+        );
+        yy += 20.0;
+        self.section_title_color(x, yy, "Worktree watchlist", C_BLUE_CSS);
+        yy += 18.0;
+        self.session_detail_rows(
+            x,
+            yy,
+            panel_w,
+            &sessions.recent_worktrees,
+            "No worktree scan yet",
+            4,
         );
     }
 
@@ -2631,7 +2874,7 @@ impl StationInner {
             x + 14.0,
             y + 38.0,
             78.0,
-            "network",
+            "route net",
             "settings",
             Some("network"),
             C_PEACH_CSS,
@@ -2640,7 +2883,7 @@ impl StationInner {
             x + 100.0,
             y + 38.0,
             80.0,
-            "open video",
+            "route video",
             "displays",
             None,
             C_PEACH_CSS,
@@ -2733,12 +2976,70 @@ impl StationInner {
             x + 14.0,
             y + 38.0,
             94.0,
-            "open control",
+            "route control",
             "activity",
             Some("control"),
             C_MAUVE_CSS,
         );
         let mut yy = y + 82.0 - self.panel_scroll;
+        self.section_title_color(x, yy, "Operator controls", C_TEAL_CSS);
+        yy += 22.0;
+        let prompt_label = if controls.prompt_mode == "steer" {
+            "steer"
+        } else {
+            "send"
+        };
+        let mut operator_actions = vec![
+            (
+                "send".to_string(),
+                prompt_label.to_string(),
+                58.0,
+                C_TEAL_CSS.to_string(),
+            ),
+            (
+                "new-session".to_string(),
+                "new session".to_string(),
+                96.0,
+                C_BLUE_CSS.to_string(),
+            ),
+        ];
+        if controls.session_can_focus {
+            operator_actions.push((
+                "target".to_string(),
+                "focus target".to_string(),
+                98.0,
+                C_PEACH_CSS.to_string(),
+            ));
+        }
+        if controls.session_can_interrupt {
+            operator_actions.push((
+                "stop".to_string(),
+                "stop".to_string(),
+                54.0,
+                C_RED_CSS.to_string(),
+            ));
+        }
+        yy = self.draw_activity_action_pills(x, panel_w, yy - 14.0, &operator_actions);
+        self.panel_row(
+            x,
+            yy,
+            "draft",
+            &format!(
+                "{} chars · {}",
+                controls.draft_chars,
+                if controls.direct_mode {
+                    "direct"
+                } else {
+                    "presence"
+                }
+            ),
+        );
+        yy += 30.0;
+
+        self.section_title_color(x, yy, "Launch defaults", C_MAUVE_CSS);
+        yy += 22.0;
+        self.panel_row(x, yy, "binary", &truncate(&controls.command, 42));
+        yy += 22.0;
         self.panel_row(x, yy, "model", &truncate(&controls.model, 42));
         yy += 22.0;
         self.panel_row(x, yy, "sandbox", &nonempty(&controls.sandbox, "--"));
@@ -2790,62 +3091,411 @@ impl StationInner {
             "new task",
             &nonempty(&controls.new_session_agent, "--"),
         );
+        yy += 30.0;
+
+        self.section_title_color(x, yy, "Live surfaces", C_BLUE_CSS);
+        yy += 22.0;
+        self.panel_row(x, yy, "display", &nonempty(&controls.display_access, "--"));
+        yy += 22.0;
+        self.panel_row(
+            x,
+            yy,
+            "voice",
+            &format!(
+                "{}{}{}",
+                nonempty(&controls.voice_state, "idle"),
+                if controls.mic_active { " / mic" } else { "" },
+                if controls.video_active {
+                    " / video"
+                } else {
+                    ""
+                }
+            ),
+        );
+        yy += 22.0;
+        self.panel_row(
+            x,
+            yy,
+            "browser",
+            &format!("{} workspaces", controls.browser_workspaces),
+        );
+        yy += 22.0;
+        self.panel_row(
+            x,
+            yy,
+            "recording",
+            &truncate(
+                &format!(
+                    "{} streams{}{}{}",
+                    controls.recordings,
+                    if controls.active_recording.is_empty() {
+                        ""
+                    } else {
+                        " · "
+                    },
+                    truncate(&controls.active_recording, 18),
+                    if controls.debug_recording {
+                        " / debug rec"
+                    } else if controls.debug_screen {
+                        " / debug"
+                    } else {
+                        ""
+                    }
+                ),
+                46,
+            ),
+        );
+        yy += 22.0;
+        self.panel_row(
+            x,
+            yy,
+            "attach",
+            &format!("{} pending", controls.pending_attachments),
+        );
+        yy += 30.0;
+        let mut surface_actions = vec![
+            (
+                "display-toggle".to_string(),
+                if controls.display_access.starts_with("on") {
+                    "revoke display".to_string()
+                } else {
+                    "share display".to_string()
+                },
+                104.0,
+                C_BLUE_CSS.to_string(),
+            ),
+            (
+                "cu-settings".to_string(),
+                "CU settings".to_string(),
+                92.0,
+                C_MAUVE_CSS.to_string(),
+            ),
+            (
+                "browser-open".to_string(),
+                "browsers".to_string(),
+                76.0,
+                C_TEAL_CSS.to_string(),
+            ),
+            (
+                "browser-new".to_string(),
+                "new browser".to_string(),
+                96.0,
+                C_TEAL_CSS.to_string(),
+            ),
+            (
+                "recordings".to_string(),
+                "recordings".to_string(),
+                92.0,
+                C_PEACH_CSS.to_string(),
+            ),
+            (
+                "debug-screen".to_string(),
+                if controls.debug_screen {
+                    "hide debug".to_string()
+                } else {
+                    "debug screen".to_string()
+                },
+                98.0,
+                C_PEACH_CSS.to_string(),
+            ),
+        ];
+        if !controls.active_browser {
+            surface_actions.push((
+                "voice-active".to_string(),
+                "make active".to_string(),
+                94.0,
+                C_YELLOW_CSS.to_string(),
+            ));
+        }
+        surface_actions.push((
+            "voice-toggle".to_string(),
+            if controls.mic_active {
+                "mic off".to_string()
+            } else {
+                "mic".to_string()
+            },
+            58.0,
+            C_TEAL_CSS.to_string(),
+        ));
+        surface_actions.push((
+            "video-toggle".to_string(),
+            if controls.video_active {
+                "video off".to_string()
+            } else {
+                "video".to_string()
+            },
+            76.0,
+            C_TEAL_CSS.to_string(),
+        ));
+        if controls.debug_screen {
+            surface_actions.push((
+                "debug-record".to_string(),
+                if controls.debug_recording {
+                    "stop rec".to_string()
+                } else {
+                    "debug rec".to_string()
+                },
+                82.0,
+                C_RED_CSS.to_string(),
+            ));
+        }
+        if controls.pending_attachments > 0 {
+            surface_actions.push((
+                "attachments-clear".to_string(),
+                "clear attach".to_string(),
+                98.0,
+                C_RED_CSS.to_string(),
+            ));
+        }
+        yy = self.draw_controls_action_pills(x, panel_w, yy - 14.0, &surface_actions);
+
+        self.section_title_color(x, yy, "Dashboard routes", C_TEAL_CSS);
+        yy += 22.0;
+        self.nav_button(
+            x + 14.0,
+            yy - 14.0,
+            58.0,
+            "stats",
+            "stats",
+            None,
+            C_TEAL_CSS,
+        );
+        self.nav_button(
+            x + 82.0,
+            yy - 14.0,
+            68.0,
+            "terminal",
+            "terminal",
+            Some("tui"),
+            C_BLUE_CSS,
+        );
+        self.nav_button(
+            x + 160.0,
+            yy - 14.0,
+            58.0,
+            "shell",
+            "terminal",
+            Some("shell"),
+            C_BLUE_CSS,
+        );
+        self.nav_button(
+            x + 228.0,
+            yy - 14.0,
+            86.0,
+            "agent settings",
+            "settings",
+            Some("agent"),
+            C_MAUVE_CSS,
+        );
+        yy += 25.0;
+        self.nav_button(
+            x + 14.0,
+            yy - 14.0,
+            96.0,
+            "network",
+            "settings",
+            Some("network"),
+            C_PEACH_CSS,
+        );
+        self.nav_button(
+            x + 120.0,
+            yy - 14.0,
+            86.0,
+            "debug",
+            "settings",
+            Some("debug"),
+            C_PEACH_CSS,
+        );
+        self.nav_button(
+            x + 216.0,
+            yy - 14.0,
+            72.0,
+            "account",
+            "settings",
+            Some("account"),
+            C_TEAL_CSS,
+        );
+        yy += 28.0;
+
+        self.section_title_color(x, yy, "Active target", C_PEACH_CSS);
         yy += 22.0;
         self.panel_row(
             x,
             yy,
             "target",
-            &nonempty(&controls.session_selection, "--"),
+            &truncate(
+                &nonempty(
+                    &controls.session_label,
+                    &nonempty(&controls.session_selection, "--"),
+                ),
+                42,
+            ),
         );
-        yy += 30.0;
-        if controls.session_can_config && !controls.session_id.is_empty() {
-            self.section_title_color(x, yy, "Active session actions", C_PEACH_CSS);
-            yy += 22.0;
-            self.pill_at(
-                x + 14.0,
-                yy - 14.0,
-                112.0,
-                21.0,
-                "launch config",
+        yy += 22.0;
+        let target_state = if controls.session_detached {
+            "detached"
+        } else if controls.session_active {
+            "active"
+        } else if controls.session_id.is_empty() {
+            "none"
+        } else {
+            "idle"
+        };
+        self.panel_row_color(
+            x,
+            yy,
+            "state",
+            target_state,
+            if controls.session_detached {
+                C_YELLOW_CSS
+            } else if controls.session_active {
+                C_GREEN_CSS
+            } else {
+                C_TEXT_CSS
+            },
+        );
+        yy += 22.0;
+        self.panel_row(x, yy, "source", &nonempty(&controls.session_source, "--"));
+        yy += 22.0;
+        self.panel_row(
+            x,
+            yy,
+            "binary",
+            &truncate(&nonempty(&controls.session_command, "--"), 42),
+        );
+        yy += 22.0;
+        self.panel_row(
+            x,
+            yy,
+            "managed",
+            &nonempty(&controls.session_managed_context, "--"),
+        );
+        yy += 22.0;
+        self.panel_row(
+            x,
+            yy,
+            "archive",
+            &nonempty(&controls.session_context_archive, "--"),
+        );
+        yy += 22.0;
+        self.panel_row(
+            x,
+            yy,
+            "service",
+            &nonempty(&controls.session_service_tier, "--"),
+        );
+        yy += 22.0;
+        self.panel_row(
+            x,
+            yy,
+            "caps",
+            &format!(
+                "{} / {}{}",
+                if controls.session_can_steer {
+                    "steer"
+                } else {
+                    "no steer"
+                },
+                if controls.session_can_interrupt {
+                    "interrupt"
+                } else {
+                    "no interrupt"
+                },
+                if controls.session_is_codex {
+                    " / codex"
+                } else {
+                    ""
+                }
+            ),
+        );
+        yy += 22.0;
+        if !controls.session_goal_objective.is_empty() {
+            self.panel_row_color(
+                x,
+                yy,
+                "goal",
+                &truncate(
+                    &format!(
+                        "{} · {}{}",
+                        nonempty(&controls.session_goal_status, "active"),
+                        controls.session_goal_objective,
+                        if controls.session_goal_tokens.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" · {} tok", controls.session_goal_tokens)
+                        }
+                    ),
+                    46,
+                ),
                 C_MAUVE_CSS,
             );
-            self.hit_zones.push(HitZone::new(
-                x + 14.0,
-                yy - 14.0,
-                112.0,
-                21.0,
-                HitAction::SessionAction {
-                    action: "config".to_string(),
-                    session_id: controls.session_id.clone(),
-                },
+        } else {
+            self.panel_row(x, yy, "goal", "--");
+        }
+        yy += 30.0;
+        if !controls.session_id.is_empty() {
+            self.section_title_color(x, yy, "Target actions", C_PEACH_CSS);
+            yy += 22.0;
+            let mut session_actions = Vec::new();
+            if controls.session_can_focus {
+                session_actions.push((
+                    "focus".to_string(),
+                    "focus".to_string(),
+                    56.0,
+                    C_TEAL_CSS.to_string(),
+                ));
+            }
+            session_actions.push((
+                "copy".to_string(),
+                "copy id".to_string(),
+                66.0,
+                C_BLUE_CSS.to_string(),
             ));
-            self.pill_at(
-                x + 134.0,
+            if controls.session_can_attach {
+                session_actions.push((
+                    "attach".to_string(),
+                    "attach".to_string(),
+                    68.0,
+                    C_TEAL_CSS.to_string(),
+                ));
+            }
+            if controls.session_can_config {
+                session_actions.push((
+                    "config".to_string(),
+                    "launch config".to_string(),
+                    112.0,
+                    C_MAUVE_CSS.to_string(),
+                ));
+                session_actions.push((
+                    "restart".to_string(),
+                    "restart saved".to_string(),
+                    112.0,
+                    C_PEACH_CSS.to_string(),
+                ));
+            }
+            if controls.session_can_rename {
+                session_actions.push((
+                    "rename".to_string(),
+                    "rename".to_string(),
+                    72.0,
+                    C_BLUE_CSS.to_string(),
+                ));
+            }
+            if controls.session_can_stop {
+                session_actions.push((
+                    "stop".to_string(),
+                    "stop".to_string(),
+                    54.0,
+                    C_RED_CSS.to_string(),
+                ));
+            }
+            yy = self.draw_session_action_pills(
+                x,
+                panel_w,
                 yy - 14.0,
-                112.0,
-                21.0,
-                "restart saved",
-                C_PEACH_CSS,
+                &session_actions,
+                &controls.session_id,
             );
-            self.hit_zones.push(HitZone::new(
-                x + 134.0,
-                yy - 14.0,
-                112.0,
-                21.0,
-                HitAction::SessionAction {
-                    action: "restart".to_string(),
-                    session_id: controls.session_id.clone(),
-                },
-            ));
-            self.text(
-                "per-session binary and managed mode",
-                x + 14.0,
-                yy + 17.0,
-                9.0,
-                C_SUBTEXT0_CSS,
-                "normal",
-            );
-            yy += 47.0;
         }
         self.section_title_color(x, yy, "Thread actions", C_MAUVE_CSS);
         yy += 22.0;
@@ -2881,38 +3531,12 @@ impl StationInner {
             ("init", "init AGENTS", 92.0),
             ("memory-reset", "reset memory", 104.0),
         ];
-        yy = self.draw_thread_action_pills(
+        let _ = self.draw_thread_action_pills(
             x,
             panel_w,
             yy - 14.0,
             &maintenance_actions,
             &codex_target,
-        );
-        self.section_title_color(x, yy, "Active session", C_PEACH_CSS);
-        yy += 18.0;
-        self.panel_row(x, yy, "session", &truncate(&controls.session_id, 38));
-        yy += 22.0;
-        self.panel_row(x, yy, "source", &nonempty(&controls.session_source, "--"));
-        yy += 22.0;
-        self.panel_row(
-            x,
-            yy,
-            "binary",
-            &truncate(&nonempty(&controls.session_command, "--"), 42),
-        );
-        yy += 22.0;
-        self.panel_row(
-            x,
-            yy,
-            "managed",
-            &nonempty(&controls.session_managed_context, "--"),
-        );
-        yy += 22.0;
-        self.panel_row(
-            x,
-            yy,
-            "archive",
-            &nonempty(&controls.session_context_archive, "--"),
         );
     }
 
@@ -2943,6 +3567,96 @@ impl StationInner {
                 },
             ));
             ax += width + 8.0;
+        }
+        ay + 35.0
+    }
+
+    fn draw_activity_action_pills(
+        &mut self,
+        x: f32,
+        panel_w: f32,
+        y: f32,
+        actions: &[(String, String, f32, String)],
+    ) -> f32 {
+        let mut ax = x + 14.0;
+        let mut ay = y;
+        for (action, label, width, color) in actions {
+            if ax + *width > x + panel_w - 14.0 {
+                ax = x + 14.0;
+                ay += 25.0;
+            }
+            self.pill_at(ax, ay, *width, 21.0, label, color);
+            self.hit_zones.push(HitZone::new(
+                ax,
+                ay,
+                *width,
+                21.0,
+                HitAction::ActivityAction {
+                    action: action.clone(),
+                    id: String::new(),
+                },
+            ));
+            ax += *width + 8.0;
+        }
+        ay + 35.0
+    }
+
+    fn draw_controls_action_pills(
+        &mut self,
+        x: f32,
+        panel_w: f32,
+        y: f32,
+        actions: &[(String, String, f32, String)],
+    ) -> f32 {
+        let mut ax = x + 14.0;
+        let mut ay = y;
+        for (action, label, width, color) in actions {
+            if ax + *width > x + panel_w - 14.0 {
+                ax = x + 14.0;
+                ay += 25.0;
+            }
+            self.pill_at(ax, ay, *width, 21.0, label, color);
+            self.hit_zones.push(HitZone::new(
+                ax,
+                ay,
+                *width,
+                21.0,
+                HitAction::ControlsAction {
+                    action: action.clone(),
+                },
+            ));
+            ax += *width + 8.0;
+        }
+        ay + 35.0
+    }
+
+    fn draw_session_action_pills(
+        &mut self,
+        x: f32,
+        panel_w: f32,
+        y: f32,
+        actions: &[(String, String, f32, String)],
+        session_id: &str,
+    ) -> f32 {
+        let mut ax = x + 14.0;
+        let mut ay = y;
+        for (action, label, width, color) in actions {
+            if ax + *width > x + panel_w - 14.0 {
+                ax = x + 14.0;
+                ay += 25.0;
+            }
+            self.pill_at(ax, ay, *width, 21.0, label, color);
+            self.hit_zones.push(HitZone::new(
+                ax,
+                ay,
+                *width,
+                21.0,
+                HitAction::SessionAction {
+                    action: action.clone(),
+                    session_id: session_id.to_string(),
+                },
+            ));
+            ax += *width + 8.0;
         }
         ay + 35.0
     }
@@ -3021,33 +3735,44 @@ impl StationInner {
                 C_SUBTEXT0_CSS,
                 "normal",
             );
-            let mut bx = x + panel_w - 144.0;
+            let mut buttons = Vec::new();
+            if row.can_attach && !row.id.is_empty() {
+                buttons.push(("attach", "attach", 58.0, C_TEAL_CSS));
+            }
             if row.can_resume && !row.id.is_empty() {
-                self.pill_at(bx, yy + 15.0, 58.0, 19.0, "resume", C_TEAL_CSS);
-                self.hit_zones.push(HitZone::new(
-                    bx,
-                    yy + 15.0,
-                    58.0,
-                    19.0,
-                    HitAction::SessionAction {
-                        action: "resume".to_string(),
-                        session_id: row.id.clone(),
-                    },
-                ));
-                bx += 64.0;
+                buttons.push(("resume", "resume", 58.0, C_TEAL_CSS));
             }
             if row.can_config && !row.id.is_empty() {
-                self.pill_at(bx, yy + 15.0, 58.0, 19.0, "config", C_MAUVE_CSS);
-                self.hit_zones.push(HitZone::new(
-                    bx,
-                    yy + 15.0,
-                    58.0,
-                    19.0,
-                    HitAction::SessionAction {
-                        action: "config".to_string(),
-                        session_id: row.id.clone(),
-                    },
-                ));
+                buttons.push(("config", "config", 58.0, C_MAUVE_CSS));
+            }
+            if row.can_stop && !row.id.is_empty() {
+                buttons.push(("stop", "stop", 46.0, C_RED_CSS));
+            }
+            if row.can_rename && !row.id.is_empty() && buttons.len() < 3 {
+                buttons.push(("rename", "rename", 58.0, C_BLUE_CSS));
+            }
+            let visible_buttons = buttons.into_iter().take(3).collect::<Vec<_>>();
+            if !visible_buttons.is_empty() {
+                let total_w: f32 = visible_buttons
+                    .iter()
+                    .map(|(_, _, width, _)| *width)
+                    .sum::<f32>()
+                    + (visible_buttons.len().saturating_sub(1) as f32 * 6.0);
+                let mut bx = x + panel_w - total_w - 28.0;
+                for (action, label, width, color) in visible_buttons {
+                    self.pill_at(bx, yy + 15.0, width, 19.0, label, color);
+                    self.hit_zones.push(HitZone::new(
+                        bx,
+                        yy + 15.0,
+                        width,
+                        19.0,
+                        HitAction::SessionAction {
+                            action: action.to_string(),
+                            session_id: row.id.clone(),
+                        },
+                    ));
+                    bx += width + 6.0;
+                }
             }
             yy += 47.0;
         }
@@ -3118,6 +3843,7 @@ impl StationInner {
             let button_label = match row.action.as_str() {
                 "anchor" => "use",
                 "record" => "select",
+                "branch" => "claim",
                 _ => "",
             };
             if !button_label.is_empty() && !row.id.is_empty() {
@@ -3612,19 +4338,23 @@ impl StationInner {
         match action {
             HitAction::Layout(layout) => {
                 self.layout = layout;
+                self.last_render_ms = 0.0;
                 None
             }
             HitAction::Mood(mood) => {
                 self.mood = mood;
+                self.last_render_ms = 0.0;
                 None
             }
             HitAction::ClosePanel => {
                 self.selected_id = None;
+                self.last_render_ms = 0.0;
                 None
             }
             HitAction::Select(id) => {
                 self.selected_id = Some(id);
                 self.panel_scroll = 0.0;
+                self.last_render_ms = 0.0;
                 None
             }
             HitAction::Slider(kind) => {
@@ -3660,6 +4390,10 @@ impl StationInner {
                     "type": "activity_action",
                     "action": action,
                     "id": id,
+            })),
+            HitAction::ControlsAction { action } => Some(serde_json::json!({
+                    "type": "controls_action",
+                    "action": action,
             })),
             HitAction::ManagedAction {
                 action,
@@ -3717,6 +4451,7 @@ impl StationInner {
             SliderKind::Ar => self.ar_strength = pct,
             SliderKind::Density => self.density = 0.5 + pct * 1.3,
         }
+        self.last_render_ms = 0.0;
     }
 
     fn hit_action_at(&self, x: f32, y: f32) -> Option<HitAction> {
@@ -3750,6 +4485,7 @@ impl StationInner {
 
     fn mark_input(&mut self) {
         self.last_input_ms = now_ms();
+        self.last_render_ms = 0.0;
     }
 
     fn css_width(&self) -> f32 {
@@ -4430,9 +5166,13 @@ struct StationManagedSummary {
     rewind_only: bool,
     records: u32,
     anchors: u32,
+    lineage_groups: u32,
+    fission_groups: u32,
+    branches: u32,
     error: String,
     recent_records: Vec<StationDetailRow>,
     recent_anchors: Vec<StationDetailRow>,
+    recent_branches: Vec<StationDetailRow>,
 }
 
 impl Default for StationManagedSummary {
@@ -4447,9 +5187,13 @@ impl Default for StationManagedSummary {
             rewind_only: false,
             records: 0,
             anchors: 0,
+            lineage_groups: 0,
+            fission_groups: 0,
+            branches: 0,
             error: String::new(),
             recent_records: Vec::new(),
             recent_anchors: Vec::new(),
+            recent_branches: Vec::new(),
         }
     }
 }
@@ -4496,11 +5240,19 @@ struct StationSessionsSummary {
     external: u32,
     total_tokens: f32,
     disk_bytes: f64,
+    worktrees: u32,
+    worktree_dirty: u32,
+    worktree_unmerged: u32,
+    worktree_active: u32,
+    worktree_cleanup: u32,
+    worktree_bytes: f64,
+    worktree_scan_status: String,
     latest_task: String,
     latest_source: String,
     latest_updated: String,
     index_status: String,
     recent: Vec<StationDetailRow>,
+    recent_worktrees: Vec<StationDetailRow>,
 }
 
 impl Default for StationSessionsSummary {
@@ -4511,11 +5263,19 @@ impl Default for StationSessionsSummary {
             external: 0,
             total_tokens: 0.0,
             disk_bytes: 0.0,
+            worktrees: 0,
+            worktree_dirty: 0,
+            worktree_unmerged: 0,
+            worktree_active: 0,
+            worktree_cleanup: 0,
+            worktree_bytes: 0.0,
+            worktree_scan_status: String::new(),
             latest_task: String::new(),
             latest_source: String::new(),
             latest_updated: String::new(),
             index_status: String::new(),
             recent: Vec::new(),
+            recent_worktrees: Vec::new(),
         }
     }
 }
@@ -4524,6 +5284,7 @@ impl Default for StationSessionsSummary {
 #[serde(default, rename_all = "camelCase")]
 struct StationControlsSummary {
     backend: String,
+    command: String,
     sandbox: String,
     approval_policy: String,
     model: String,
@@ -4536,18 +5297,47 @@ struct StationControlsSummary {
     writable_roots: u32,
     new_session_agent: String,
     session_id: String,
+    session_label: String,
     session_selection: String,
     session_source: String,
     session_command: String,
     session_managed_context: String,
     session_context_archive: String,
     session_can_config: bool,
+    session_can_focus: bool,
+    session_can_attach: bool,
+    session_can_stop: bool,
+    session_can_rename: bool,
+    session_can_interrupt: bool,
+    session_can_steer: bool,
+    session_detached: bool,
+    session_active: bool,
+    session_is_codex: bool,
+    session_service_tier: String,
+    session_goal_status: String,
+    session_goal_objective: String,
+    session_goal_tokens: String,
+    prompt_mode: String,
+    direct_mode: bool,
+    draft_chars: u32,
+    display_access: String,
+    voice_state: String,
+    mic_active: bool,
+    video_active: bool,
+    active_browser: bool,
+    browser_workspaces: u32,
+    recordings: u32,
+    active_recording: String,
+    debug_screen: bool,
+    debug_recording: bool,
+    pending_attachments: u32,
 }
 
 impl Default for StationControlsSummary {
     fn default() -> Self {
         Self {
             backend: String::new(),
+            command: String::new(),
             sandbox: String::new(),
             approval_policy: String::new(),
             model: String::new(),
@@ -4560,12 +5350,40 @@ impl Default for StationControlsSummary {
             writable_roots: 0,
             new_session_agent: String::new(),
             session_id: String::new(),
+            session_label: String::new(),
             session_selection: String::new(),
             session_source: String::new(),
             session_command: String::new(),
             session_managed_context: String::new(),
             session_context_archive: String::new(),
             session_can_config: false,
+            session_can_focus: false,
+            session_can_attach: false,
+            session_can_stop: false,
+            session_can_rename: false,
+            session_can_interrupt: false,
+            session_can_steer: false,
+            session_detached: false,
+            session_active: false,
+            session_is_codex: false,
+            session_service_tier: String::new(),
+            session_goal_status: String::new(),
+            session_goal_objective: String::new(),
+            session_goal_tokens: String::new(),
+            prompt_mode: String::new(),
+            direct_mode: false,
+            draft_chars: 0,
+            display_access: String::new(),
+            voice_state: String::new(),
+            mic_active: false,
+            video_active: false,
+            active_browser: true,
+            browser_workspaces: 0,
+            recordings: 0,
+            active_recording: String::new(),
+            debug_screen: false,
+            debug_recording: false,
+            pending_attachments: 0,
         }
     }
 }
@@ -4598,6 +5416,9 @@ struct StationDetailRow {
     tone: String,
     can_resume: bool,
     can_config: bool,
+    can_rename: bool,
+    can_attach: bool,
+    can_stop: bool,
 }
 
 impl Default for StationDetailRow {
@@ -4612,6 +5433,9 @@ impl Default for StationDetailRow {
             tone: String::new(),
             can_resume: false,
             can_config: false,
+            can_rename: false,
+            can_attach: false,
+            can_stop: false,
         }
     }
 }
@@ -4678,6 +5502,9 @@ enum HitAction {
     ActivityAction {
         action: String,
         id: String,
+    },
+    ControlsAction {
+        action: String,
     },
     ManagedAction {
         action: String,
@@ -5152,15 +5979,16 @@ fn unit(seed: u32) -> f32 {
     seed as f32 / u32::MAX as f32
 }
 
+fn station_enable_webgpu() -> bool {
+    web_sys::window()
+        .and_then(|w| w.document())
+        .and_then(|document| document.url().ok())
+        .is_some_and(|url| url.contains("station_gpu=webgpu"))
+}
+
 fn now_ms() -> f64 {
     web_sys::window()
         .and_then(|w| w.performance())
         .map(|p| p.now())
         .unwrap_or(0.0)
-}
-
-fn request_animation_frame(f: &Closure<dyn FnMut(f64)>) {
-    let _ = web_sys::window()
-        .expect("window")
-        .request_animation_frame(f.as_ref().unchecked_ref());
 }
