@@ -11098,6 +11098,8 @@ let stationComputerUseStatus = '';
 let stationComputerUseSaving = false;
 let stationRecordingSettingsStatus = '';
 let stationRecordingSettingsSaving = false;
+let stationAudioSettingsStatus = '';
+let stationAudioSettingsSaving = false;
 let stationManagedDraft = {
   anchor: '',
   position: '',
@@ -15395,6 +15397,103 @@ function stationRenderRecordingDefaultsEditor(parent) {
   ]);
 }
 
+function stationAudioSettingValue(id, fallback = '') {
+  const el = document.getElementById(id);
+  if (!el) return fallback;
+  if (el.type === 'checkbox') return el.checked;
+  return el.value || fallback;
+}
+
+function stationSetAudioSetting(id, value) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  if (el.type === 'checkbox') el.checked = !!value;
+  else el.value = value || '';
+  stationAudioSettingsStatus = 'Unsaved live audio settings.';
+  stationRenderControlsDock('audio');
+}
+
+async function stationSaveAudioSettingsFromDock() {
+  stationAudioSettingsSaving = true;
+  stationAudioSettingsStatus = 'Saving live audio settings...';
+  stationRenderControlsDock('audio');
+  try {
+    await saveSettings();
+    stationAudioSettingsStatus = 'Saved live audio settings.';
+    showControlToast?.('success', 'Live audio settings saved');
+  } catch (err) {
+    stationAudioSettingsStatus = err?.message || 'Live audio settings save failed.';
+    showControlToast?.('error', stationAudioSettingsStatus);
+  } finally {
+    stationAudioSettingsSaving = false;
+    stationRenderControlsDock('audio');
+  }
+}
+
+async function stationReloadAudioSettingsForDock() {
+  stationAudioSettingsStatus = 'Reloading live audio settings...';
+  stationRenderControlsDock('audio');
+  settingsLoaded = false;
+  await loadSettings();
+  stationAudioSettingsStatus = 'Reloaded live audio settings.';
+  stationRenderControlsDock('audio');
+}
+
+function stationTranscriptionModelOptions() {
+  return [
+    ['whisper-1', 'whisper-1'],
+    ['gpt-4o-transcribe', 'gpt-4o-transcribe'],
+    ['gpt-4o-mini-transcribe', 'gpt-4o-mini-transcribe'],
+  ];
+}
+
+function stationRenderAudioDefaultsEditor(parent) {
+  const section = stationDockSection(parent, 'Live audio defaults');
+  const liveEnabled = !!stationAudioSettingValue('set-live-audio-enabled', false);
+  const timeout = stationAudioSettingValue('set-live-audio-timeout', '300');
+  const transcriptionEnabled = !!stationAudioSettingValue('set-transcription-enabled', false);
+  const provider = stationAudioSettingValue('set-transcription-provider', 'openai');
+  const model = stationAudioSettingValue('set-transcription-model', 'whisper-1');
+  const endpoint = stationAudioSettingValue('set-transcription-endpoint', '');
+  const language = stationAudioSettingValue('set-transcription-language', '');
+  stationDockRow(section, 'live audio', liveEnabled ? 'enabled' : 'off');
+  stationDockRow(section, 'timeout', `${timeout || 300}s`);
+  stationDockRow(section, 'transcription', transcriptionEnabled ? 'enabled' : 'off');
+  stationDockRow(section, 'transcriber', `${provider || 'openai'} / ${model || 'whisper-1'}`);
+
+  const liveBox = stationDockCheckbox(section, 'Live audio', liveEnabled, { id: 'station-live-audio-enabled' });
+  liveBox.addEventListener('change', ev => stationSetAudioSetting('set-live-audio-enabled', ev.target.checked));
+  const timeoutInput = stationDockInput(section, 'Timeout (s)', timeout || '300', {
+    id: 'station-live-audio-timeout',
+    type: 'number',
+    min: 30,
+    max: 3600,
+  });
+  timeoutInput.addEventListener('change', ev => stationSetAudioSetting('set-live-audio-timeout', ev.target.value || '300'));
+  timeoutInput.addEventListener('blur', ev => stationSetAudioSetting('set-live-audio-timeout', ev.target.value || '300'));
+
+  const transcriptionBox = stationDockCheckbox(section, 'Transcription', transcriptionEnabled, { id: 'station-transcription-enabled' });
+  transcriptionBox.addEventListener('change', ev => stationSetAudioSetting('set-transcription-enabled', ev.target.checked));
+  const providerInput = stationDockInput(section, 'Provider', provider || 'openai', { id: 'station-transcription-provider', placeholder: 'openai' });
+  providerInput.addEventListener('change', ev => stationSetAudioSetting('set-transcription-provider', ev.target.value || 'openai'));
+  providerInput.addEventListener('blur', ev => stationSetAudioSetting('set-transcription-provider', ev.target.value || 'openai'));
+  const modelSelect = stationDockSelect(section, 'Model', model || 'whisper-1', stationTranscriptionModelOptions(), { id: 'station-transcription-model' });
+  modelSelect.addEventListener('change', ev => stationSetAudioSetting('set-transcription-model', ev.target.value || 'whisper-1'));
+  const endpointInput = stationDockInput(section, 'Endpoint', endpoint || '', { id: 'station-transcription-endpoint', placeholder: 'Default (OpenAI)' });
+  endpointInput.addEventListener('change', ev => stationSetAudioSetting('set-transcription-endpoint', ev.target.value || ''));
+  endpointInput.addEventListener('blur', ev => stationSetAudioSetting('set-transcription-endpoint', ev.target.value || ''));
+  const languageInput = stationDockInput(section, 'Language', language || '', { id: 'station-transcription-language', placeholder: 'Auto-detect' });
+  languageInput.addEventListener('change', ev => stationSetAudioSetting('set-transcription-language', ev.target.value || ''));
+  languageInput.addEventListener('blur', ev => stationSetAudioSetting('set-transcription-language', ev.target.value || ''));
+
+  if (stationAudioSettingsStatus) stationDockEmpty(section, stationAudioSettingsStatus);
+  stationDockActions(section, [
+    { label: stationAudioSettingsSaving ? 'Saving...' : 'Save audio', primary: true, disabled: stationAudioSettingsSaving, onClick: stationSaveAudioSettingsFromDock },
+    { label: 'Reload', disabled: stationAudioSettingsSaving, onClick: stationReloadAudioSettingsForDock },
+    stationDockRouteAction('Route audio settings', 'settings', 'agent', () => document.getElementById('set-live-audio-enabled')?.focus()),
+  ]);
+}
+
 function stationPendingApprovalRows() {
   const rows = [];
   if (stationCurrentApproval?.id) {
@@ -15930,6 +16029,7 @@ function stationRenderControlsDock(sectionName = 'overview') {
   if (sectionName === 'browser' || sectionName === 'overview') stationRenderBrowserWorkspaceSection(body);
   if (sectionName === 'recordings' || sectionName === 'overview') stationRenderRecordingSection(body);
   if (sectionName === 'recordings' || sectionName === 'overview') stationRenderRecordingDefaultsEditor(body);
+  if (sectionName === 'audio' || sectionName === 'overview') stationRenderAudioDefaultsEditor(body);
 
   stationRenderComputerUseDefaultsEditor(body, controls);
 
