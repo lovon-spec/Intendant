@@ -10734,6 +10734,8 @@ let stationActivityDockHost = activeHostFilter || '';
 let stationHumanDraft = '';
 let stationSelectedContextPart = '';
 let stationSelectedChangePath = '';
+let stationSelectedManagedAnchor = '';
+let stationSelectedManagedRecord = '';
 let stationSelectedPeerHost = '';
 let stationPeerStatus = '';
 let stationPeerStatusKind = '';
@@ -11957,6 +11959,37 @@ function stationManagedResultText() {
   return managedContextEl?.('managed-context-action-result')?.textContent || '';
 }
 
+function stationManagedCanRunAction(managed) {
+  return !!managed?.sessionId && String(managed.mode || '').toLowerCase() === 'managed';
+}
+
+function stationManagedActionReadyText(managed) {
+  if (!managed?.sessionId) return 'Select a session before running managed-context actions.';
+  if (String(managed.mode || '').toLowerCase() !== 'managed') return 'This session is in vanilla context mode; managed actions are read-only here.';
+  return '';
+}
+
+function stationClearManagedResult() {
+  const result = managedContextEl?.('managed-context-action-result');
+  if (result) result.textContent = 'No action yet';
+}
+
+function stationRenderManagedActionResult(parent) {
+  const result = stationManagedResultText();
+  if (!result || result === 'No action yet') return;
+  const section = stationDockSection(parent, 'Action result');
+  const firstLine = result.split('\n').find(Boolean) || 'Managed context result';
+  stationDockCard(section, {
+    title: firstLine.slice(0, 96),
+    meta: `${result.length} chars`,
+    detail: result.length > 900 ? `${result.slice(0, 900)}...` : result,
+    actions: [
+      { label: 'Copy result', primary: true, onClick: () => copyTextToClipboard(result) },
+      { label: 'Clear', onClick: () => { stationClearManagedResult(); stationRenderManagedDock(); } },
+    ],
+  });
+}
+
 function stationSetValueIfEmpty(id, value) {
   const el = document.getElementById(id);
   if (!el || el.value.trim()) return;
@@ -11994,10 +12027,12 @@ async function stationApplyManagedAction(op, id = '', sessionId = '') {
     return;
   }
   if (op === 'anchor') {
+    stationSelectedManagedAnchor = id;
     fillManagedContextAnchor(id, sessionId);
     return;
   }
   if (op === 'record') {
+    stationSelectedManagedRecord = id;
     const record = (managedContextRecords || []).find(candidate => candidate && candidate.record_id === id);
     if (record) selectManagedContextRecord(record);
     else {
@@ -12014,6 +12049,22 @@ async function stationApplyManagedAction(op, id = '', sessionId = '') {
   }
 }
 
+function stationClearManagedTarget(kind) {
+  if (kind === 'record') {
+    stationSelectedManagedRecord = '';
+    const record = managedContextEl?.('managed-context-record-id');
+    if (record) record.value = '';
+    const stationRecord = document.getElementById('station-managed-record');
+    if (stationRecord) stationRecord.value = '';
+  } else {
+    stationSelectedManagedAnchor = '';
+    const anchor = managedContextEl?.('managed-context-anchor');
+    if (anchor) anchor.value = '';
+    const stationAnchor = document.getElementById('station-managed-anchor');
+    if (stationAnchor) stationAnchor.value = '';
+  }
+}
+
 function stationRenderManagedDock(mode = '') {
   const context = stationBuildContextSummary();
   const managed = stationBuildManagedSummary(context);
@@ -12023,6 +12074,7 @@ function stationRenderManagedDock(mode = '') {
     `${managed.mode || 'unknown'} / ${managed.status || 'unknown'}`
   );
   if (!body) return;
+  const actionReadyText = stationManagedActionReadyText(managed);
   const overview = stationDockSection(body, 'Pressure');
   stationDockRow(overview, 'session', managed.sessionId || '--');
   stationDockRow(overview, 'effective', `${stationCompactNumber(managed.usedTokens)} / ${stationCompactNumber(managed.effectiveWindow)}`);
@@ -12030,6 +12082,7 @@ function stationRenderManagedDock(mode = '') {
   stationDockRow(overview, 'pressure', managed.effectiveWindow ? `${Math.round((managed.usedTokens / managed.effectiveWindow) * 100)}% effective${managed.rewindOnly ? ' / rewind only' : ''}` : (managed.rewindOnly ? 'rewind only' : '--'));
   stationDockRow(overview, 'history', `${managed.records} records / ${managed.anchors} anchors`);
   stationDockRow(overview, 'branches', `${managed.lineageGroups} lineage / ${managed.fissionGroups} fission / ${managed.branches} branches`);
+  stationDockRow(overview, 'actions', actionReadyText ? 'read only' : 'ready');
   const sessionOptions = managedContextSessionOptions();
   if (sessionOptions.length) {
     const selector = stationDockSelect(overview, 'Session', managed.sessionId || sessionOptions[0][0], sessionOptions, { id: 'station-managed-session' });
@@ -12039,6 +12092,7 @@ function stationRenderManagedDock(mode = '') {
     });
   }
   if (managed.error) stationDockEmpty(overview, managed.error);
+  if (actionReadyText) stationDockEmpty(overview, actionReadyText);
   stationDockActions(overview, [
     { label: 'Refresh', primary: mode === 'refresh', onClick: async () => { await stationApplyManagedAction('refresh', '', managed.sessionId); stationRenderManagedDock('refresh'); } },
     { label: 'Prepare rewind', primary: mode === 'rewind', onClick: () => stationRenderManagedDock('rewind') },
@@ -12059,7 +12113,7 @@ function stationRenderManagedDock(mode = '') {
     ], { id: 'station-managed-backout-mode' });
     stationDockInput(form, 'Fork name', managedContextEl?.('managed-context-backout-name')?.value || '', { id: 'station-managed-backout-name', placeholder: 'optional' });
     stationDockActions(form, [
-      { label: 'Run backout', primary: true, onClick: async () => { stationCopyManagedFormToLegacy(); await submitManagedContextBackout(); stationRenderManagedDock('backout'); } },
+      { label: 'Run backout', primary: true, disabled: !recordDefault, title: recordDefault ? '' : 'Select a rewind record first', onClick: async () => { stationCopyManagedFormToLegacy(); await submitManagedContextBackout(); stationRenderManagedDock('backout'); } },
     ]);
   } else {
     stationDockInput(form, 'Anchor item id', anchorDefault, { id: 'station-managed-anchor', placeholder: 'exact rewind anchor item_id' });
@@ -12075,12 +12129,36 @@ function stationRenderManagedDock(mode = '') {
     stationDockInput(form, 'Next steps', managedContextEl?.('managed-context-next-steps')?.value || '', { id: 'station-managed-next-steps', placeholder: 'immediate continuation steps', multiline: true, rows: 2 });
     stationDockActions(form, [
       { label: 'Seed from context', onClick: () => { stationSeedManagedDraftFromContext(); stationRenderManagedDock('rewind'); } },
-      { label: 'Inspect anchor', onClick: async () => { stationCopyManagedFormToLegacy(); await inspectManagedContextAnchor(); stationRenderManagedDock('rewind'); } },
-      { label: 'Dispatch rewind', primary: true, onClick: async () => { stationCopyManagedFormToLegacy(); await submitManagedContextRewind(); stationRenderManagedDock('rewind'); } },
+      { label: 'Inspect anchor', disabled: !anchorDefault, title: anchorDefault ? '' : 'Select an anchor first', onClick: async () => { stationCopyManagedFormToLegacy(); await inspectManagedContextAnchor(); stationRenderManagedDock('rewind'); } },
+      { label: 'Dispatch rewind', primary: true, disabled: !stationManagedCanRunAction(managed), title: actionReadyText, onClick: async () => { stationCopyManagedFormToLegacy(); await submitManagedContextRewind(); stationRenderManagedDock('rewind'); } },
     ]);
   }
-  const result = stationManagedResultText();
-  if (result) stationDockEmpty(form, result);
+  if (anchorDefault || recordDefault) {
+    const selected = stationDockSection(body, 'Selected targets');
+    if (anchorDefault) {
+      stationDockCard(selected, {
+        title: anchorDefault,
+        meta: 'rewind anchor',
+        detail: 'Used by Inspect anchor and Dispatch rewind.',
+        actions: [
+          { label: 'Copy', onClick: () => copyTextToClipboard(anchorDefault) },
+          { label: 'Clear', onClick: () => { stationClearManagedTarget('anchor'); stationRenderManagedDock(mode || 'rewind'); } },
+        ],
+      });
+    }
+    if (recordDefault) {
+      stationDockCard(selected, {
+        title: recordDefault,
+        meta: 'rewind record',
+        detail: 'Used by Backout inspect, restore, fork, or backout.',
+        actions: [
+          { label: 'Copy', onClick: () => copyTextToClipboard(recordDefault) },
+          { label: 'Clear', onClick: () => { stationClearManagedTarget('record'); stationRenderManagedDock(mode || 'backout'); } },
+        ],
+      });
+    }
+  }
+  stationRenderManagedActionResult(body);
 
   const anchors = stationDockSection(body, 'Anchor catalog');
   if (!managed.recentAnchors.length) {
@@ -12091,8 +12169,10 @@ function stationRenderManagedDock(mode = '') {
         title: row.label || row.id,
         meta: row.value || 'anchor',
         detail: row.detail || '',
+        active: row.id && row.id === (stationSelectedManagedAnchor || anchorDefault),
         actions: [
           { label: 'Use', primary: true, onClick: async () => { await stationApplyManagedAction('anchor', row.id, row.sessionId); stationRenderManagedDock('rewind'); } },
+          { label: 'Inspect', onClick: async () => { await stationApplyManagedAction('anchor', row.id, row.sessionId); await inspectManagedContextAnchor(); stationRenderManagedDock('rewind'); } },
           { label: 'Copy', onClick: () => copyTextToClipboard(row.id) },
         ],
       });
@@ -12107,8 +12187,10 @@ function stationRenderManagedDock(mode = '') {
         title: row.label || row.id,
         meta: row.value || 'record',
         detail: row.detail || '',
+        active: row.id && row.id === (stationSelectedManagedRecord || recordDefault),
         actions: [
           { label: 'Select', onClick: async () => { await stationApplyManagedAction('record', row.id, row.sessionId); stationRenderManagedDock('backout'); } },
+          { label: 'Inspect', primary: true, onClick: async () => { await stationApplyManagedAction('record', row.id, row.sessionId); const modeEl = managedContextEl?.('managed-context-backout-mode'); if (modeEl) modeEl.value = 'inspect'; await submitManagedContextBackout(); stationRenderManagedDock('backout'); } },
           { label: 'Copy', onClick: () => copyTextToClipboard(row.id) },
         ],
       });
