@@ -148,6 +148,22 @@ features they lack.
   `INTENDANT_SESSION_ID`, and `INTENDANT_MANAGED_CONTEXT`, so agent shells can
   run `"$INTENDANT" ctl ...` without relying on user PATH setup.
 
+  For dashboard/browser validation against an already-running Intendant web port,
+  managed agents should use the repository helper instead of generating ad-hoc
+  Chromium/CDP scripts:
+
+  ```bash
+  node scripts/validate-dashboard.cjs --port <web_port> --selector '<css>'
+  node scripts/validate-dashboard.cjs --url http://127.0.0.1:<web_port>/app \
+    --wait-for-function '() => Boolean(window.someReadyFlag)'
+  ```
+
+  The helper launches a fresh isolated headless Chromium, waits for CDP
+  readiness, supports selector/function waits, falls back when Node has no
+  WebSocket module, and prints compact PASS/FAIL output with bounded log
+  excerpts on failure. It does not default to port 8765; pass `--port`/`--url` or
+  let it derive the port from `INTENDANT_MCP_URL`.
+
   `[agent.codex] managed_context = "vanilla"` is the default and is safe for
   upstream Codex or the original Codex fork. Set it to `"managed"` only when
   launching the Intendant-aware Codex fork; that mode advertises

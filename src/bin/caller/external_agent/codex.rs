@@ -55,6 +55,7 @@ Intendant, not Codex automatic compaction, owns long-task context density. This 
 Keep the live transcript informationally dense:
 - Prefer targeted reads and searches over dumping large files, logs, or generated artifacts.
 - For GUI inspection in Intendant-managed sessions, use Intendant MCP `take_screenshot` and `execute_cu_actions` directly. Do not enumerate desktop apps or read bulky browser/computer-use plugin manuals when those direct tools are available; use Browser/Chrome/plugin CU only when their specialized capabilities are actually required. Do not use shell-driven GUI fallbacks such as `open`, `cliclick`, `osascript`, accessibility queries, or app binary inspection for GUI interaction.
+- For browser/dashboard validation against an existing Intendant web port, prefer `node scripts/validate-dashboard.cjs --port <port> --selector <css>` or `--url <url>` before writing ad-hoc Chromium/CDP scripts. The helper launches isolated headless Chromium, waits for CDP and selectors/functions, handles WebSocket fallbacks, and prints compact PASS/FAIL output with bounded failure excerpts.
 - After a successful build, run dev servers through already-built binaries or quiet commands when possible. Avoid repeating `cargo run` or other build commands that stream known warnings only to launch a server; if a noisy command is unavoidable, preserve only the durable result and compact immediately.
 - A rewind can cancel the active long-running command. If the chosen anchor is before a server launch, assume the server may be gone; verify it with a small health check and relaunch tersely instead of preserving the old PID as if it survived.
 - After noisy or unexpectedly large tool output, failed exploration, broad research, or finishing a coherent subtask, crystallize durable facts and use Intendant managed-context tools before continuing broad ordinary-tool work.
@@ -7843,6 +7844,8 @@ mod tests {
         assert!(developer_instructions.contains("Keep the live transcript informationally dense"));
         assert!(developer_instructions.contains("take_screenshot"));
         assert!(developer_instructions.contains("execute_cu_actions"));
+        assert!(developer_instructions.contains("scripts/validate-dashboard.cjs"));
+        assert!(developer_instructions.contains("compact PASS/FAIL"));
         assert!(developer_instructions.contains("cliclick"));
         assert!(developer_instructions.contains("osascript"));
         assert!(developer_instructions.contains("already-built binaries"));
