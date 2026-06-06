@@ -717,6 +717,8 @@ html, body {
   font-size: 12px;
   background: rgba(17, 17, 27, 0.55);
 }
+.station-dock-empty.ok { color: var(--green); border-color: rgba(166, 227, 161, 0.45); }
+.station-dock-empty.error { color: var(--red); border-color: rgba(243, 139, 168, 0.45); }
 .station-dock-diff {
   max-height: 270px;
   overflow: auto;
@@ -10319,6 +10321,7 @@ let stationInitPromise = null;
 let stationDomFallback = false;
 let stationCurrentTask = '';
 let stationCurrentApproval = null;
+let stationCurrentHumanQuestion = '';
 const stationLogEvents = [];
 const stationRegisteredSources = new Set();
 let stationLastSnapshotJson = '';
@@ -10713,9 +10716,30 @@ function stationForceRouteTo(tab, subtab, after) {
 }
 
 let stationSessionDockFilter = '';
+let stationSessionDockSourceFilter = '';
+let stationSessionDockStatusFilter = '';
 let stationWorktreeDockFilter = '';
+let stationActivityDockFilter = '';
+let stationActivityDockHost = activeHostFilter || '';
+let stationHumanDraft = '';
 let stationSelectedContextPart = '';
 let stationSelectedChangePath = '';
+let stationSelectedPeerHost = '';
+let stationPeerStatus = '';
+let stationPeerStatusKind = '';
+let stationPeerEligibleRows = [];
+let stationPeerRouteResult = null;
+let stationPeerDraft = {
+  url: '',
+  label: '',
+  via: '',
+  browserTcpVia: '',
+  selectedHostId: '',
+  message: '',
+  capabilityFilter: 'display',
+  routeCapabilities: 'display',
+  routeInstructions: '',
+};
 let stationLaunchDraft = {
   task: '',
   name: '',
@@ -10918,6 +10942,291 @@ function stationHotspotAt(clientX, clientY) {
   return '';
 }
 
+function stationSetPeerStatus(message = '', kind = '') {
+  stationPeerStatus = message || '';
+  stationPeerStatusKind = kind || '';
+  if (typeof setDaemonsStatus === 'function') {
+    setDaemonsStatus(stationPeerStatus, stationPeerStatusKind);
+  }
+}
+
+function stationPeerDraftValue(key, fallback = '') {
+  const value = stationPeerDraft[key];
+  return value === undefined || value === null || value === '' ? fallback : value;
+}
+
+function stationRememberPeerDraft() {
+  const fields = [
+    ['url', 'station-peer-url'],
+    ['label', 'station-peer-label'],
+    ['via', 'station-peer-via'],
+    ['browserTcpVia', 'station-peer-browser-tcp-via'],
+    ['selectedHostId', 'station-peer-selected'],
+    ['message', 'station-peer-message'],
+    ['capabilityFilter', 'station-peer-capabilities'],
+    ['routeCapabilities', 'station-peer-route-capabilities'],
+    ['routeInstructions', 'station-peer-route-instructions'],
+  ];
+  for (const [key, id] of fields) {
+    const el = document.getElementById(id);
+    if (el) stationPeerDraft[key] = el.value || '';
+  }
+}
+
+function stationPeerDisplayName(peer) {
+  if (!peer) return '';
+  return compactSessionText(peer.label || peer.host_id || peer.id || '') || '';
+}
+
+function stationPeerCapabilityLabels(peer) {
+  return (Array.isArray(peer?.capabilities) ? peer.capabilities : [])
+    .map(cap => cap && (cap.kind || cap.name || cap.capability || cap))
+    .map(cap => String(cap || '').trim())
+    .filter(Boolean);
+}
+
+function stationSelectedPeer() {
+  const selected = String(stationPeerDraft.selectedHostId || stationSelectedPeerHost || '').trim();
+  return daemons.find(d => d.host_id === selected) || daemons[0] || null;
+}
+
+async function stationAddPeerFromDock() {
+  stationRememberPeerDraft();
+  const baseUrl = String(stationPeerDraft.url || '').trim();
+  if (!baseUrl) {
+    stationSetPeerStatus('Peer URL is required', 'error');
+    stationRenderPeersDock();
+    return;
+  }
+  if (!/^https?:\/\//.test(baseUrl)) {
+    stationSetPeerStatus('Peer URL must start with http:// or https://', 'error');
+    stationRenderPeersDock();
+    return;
+  }
+  if (location.protocol === 'https:' && baseUrl.startsWith('http://')) {
+    stationSetPeerStatus('HTTPS dashboards can only add HTTPS peers.', 'error');
+    stationRenderPeersDock();
+    return;
+  }
+  stationSetPeerStatus('Adding peer...', '');
+  stationRenderPeersDock();
+  const body = { card_url: baseUrl.replace(/\/$/, '') + '/.well-known/agent-card.json' };
+  const viaUrls = parseTokenList(stationPeerDraft.via || '');
+  const browserTcpViaUrl = String(stationPeerDraft.browserTcpVia || '').trim();
+  if (viaUrls.length) body.via_urls = viaUrls;
+  if (browserTcpViaUrl) body.browser_tcp_via_url = browserTcpViaUrl;
+  try {
+    const resp = await authedFetch('/api/peers', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const result = await resp.json().catch(() => ({}));
+    if (!resp.ok) {
+      stationSetPeerStatus(`Failed to add peer: ${result.error || resp.status}`, 'error');
+      stationRenderPeersDock();
+      return;
+    }
+    await refreshPeersFromApi();
+    stationPeerDraft.url = '';
+    stationPeerDraft.label = '';
+    stationPeerDraft.via = '';
+    stationPeerDraft.browserTcpVia = '';
+    stationPeerDraft.selectedHostId = result.peer_id || stationPeerDraft.selectedHostId || '';
+    stationSelectedPeerHost = stationPeerDraft.selectedHostId;
+    stationSetPeerStatus(`Added ${result.peer_id || 'peer'}`, 'ok');
+  } catch (err) {
+    stationSetPeerStatus(`Add peer failed: ${err?.message || err}`, 'error');
+  }
+  stationRenderPeersDock();
+}
+
+async function stationFindEligiblePeersFromDock() {
+  stationRememberPeerDraft();
+  const caps = parseTokenList(stationPeerDraft.capabilityFilter || '');
+  if (!caps.length) {
+    stationPeerEligibleRows = [];
+    stationSetPeerStatus('Enter at least one capability.', 'error');
+    stationRenderPeersDock();
+    return;
+  }
+  stationSetPeerStatus('Finding eligible peers...', '');
+  stationRenderPeersDock();
+  try {
+    const query = caps.map(c => `capability=${encodeURIComponent(c)}`).join('&');
+    const resp = await authedFetch(`/api/peers/eligible?${query}`);
+    const result = await resp.json().catch(() => ({}));
+    if (!resp.ok) {
+      stationPeerEligibleRows = [];
+      stationSetPeerStatus(`Eligibility failed: ${result.error || resp.status}`, 'error');
+      stationRenderPeersDock();
+      return;
+    }
+    stationPeerEligibleRows = Array.isArray(result.peers) ? result.peers : [];
+    stationSetPeerStatus(
+      stationPeerEligibleRows.length
+        ? `Found ${stationPeerEligibleRows.length} eligible peer${stationPeerEligibleRows.length === 1 ? '' : 's'}`
+        : `No connected peer satisfies ${caps.join(', ')}`,
+      stationPeerEligibleRows.length ? 'ok' : ''
+    );
+  } catch (err) {
+    stationPeerEligibleRows = [];
+    stationSetPeerStatus(`Eligibility check failed: ${err?.message || err}`, 'error');
+  }
+  stationRenderPeersDock();
+}
+
+async function stationRoutePeerTaskFromDock() {
+  stationRememberPeerDraft();
+  const caps = parseTokenList(stationPeerDraft.routeCapabilities || '');
+  const instructions = String(stationPeerDraft.routeInstructions || '').trim();
+  if (!caps.length || !instructions) {
+    stationSetPeerStatus('Route requires capabilities and instructions.', 'error');
+    stationRenderPeersDock();
+    return;
+  }
+  stationSetPeerStatus('Routing task...', '');
+  stationRenderPeersDock();
+  try {
+    const resp = await authedFetch('/api/coordinator/route', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ required_capabilities: caps, task: { instructions } }),
+    });
+    const result = await resp.json().catch(() => ({}));
+    stationPeerRouteResult = result;
+    if (resp.ok) {
+      stationPeerDraft.routeInstructions = '';
+      stationSetPeerStatus(`Routed to ${result.peer_id || 'peer'} (${result.task_id || 'task'})`, 'ok');
+    } else {
+      stationSetPeerStatus(`Route failed: ${result.error || resp.status}`, 'error');
+    }
+  } catch (err) {
+    stationPeerRouteResult = null;
+    stationSetPeerStatus(`Route failed: ${err?.message || err}`, 'error');
+  }
+  stationRenderPeersDock();
+}
+
+async function stationSubmitPeerInputFromDock(kind = 'message') {
+  stationRememberPeerDraft();
+  const peer = stationSelectedPeer();
+  const hostId = String(peer?.host_id || stationPeerDraft.selectedHostId || '').trim();
+  const text = String(stationPeerDraft.message || '').trim();
+  if (!hostId || !text) {
+    stationSetPeerStatus(`${kind === 'task' ? 'Task' : 'Message'} requires a peer and text.`, 'error');
+    stationRenderPeersDock();
+    return;
+  }
+  stationSetPeerStatus(kind === 'task' ? 'Starting peer task...' : 'Sending peer message...', '');
+  stationRenderPeersDock();
+  const url = kind === 'task' ? `/api/peers/${hostId}/task` : `/api/peers/${hostId}/message`;
+  const body = kind === 'task' ? { instructions: text } : { text };
+  try {
+    const resp = await authedFetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const result = await resp.json().catch(() => ({}));
+    if (!resp.ok) {
+      stationSetPeerStatus(`Peer ${kind} failed: ${result.error || resp.status}`, 'error');
+    } else {
+      stationPeerDraft.message = '';
+      stationSetPeerStatus(kind === 'task'
+        ? `Task started on ${hostId} (${result.task_id || '?'})`
+        : `Message sent to ${hostId} (${result.message_id || '?'})`, 'ok');
+    }
+  } catch (err) {
+    stationSetPeerStatus(`Peer ${kind} failed: ${err?.message || err}`, 'error');
+  }
+  stationRenderPeersDock();
+}
+
+function stationRenderPeerAddSection(parent) {
+  const section = stationDockSection(parent, 'Add peer');
+  const url = stationDockInput(section, 'URL', stationPeerDraftValue('url', document.getElementById('daemon-add-url')?.value || ''), { id: 'station-peer-url', placeholder: 'http://192.168.1.206:8765' });
+  const label = stationDockInput(section, 'Label', stationPeerDraftValue('label', document.getElementById('daemon-add-label')?.value || ''), { id: 'station-peer-label', placeholder: 'optional local note' });
+  const via = stationDockInput(section, 'Via URLs', stationPeerDraftValue('via', document.getElementById('daemon-add-via')?.value || ''), { id: 'station-peer-via', placeholder: 'optional ws://.../ws overrides' });
+  const browser = stationDockInput(section, 'Browser TCP', stationPeerDraftValue('browserTcpVia', document.getElementById('daemon-add-browser-tcp-via')?.value || ''), { id: 'station-peer-browser-tcp-via', placeholder: 'optional WebRTC tcp via URL' });
+  [url, label, via, browser].forEach(control => {
+    control.addEventListener('input', stationRememberPeerDraft);
+    control.addEventListener('keydown', ev => {
+      if (ev.key !== 'Enter') return;
+      ev.preventDefault();
+      stationAddPeerFromDock();
+    });
+  });
+  stationDockActions(section, [
+    { label: 'Add peer', primary: true, onClick: stationAddPeerFromDock },
+  ]);
+}
+
+function stationRenderPeerCoordinatorSection(parent) {
+  const section = stationDockSection(parent, 'Coordinator');
+  const caps = stationDockInput(section, 'Find caps', stationPeerDraftValue('capabilityFilter', 'display'), { id: 'station-peer-capabilities', placeholder: 'display, computer-use' });
+  caps.addEventListener('input', stationRememberPeerDraft);
+  caps.addEventListener('keydown', ev => {
+    if (ev.key !== 'Enter') return;
+    ev.preventDefault();
+    stationFindEligiblePeersFromDock();
+  });
+  stationDockActions(section, [
+    { label: 'Find peers', primary: true, onClick: stationFindEligiblePeersFromDock },
+  ]);
+  if (stationPeerEligibleRows.length) {
+    for (const peer of stationPeerEligibleRows.slice(0, 5)) {
+      const id = peer.host_id || peer.id || '';
+      stationDockCard(section, {
+        title: stationPeerDisplayName(peer) || id,
+        meta: stationPeerCapabilityLabels(peer).join(', ') || 'eligible',
+        detail: id,
+        actions: [
+          { label: 'Select', onClick: () => { stationSelectedPeerHost = id; stationPeerDraft.selectedHostId = id; stationRenderPeersDock(); } },
+        ],
+      });
+    }
+  }
+  const routeCaps = stationDockInput(section, 'Route caps', stationPeerDraftValue('routeCapabilities', 'display'), { id: 'station-peer-route-capabilities', placeholder: 'display, computer-use' });
+  const instructions = stationDockInput(section, 'Instructions', stationPeerDraftValue('routeInstructions'), { id: 'station-peer-route-instructions', placeholder: 'Task for an eligible peer', multiline: true, rows: 3 });
+  routeCaps.addEventListener('input', stationRememberPeerDraft);
+  instructions.addEventListener('input', stationRememberPeerDraft);
+  stationDockActions(section, [
+    { label: 'Route task', primary: true, onClick: stationRoutePeerTaskFromDock },
+    stationDockRouteAction('Route network tab', 'settings', 'network'),
+  ]);
+  if (stationPeerRouteResult?.considered?.length) {
+    stationDockEmpty(section, `Considered: ${stationPeerRouteResult.considered.join(', ')}`);
+  }
+}
+
+function stationRenderPeerCommandSection(parent) {
+  const peer = stationSelectedPeer();
+  const section = stationDockSection(parent, 'Peer command');
+  const peerOptions = daemons.map(d => [d.host_id, stationPeerDisplayName(d) || d.host_id]);
+  if (!peerOptions.length) {
+    stationDockEmpty(section, 'Add or connect a peer before sending messages or tasks.');
+    return;
+  }
+  const selected = peer?.host_id || peerOptions[0][0];
+  stationSelectedPeerHost = selected;
+  if (!peerOptions.some(([value]) => value === stationPeerDraft.selectedHostId)) {
+    stationPeerDraft.selectedHostId = selected;
+  }
+  const select = stationDockSelect(section, 'Peer', stationPeerDraft.selectedHostId || selected, peerOptions, { id: 'station-peer-selected' });
+  select.addEventListener('change', ev => {
+    stationPeerDraft.selectedHostId = ev.target.value;
+    stationSelectedPeerHost = ev.target.value;
+    stationRenderPeersDock();
+  });
+  const message = stationDockInput(section, 'Message/task', stationPeerDraftValue('message'), { id: 'station-peer-message', placeholder: 'Follow-up message or task instructions', multiline: true, rows: 3 });
+  message.addEventListener('input', stationRememberPeerDraft);
+  stationDockActions(section, [
+    { label: 'Send message', primary: true, onClick: () => stationSubmitPeerInputFromDock('message') },
+    { label: 'Start task', onClick: () => stationSubmitPeerInputFromDock('task') },
+  ]);
+}
+
 function stationRenderPeersDock() {
   const body = stationDockBegin('peers', 'Peers and Displays', `${daemons.length} peers / ${displaySlots.size + peerDisplayConnections.size} displays`);
   if (!body) return;
@@ -10929,13 +11238,19 @@ function stationRenderPeersDock() {
     peerGrid.className = 'station-dock-grid station-peer-grid';
     peers.appendChild(peerGrid);
     for (const d of daemons) {
+      const caps = stationPeerCapabilityLabels(d);
       stationDockCard(peerGrid, {
         className: 'station-peer-card',
         title: d.label || d.host_id,
-        meta: d.connected ? 'connected' : 'offline',
+        meta: `${d.connected ? 'connected' : 'offline'}${caps.length ? ' / ' + caps.join(', ') : ''}`,
         detail: d.url || daemonPlatformLabel(d) || '',
+        active: stationSelectedPeerHost === d.host_id || stationPeerDraft.selectedHostId === d.host_id,
         actions: [
-          { label: 'Open display', onClick: () => stationOpenDisplay(d.host_id) },
+          peerCanShareDisplay(d) ? { label: 'Open display', primary: true, onClick: () => stationOpenDisplay(d.host_id) } : null,
+          { label: 'Select', onClick: () => { stationSelectedPeerHost = d.host_id; stationPeerDraft.selectedHostId = d.host_id; stationRenderPeersDock(); } },
+          { label: 'Message', onClick: () => { stationSelectedPeerHost = d.host_id; stationPeerDraft.selectedHostId = d.host_id; stationRenderPeersDock(); setTimeout(() => document.getElementById('station-peer-message')?.focus(), 0); } },
+          { label: 'Task', onClick: () => { stationSelectedPeerHost = d.host_id; stationPeerDraft.selectedHostId = d.host_id; stationRenderPeersDock(); setTimeout(() => document.getElementById('station-peer-message')?.focus(), 0); } },
+          { label: 'Remove', danger: true, onClick: async () => { await removeDaemon(d.host_id); stationSetPeerStatus(`Removed ${d.host_id}`, ''); stationRenderPeersDock(); } },
         ],
       });
     }
@@ -10968,11 +11283,22 @@ function stationRenderPeersDock() {
   stationDockRow(overview, 'host', selfHostLabel || selfPeerId || 'local');
   stationDockRow(overview, 'access', document.getElementById('sb-display-access')?.textContent || 'off');
   stationDockRow(overview, 'streams', String(displaySlots.size));
+  stationDockRow(overview, 'peer state', stationPeerStatus || (daemons.length ? 'connected registry' : 'no peers'));
   stationDockActions(overview, [
     { label: userDisplayGranted ? 'Revoke local' : 'Share local', primary: true, onClick: () => window.toggleUserDisplay?.() },
+    { label: 'Refresh peers', onClick: async () => { await refreshPeersFromApi(); stationSetPeerStatus('Peer registry refreshed', 'ok'); stationRenderPeersDock(); } },
     stationDockRouteAction('Route video tab', 'displays', ''),
     stationDockRouteAction('Route network', 'settings', 'network'),
   ]);
+  if (stationPeerStatus) {
+    const status = document.createElement('div');
+    status.className = 'station-dock-empty' + (stationPeerStatusKind ? ` ${stationPeerStatusKind}` : '');
+    status.textContent = stationPeerStatus;
+    overview.appendChild(status);
+  }
+  stationRenderPeerAddSection(body);
+  stationRenderPeerCommandSection(body);
+  stationRenderPeerCoordinatorSection(body);
   const localDisplays = stationDockSection(body, 'Local streams');
   if (!displaySlots.size) {
     stationDockEmpty(localDisplays, 'No local display stream is active.');
@@ -11246,21 +11572,65 @@ function stationDockSetTextValue(controlId, value) {
   return el || { value: value || '' };
 }
 
+function stationActivityHostOptions() {
+  const options = [['', 'All hosts']];
+  const add = (id, label) => {
+    const hostId = String(id || '').trim();
+    if (!hostId || options.some(([value]) => value === hostId)) return;
+    options.push([hostId, compactSessionText(label || hostId) || hostId]);
+  };
+  add(selfPeerId || 'local', selfHostLabel || 'local');
+  for (const d of daemons) add(d.host_id, d.label || d.host_id);
+  return options;
+}
+
+function stationApplyActivityHostFilter(hostId) {
+  stationActivityDockHost = String(hostId || '').trim();
+  activeHostFilter = stationActivityDockHost;
+  const select = document.getElementById('host-filter-select');
+  if (select) select.value = activeHostFilter;
+  localStorage.setItem(HOST_FILTER_KEY, activeHostFilter);
+  applyHostFilter();
+}
+
 function stationRenderActivityDock(focusId = '') {
-  const events = stationLastSnapshotForFallback().events || [];
-  const body = stationDockBegin('activity', 'Activity Log', `${events.length} retained events`);
+  const allEvents = stationLastSnapshotForFallback().events || [];
+  const hostFilter = String(stationActivityDockHost || activeHostFilter || '').trim();
+  const query = stationActivityDockFilter.trim().toLowerCase();
+  const events = allEvents.filter(ev => {
+    if (hostFilter && String(ev.hostId || ev.host_id || '') !== hostFilter) return false;
+    if (!query) return true;
+    return [ev.id, ev.hostId, ev.host_id, ev.level, ev.ts, ev.msg]
+      .join(' ')
+      .toLowerCase()
+      .includes(query);
+  });
+  const body = stationDockBegin('activity', 'Activity Log', `${events.length} shown / ${allEvents.length} retained`);
   if (!body) return;
   const controls = stationDockSection(body, 'Log controls');
+  const textFilter = stationDockInput(controls, 'Filter', stationActivityDockFilter, { id: 'station-activity-filter', placeholder: 'message, id, level' });
+  textFilter.addEventListener('input', () => {
+    stationActivityDockFilter = textFilter.value.toLowerCase();
+    stationRenderActivityDock(focusId);
+    document.getElementById('station-activity-filter')?.focus();
+  });
+  const hostSelect = stationDockSelect(controls, 'Host', hostFilter, stationActivityHostOptions(), { id: 'station-activity-host' });
+  hostSelect.addEventListener('change', ev => {
+    stationApplyActivityHostFilter(ev.target.value);
+    stationRenderActivityDock(focusId);
+  });
+  stationDockRow(controls, 'verbosity', document.getElementById('verbosity-select')?.value || 'normal');
   stationDockActions(controls, [
     { label: 'Normal', onClick: () => stationSetActivityVerbosity('normal') },
     { label: 'Verbose', onClick: () => stationSetActivityVerbosity('verbose') },
     { label: 'Debug', onClick: () => stationSetActivityVerbosity('debug') },
-    { label: 'All hosts', onClick: () => stationClearActivityHostFilter() },
+    { label: 'All hosts', onClick: () => { stationClearActivityHostFilter(); stationActivityDockHost = ''; stationRenderActivityDock(focusId); } },
+    { label: 'Bottom', onClick: () => { document.getElementById('scroll-bottom')?.click(); stationRenderActivityDock(events.at(-1)?.id || focusId); } },
     stationDockRouteAction('Route log tab', 'activity', 'log', () => document.getElementById('scroll-bottom')?.click()),
   ]);
   const list = stationDockSection(body, 'Recent events');
   if (!events.length) {
-    stationDockEmpty(list, 'Waiting for dashboard events.');
+    stationDockEmpty(list, allEvents.length ? 'No events match the Station filters.' : 'Waiting for dashboard events.');
     return;
   }
   for (const ev of events.slice(-14).reverse()) {
@@ -11271,6 +11641,7 @@ function stationRenderActivityDock(focusId = '') {
       active: focusId && ev.id === focusId,
       actions: [
         ev.id ? { label: 'Pin', onClick: () => stationRenderActivityDock(ev.id) } : null,
+        ev.id ? { label: 'Show', primary: true, onClick: () => focusActivityLogEvent(ev.id) } : null,
         ev.id ? { label: 'Copy id', onClick: () => copyTextToClipboard(ev.id) } : null,
       ],
     });
@@ -11367,6 +11738,10 @@ function stationCopyManagedFormToLegacy() {
   copyValue('station-managed-position', 'managed-context-position');
   copyValue('station-managed-reason', 'managed-context-reason');
   copyValue('station-managed-primer', 'managed-context-primer');
+  copyValue('station-managed-preserve', 'managed-context-preserve');
+  copyValue('station-managed-discard', 'managed-context-discard');
+  copyValue('station-managed-artifacts', 'managed-context-artifacts');
+  copyValue('station-managed-next-steps', 'managed-context-next-steps');
   copyValue('station-managed-record', 'managed-context-record-id');
   copyValue('station-managed-backout-mode', 'managed-context-backout-mode');
   copyValue('station-managed-backout-name', 'managed-context-backout-name');
@@ -11458,6 +11833,10 @@ function stationRenderManagedDock(mode = '') {
     ], { id: 'station-managed-position' });
     stationDockInput(form, 'Reason', managedContextEl?.('managed-context-reason')?.value || '', { id: 'station-managed-reason', placeholder: 'why this rewind is needed' });
     stationDockInput(form, 'Primer', managedContextEl?.('managed-context-primer')?.value || '', { id: 'station-managed-primer', placeholder: 'dense carry-forward context', multiline: true, rows: 4 });
+    stationDockInput(form, 'Preserve', managedContextEl?.('managed-context-preserve')?.value || '', { id: 'station-managed-preserve', placeholder: 'durable facts, one per line', multiline: true, rows: 2 });
+    stationDockInput(form, 'Discard', managedContextEl?.('managed-context-discard')?.value || '', { id: 'station-managed-discard', placeholder: 'noise or obsolete branches, one per line', multiline: true, rows: 2 });
+    stationDockInput(form, 'Artifacts', managedContextEl?.('managed-context-artifacts')?.value || '', { id: 'station-managed-artifacts', placeholder: 'files, commits, outputs to keep', multiline: true, rows: 2 });
+    stationDockInput(form, 'Next steps', managedContextEl?.('managed-context-next-steps')?.value || '', { id: 'station-managed-next-steps', placeholder: 'immediate continuation steps', multiline: true, rows: 2 });
     stationDockActions(form, [
       { label: 'Inspect anchor', onClick: async () => { stationCopyManagedFormToLegacy(); await inspectManagedContextAnchor(); stationRenderManagedDock('rewind'); } },
       { label: 'Dispatch rewind', primary: true, onClick: async () => { stationCopyManagedFormToLegacy(); await submitManagedContextRewind(); stationRenderManagedDock('rewind'); } },
@@ -11816,6 +12195,31 @@ function stationRenderSessionDetailSection(parent, sessionId) {
   stationRenderCodexThreadActionsSection(parent, sid);
 }
 
+function stationSessionDockSourceOptions() {
+  return [
+    ['', 'All sources'],
+    ...SESSION_SOURCE_FILTER_OPTIONS.map(opt => [opt.value, opt.label]),
+  ];
+}
+
+function stationSessionDockStatusOptions() {
+  return [
+    ['', 'All statuses'],
+    ...SESSION_STATUS_FILTER_OPTIONS.map(opt => [opt.value, opt.label]),
+  ];
+}
+
+function stationSessionDockRowMatchesFilters(row, query, sourceFilter, statusFilter) {
+  const text = [row.id, row.label, row.value, row.detail].join(' ').toLowerCase();
+  if (query && !text.includes(query)) return false;
+  if (statusFilter && !text.includes(statusFilter)) return false;
+  if (!sourceFilter) return true;
+  if (sourceFilter === 'external') {
+    return ['external', 'codex', 'claude', 'claude-code', 'gemini'].some(source => text.includes(source));
+  }
+  return text.includes(sourceFilter);
+}
+
 function stationRenderSessionsDock(focusId = '') {
   const sessions = stationBuildSessionsSummary();
   const body = stationDockBegin('sessions', 'Sessions', `${sessions.total} known / ${sessions.active} active`);
@@ -11831,8 +12235,19 @@ function stationRenderSessionsDock(focusId = '') {
     stationRenderSessionsDock(focusId);
     document.getElementById('station-session-search')?.focus();
   });
+  const sourceSelect = stationDockSelect(overview, 'Source', stationSessionDockSourceFilter, stationSessionDockSourceOptions(), { id: 'station-session-source-filter' });
+  sourceSelect.addEventListener('change', ev => {
+    stationSessionDockSourceFilter = ev.target.value || '';
+    stationRenderSessionsDock(focusId);
+  });
+  const statusSelect = stationDockSelect(overview, 'Status', stationSessionDockStatusFilter, stationSessionDockStatusOptions(), { id: 'station-session-status-filter' });
+  statusSelect.addEventListener('change', ev => {
+    stationSessionDockStatusFilter = ev.target.value || '';
+    stationRenderSessionsDock(focusId);
+  });
   stationDockActions(overview, [
     { label: 'Refresh', primary: true, onClick: async () => { await loadSessions({ force: true }); stationRenderSessionsDock(focusId); } },
+    { label: 'Clear filters', onClick: () => { stationSessionDockFilter = ''; stationSessionDockSourceFilter = ''; stationSessionDockStatusFilter = ''; stationRenderSessionsDock(focusId); } },
     { label: 'New session', onClick: () => { if (typeof openNewSessionFromPrompt === 'function') openNewSessionFromPrompt(); else stationForceRouteTo('sessions', 'new'); } },
     { label: 'Worktrees', onClick: () => stationRenderWorktreesDock() },
     stationDockRouteAction('Route sessions tab', 'sessions', 'recent'),
@@ -11843,12 +12258,17 @@ function stationRenderSessionsDock(focusId = '') {
 
   const list = stationDockSection(body, 'Recent sessions');
   const query = stationSessionDockFilter.trim();
-  const rows = stationSessionRowsForDock().filter(row => {
-    if (!query) return true;
-    return [row.id, row.label, row.value, row.detail].join(' ').toLowerCase().includes(query);
-  });
+  const hasSessionFilters = !!(query || stationSessionDockSourceFilter || stationSessionDockStatusFilter);
+  const rows = stationSessionRowsForDock().filter(row =>
+    stationSessionDockRowMatchesFilters(
+      row,
+      query,
+      stationSessionDockSourceFilter,
+      stationSessionDockStatusFilter
+    )
+  );
   if (!rows.length) {
-    stationDockEmpty(list, query ? 'No sessions match the Station filter.' : 'No cached sessions yet.');
+    stationDockEmpty(list, hasSessionFilters ? 'No sessions match the Station filters.' : 'No cached sessions yet.');
   } else {
     for (const row of rows) {
       stationDockCard(list, {
@@ -12074,6 +12494,83 @@ function stationRenderApprovalsSection(parent) {
   }
 }
 
+function stationHumanQuestionText() {
+  const panel = document.getElementById('human-panel');
+  const visible = panel?.classList.contains('visible');
+  return stationCurrentHumanQuestion || (visible ? (document.getElementById('human-question')?.textContent || '') : '');
+}
+
+function stationCopyHumanDraftToLegacy() {
+  const source = document.getElementById('station-human-input');
+  if (source) stationHumanDraft = source.value || '';
+  const target = document.getElementById('human-input');
+  if (target) target.value = stationHumanDraft;
+}
+
+function stationSubmitHumanResponseFromDock() {
+  stationCopyHumanDraftToLegacy();
+  if (!stationHumanDraft.trim()) {
+    showControlToast?.('error', 'Enter a response before sending');
+    document.getElementById('station-human-input')?.focus();
+    return;
+  }
+  window.sendHumanResponse?.();
+  stationHumanDraft = '';
+  stationRenderControlsDock('input');
+}
+
+function stationRenderHumanInputSection(parent) {
+  const question = stationHumanQuestionText();
+  const section = stationDockSection(parent, 'Input requests');
+  stationDockRow(section, 'human input', question ? 'waiting' : 'clear');
+  if (!question) {
+    stationDockEmpty(section, 'No pending human input request.');
+    return;
+  }
+  stationDockCard(section, {
+    title: 'Question',
+    meta: 'agent is waiting',
+    detail: compactSessionText(question),
+    actions: [
+      stationDockRouteAction('Route Activity', 'activity', 'log', () => document.getElementById('human-input')?.focus()),
+    ],
+  });
+  const input = stationDockInput(
+    section,
+    'Response',
+    stationHumanDraft || document.getElementById('human-input')?.value || '',
+    { id: 'station-human-input', placeholder: 'Type a response for the waiting agent', multiline: true, rows: 3 }
+  );
+  input.addEventListener('input', ev => {
+    stationHumanDraft = ev.target.value || '';
+  });
+  input.addEventListener('keydown', ev => {
+    if (ev.key !== 'Enter' || ev.shiftKey) return;
+    ev.preventDefault();
+    stationSubmitHumanResponseFromDock();
+  });
+  stationDockActions(section, [
+    { label: 'Send response', primary: true, onClick: stationSubmitHumanResponseFromDock },
+  ]);
+}
+
+function stationRenderLiveStatusSection(parent, controls) {
+  const section = stationDockSection(parent, 'Live status');
+  stationDockRow(section, 'host', `${selfHostLabel || 'local'} / ${selfPeerId || 'local'}`);
+  stationDockRow(section, 'connection', document.getElementById('sb-conn')?.classList.contains('ok') ? 'connected' : 'disconnected');
+  stationDockRow(section, 'phase', currentPhase || '--');
+  stationDockRow(section, 'turn', document.getElementById('sb-turn')?.textContent || '--');
+  stationDockRow(section, 'budget', document.getElementById('sb-budget-pct')?.textContent || '--');
+  stationDockRow(section, 'provider', document.getElementById('sb-provider')?.textContent || '--');
+  stationDockRow(section, 'model', document.getElementById('sb-model')?.textContent || '--');
+  stationDockRow(section, 'autonomy', document.getElementById('sb-autonomy')?.textContent || '--');
+  stationDockRow(section, 'browser', controls.activeBrowser ? 'active' : 'passive');
+  stationDockActions(section, [
+    { label: 'Refresh', onClick: () => { stationRefreshSharedCaches(); stationRenderControlsDock('overview'); } },
+    { label: 'Cycle autonomy', onClick: () => { window.cycleAutonomy?.(); stationRenderControlsDock('overview'); } },
+  ]);
+}
+
 function stationApplyDockSelect(controlId, value, handler, rerenderSection = 'overview') {
   const target = stationDockSetSelectValue(controlId, value);
   handler({ target });
@@ -12225,6 +12722,8 @@ function stationRenderControlsDock(sectionName = 'overview') {
     controls.sessionCanInterrupt ? { label: 'Stop', danger: true, onClick: () => stationHandleActivityAction({ action: 'stop' }) } : null,
   ]);
 
+  stationRenderLiveStatusSection(body, controls);
+
   const launch = stationDockSection(body, 'Launch defaults');
   stationDockRow(launch, 'binary', controls.command || '--');
   stationDockRow(launch, 'model', controls.model || '--');
@@ -12240,6 +12739,7 @@ function stationRenderControlsDock(sectionName = 'overview') {
   stationRenderApprovalRulesEditor(body);
 
   stationRenderApprovalsSection(body);
+  stationRenderHumanInputSection(body);
 
   const live = stationDockSection(body, 'Live surfaces');
   stationDockRow(live, 'display', controls.displayAccess || '--');
@@ -12590,6 +13090,7 @@ function stationSetActivityVerbosity(level) {
 
 function stationClearActivityHostFilter() {
   activeHostFilter = '';
+  stationActivityDockHost = '';
   const select = document.getElementById('host-filter-select');
   if (select) select.value = '';
   localStorage.setItem(HOST_FILTER_KEY, activeHostFilter);
@@ -12639,19 +13140,21 @@ function focusActivityLogEvent(id) {
 }
 
 function stationOpenDisplay(hostId) {
+  const d = daemons.find(x => x.host_id === hostId);
+  if (d) {
+    const tcpViaUrl = resolveBrowserTcpViaUrl(d);
+    openPeerDisplay(hostId, 0, tcpViaUrl).catch(err => {
+      console.error('Station openPeerDisplay failed:', err);
+      stationStatus('Display open failed: ' + (err && err.message ? err.message : err));
+    });
+    return;
+  }
   if (!hostId || hostId === selfPeerId || hostId === 'local') {
     if (displaySlots.size === 0 && !userDisplayGranted) {
       window.toggleUserDisplay();
     }
     return;
   }
-  const d = daemons.find(x => x.host_id === hostId);
-  if (!d) return;
-  const tcpViaUrl = resolveBrowserTcpViaUrl(d);
-  openPeerDisplay(hostId, 0, tcpViaUrl).catch(err => {
-    console.error('Station openPeerDisplay failed:', err);
-    stationStatus('Display open failed: ' + (err && err.message ? err.message : err));
-  });
 }
 
 function stationSnapshotForContext() {
@@ -23987,19 +24490,29 @@ function showApproval(id, command, category, sessionId) {
 
 function showHumanInput(question) {
   hideAllPanels();
+  stationCurrentHumanQuestion = question || '';
   document.getElementById('human-question').textContent = question;
   revealActivityLogPanel();
   document.getElementById('human-panel').classList.add('visible');
+  stationScheduleUpdate();
 }
 
 function showPanel(id) { hideAllPanels(); document.getElementById(id).classList.add('visible'); }
 function hidePanel(id) {
   if (id === 'approval-panel') clearPendingApproval();
+  if (id === 'human-panel') {
+    stationCurrentHumanQuestion = '';
+    stationHumanDraft = '';
+    stationScheduleUpdate();
+  }
   document.getElementById(id).classList.remove('visible');
 }
 function hideAllPanels() {
   clearPendingApproval();
+  stationCurrentHumanQuestion = '';
+  stationHumanDraft = '';
   document.querySelectorAll('.bottom-panel').forEach(p => p.classList.remove('visible'));
+  stationScheduleUpdate();
 }
 
 function showBadge(tab, text) {
