@@ -12212,20 +12212,22 @@ function stationRenderPeerCommandSection(parent) {
   const peer = stationSelectedPeer();
   const section = stationDockSection(parent, 'Peer command');
   const peerOptions = daemons.map(d => [d.host_id, stationPeerDisplayName(d) || d.host_id]);
-  if (!peerOptions.length) {
-    stationDockEmpty(section, 'Add or connect a peer before sending messages or tasks.');
-    return;
+  const selected = peer?.host_id || peerOptions[0]?.[0] || '';
+  if (selected) {
+    stationSelectedPeerHost = selected;
+    if (!peerOptions.some(([value]) => value === stationPeerDraft.selectedHostId)) {
+      stationPeerDraft.selectedHostId = selected;
+    }
   }
-  const selected = peer?.host_id || peerOptions[0][0];
-  stationSelectedPeerHost = selected;
-  if (!peerOptions.some(([value]) => value === stationPeerDraft.selectedHostId)) {
-    stationPeerDraft.selectedHostId = selected;
+  if (peerOptions.length) {
+    const select = stationDockSelect(section, 'Peer', stationPeerDraft.selectedHostId || selected, peerOptions, { id: 'station-peer-selected' });
+    select.addEventListener('change', ev => {
+      stationSetPeerTarget(ev.target.value);
+      stationRenderPeersDock();
+    });
+  } else {
+    stationDockRow(section, 'peer', 'none configured');
   }
-  const select = stationDockSelect(section, 'Peer', stationPeerDraft.selectedHostId || selected, peerOptions, { id: 'station-peer-selected' });
-  select.addEventListener('change', ev => {
-    stationSetPeerTarget(ev.target.value);
-    stationRenderPeersDock();
-  });
   const displayId = stationDockInput(section, 'Display ID', stationPeerDraftValue('displayId', '0'), { id: 'station-peer-display-id', type: 'number', placeholder: '0' });
   displayId.min = '0';
   displayId.step = '1';
@@ -12238,6 +12240,11 @@ function stationRenderPeerCommandSection(parent) {
     stationRememberPeerDisplayTarget(stationPeerDraft.selectedHostId, stationPeerDisplayId());
     stationRenderPeersDock();
   });
+  if (!peerOptions.length) {
+    stationDockRow(section, 'target', `new peer :${stationPeerDisplayId()}`);
+    stationDockEmpty(section, 'Add or connect a peer before sending messages or tasks.');
+    return;
+  }
   const message = stationDockInput(section, 'Message/task', stationPeerDraftValue('message'), { id: 'station-peer-message', placeholder: 'Follow-up message or task instructions', multiline: true, rows: 3 });
   message.addEventListener('input', stationRememberPeerDraft);
   const selectedPeer = stationSelectedPeer();
