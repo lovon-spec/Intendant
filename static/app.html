@@ -10820,6 +10820,7 @@ function stationForceRouteTo(tab, subtab, after) {
 let stationSessionDockFilter = '';
 let stationSessionDockSourceFilter = '';
 let stationSessionDockStatusFilter = '';
+let stationSessionDockProjectFilter = '';
 let stationSessionDeepDraft = {
   query: '',
   mode: 'all_keywords',
@@ -12819,8 +12820,68 @@ function stationRenderChangesDock(selectedPath = stationSelectedChangePath || ac
   }
 }
 
+function stationCollectSessionSet() {
+  const indexedSessions = Array.isArray(_cachedSessions) && _cachedSessions.length
+    ? _cachedSessions
+    : (sessionsListCache.get(selfPeerId) || []);
+  const byId = new Map();
+  const indexedIds = new Set();
+  for (const session of indexedSessions) {
+    const id = session?.session_id || session?.resume_id || session?.backend_session_id || JSON.stringify(session);
+    byId.set(String(id), session);
+    indexedIds.add(String(id));
+  }
+  for (const session of stationSessionWindowSummaries()) {
+    const id = session?.session_id || session?.resume_id || session?.backend_session_id || JSON.stringify(session);
+    if (!byId.has(String(id))) byId.set(String(id), session);
+  }
+  for (const session of stationSessionMetadataSummaries()) {
+    const id = session?.session_id || session?.resume_id || session?.backend_session_id || JSON.stringify(session);
+    if (!byId.has(String(id))) byId.set(String(id), session);
+  }
+  const currentDaemonSession = stationCurrentDaemonSessionSummary();
+  if (currentDaemonSession) {
+    const id = currentDaemonSession.session_id || JSON.stringify(currentDaemonSession);
+    if (!byId.has(String(id))) byId.set(String(id), currentDaemonSession);
+  }
+  return { sessions: [...byId.values()], indexedIds };
+}
+
+function stationSessionRowForDock(session, indexedIds = new Set()) {
+  const id = session?.session_id || session?.resume_id || session?.backend_session_id || '';
+  const status = normalizeSessionPhase(session?.status || '') || String(session?.status || 'session').trim();
+  const configMeta = sessionConfigMetadata(session);
+  const configSource = sessionConfigSource(configMeta);
+  const source = normalizeAgentId(configSource || stationSessionSource(session) || session?.source || '') || 'intendant';
+  const project = sessionProjectDirectory(session);
+  const rowId = String(id || '').trim();
+  return {
+    id: rowId,
+    action: indexedIds.has(String(id)) ? 'detail' : '',
+    label: stationSessionTask(session) || 'Untitled session',
+    value: [status, source].filter(Boolean).join(' · '),
+    detail: [
+      String(id).slice(0, 8),
+      project ? compactPathLabel(project, true) : '',
+      formatContextTimestamp(session?.updated_at || session?.updatedAt || session?.changed_at || session?.changedAt || session?.created_at || session?.createdAt),
+    ].filter(Boolean).join(' · '),
+    tone: 'session',
+    source,
+    status,
+    project,
+    canResume: !!rowId && session?.can_resume !== false,
+    canConfig: !!rowId && !!configSource && configSource !== 'intendant',
+    canRename: !!rowId,
+    canAttach: !!rowId && canAttachSessionWindow(rowId),
+    canStop: !!rowId && sessionWindowStopAvailability(rowId).ok,
+  };
+}
+
 function stationSessionRowsForDock() {
-  return stationBuildSessionsSummary().recent || [];
+  const { sessions, indexedIds } = stationCollectSessionSet();
+  return [...sessions]
+    .sort((a, b) => stationSessionUpdatedMs(b) - stationSessionUpdatedMs(a))
+    .map(session => stationSessionRowForDock(session, indexedIds));
 }
 
 function stationLaunchDraftValue(key, fallback = '') {
@@ -13144,15 +13205,21 @@ function stationSessionDockStatusOptions() {
   ];
 }
 
-function stationSessionDockRowMatchesFilters(row, query, sourceFilter, statusFilter) {
-  const text = [row.id, row.label, row.value, row.detail].join(' ').toLowerCase();
+function stationSessionDockProjectOptions() {
+  const { sessions } = stationCollectSessionSet();
+  return [
+    ['', 'All projects'],
+    ...sessionProjectFilterOptions(sessions).map(item => [item.path, item.label]),
+  ];
+}
+
+function stationSessionDockRowMatchesFilters(row, query, sourceFilter, statusFilter, projectFilter) {
+  const text = [row.id, row.label, row.value, row.detail, row.project].join(' ').toLowerCase();
   if (query && !text.includes(query)) return false;
-  if (statusFilter && !text.includes(statusFilter)) return false;
-  if (!sourceFilter) return true;
-  if (sourceFilter === 'external') {
-    return ['external', 'codex', 'claude', 'claude-code', 'gemini'].some(source => text.includes(source));
-  }
-  return text.includes(sourceFilter);
+  if (projectFilter && row.project !== projectFilter) return false;
+  if (sourceFilter && !sessionMatchesSourceFilter(row.source || '', sourceFilter)) return false;
+  if (statusFilter && !sessionMatchesStatusFilter(row.status || '', statusFilter)) return false;
+  return true;
 }
 
 function stationSessionDeepModeOptions() {
@@ -13414,9 +13481,18 @@ function stationRenderSessionsDock(focusId = '') {
     stationSessionDockStatusFilter = ev.target.value || '';
     stationRenderSessionsDock(focusId);
   });
+  const projectOptions = stationSessionDockProjectOptions();
+  if (stationSessionDockProjectFilter && !projectOptions.some(([value]) => value === stationSessionDockProjectFilter)) {
+    stationSessionDockProjectFilter = '';
+  }
+  const projectSelect = stationDockSelect(overview, 'Project', stationSessionDockProjectFilter, projectOptions, { id: 'station-session-project-filter' });
+  projectSelect.addEventListener('change', ev => {
+    stationSessionDockProjectFilter = ev.target.value || '';
+    stationRenderSessionsDock(focusId);
+  });
   stationDockActions(overview, [
     { label: 'Refresh', primary: true, onClick: async () => { await loadSessions({ force: true }); stationRenderSessionsDock(focusId); } },
-    { label: 'Clear filters', onClick: () => { stationSessionDockFilter = ''; stationSessionDockSourceFilter = ''; stationSessionDockStatusFilter = ''; stationRenderSessionsDock(focusId); } },
+    { label: 'Clear filters', onClick: () => { stationSessionDockFilter = ''; stationSessionDockSourceFilter = ''; stationSessionDockStatusFilter = ''; stationSessionDockProjectFilter = ''; stationRenderSessionsDock(focusId); } },
     { label: 'New session', onClick: () => { if (typeof openNewSessionFromPrompt === 'function') openNewSessionFromPrompt(); else stationForceRouteTo('sessions', 'new'); } },
     { label: 'Worktrees', onClick: () => stationRenderWorktreesDock() },
     stationDockRouteAction('Route sessions tab', 'sessions', 'recent'),
@@ -13428,19 +13504,24 @@ function stationRenderSessionsDock(focusId = '') {
 
   const list = stationDockSection(body, 'Recent sessions');
   const query = stationSessionDockFilter.trim();
-  const hasSessionFilters = !!(query || stationSessionDockSourceFilter || stationSessionDockStatusFilter);
+  const hasSessionFilters = !!(query || stationSessionDockSourceFilter || stationSessionDockStatusFilter || stationSessionDockProjectFilter);
   const rows = stationSessionRowsForDock().filter(row =>
     stationSessionDockRowMatchesFilters(
       row,
       query,
       stationSessionDockSourceFilter,
-      stationSessionDockStatusFilter
+      stationSessionDockStatusFilter,
+      stationSessionDockProjectFilter
     )
   );
   if (!rows.length) {
     stationDockEmpty(list, hasSessionFilters ? 'No sessions match the Station filters.' : 'No cached sessions yet.');
   } else {
-    for (const row of rows) {
+    const visibleRows = rows.slice(0, 20);
+    if (rows.length > visibleRows.length) {
+      stationDockEmpty(list, `Showing ${visibleRows.length} of ${rows.length} matching sessions.`);
+    }
+    for (const row of visibleRows) {
       stationDockCard(list, {
         title: row.label || row.id || 'session',
         meta: row.value || '',
@@ -14923,30 +15004,7 @@ function stationCurrentDaemonSessionSummary() {
 
 function stationBuildSessionsSummary() {
   const worktrees = stationBuildWorktreesSummary();
-  const indexedSessions = Array.isArray(_cachedSessions) && _cachedSessions.length
-    ? _cachedSessions
-    : (sessionsListCache.get(selfPeerId) || []);
-  const byId = new Map();
-  const indexedIds = new Set();
-  for (const session of indexedSessions) {
-    const id = session?.session_id || session?.resume_id || session?.backend_session_id || JSON.stringify(session);
-    byId.set(String(id), session);
-    indexedIds.add(String(id));
-  }
-  for (const session of stationSessionWindowSummaries()) {
-    const id = session?.session_id || session?.resume_id || session?.backend_session_id || JSON.stringify(session);
-    if (!byId.has(String(id))) byId.set(String(id), session);
-  }
-  for (const session of stationSessionMetadataSummaries()) {
-    const id = session?.session_id || session?.resume_id || session?.backend_session_id || JSON.stringify(session);
-    if (!byId.has(String(id))) byId.set(String(id), session);
-  }
-  const currentDaemonSession = stationCurrentDaemonSessionSummary();
-  if (currentDaemonSession) {
-    const id = currentDaemonSession.session_id || JSON.stringify(currentDaemonSession);
-    if (!byId.has(String(id))) byId.set(String(id), currentDaemonSession);
-  }
-  const sessions = [...byId.values()];
+  const { sessions, indexedIds } = stationCollectSessionSet();
   const externalIds = new Set();
   for (const session of sessions) {
     const source = normalizeAgentId(session?.backend_source || session?.backendSource || session?.source || '');
@@ -14969,27 +15027,7 @@ function stationBuildSessionsSummary() {
   const recent = [...sessions]
     .sort((a, b) => stationSessionUpdatedMs(b) - stationSessionUpdatedMs(a))
     .slice(0, 6)
-    .map(session => {
-      const id = session?.session_id || session?.resume_id || session?.backend_session_id || '';
-      const status = session?.status || 'session';
-      const configMeta = sessionConfigMetadata(session);
-      const configSource = sessionConfigSource(configMeta);
-      const source = configSource || stationSessionSource(session) || session?.source || '';
-      const rowId = String(id || '').trim();
-      return {
-        id: rowId,
-        action: indexedIds.has(String(id)) ? 'detail' : '',
-        label: stationSessionTask(session) || 'Untitled session',
-        value: [status, source].filter(Boolean).join(' · '),
-        detail: [String(id).slice(0, 8), formatContextTimestamp(session?.updated_at || session?.updatedAt || session?.changed_at || session?.changedAt || session?.created_at || session?.createdAt)].filter(Boolean).join(' · '),
-        tone: 'session',
-        canResume: !!rowId && session?.can_resume !== false,
-        canConfig: !!rowId && !!configSource && configSource !== 'intendant',
-        canRename: !!rowId,
-        canAttach: !!rowId && canAttachSessionWindow(rowId),
-        canStop: !!rowId && sessionWindowStopAvailability(rowId).ok,
-      };
-    });
+    .map(session => stationSessionRowForDock(session, indexedIds));
   return {
     total: sessions.length,
     active,
