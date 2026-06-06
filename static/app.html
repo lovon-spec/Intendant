@@ -14381,12 +14381,14 @@ function stationRenderCodexThreadActionsSection(parent, sessionId, sessionOrMeta
     ['goal-resume', 'Resume goal'],
     ['goal-complete', 'Complete goal'],
     ['goal-clear', 'Clear goal'],
+    ['init', 'Init AGENTS.md'],
+    ['memory-reset', 'Reset memory'],
   ];
   stationDockActions(section, specs.map(([op, label]) => {
     const state = codexThreadActionStateForSession(sid, op);
     return {
       label,
-      danger: op === 'goal-clear',
+      danger: op === 'goal-clear' || op === 'memory-reset',
       disabled: !state.allowed,
       title: state.allowed ? `/${op}` : state.reason,
       onClick: () => stationHandleThreadAction({ op, session_id: sid }),
