@@ -162,7 +162,10 @@ features they lack.
   readiness, supports selector/function waits, falls back when Node has no
   WebSocket module, and prints compact PASS/FAIL output with bounded log
   excerpts on failure. It does not default to port 8765; pass `--port`/`--url` or
-  let it derive the port from `INTENDANT_MCP_URL`.
+  let it derive the port from `INTENDANT_MCP_URL`. Managed agents should keep
+  validation bounded: one primary smoke, at most one diagnostic retry such as
+  `--diagnostics --json`, then either a targeted fix or a clear
+  partial-validation conclusion with the helper reason/logs/diagnostics.
 
   `[agent.codex] managed_context = "vanilla"` is the default and is safe for
   upstream Codex or the original Codex fork. Set it to `"managed"` only when

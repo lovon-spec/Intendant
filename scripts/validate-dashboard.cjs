@@ -45,6 +45,7 @@ Options:
   --headed                   Run without --headless=new
   --sandbox                  Omit default --no-sandbox
   --log-lines N              Bounded browser/page log lines on failure (default: ${DEFAULT_LOG_LINES})
+  --diagnostics              On failure, include compact generic DOM/page state
   --json                     Print one compact JSON result
   --self-test                Run parser/formatter self-tests; does not launch a browser
 
@@ -61,6 +62,7 @@ function parseArgs(argv, env = process.env) {
     timeoutMs: DEFAULT_TIMEOUT_MS,
     cdpTimeoutMs: DEFAULT_CDP_TIMEOUT_MS,
     logLines: DEFAULT_LOG_LINES,
+    diagnostics: false,
     headless: true,
     noSandbox: true,
     json: false,
@@ -134,6 +136,8 @@ function parseArgs(argv, env = process.env) {
       opts.logLines = readNumber('--log-lines');
     } else if (arg.startsWith('--log-lines=')) {
       opts.logLines = parsePositiveInt(arg.slice('--log-lines='.length), '--log-lines');
+    } else if (arg === '--diagnostics') {
+      opts.diagnostics = true;
     } else if (arg === '--json') {
       opts.json = true;
     } else {
@@ -245,6 +249,11 @@ async function main() {
     };
     printResult(opts, result);
   } catch (error) {
+    const diagnostics = opts.diagnostics && harness
+      ? await harness.failureDiagnostics(opts).catch((diagError) => ({
+          error: diagError.message || String(diagError),
+        }))
+      : undefined;
     const result = {
       status: 'fail',
       url: opts.url,
@@ -253,6 +262,7 @@ async function main() {
       browser: harness && harness.browserExecutable,
       websocket: harness && harness.websocketKind,
       logs: harness ? harness.failureExcerpt(opts.logLines) : [],
+      diagnostics,
     };
     printResult(opts, result);
     process.exitCode = 1;
@@ -278,6 +288,9 @@ function printResult(opts, result) {
     `FAIL dashboard-validation url=${quote(result.url)} reason=${quote(result.reason)} ms=${result.ms}`,
   );
   for (const line of result.logs || []) {
+    console.error(`  ${line}`);
+  }
+  for (const line of formatDiagnostics(result.diagnostics)) {
     console.error(`  ${line}`);
   }
 }
@@ -444,6 +457,10 @@ class BrowserHarness {
       ...this.pageLogs.excerpt(lineCount),
       ...this.stderr.excerpt(Math.max(0, lineCount - this.pageLogs.size())),
     ];
+  }
+
+  async failureDiagnostics(opts) {
+    return this.evaluate(`(${pageDiagnosticsSource()})(${JSON.stringify(opts.selectors || [])})`);
   }
 
   async close() {
@@ -1045,6 +1062,97 @@ function exceptionText(details) {
   );
 }
 
+function pageDiagnosticsSource() {
+  return function collectPageDiagnostics(selectors) {
+    const compact = (value, limit = 180) => {
+      const text = String(value || '').replace(/\s+/g, ' ').trim();
+      return text.length <= limit ? text : `${text.slice(0, limit - 1)}...`;
+    };
+    const describeElement = (el) => {
+      if (!el) {
+        return '';
+      }
+      const tag = (el.tagName || '').toLowerCase();
+      const id = el.id ? `#${el.id}` : '';
+      const classes = el.classList && el.classList.length
+        ? `.${Array.from(el.classList).slice(0, 3).join('.')}`
+        : '';
+      const text = compact(
+        el.getAttribute('aria-label') ||
+          el.getAttribute('title') ||
+          el.placeholder ||
+          el.innerText ||
+          el.textContent ||
+          '',
+        80,
+      );
+      return compact(`${tag}${id}${classes}${text ? ` "${text}"` : ''}`, 120);
+    };
+    const describeMany = (query, limit) => Array.from(document.querySelectorAll(query))
+      .slice(0, limit)
+      .map(describeElement)
+      .filter(Boolean);
+    return {
+      location: window.location.href,
+      title: compact(document.title, 120),
+      readyState: document.readyState,
+      activeElement: describeElement(document.activeElement),
+      bodyText: compact(document.body ? document.body.innerText || document.body.textContent : '', 360),
+      headings: describeMany('h1,h2,h3,[role="heading"]', 8),
+      controls: describeMany('button,a,[role="button"],input,select,textarea', 12),
+      selectorMatches: selectors.map((selector) => {
+        try {
+          const matches = Array.from(document.querySelectorAll(selector));
+          return {
+            selector,
+            count: matches.length,
+            first: describeElement(matches[0]),
+          };
+        } catch (error) {
+          return {
+            selector,
+            error: error.message || String(error),
+          };
+        }
+      }),
+    };
+  }.toString();
+}
+
+function formatDiagnostics(diagnostics) {
+  if (!diagnostics) {
+    return [];
+  }
+  if (diagnostics.error) {
+    return [`diagnostics error=${quote(diagnostics.error)}`];
+  }
+  const lines = [
+    `diagnostics readyState=${quote(diagnostics.readyState || '')} title=${quote(diagnostics.title || '')} location=${quote(diagnostics.location || '')}`,
+  ];
+  if (diagnostics.activeElement) {
+    lines.push(`diagnostics active=${quote(diagnostics.activeElement)}`);
+  }
+  if (diagnostics.bodyText) {
+    lines.push(`diagnostics body=${quote(diagnostics.bodyText)}`);
+  }
+  for (const selector of diagnostics.selectorMatches || []) {
+    if (selector.error) {
+      lines.push(`diagnostics selector=${quote(selector.selector)} error=${quote(selector.error)}`);
+    } else {
+      lines.push(
+        `diagnostics selector=${quote(selector.selector)} count=${selector.count || 0} first=${quote(selector.first || '')}`,
+      );
+    }
+  }
+  if (diagnostics.headings && diagnostics.headings.length) {
+    lines.push(`diagnostics headings=${quote(diagnostics.headings.join(' | '))}`);
+  }
+  if (diagnostics.controls && diagnostics.controls.length) {
+    lines.push(`diagnostics controls=${quote(diagnostics.controls.join(' | '))}`);
+  }
+  return lines.map((line) => truncate(line, 520));
+}
+
 function quote(value) {
   return JSON.stringify(String(value));
 }
@@ -1085,6 +1193,7 @@ function runSelfTest() {
       '--timeout=2500',
       '--log-lines',
       '3',
+      '--diagnostics',
     ],
     {},
   );
@@ -1093,11 +1202,23 @@ function runSelfTest() {
   assert.deepStrictEqual(parsed.functions, ['() => true']);
   assert.strictEqual(parsed.timeoutMs, 2500);
   assert.strictEqual(parsed.logLines, 3);
+  assert.strictEqual(parsed.diagnostics, true);
   assert.strictEqual(
     dashboardUrlFromMcpUrl('http://localhost:7777/mcp?managed_context=managed'),
     'http://localhost:7777/',
   );
   assert.ok(waitFunctionExpression('document.body').includes('typeof candidate'));
+  assert.ok(pageDiagnosticsSource().includes('selectorMatches'));
+  assert.deepStrictEqual(formatDiagnostics(undefined), []);
+  assert.deepStrictEqual(formatDiagnostics({ error: 'boom' }), ['diagnostics error="boom"']);
+  assert.ok(
+    formatDiagnostics({
+      readyState: 'complete',
+      title: 'Dashboard',
+      location: 'http://127.0.0.1:1234/',
+      selectorMatches: [{ selector: '#root', count: 0, first: '' }],
+    }).some((line) => line.includes('selector="#root" count=0')),
+  );
   const log = new BoundedLog(2);
   log.push('a', 'first');
   log.push('b', 'second');

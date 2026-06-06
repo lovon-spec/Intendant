@@ -56,6 +56,7 @@ Keep the live transcript informationally dense:
 - Prefer targeted reads and searches over dumping large files, logs, or generated artifacts.
 - For GUI inspection in Intendant-managed sessions, use Intendant MCP `take_screenshot` and `execute_cu_actions` directly. Do not enumerate desktop apps or read bulky browser/computer-use plugin manuals when those direct tools are available; use Browser/Chrome/plugin CU only when their specialized capabilities are actually required. Do not use shell-driven GUI fallbacks such as `open`, `cliclick`, `osascript`, accessibility queries, or app binary inspection for GUI interaction.
 - For browser/dashboard validation against an existing Intendant web port, prefer `node scripts/validate-dashboard.cjs --port <port> --selector <css>` or `--url <url>` before writing ad-hoc Chromium/CDP scripts. The helper launches isolated headless Chromium, waits for CDP and selectors/functions, handles WebSocket fallbacks, and prints compact PASS/FAIL output with bounded failure excerpts.
+- Browser validation retry discipline: run one primary helper smoke. If it fails or times out, run at most one compact diagnostic retry with `--diagnostics --json` and a targeted selector/function. Then either make a targeted code fix from those facts, or report a clear partial-validation conclusion with the helper reason/logs/diagnostics. Do not cycle through raw CDP, Node, Python, Browser, Chrome, and plugin automation stacks unless the user explicitly asks for deeper manual investigation or the helper itself is the suspected broken component.
 - After a successful build, run dev servers through already-built binaries or quiet commands when possible. Avoid repeating `cargo run` or other build commands that stream known warnings only to launch a server; if a noisy command is unavoidable, preserve only the durable result and compact immediately.
 - While a long-running command/tool is still active, do not emit assistant status messages that only say you are still waiting/building/running and have no new output or errors. Wait silently for material output, completion, an approval need, or a real decision; Intendant surfaces tool lifecycle separately.
 - A rewind can cancel the active long-running command. If the chosen anchor is before a server launch, assume the server may be gone; verify it with a small health check and relaunch tersely instead of preserving the old PID as if it survived.
@@ -8118,6 +8119,9 @@ mod tests {
         assert!(developer_instructions.contains("execute_cu_actions"));
         assert!(developer_instructions.contains("scripts/validate-dashboard.cjs"));
         assert!(developer_instructions.contains("compact PASS/FAIL"));
+        assert!(developer_instructions.contains("--diagnostics --json"));
+        assert!(developer_instructions.contains("one primary helper smoke"));
+        assert!(developer_instructions.contains("Do not cycle through raw CDP"));
         assert!(developer_instructions.contains("cliclick"));
         assert!(developer_instructions.contains("osascript"));
         assert!(developer_instructions.contains("already-built binaries"));
