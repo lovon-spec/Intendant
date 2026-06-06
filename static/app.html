@@ -9732,6 +9732,10 @@ body.display-fullscreen-open {
                 <input id="set-codex-command" type="text" placeholder="codex or /usr/local/bin/codex" autocomplete="off">
               </div>
               <div class="settings-row">
+                <label>Claude binary</label>
+                <input id="set-claude-command" type="text" placeholder="claude or /usr/local/bin/claude" autocomplete="off">
+              </div>
+              <div class="settings-row">
                 <label>Codex tier</label>
                 <select id="set-codex-service-tier">
                   <option value="">Inherit Codex config</option>
@@ -15888,6 +15892,80 @@ function stationRenderGeminiSessionSection(parent, controls) {
   ]);
 }
 
+function stationClaudeCommandValue() {
+  return document.getElementById('set-claude-command')?.value
+    || commandDefaultForNewSessionAgent('claude-code')
+    || 'claude';
+}
+
+function stationSetClaudeCommandFromDock(value) {
+  const command = String(value || '').trim() || 'claude';
+  const input = document.getElementById('set-claude-command');
+  if (input) input.value = command;
+  newSessionAgentCommands['claude-code'] = command;
+  stationClaudeCommandStatus = 'Unsaved Claude Code binary.';
+  renderNewSessionAgentControls();
+  stationRenderControlsDock('launch');
+}
+
+async function stationSaveClaudeDefaultsFromDock() {
+  const current = document.getElementById('station-claude-command')?.value;
+  if (current !== undefined) {
+    const command = String(current || '').trim() || 'claude';
+    const input = document.getElementById('set-claude-command');
+    if (input) input.value = command;
+    newSessionAgentCommands['claude-code'] = command;
+  }
+  stationClaudeCommandSaving = true;
+  stationClaudeCommandStatus = 'Saving Claude Code defaults...';
+  stationRenderControlsDock('launch');
+  try {
+    await saveSettings();
+    stationClaudeCommandStatus = 'Saved Claude Code defaults.';
+    showControlToast?.('success', 'Claude Code defaults saved');
+  } catch (err) {
+    stationClaudeCommandStatus = err?.message || 'Claude Code defaults save failed.';
+    showControlToast?.('error', stationClaudeCommandStatus);
+  } finally {
+    stationClaudeCommandSaving = false;
+    stationRenderControlsDock('launch');
+  }
+}
+
+async function stationReloadClaudeDefaultsFromDock() {
+  stationClaudeCommandStatus = 'Reloading Claude Code defaults...';
+  stationRenderControlsDock('launch');
+  settingsLoaded = false;
+  await loadSettings();
+  stationClaudeCommandStatus = 'Reloaded Claude Code defaults.';
+  stationRenderControlsDock('launch');
+}
+
+function stationRenderClaudeSessionSection(parent, controls) {
+  const active = controls.backend === 'claude-code' || controls.newSessionAgent === 'claude-code';
+  const section = stationDockSection(parent, 'Claude Code session');
+  stationDockRow(section, 'backend', active ? 'selected' : 'not selected');
+  stationDockRow(section, 'binary', stationClaudeCommandValue() || 'claude');
+  stationDockActions(section, [
+    { label: 'Use Claude', primary: active, onClick: () => stationApplyExternalBackendFromDock('claude-code') },
+    { label: 'Draft Claude launch', primary: stationEffectiveLaunchAgent() === 'claude-code', onClick: () => stationSetLaunchDraftAgent('claude-code') },
+    stationDockRouteAction('Route Claude settings', 'settings', 'agent', () => document.getElementById('set-claude-command')?.focus()),
+  ]);
+}
+
+function stationRenderClaudeDefaultsEditor(parent) {
+  if (controlCurrentBackend !== 'claude-code') return;
+  const section = stationDockSection(parent, 'Claude Code defaults');
+  const command = stationDockInput(section, 'Binary', stationClaudeCommandValue(), { id: 'station-claude-command', placeholder: 'claude or /absolute/path/claude' });
+  stationDockCommitOnEnter(command, ev => stationSetClaudeCommandFromDock(ev.target.value));
+  if (stationClaudeCommandStatus) stationDockEmpty(section, stationClaudeCommandStatus);
+  stationDockActions(section, [
+    { label: stationClaudeCommandSaving ? 'Saving...' : 'Save Claude', primary: true, disabled: stationClaudeCommandSaving, onClick: stationSaveClaudeDefaultsFromDock },
+    { label: 'Reload', disabled: stationClaudeCommandSaving, onClick: stationReloadClaudeDefaultsFromDock },
+    stationDockRouteAction('Route Agent settings', 'settings', 'agent', () => document.getElementById('set-claude-command')?.focus()),
+  ]);
+}
+
 function stationApplyCodexCommandFromDock(value) {
   const command = String(value || '').trim() || 'codex';
   const settingsInput = document.getElementById('set-codex-command');
@@ -16128,6 +16206,7 @@ function stationRenderControlsDock(sectionName = 'overview') {
   stationRenderLiveStatusSection(body, controls);
   stationRenderDashboardRoutesSection(body);
   stationRenderExternalBackendEditor(body, controls);
+  stationRenderClaudeSessionSection(body, controls);
   stationRenderGeminiSessionSection(body, controls);
   stationRenderLaunchReadinessSection(body, {
     title: 'Next launch',
@@ -16146,6 +16225,7 @@ function stationRenderControlsDock(sectionName = 'overview') {
     stationDockRouteAction('Route agent settings', 'settings', 'agent'),
   ]);
   stationRenderCodexDefaultsEditor(body);
+  stationRenderClaudeDefaultsEditor(body);
   stationRenderGeminiDefaultsEditor(body);
   stationRenderApprovalRulesEditor(body);
 
@@ -19721,6 +19801,8 @@ let sessionRenameEditing = null;
 let sessionConfigEditing = null;
 let sessionConfigSavePending = null;
 let sessionDeletePending = null;
+let stationClaudeCommandStatus = '';
+let stationClaudeCommandSaving = false;
 const NEW_SESSION_SPAWN_TIMEOUT_MS = 90000;
 const NEW_SESSION_LAUNCH_FAILURE_GRACE_MS = 15000;
 
@@ -38921,6 +39003,7 @@ async function loadSettings() {
     document.getElementById('set-live-audio-enabled').checked = d.live_audio_enabled;
     document.getElementById('set-live-audio-timeout').value = d.live_audio_timeout_secs || 300;
     document.getElementById('set-codex-command').value = d.codex_command || 'codex';
+    document.getElementById('set-claude-command').value = d.claude_command || 'claude';
     document.getElementById('set-codex-service-tier').value = normalizeCodexServiceTier(d.codex_service_tier || '');
     controlCodexConfig.command = d.codex_command || 'codex';
     controlCodexConfig.service_tier = normalizeCodexServiceTier(d.codex_service_tier || '');
@@ -38968,8 +39051,10 @@ async function loadSettings() {
 async function saveSettings() {
   const g = id => document.getElementById(id);
   const selectedCodexServiceTier = normalizeCodexServiceTier(g('set-codex-service-tier')?.value ?? controlCodexConfig.service_tier ?? '');
+  const selectedClaudeCommand = (g('set-claude-command')?.value || '').trim() || 'claude';
   controlCodexConfig.service_tier = selectedCodexServiceTier;
   newSessionCodexDefaultServiceTier = selectedCodexServiceTier;
+  newSessionAgentCommands['claude-code'] = selectedClaudeCommand;
   if (!newSessionCodexFastModeTouched) {
     newSessionCodexFastMode = codexServiceTierIsFast(selectedCodexServiceTier);
   }
@@ -38995,6 +39080,7 @@ async function saveSettings() {
     // Persisted to intendant.toml so it survives daemon restart.
     external_agent: g('set-external-agent').value || null,
     codex_command: (g('set-codex-command').value || '').trim() || 'codex',
+    claude_command: selectedClaudeCommand,
     codex_sandbox: controlCodexConfig.sandbox || 'workspace-write',
     codex_approval_policy: controlCodexConfig.approval_policy || 'on-request',
     codex_model: controlCodexConfig.model || null,
