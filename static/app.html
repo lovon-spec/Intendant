@@ -10838,6 +10838,20 @@ let stationSelectedContextPart = '';
 let stationSelectedChangePath = '';
 let stationSelectedManagedAnchor = '';
 let stationSelectedManagedRecord = '';
+let stationManagedActionResult = '';
+let stationManagedDraft = {
+  anchor: '',
+  position: '',
+  reason: '',
+  primer: '',
+  preserve: '',
+  discard: '',
+  artifacts: '',
+  nextSteps: '',
+  record: '',
+  backoutMode: '',
+  backoutName: '',
+};
 let stationSelectedPeerHost = '';
 const stationPeerDisplayTargets = new Map();
 let stationPeerStatus = '';
@@ -12077,6 +12091,7 @@ function stationDockEmpty(parent, text) {
 function stationDockButton(label, onClick, opts = {}) {
   const button = document.createElement('button');
   button.type = 'button';
+  if (opts.id) button.id = opts.id;
   button.className = 'station-dock-btn' +
     (opts.primary ? ' primary' : '') +
     (opts.danger ? ' danger' : '') +
@@ -12552,37 +12567,73 @@ function stationSetManagedSession(sessionId) {
   if (typeof renderManagedContextSessionSelect === 'function') renderManagedContextSessionSelect();
   const sel = managedContextEl?.('managed-context-session');
   if (sel && Array.from(sel.options).some(option => option.value === sessionId)) {
+    const previous = managedContextCurrentSessionId?.() || '';
     sel.value = sessionId;
     managedContextSessionManuallySelected = true;
     if (typeof syncManagedContextActiveSession === 'function') syncManagedContextActiveSession();
+    if (previous && previous !== sessionId) stationResetManagedDraft();
   }
 }
 
-function stationCopyManagedFormToLegacy() {
-  const copyValue = (from, to) => {
-    const source = document.getElementById(from);
-    const target = managedContextEl?.(to);
-    if (source && target) target.value = source.value;
+function stationResetManagedDraft() {
+  stationSelectedManagedAnchor = '';
+  stationSelectedManagedRecord = '';
+  stationManagedDraft = {
+    anchor: '',
+    position: '',
+    reason: '',
+    primer: '',
+    preserve: '',
+    discard: '',
+    artifacts: '',
+    nextSteps: '',
+    record: '',
+    backoutMode: '',
+    backoutName: '',
   };
-  copyValue('station-managed-anchor', 'managed-context-anchor');
-  copyValue('station-managed-position', 'managed-context-position');
-  copyValue('station-managed-reason', 'managed-context-reason');
-  copyValue('station-managed-primer', 'managed-context-primer');
-  copyValue('station-managed-preserve', 'managed-context-preserve');
-  copyValue('station-managed-discard', 'managed-context-discard');
-  copyValue('station-managed-artifacts', 'managed-context-artifacts');
-  copyValue('station-managed-next-steps', 'managed-context-next-steps');
-  copyValue('station-managed-record', 'managed-context-record-id');
-  copyValue('station-managed-backout-mode', 'managed-context-backout-mode');
-  copyValue('station-managed-backout-name', 'managed-context-backout-name');
+}
+
+function stationManagedDraftValue(key, legacyId = '', fallback = '') {
+  const draftValue = stationManagedDraft[key];
+  if (draftValue !== undefined && draftValue !== null && draftValue !== '') return draftValue;
+  const legacyValue = legacyId ? String(managedContextEl?.(legacyId)?.value || '') : '';
+  if (legacyValue) return legacyValue;
+  return fallback || '';
+}
+
+function stationRememberManagedDraftValue(key, value) {
+  stationManagedDraft[key] = String(value || '');
+}
+
+function stationCopyManagedFormToLegacy() {
+  const copyValue = (key, from, to) => {
+    const source = document.getElementById(from);
+    if (source) stationRememberManagedDraftValue(key, source.value);
+    const value = source ? String(source.value || '') : String(stationManagedDraft[key] || '');
+    const target = managedContextEl?.(to);
+    if (target && (source || value)) target.value = value;
+  };
+  copyValue('anchor', 'station-managed-anchor', 'managed-context-anchor');
+  copyValue('position', 'station-managed-position', 'managed-context-position');
+  copyValue('reason', 'station-managed-reason', 'managed-context-reason');
+  copyValue('primer', 'station-managed-primer', 'managed-context-primer');
+  copyValue('preserve', 'station-managed-preserve', 'managed-context-preserve');
+  copyValue('discard', 'station-managed-discard', 'managed-context-discard');
+  copyValue('artifacts', 'station-managed-artifacts', 'managed-context-artifacts');
+  copyValue('nextSteps', 'station-managed-next-steps', 'managed-context-next-steps');
+  copyValue('record', 'station-managed-record', 'managed-context-record-id');
+  copyValue('backoutMode', 'station-managed-backout-mode', 'managed-context-backout-mode');
+  copyValue('backoutName', 'station-managed-backout-name', 'managed-context-backout-name');
 }
 
 function stationManagedResultText() {
-  return managedContextEl?.('managed-context-action-result')?.textContent || '';
+  return stationManagedActionResult || managedContextEl?.('managed-context-action-result')?.textContent || '';
 }
 
-function stationManagedCanRunAction(managed) {
-  return !!managed?.sessionId && String(managed.mode || '').toLowerCase() === 'managed';
+function stationSetManagedResult(text) {
+  stationManagedActionResult = text || 'No action yet';
+  const result = managedContextEl?.('managed-context-action-result');
+  if (result) result.textContent = stationManagedActionResult;
 }
 
 function stationManagedActionReadyText(managed) {
@@ -12591,9 +12642,87 @@ function stationManagedActionReadyText(managed) {
   return '';
 }
 
+function stationManagedFormValue(key, stationId, legacyId) {
+  const stationEl = document.getElementById(stationId);
+  if (stationEl) return String(stationEl.value || '').trim();
+  return stationManagedDraftValue(key, legacyId).trim();
+}
+
+function stationManagedReadiness(managed) {
+  const base = stationManagedActionReadyText(managed);
+  const anchor = stationManagedFormValue('anchor', 'station-managed-anchor', 'managed-context-anchor');
+  const reason = stationManagedFormValue('reason', 'station-managed-reason', 'managed-context-reason');
+  const primer = stationManagedFormValue('primer', 'station-managed-primer', 'managed-context-primer');
+  const record = stationManagedFormValue('record', 'station-managed-record', 'managed-context-record-id');
+  const rewindMissing = [];
+  if (!anchor) rewindMissing.push('anchor');
+  if (!reason) rewindMissing.push('reason');
+  if (!primer) rewindMissing.push('primer');
+  return {
+    base,
+    anchor,
+    reason,
+    primer,
+    record,
+    canInspect: !base && !!anchor,
+    canRewind: !base && rewindMissing.length === 0,
+    canBackout: !base && !!record,
+    inspectTitle: base || (anchor ? '' : 'Select an anchor first'),
+    rewindTitle: base || (rewindMissing.length ? `Missing ${rewindMissing.join(', ')}` : ''),
+    backoutTitle: base || (record ? '' : 'Select a rewind record first'),
+  };
+}
+
+function stationSetDockButtonState(id, enabled, title = '') {
+  const button = document.getElementById(id);
+  if (!button) return;
+  button.disabled = !enabled;
+  button.title = title || '';
+}
+
+function stationRefreshManagedDockActionState(managed) {
+  const ready = stationManagedReadiness(managed);
+  stationSetDockButtonState('station-managed-inspect-btn', ready.canInspect, ready.inspectTitle);
+  stationSetDockButtonState('station-managed-dispatch-btn', ready.canRewind, ready.rewindTitle);
+  stationSetDockButtonState('station-managed-backout-btn', ready.canBackout, ready.backoutTitle);
+  const overview = document.getElementById('station-managed-action-state');
+  if (overview) {
+    overview.textContent = ready.base
+      ? 'read only'
+      : (ready.canRewind || ready.canBackout ? 'ready' : 'needs draft');
+  }
+}
+
+function stationBindManagedDraftControls(managed) {
+  const ids = [
+    'station-managed-anchor',
+    'station-managed-position',
+    'station-managed-reason',
+    'station-managed-primer',
+    'station-managed-preserve',
+    'station-managed-discard',
+    'station-managed-artifacts',
+    'station-managed-next-steps',
+    'station-managed-record',
+    'station-managed-backout-mode',
+    'station-managed-backout-name',
+  ];
+  const sync = () => {
+    stationCopyManagedFormToLegacy();
+    stationRefreshManagedDockActionState(managed);
+  };
+  for (const id of ids) {
+    const el = document.getElementById(id);
+    if (!el) continue;
+    el.addEventListener('input', sync);
+    el.addEventListener('change', sync);
+    el.addEventListener('blur', sync);
+  }
+  stationRefreshManagedDockActionState(managed);
+}
+
 function stationClearManagedResult() {
-  const result = managedContextEl?.('managed-context-action-result');
-  if (result) result.textContent = 'No action yet';
+  stationSetManagedResult('No action yet');
 }
 
 function stationRenderManagedActionResult(parent) {
@@ -12642,6 +12771,97 @@ function stationSeedManagedDraftFromContext() {
   showControlToast?.('success', 'Station managed-context draft seeded from current context');
 }
 
+function stationManagedDraftLines(key) {
+  return String(stationManagedDraftValue(key) || '')
+    .split('\n')
+    .map(line => line.trim())
+    .filter(Boolean);
+}
+
+function stationManagedCurrentActionSession() {
+  return stationManagedSessionCandidate();
+}
+
+async function stationInspectManagedAnchorFromDock() {
+  const sessionId = stationManagedCurrentActionSession();
+  const itemId = stationManagedFormValue('anchor', 'station-managed-anchor', 'managed-context-anchor');
+  if (!sessionId || !itemId) {
+    showControlToast?.('error', 'Inspect needs session and anchor');
+    return;
+  }
+  stationCopyManagedFormToLegacy();
+  stationSetManagedResult('Inspecting anchor...');
+  try {
+    const text = await managedContextMcpToolForSession(sessionId, 'inspect_rewind_anchor', {
+      session_id: sessionId,
+      item_id: itemId,
+      radius: 2,
+    });
+    stationSetManagedResult(text || 'ok');
+  } catch (err) {
+    stationSetManagedResult(err?.message || String(err));
+    showControlToast?.('error', err?.message || 'Anchor inspect failed');
+  }
+}
+
+async function stationSubmitManagedRewindFromDock() {
+  const sessionId = stationManagedCurrentActionSession();
+  const itemId = stationManagedFormValue('anchor', 'station-managed-anchor', 'managed-context-anchor');
+  const reason = stationManagedFormValue('reason', 'station-managed-reason', 'managed-context-reason');
+  const primer = stationManagedFormValue('primer', 'station-managed-primer', 'managed-context-primer');
+  if (!sessionId || !itemId || !reason || !primer) {
+    showControlToast?.('error', 'Rewind needs session, anchor, reason, and primer');
+    return;
+  }
+  stationCopyManagedFormToLegacy();
+  stationSetManagedResult('Dispatching rewind...');
+  try {
+    const text = await managedContextMcpToolForSession(sessionId, 'rewind_context', {
+      session_id: sessionId,
+      anchor: {
+        item_id: itemId,
+        position: stationManagedDraftValue('position', 'managed-context-position', 'after') === 'before' ? 'before' : 'after',
+      },
+      reason,
+      primer,
+      preserve: stationManagedDraftLines('preserve'),
+      discard: stationManagedDraftLines('discard'),
+      artifacts: stationManagedDraftLines('artifacts'),
+      next_steps: stationManagedDraftLines('nextSteps'),
+    });
+    stationSetManagedResult(text || 'ok');
+    showControlToast?.('success', 'Managed rewind dispatched');
+    scheduleManagedContextRefresh(1000);
+  } catch (err) {
+    stationSetManagedResult(err?.message || String(err));
+    showControlToast?.('error', err?.message || 'Managed rewind failed');
+  }
+}
+
+async function stationSubmitManagedBackoutFromDock(modeOverride = '') {
+  const sessionId = stationManagedCurrentActionSession();
+  const recordId = stationManagedFormValue('record', 'station-managed-record', 'managed-context-record-id');
+  if (!sessionId || !recordId) {
+    showControlToast?.('error', 'Backout needs session and record id');
+    return;
+  }
+  stationCopyManagedFormToLegacy();
+  const mode = modeOverride || stationManagedDraftValue('backoutMode', 'managed-context-backout-mode', 'inspect') || 'inspect';
+  const name = stationManagedDraftValue('backoutName', 'managed-context-backout-name');
+  stationSetManagedResult(`Running ${mode}...`);
+  try {
+    const args = { session_id: sessionId, record_id: recordId, mode };
+    if (name) args.name = name;
+    const text = await managedContextMcpToolForSession(sessionId, 'rewind_backout', args);
+    stationSetManagedResult(text || 'ok');
+    showControlToast?.('success', `Managed ${mode} complete`);
+    scheduleManagedContextRefresh(1000);
+  } catch (err) {
+    stationSetManagedResult(err?.message || String(err));
+    showControlToast?.('error', err?.message || 'Managed backout failed');
+  }
+}
+
 async function stationApplyManagedAction(op, id = '', sessionId = '') {
   if (sessionId) stationSetManagedSession(sessionId);
   if (op === 'refresh') {
@@ -12650,11 +12870,13 @@ async function stationApplyManagedAction(op, id = '', sessionId = '') {
   }
   if (op === 'anchor') {
     stationSelectedManagedAnchor = id;
+    stationRememberManagedDraftValue('anchor', id);
     fillManagedContextAnchor(id, sessionId);
     return;
   }
   if (op === 'record') {
     stationSelectedManagedRecord = id;
+    stationRememberManagedDraftValue('record', id);
     const record = (managedContextRecords || []).find(candidate => candidate && candidate.record_id === id);
     if (record) selectManagedContextRecord(record);
     else {
@@ -12674,12 +12896,14 @@ async function stationApplyManagedAction(op, id = '', sessionId = '') {
 function stationClearManagedTarget(kind) {
   if (kind === 'record') {
     stationSelectedManagedRecord = '';
+    stationRememberManagedDraftValue('record', '');
     const record = managedContextEl?.('managed-context-record-id');
     if (record) record.value = '';
     const stationRecord = document.getElementById('station-managed-record');
     if (stationRecord) stationRecord.value = '';
   } else {
     stationSelectedManagedAnchor = '';
+    stationRememberManagedDraftValue('anchor', '');
     const anchor = managedContextEl?.('managed-context-anchor');
     if (anchor) anchor.value = '';
     const stationAnchor = document.getElementById('station-managed-anchor');
@@ -12704,7 +12928,9 @@ function stationRenderManagedDock(mode = '') {
   stationDockRow(overview, 'pressure', managed.effectiveWindow ? `${Math.round((managed.usedTokens / managed.effectiveWindow) * 100)}% effective${managed.rewindOnly ? ' / rewind only' : ''}` : (managed.rewindOnly ? 'rewind only' : '--'));
   stationDockRow(overview, 'history', `${managed.records} records / ${managed.anchors} anchors`);
   stationDockRow(overview, 'branches', `${managed.lineageGroups} lineage / ${managed.fissionGroups} fission / ${managed.branches} branches`);
-  stationDockRow(overview, 'actions', actionReadyText ? 'read only' : 'ready');
+  const actionStateRow = stationDockRow(overview, 'actions', actionReadyText ? 'read only' : 'checking');
+  const actionStateValue = actionStateRow.querySelector('.station-dock-value');
+  if (actionStateValue) actionStateValue.id = 'station-managed-action-state';
   const sessionOptions = managedContextSessionOptions();
   if (sessionOptions.length) {
     const selector = stationDockSelect(overview, 'Session', managed.sessionId || sessionOptions[0][0], sessionOptions, { id: 'station-managed-session' });
@@ -12723,38 +12949,41 @@ function stationRenderManagedDock(mode = '') {
   ]);
 
   const form = stationDockSection(body, mode === 'backout' ? 'Backout' : 'Rewind');
-  const anchorDefault = managedContextEl?.('managed-context-anchor')?.value || managed.recentAnchors?.[0]?.id || '';
-  const recordDefault = managedContextEl?.('managed-context-record-id')?.value || managed.recentRecords?.[0]?.id || '';
+  const anchorDefault = stationManagedDraftValue('anchor', 'managed-context-anchor', managed.recentAnchors?.[0]?.id || '');
+  const recordDefault = stationManagedDraftValue('record', 'managed-context-record-id', managed.recentRecords?.[0]?.id || '');
   if (mode === 'backout') {
     stationDockInput(form, 'Record id', recordDefault, { id: 'station-managed-record', placeholder: 'rewind record id' });
-    stationDockSelect(form, 'Mode', managedContextEl?.('managed-context-backout-mode')?.value || 'inspect', [
+    stationDockSelect(form, 'Mode', stationManagedDraftValue('backoutMode', 'managed-context-backout-mode', 'inspect'), [
       ['inspect', 'inspect'],
       ['restore', 'restore active thread'],
       ['fork', 'fork'],
       ['backout', 'backout'],
     ], { id: 'station-managed-backout-mode' });
-    stationDockInput(form, 'Fork name', managedContextEl?.('managed-context-backout-name')?.value || '', { id: 'station-managed-backout-name', placeholder: 'optional' });
+    stationDockInput(form, 'Fork name', stationManagedDraftValue('backoutName', 'managed-context-backout-name'), { id: 'station-managed-backout-name', placeholder: 'optional' });
+    const ready = stationManagedReadiness(managed);
     stationDockActions(form, [
-      { label: 'Run backout', primary: true, disabled: !recordDefault, title: recordDefault ? '' : 'Select a rewind record first', onClick: async () => { stationCopyManagedFormToLegacy(); await submitManagedContextBackout(); stationRenderManagedDock('backout'); } },
+      { id: 'station-managed-backout-btn', label: 'Run backout', primary: true, disabled: !ready.canBackout, title: ready.backoutTitle, onClick: async () => { await stationSubmitManagedBackoutFromDock(); stationRenderManagedDock('backout'); } },
     ]);
   } else {
     stationDockInput(form, 'Anchor item id', anchorDefault, { id: 'station-managed-anchor', placeholder: 'exact rewind anchor item_id' });
-    stationDockSelect(form, 'Position', managedContextEl?.('managed-context-position')?.value || 'after', [
+    stationDockSelect(form, 'Position', stationManagedDraftValue('position', 'managed-context-position', 'after'), [
       ['after', 'after anchor'],
       ['before', 'before anchor'],
     ], { id: 'station-managed-position' });
-    stationDockInput(form, 'Reason', managedContextEl?.('managed-context-reason')?.value || '', { id: 'station-managed-reason', placeholder: 'why this rewind is needed' });
-    stationDockInput(form, 'Primer', managedContextEl?.('managed-context-primer')?.value || '', { id: 'station-managed-primer', placeholder: 'dense carry-forward context', multiline: true, rows: 4 });
-    stationDockInput(form, 'Preserve', managedContextEl?.('managed-context-preserve')?.value || '', { id: 'station-managed-preserve', placeholder: 'durable facts, one per line', multiline: true, rows: 2 });
-    stationDockInput(form, 'Discard', managedContextEl?.('managed-context-discard')?.value || '', { id: 'station-managed-discard', placeholder: 'noise or obsolete branches, one per line', multiline: true, rows: 2 });
-    stationDockInput(form, 'Artifacts', managedContextEl?.('managed-context-artifacts')?.value || '', { id: 'station-managed-artifacts', placeholder: 'files, commits, outputs to keep', multiline: true, rows: 2 });
-    stationDockInput(form, 'Next steps', managedContextEl?.('managed-context-next-steps')?.value || '', { id: 'station-managed-next-steps', placeholder: 'immediate continuation steps', multiline: true, rows: 2 });
+    stationDockInput(form, 'Reason', stationManagedDraftValue('reason', 'managed-context-reason'), { id: 'station-managed-reason', placeholder: 'why this rewind is needed' });
+    stationDockInput(form, 'Primer', stationManagedDraftValue('primer', 'managed-context-primer'), { id: 'station-managed-primer', placeholder: 'dense carry-forward context', multiline: true, rows: 4 });
+    stationDockInput(form, 'Preserve', stationManagedDraftValue('preserve', 'managed-context-preserve'), { id: 'station-managed-preserve', placeholder: 'durable facts, one per line', multiline: true, rows: 2 });
+    stationDockInput(form, 'Discard', stationManagedDraftValue('discard', 'managed-context-discard'), { id: 'station-managed-discard', placeholder: 'noise or obsolete branches, one per line', multiline: true, rows: 2 });
+    stationDockInput(form, 'Artifacts', stationManagedDraftValue('artifacts', 'managed-context-artifacts'), { id: 'station-managed-artifacts', placeholder: 'files, commits, outputs to keep', multiline: true, rows: 2 });
+    stationDockInput(form, 'Next steps', stationManagedDraftValue('nextSteps', 'managed-context-next-steps'), { id: 'station-managed-next-steps', placeholder: 'immediate continuation steps', multiline: true, rows: 2 });
+    const ready = stationManagedReadiness(managed);
     stationDockActions(form, [
       { label: 'Seed from context', onClick: () => { stationSeedManagedDraftFromContext(); stationRenderManagedDock('rewind'); } },
-      { label: 'Inspect anchor', disabled: !anchorDefault, title: anchorDefault ? '' : 'Select an anchor first', onClick: async () => { stationCopyManagedFormToLegacy(); await inspectManagedContextAnchor(); stationRenderManagedDock('rewind'); } },
-      { label: 'Dispatch rewind', primary: true, disabled: !stationManagedCanRunAction(managed), title: actionReadyText, onClick: async () => { stationCopyManagedFormToLegacy(); await submitManagedContextRewind(); stationRenderManagedDock('rewind'); } },
+      { id: 'station-managed-inspect-btn', label: 'Inspect anchor', disabled: !ready.canInspect, title: ready.inspectTitle, onClick: async () => { await stationInspectManagedAnchorFromDock(); stationRenderManagedDock('rewind'); } },
+      { id: 'station-managed-dispatch-btn', label: 'Dispatch rewind', primary: true, disabled: !ready.canRewind, title: ready.rewindTitle, onClick: async () => { await stationSubmitManagedRewindFromDock(); stationRenderManagedDock('rewind'); } },
     ]);
   }
+  stationBindManagedDraftControls(managed);
   if (anchorDefault || recordDefault) {
     const selected = stationDockSection(body, 'Selected targets');
     if (anchorDefault) {
@@ -12794,7 +13023,7 @@ function stationRenderManagedDock(mode = '') {
         active: row.id && row.id === (stationSelectedManagedAnchor || anchorDefault),
         actions: [
           { label: 'Use', primary: true, onClick: async () => { await stationApplyManagedAction('anchor', row.id, row.sessionId); stationRenderManagedDock('rewind'); } },
-          { label: 'Inspect', onClick: async () => { await stationApplyManagedAction('anchor', row.id, row.sessionId); await inspectManagedContextAnchor(); stationRenderManagedDock('rewind'); } },
+          { label: 'Inspect', onClick: async () => { await stationApplyManagedAction('anchor', row.id, row.sessionId); await stationInspectManagedAnchorFromDock(); stationRenderManagedDock('rewind'); } },
           { label: 'Copy', onClick: () => copyTextToClipboard(row.id) },
         ],
       });
@@ -12812,7 +13041,7 @@ function stationRenderManagedDock(mode = '') {
         active: row.id && row.id === (stationSelectedManagedRecord || recordDefault),
         actions: [
           { label: 'Select', onClick: async () => { await stationApplyManagedAction('record', row.id, row.sessionId); stationRenderManagedDock('backout'); } },
-          { label: 'Inspect', primary: true, onClick: async () => { await stationApplyManagedAction('record', row.id, row.sessionId); const modeEl = managedContextEl?.('managed-context-backout-mode'); if (modeEl) modeEl.value = 'inspect'; await submitManagedContextBackout(); stationRenderManagedDock('backout'); } },
+          { label: 'Inspect', primary: true, onClick: async () => { await stationApplyManagedAction('record', row.id, row.sessionId); stationRememberManagedDraftValue('backoutMode', 'inspect'); await stationSubmitManagedBackoutFromDock('inspect'); stationRenderManagedDock('backout'); } },
           { label: 'Copy', onClick: () => copyTextToClipboard(row.id) },
         ],
       });
@@ -19395,8 +19624,7 @@ function managedContextSplitLines(id) {
     .filter(Boolean);
 }
 
-async function managedContextMcpTool(name, args = {}) {
-  const sessionId = managedContextCurrentSessionId();
+async function managedContextMcpToolForSession(sessionId, name, args = {}) {
   if (!sessionId) throw new Error('Select a Codex session first.');
   const resp = await authedFetch(`/mcp?session_id=${encodeURIComponent(sessionId)}`, {
     method: 'POST',
@@ -19417,6 +19645,10 @@ async function managedContextMcpTool(name, args = {}) {
     : '';
   if (result.isError) throw new Error(text || `${name} failed`);
   return text;
+}
+
+async function managedContextMcpTool(name, args = {}) {
+  return managedContextMcpToolForSession(managedContextCurrentSessionId(), name, args);
 }
 
 async function fetchManagedContextStatus() {
