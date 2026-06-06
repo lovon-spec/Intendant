@@ -13610,6 +13610,40 @@ async function stationSelectChange(path) {
   stationRenderChangesDock(stationSelectedChangePath);
 }
 
+function stationChangedPathsForDock() {
+  return [...changedFiles.keys()].sort((a, b) => a.localeCompare(b));
+}
+
+async function stationCopyChangedPathsFromDock() {
+  const paths = stationChangedPathsForDock();
+  if (!paths.length) {
+    showControlToast?.('info', 'No changed files to copy');
+    return;
+  }
+  await copyTextToClipboard(paths.join('\n'));
+  showControlToast?.('info', `Copied ${paths.length} changed file path${paths.length === 1 ? '' : 's'}`);
+}
+
+async function stationCopyChangeDiffFromDock(pathArg = '') {
+  const path = String(pathArg || stationSelectedChangePath || activeChangesFile || '').trim();
+  if (!path) {
+    showControlToast?.('error', 'Select a changed file before copying a diff');
+    return;
+  }
+  const resp = await fetch(changesRequestUrl(path));
+  const data = await parseChangesResponse(resp);
+  if (data.diff_available === false) {
+    throw new Error(data.reason || 'Textual diff is unavailable for this file.');
+  }
+  const diff = String(data.diff || '').trimEnd();
+  if (!diff) {
+    showControlToast?.('info', 'Selected file has no text diff to copy');
+    return;
+  }
+  await copyTextToClipboard(diff);
+  showControlToast?.('info', `Copied diff for ${path}`);
+}
+
 function stationRenderChangesDock(selectedPath = stationSelectedChangePath || activeChangesFile || '') {
   stationSelectedChangePath = selectedPath || '';
   const changes = stationBuildChangesSummary();
@@ -13621,6 +13655,7 @@ function stationRenderChangesDock(selectedPath = stationSelectedChangePath || ac
   stationDockRow(overview, 'lines', `+${stationCompactNumber(changes.totalAdded)} / -${stationCompactNumber(changes.totalRemoved)}`);
   stationDockActions(overview, [
     { label: 'Refresh', primary: true, onClick: async () => { await refreshChangesList({ refreshActive: !!activeChangesFile, quiet: true }); stationRenderChangesDock(activeChangesFile || selectedPath); } },
+    { label: 'Copy paths', disabled: changes.count <= 0, onClick: stationCopyChangedPathsFromDock },
     { label: 'Redo', onClick: () => { document.getElementById('redo-btn')?.click(); stationRenderChangesDock(selectedPath); } },
     { label: 'Prune', danger: true, onClick: () => { document.getElementById('prune-btn')?.click(); stationRenderChangesDock(selectedPath); } },
     stationDockRouteAction('Route changes tab', 'activity', 'changes'),
@@ -13638,6 +13673,7 @@ function stationRenderChangesDock(selectedPath = stationSelectedChangePath || ac
         active: row.id && row.id === selectedPath,
         actions: [
           row.id ? { label: 'View', primary: true, onClick: () => stationSelectChange(row.id) } : null,
+          row.id ? { label: 'Copy diff', onClick: async () => stationCopyChangeDiffFromDock(row.id) } : null,
           row.id ? { label: 'Copy path', onClick: () => copyTextToClipboard(row.id) } : null,
         ],
       });
@@ -13649,6 +13685,11 @@ function stationRenderChangesDock(selectedPath = stationSelectedChangePath || ac
     stationDockEmpty(diff, 'Select a changed file to view its diff in Station.');
   } else {
     stationDockRow(diff, 'file', selectedPath);
+    stationDockActions(diff, [
+      { label: 'Copy diff', primary: true, onClick: async () => stationCopyChangeDiffFromDock(selectedPath) },
+      { label: 'Copy path', onClick: () => copyTextToClipboard(selectedPath) },
+      { label: 'Refresh file', onClick: async () => stationSelectChange(selectedPath) },
+    ]);
     const legacy = document.getElementById('changes-diff-content');
     const box = document.createElement('div');
     box.className = 'station-dock-diff';
