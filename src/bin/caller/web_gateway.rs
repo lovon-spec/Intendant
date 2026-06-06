@@ -77,12 +77,19 @@ static SESSION_LIST_ROW_CACHE: OnceLock<Mutex<HashMap<String, SessionListRowCach
     OnceLock::new();
 static CODEX_SESSION_LIST_CACHE: OnceLock<Mutex<HashMap<String, CodexSessionListCacheEntry>>> =
     OnceLock::new();
+static CODEX_PARENT_USAGE_BASELINE_CACHE: OnceLock<
+    Mutex<HashMap<String, CodexParentUsageBaselineCacheEntry>>,
+> = OnceLock::new();
 static INTENDANT_SESSION_LIST_CACHE: OnceLock<
     Mutex<HashMap<String, IntendantSessionListCacheEntry>>,
 > = OnceLock::new();
 
 const EXTERNAL_SESSION_SCAN_LIMIT: usize = 2_000;
 const EXTERNAL_SESSION_READ_LIMIT: u64 = 512 * 1024;
+// Exact fork baselines are a synchronous `/api/sessions` refinement. The scanner
+// below parses compact Codex token lines without materializing full JSON values.
+const CODEX_PARENT_BASELINE_MAX_FILE_BYTES: u64 = 1024 * 1024 * 1024;
+const CODEX_PARENT_BASELINE_SCAN_BUDGET_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const WORKTREE_OBSERVED_SESSION_FILE_LIMIT: usize = 1_000;
 const WORKTREE_OBSERVED_HINT_LIMIT: usize = 1_000;
 const WORKTREE_OBSERVED_PATHS_PER_SESSION: usize = 32;
@@ -167,6 +174,12 @@ struct CodexUsageEvent {
 struct CodexSessionListCacheEntry {
     key: SessionListCacheKey,
     summary: CodexSessionListSummary,
+}
+
+#[derive(Clone, Debug)]
+struct CodexParentUsageBaselineCacheEntry {
+    key: SessionListCacheKey,
+    usage: Option<SessionUsage>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -4559,6 +4572,33 @@ fn store_codex_session_list_entry(key: SessionListCacheKey, summary: CodexSessio
     cache.insert(slot, CodexSessionListCacheEntry { key, summary });
 }
 
+fn codex_parent_usage_baseline_cache(
+) -> &'static Mutex<HashMap<String, CodexParentUsageBaselineCacheEntry>> {
+    CODEX_PARENT_USAGE_BASELINE_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn cached_codex_parent_usage_baseline(key: &SessionListCacheKey) -> Option<Option<SessionUsage>> {
+    let slot = session_list_cache_slot(key);
+    let cache = codex_parent_usage_baseline_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    cache
+        .get(&slot)
+        .filter(|entry| &entry.key == key)
+        .map(|entry| entry.usage)
+}
+
+fn store_codex_parent_usage_baseline(key: SessionListCacheKey, usage: Option<SessionUsage>) {
+    let slot = session_list_cache_slot(&key);
+    let mut cache = codex_parent_usage_baseline_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if cache.len() >= SESSION_LIST_ROW_CACHE_LIMIT && !cache.contains_key(&slot) {
+        cache.clear();
+    }
+    cache.insert(slot, CodexParentUsageBaselineCacheEntry { key, usage });
+}
+
 fn intendant_session_list_cache() -> &'static Mutex<HashMap<String, IntendantSessionListCacheEntry>>
 {
     INTENDANT_SESSION_LIST_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
@@ -4961,6 +5001,18 @@ fn codex_usage_bucket<'a>(
 }
 
 fn codex_session_usage_from_payload(payload: &serde_json::Value) -> Option<SessionUsage> {
+    codex_session_usage_from_payload_bucket(
+        payload,
+        &["total_token_usage", "totalTokenUsage", "total"],
+        true,
+    )
+}
+
+fn codex_session_usage_from_payload_bucket(
+    payload: &serde_json::Value,
+    bucket_names: &[&str],
+    fallback_to_info: bool,
+) -> Option<SessionUsage> {
     let info = payload
         .get("info")
         .or_else(|| payload.get("tokenUsage"))
@@ -4968,7 +5020,8 @@ fn codex_session_usage_from_payload(payload: &serde_json::Value) -> Option<Sessi
     if info.is_null() {
         return None;
     }
-    let total = codex_usage_bucket(info, &["total_token_usage", "total"]).unwrap_or(info);
+    let total =
+        codex_usage_bucket(info, bucket_names).or_else(|| fallback_to_info.then_some(info))?;
     let prompt_tokens = value_u64_at(total, &["/input_tokens", "/inputTokens"])?;
     let completion_tokens = value_u64_at(total, &["/output_tokens", "/outputTokens"]).unwrap_or(0);
     let cached_tokens = value_u64_at(
@@ -5116,13 +5169,246 @@ fn codex_usage_at_or_before(
     selected
 }
 
+fn json_compact_string_field<'a>(line: &'a str, key: &str) -> Option<&'a str> {
+    let marker = format!("\"{key}\":\"");
+    let start = line.find(&marker)? + marker.len();
+    let rest = &line[start..];
+    let end = rest.find('"')?;
+    Some(&rest[..end])
+}
+
+fn json_compact_u64_field(object: &str, key: &str) -> Option<u64> {
+    let marker = format!("\"{key}\":");
+    let start = object.find(&marker)? + marker.len();
+    let bytes = object.as_bytes();
+    let mut i = start;
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    let digits_start = i;
+    while i < bytes.len() && bytes[i].is_ascii_digit() {
+        i += 1;
+    }
+    if i == digits_start {
+        return None;
+    }
+    object[digits_start..i].parse().ok()
+}
+
+fn json_compact_object_for_key<'a>(line: &'a str, key: &str) -> Option<&'a str> {
+    let marker = format!("\"{key}\":{{");
+    let object_start = line.find(&marker)? + marker.len() - 1;
+    let bytes = line.as_bytes();
+    let mut depth = 0i32;
+    let mut in_string = false;
+    let mut escaped = false;
+    for i in object_start..bytes.len() {
+        let byte = bytes[i];
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if in_string {
+            if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match byte {
+            b'"' => in_string = true,
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(&line[object_start..=i]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn codex_usage_from_compact_total_bucket(bucket: &str) -> Option<SessionUsage> {
+    let prompt_tokens = json_compact_u64_field(bucket, "input_tokens")
+        .or_else(|| json_compact_u64_field(bucket, "inputTokens"))?;
+    let completion_tokens = json_compact_u64_field(bucket, "output_tokens")
+        .or_else(|| json_compact_u64_field(bucket, "outputTokens"))
+        .unwrap_or(0);
+    let cached_tokens = json_compact_u64_field(bucket, "cached_input_tokens")
+        .or_else(|| json_compact_u64_field(bucket, "cachedInputTokens"))
+        .or_else(|| json_compact_u64_field(bucket, "cached_tokens"))
+        .or_else(|| json_compact_u64_field(bucket, "cachedTokens"))
+        .unwrap_or(0);
+    let total_tokens = json_compact_u64_field(bucket, "total_tokens")
+        .or_else(|| json_compact_u64_field(bucket, "totalTokens"))
+        .unwrap_or_else(|| prompt_tokens + completion_tokens);
+    Some(SessionUsage {
+        total_tokens,
+        prompt_tokens,
+        completion_tokens,
+        cache_creation_tokens: 0,
+        cached_tokens,
+    })
+}
+
+fn codex_token_count_usage_from_line(line: &str) -> Option<(i64, SessionUsage)> {
+    if line.contains("\"type\":\"event_msg\"") && line.contains("\"type\":\"token_count\"") {
+        let timestamp = json_compact_string_field(line, "timestamp")?;
+        let event_ts = timestamp_sort_secs(timestamp);
+        if event_ts <= 0 {
+            return None;
+        }
+        let bucket = json_compact_object_for_key(line, "total_token_usage")
+            .or_else(|| json_compact_object_for_key(line, "totalTokenUsage"))
+            .or_else(|| json_compact_object_for_key(line, "total"))?;
+        let usage = codex_usage_from_compact_total_bucket(bucket)?;
+        return Some((event_ts, usage));
+    }
+
+    let Ok(obj) = serde_json::from_str::<serde_json::Value>(line) else {
+        return None;
+    };
+    if obj.get("type").and_then(|v| v.as_str()) != Some("event_msg") {
+        return None;
+    }
+    let payload = obj.get("payload")?;
+    if payload.get("type").and_then(|v| v.as_str()) != Some("token_count") {
+        return None;
+    }
+    let parsed = codex_session_usage_from_payload(payload)?;
+    let event_ts = value_str(&obj, "timestamp")
+        .as_deref()
+        .map(timestamp_sort_secs)
+        .unwrap_or(0);
+    if event_ts <= 0 {
+        return None;
+    }
+    Some((event_ts, parsed))
+}
+
+fn codex_usage_baselines_from_file(
+    path: &Path,
+    cutoff_secs: &[i64],
+) -> HashMap<i64, Option<SessionUsage>> {
+    let mut cutoffs = cutoff_secs
+        .iter()
+        .copied()
+        .filter(|cutoff| *cutoff > 0)
+        .collect::<Vec<_>>();
+    cutoffs.sort_unstable();
+    cutoffs.dedup();
+
+    let mut baselines = HashMap::new();
+    let mut uncached_cutoffs = Vec::new();
+    for cutoff in cutoffs {
+        let Some(key) = session_list_cache_key("codex-parent-baseline", path, cutoff.to_string())
+        else {
+            uncached_cutoffs.push(cutoff);
+            continue;
+        };
+        if let Some(usage) = cached_codex_parent_usage_baseline(&key) {
+            baselines.insert(cutoff, usage);
+        } else {
+            uncached_cutoffs.push(cutoff);
+        }
+    }
+    if uncached_cutoffs.is_empty() {
+        return baselines;
+    }
+
+    let scanned = codex_usage_baselines_from_file_uncached(path, &uncached_cutoffs);
+    for cutoff in uncached_cutoffs {
+        let usage = scanned.get(&cutoff).copied().unwrap_or(None);
+        if let Some(key) = session_list_cache_key("codex-parent-baseline", path, cutoff.to_string())
+        {
+            store_codex_parent_usage_baseline(key, usage);
+        }
+        baselines.insert(cutoff, usage);
+    }
+    baselines
+}
+
+fn codex_usage_baselines_from_file_uncached(
+    path: &Path,
+    cutoff_secs: &[i64],
+) -> HashMap<i64, Option<SessionUsage>> {
+    let mut cutoffs = cutoff_secs
+        .iter()
+        .copied()
+        .filter(|cutoff| *cutoff > 0)
+        .collect::<Vec<_>>();
+    cutoffs.sort_unstable();
+    cutoffs.dedup();
+
+    let mut baselines = HashMap::new();
+    if cutoffs.is_empty() {
+        return baselines;
+    }
+
+    let Ok(file) = std::fs::File::open(path) else {
+        for cutoff in cutoffs {
+            baselines.insert(cutoff, None);
+        }
+        return baselines;
+    };
+
+    let reader = std::io::BufReader::new(file);
+    let mut cutoff_index = 0usize;
+    let mut selected = None;
+    for line in reader.lines().map_while(Result::ok) {
+        let line = line.trim();
+        if line.is_empty() || !line.contains("\"token_count\"") {
+            continue;
+        }
+        let Some((event_ts, parsed)) = codex_token_count_usage_from_line(line) else {
+            continue;
+        };
+
+        while cutoff_index < cutoffs.len() && cutoffs[cutoff_index] < event_ts {
+            baselines.insert(cutoffs[cutoff_index], selected);
+            cutoff_index += 1;
+        }
+        if cutoff_index >= cutoffs.len() {
+            break;
+        }
+
+        selected = Some(parsed);
+    }
+
+    while cutoff_index < cutoffs.len() {
+        baselines.insert(cutoffs[cutoff_index], selected);
+        cutoff_index += 1;
+    }
+
+    baselines
+}
+
 fn codex_incremental_session_usage(
     summary: &CodexSessionListSummary,
     usage_events_by_id: &HashMap<String, Vec<CodexUsageEvent>>,
+    exact_parent_baselines: &HashMap<(String, i64), Option<SessionUsage>>,
 ) -> SessionUsage {
     let Some(parent_id) = summary.parent_id.as_deref() else {
         return summary.usage;
     };
+
+    let cutoff = summary
+        .created_at
+        .as_deref()
+        .map(timestamp_sort_secs)
+        .unwrap_or(0);
+    if cutoff > 0 {
+        let exact_key = (parent_id.to_string(), cutoff);
+        if let Some(exact_baseline) = exact_parent_baselines.get(&exact_key) {
+            return exact_baseline
+                .map(|baseline| summary.usage.saturating_sub(baseline))
+                .unwrap_or(summary.usage);
+        }
+    }
+
     let Some(parent_events) = usage_events_by_id.get(parent_id) else {
         return summary.usage;
     };
@@ -5307,6 +5593,7 @@ fn list_codex_sessions_with_limit(home: &Path, scan_limit: usize) -> Vec<serde_j
     let mut model_by_id: HashMap<String, String> = HashMap::new();
     let mut parent_by_id: HashMap<String, String> = HashMap::new();
     let mut usage_events_by_id: HashMap<String, Vec<CodexUsageEvent>> = HashMap::new();
+    let mut path_by_id: HashMap<String, PathBuf> = HashMap::new();
     let index_path = codex.join("session_index.jsonl");
     if let Ok(contents) = std::fs::read_to_string(&index_path) {
         for line in contents.lines() {
@@ -5362,7 +5649,59 @@ fn list_codex_sessions_with_limit(home: &Path, scan_limit: usize) -> Vec<serde_j
             parent_by_id.insert(id.clone(), parent_id);
         }
         usage_events_by_id.insert(id, summary.usage_events.clone());
+        path_by_id.insert(summary.id.clone(), path.clone());
         summaries.push((path, summary));
+    }
+
+    let mut parent_cutoffs_by_id: HashMap<String, Vec<i64>> = HashMap::new();
+    for (_, summary) in &summaries {
+        let Some(parent_id) = summary.parent_id.as_ref() else {
+            continue;
+        };
+        let Some(parent_path) = path_by_id.get(parent_id) else {
+            continue;
+        };
+        if file_size(parent_path) <= (EXTERNAL_SESSION_READ_LIMIT * 2) as u64 {
+            continue;
+        }
+        let cutoff = summary
+            .created_at
+            .as_deref()
+            .map(timestamp_sort_secs)
+            .unwrap_or(0);
+        if cutoff > 0 {
+            parent_cutoffs_by_id
+                .entry(parent_id.clone())
+                .or_default()
+                .push(cutoff);
+        }
+    }
+
+    let mut parent_cutoffs = parent_cutoffs_by_id
+        .into_iter()
+        .filter_map(|(parent_id, cutoffs)| {
+            path_by_id
+                .get(&parent_id)
+                .map(|path| (parent_id, file_size(path), cutoffs))
+        })
+        .collect::<Vec<_>>();
+    parent_cutoffs.sort_by(|a, b| b.2.len().cmp(&a.2.len()).then(a.1.cmp(&b.1)));
+
+    let mut exact_parent_baselines: HashMap<(String, i64), Option<SessionUsage>> = HashMap::new();
+    let mut remaining_exact_scan_budget = CODEX_PARENT_BASELINE_SCAN_BUDGET_BYTES;
+    for (parent_id, parent_bytes, cutoffs) in parent_cutoffs {
+        if parent_bytes > CODEX_PARENT_BASELINE_MAX_FILE_BYTES
+            || parent_bytes > remaining_exact_scan_budget
+        {
+            continue;
+        }
+        let Some(parent_path) = path_by_id.get(&parent_id) else {
+            continue;
+        };
+        remaining_exact_scan_budget = remaining_exact_scan_budget.saturating_sub(parent_bytes);
+        for (cutoff, usage) in codex_usage_baselines_from_file(parent_path, &cutoffs) {
+            exact_parent_baselines.insert((parent_id.clone(), cutoff), usage);
+        }
     }
 
     for (path, summary) in summaries {
@@ -5405,7 +5744,8 @@ fn list_codex_sessions_with_limit(home: &Path, scan_limit: usize) -> Vec<serde_j
             Some(path.to_string_lossy().to_string()),
             summary.bytes,
         );
-        let usage = codex_incremental_session_usage(&summary, &usage_events_by_id);
+        let usage =
+            codex_incremental_session_usage(&summary, &usage_events_by_id, &exact_parent_baselines);
         apply_session_usage(&mut session, usage, summary.model.as_deref());
         rows.insert(id, session);
     }
@@ -20978,6 +21318,159 @@ mod tests {
             (cost - 0.0011625).abs() < 1e-12,
             "unexpected child cost {cost}"
         );
+    }
+
+    #[test]
+    fn list_codex_sessions_full_scans_large_parent_for_fork_baseline() {
+        let home = tempfile::tempdir().unwrap();
+        let sessions_dir = home
+            .path()
+            .join(".codex")
+            .join("sessions")
+            .join("2026")
+            .join("05")
+            .join("17");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+
+        let parent_id = "019e37c5-large-parent-thread";
+        let child_id = "019e37c5-child-large-parent";
+        let large_padding = "x".repeat(EXTERNAL_SESSION_READ_LIMIT as usize + 1024);
+        let parent_head = serde_json::json!({
+            "timestamp": "2026-05-17T21:09:00Z",
+            "type": "session_meta",
+            "payload": {
+                "id": parent_id,
+                "timestamp": "2026-05-17T21:09:00Z",
+                "model": "gpt-5.4",
+                "model_provider": "openai"
+            }
+        })
+        .to_string();
+        let parent_early_usage = serde_json::json!({
+            "timestamp": "2026-05-17T21:09:10Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": {
+                    "total_token_usage": {
+                        "input_tokens": 1000,
+                        "cached_input_tokens": 400,
+                        "output_tokens": 250,
+                        "total_tokens": 1250
+                    }
+                }
+            }
+        })
+        .to_string();
+        let parent_middle_usage = serde_json::json!({
+            "timestamp": "2026-05-17T21:09:59Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": {
+                    "total_token_usage": {
+                        "input_tokens": 2000,
+                        "cached_input_tokens": 700,
+                        "output_tokens": 500,
+                        "total_tokens": 2500
+                    }
+                }
+            }
+        })
+        .to_string();
+        let parent_late_usage = serde_json::json!({
+            "timestamp": "2026-05-17T21:12:00Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": {
+                    "total_token_usage": {
+                        "input_tokens": 6000,
+                        "cached_input_tokens": 1200,
+                        "output_tokens": 900,
+                        "total_tokens": 6900
+                    }
+                }
+            }
+        })
+        .to_string();
+        let parent_contents = [
+            parent_head,
+            parent_early_usage,
+            large_padding.clone(),
+            parent_middle_usage,
+            large_padding,
+            parent_late_usage,
+        ]
+        .join("\n");
+        let child_lines = [
+            serde_json::json!({
+                "timestamp": "2026-05-17T21:10:00Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": child_id,
+                    "forked_from_id": parent_id,
+                    "timestamp": "2026-05-17T21:10:00Z",
+                    "model": "gpt-5.4",
+                    "model_provider": "openai"
+                }
+            }),
+            serde_json::json!({
+                "timestamp": "2026-05-17T21:10:30Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "total_token_usage": {
+                            "input_tokens": 2400,
+                            "cached_input_tokens": 850,
+                            "output_tokens": 550,
+                            "total_tokens": 2950
+                        }
+                    }
+                }
+            }),
+            serde_json::json!({
+                "timestamp": "2026-05-17T21:11:30Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "total_token_usage": {
+                            "input_tokens": 2700,
+                            "cached_input_tokens": 950,
+                            "output_tokens": 650,
+                            "total_tokens": 3350
+                        }
+                    }
+                }
+            }),
+        ];
+        std::fs::write(
+            sessions_dir.join(format!("rollout-2026-05-17T21-09-00-{parent_id}.jsonl")),
+            parent_contents,
+        )
+        .unwrap();
+        std::fs::write(
+            sessions_dir.join(format!("rollout-2026-05-17T21-10-00-{child_id}.jsonl")),
+            child_lines
+                .iter()
+                .map(serde_json::Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+
+        let sessions = list_codex_sessions(home.path());
+        let child = sessions
+            .iter()
+            .find(|s| s.get("session_id").and_then(|v| v.as_str()) == Some(child_id))
+            .expect("child codex session should be listed");
+
+        assert_eq!(child["prompt_tokens"].as_u64(), Some(700));
+        assert_eq!(child["completion_tokens"].as_u64(), Some(150));
+        assert_eq!(child["cached_tokens"].as_u64(), Some(250));
+        assert_eq!(child["total_tokens"].as_u64(), Some(850));
     }
 
     #[test]

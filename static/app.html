@@ -3313,6 +3313,184 @@ body.context-focus-active {
 .cost-grid .label { color: var(--overlay1); }
 .cost-grid .value { text-align: right; color: var(--green); font-weight: 600; }
 
+/* Token activity */
+.token-activity-section {
+  overflow: hidden;
+}
+.token-activity-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+.token-activity-head .cost-title {
+  margin-bottom: 0;
+}
+.token-activity-controls {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+.token-activity-segment {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 2px;
+  background: var(--surface0);
+  border: 1px solid var(--surface1);
+  border-radius: 6px;
+}
+.token-activity-segment button {
+  height: 24px;
+  padding: 0 8px;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--overlay1);
+  font: inherit;
+  font-size: 11px;
+  line-height: 1;
+  cursor: pointer;
+}
+.token-activity-segment button:hover {
+  color: var(--text);
+  background: var(--surface1);
+}
+.token-activity-segment button:disabled {
+  color: var(--surface2);
+  cursor: default;
+}
+.token-activity-segment button:disabled:hover {
+  background: transparent;
+}
+.token-activity-segment button.active {
+  color: var(--crust);
+  background: var(--blue);
+}
+.token-activity-stats {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  border: 1px solid var(--surface0);
+  border-radius: 8px;
+  margin-bottom: 14px;
+  overflow: hidden;
+}
+.token-activity-stat {
+  min-width: 0;
+  padding: 10px 12px;
+  text-align: center;
+  border-right: 1px solid var(--surface0);
+}
+.token-activity-stat:last-child {
+  border-right: 0;
+}
+.token-activity-stat .value {
+  color: var(--text);
+  font-size: 18px;
+  font-weight: 650;
+  line-height: 1.25;
+  font-variant-numeric: tabular-nums;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.token-activity-stat .label {
+  color: var(--overlay1);
+  font-size: 11px;
+  line-height: 1.25;
+  margin-top: 2px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.token-activity-skyline {
+  height: 96px;
+  display: grid;
+  grid-auto-flow: column;
+  grid-auto-columns: minmax(3px, 1fr);
+  align-items: end;
+  gap: 2px;
+  padding: 10px 0 2px;
+  margin-bottom: 12px;
+  border-bottom: 1px solid var(--surface0);
+}
+.token-activity-skyline-bar {
+  min-height: 2px;
+  border-radius: 3px 3px 0 0;
+  background: linear-gradient(180deg, var(--peach), var(--blue));
+  opacity: 0.82;
+}
+.token-activity-skyline-bar.empty {
+  background: var(--surface0);
+  opacity: 0.75;
+}
+.token-activity-heatmap-wrap {
+  overflow-x: auto;
+  padding-bottom: 2px;
+}
+.token-activity-months,
+.token-activity-heatmap {
+  display: grid;
+  grid-template-columns: repeat(53, minmax(10px, 1fr));
+  min-width: 720px;
+}
+.token-activity-months {
+  margin-bottom: 6px;
+  color: var(--overlay1);
+  font-size: 11px;
+}
+.token-activity-month {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: clip;
+  white-space: nowrap;
+}
+.token-activity-heatmap {
+  grid-template-rows: repeat(7, 12px);
+  grid-auto-flow: column;
+  gap: 4px;
+}
+.token-activity-day {
+  width: 100%;
+  height: 12px;
+  border-radius: 3px;
+  background: var(--surface0);
+}
+.token-activity-day.future {
+  opacity: 0.45;
+}
+.token-activity-day.level-1 { background: color-mix(in srgb, var(--blue) 22%, var(--surface0)); }
+.token-activity-day.level-2 { background: color-mix(in srgb, var(--sapphire) 42%, var(--surface0)); }
+.token-activity-day.level-3 { background: color-mix(in srgb, var(--green) 56%, var(--surface0)); }
+.token-activity-day.level-4 { background: color-mix(in srgb, var(--yellow) 72%, var(--surface0)); }
+.token-activity-day.level-5 { background: color-mix(in srgb, var(--peach) 88%, var(--surface0)); }
+.token-activity-empty {
+  padding: 12px 0;
+  color: var(--overlay1);
+  font-size: 13px;
+}
+@media (max-width: 760px) {
+  .token-activity-head {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+  .token-activity-controls {
+    justify-content: flex-start;
+  }
+  .token-activity-stats {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .token-activity-stat:nth-child(2) {
+    border-right: 0;
+  }
+  .token-activity-stat:nth-child(-n + 2) {
+    border-bottom: 1px solid var(--surface0);
+  }
+}
+
 /* Display transport metrics */
 .display-metrics-table {
   width: 100%;
@@ -8351,6 +8529,30 @@ body.display-fullscreen-open {
         <div class="token-history" id="token-history" style="display:none">
           <div class="history-title">Tokens per Turn</div>
           <div class="history-chart" id="history-chart"></div>
+        </div>
+        <div class="cost-section token-activity-section" id="token-activity-section" style="display:none">
+          <div class="token-activity-head">
+            <div class="cost-title" id="token-activity-title">Token Activity</div>
+            <div class="token-activity-controls">
+              <div class="token-activity-segment" id="token-activity-agent" role="tablist" aria-label="Token activity agent">
+                <button type="button" data-agent="codex">Codex</button>
+                <button type="button" data-agent="all">All</button>
+                <button type="button" data-agent="claude">Claude</button>
+                <button type="button" data-agent="gemini">Gemini</button>
+              </div>
+              <div class="token-activity-segment" id="token-activity-view" role="tablist" aria-label="Token activity view">
+                <button type="button" data-view="daily">Daily</button>
+                <button type="button" data-view="weekly">Weekly</button>
+                <button type="button" data-view="cumulative">Cumulative</button>
+              </div>
+            </div>
+          </div>
+          <div class="token-activity-stats" id="token-activity-stats"></div>
+          <div class="token-activity-skyline" id="token-activity-skyline"></div>
+          <div class="token-activity-heatmap-wrap">
+            <div class="token-activity-months" id="token-activity-months"></div>
+            <div class="token-activity-heatmap" id="token-activity-heatmap"></div>
+          </div>
         </div>
         <div class="cost-section" id="all-sessions-usage" style="display:none">
           <div class="cost-title">All Sessions</div>
@@ -31023,6 +31225,7 @@ function currentStatsHostKey() {
 }
 
 function renderStatsSessionSections(sessions) {
+  renderTokenActivity(sessions);
   renderAllSessionsUsage(sessions);
   renderDiskUsage(sessions);
 }
@@ -31166,6 +31369,313 @@ function summarizeUsageByAgent(sessions) {
   }
 
   return Array.from(buckets.values()).filter(b => b.sessions > 0);
+}
+
+let tokenActivityAgent = 'codex';
+let tokenActivityView = 'daily';
+const TOKEN_ACTIVITY_WEEKS = 53;
+const TOKEN_ACTIVITY_DAYS = TOKEN_ACTIVITY_WEEKS * 7;
+const TOKEN_ACTIVITY_SKYLINE_DAYS = 84;
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+function tokenActivityAgentLabel(key) {
+  return {
+    all: 'All',
+    codex: 'Codex',
+    claude: 'Claude',
+    gemini: 'Gemini',
+    intendant: 'Intendant',
+    other: 'Other',
+  }[key] || key;
+}
+
+function tokenActivityIsoToday() {
+  return new Date().toISOString().slice(0, 10);
+}
+
+function parseIsoDayMs(iso) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(String(iso || ''))) return null;
+  const [year, month, day] = iso.split('-').map(Number);
+  return Date.UTC(year, month - 1, day);
+}
+
+function isoDayFromMs(ms) {
+  return new Date(ms).toISOString().slice(0, 10);
+}
+
+function addIsoDays(iso, days) {
+  const ms = parseIsoDayMs(iso);
+  return ms == null ? null : isoDayFromMs(ms + days * DAY_MS);
+}
+
+function startOfWeekIso(iso) {
+  const ms = parseIsoDayMs(iso);
+  if (ms == null) return tokenActivityIsoToday();
+  const d = new Date(ms);
+  return isoDayFromMs(ms - d.getUTCDay() * DAY_MS);
+}
+
+function sessionActivityDay(session) {
+  const raw = session && (session.updated_at || session.created_at);
+  if (!raw) return null;
+  const text = String(raw);
+  const m = /^(\d{4}-\d{2}-\d{2})/.exec(text);
+  if (m) return m[1];
+  const parsed = Date.parse(text);
+  return Number.isNaN(parsed) ? null : new Date(parsed).toISOString().slice(0, 10);
+}
+
+function formatCompactNumber(value, digits = 1) {
+  const n = Number(value || 0);
+  if (!Number.isFinite(n)) return '--';
+  return new Intl.NumberFormat(undefined, {
+    maximumFractionDigits: digits,
+    notation: 'compact',
+  }).format(Math.max(0, Math.round(n)));
+}
+
+function formatShortIsoDate(iso) {
+  const ms = parseIsoDayMs(iso);
+  if (ms == null) return '--';
+  return new Intl.DateTimeFormat(undefined, {
+    day: 'numeric',
+    month: 'short',
+    timeZone: 'UTC',
+  }).format(new Date(ms));
+}
+
+function formatMonthLabel(iso) {
+  const ms = parseIsoDayMs(iso);
+  if (ms == null) return '';
+  return new Intl.DateTimeFormat(undefined, {
+    month: 'short',
+    timeZone: 'UTC',
+  }).format(new Date(ms));
+}
+
+function tokenActivitySessionMatches(session, agentKey) {
+  if (agentKey === 'all') return true;
+  return agentUsageKey(session) === agentKey;
+}
+
+function tokenActivityAvailableAgents(sessions) {
+  const available = new Set(['all']);
+  for (const s of sessions) {
+    const total = sessionNumber(s.total_tokens) || sessionNumber(s.prompt_tokens) + sessionNumber(s.completion_tokens);
+    if (total > 0) available.add(agentUsageKey(s));
+  }
+  return available;
+}
+
+function ensureTokenActivityAgent(sessions) {
+  const available = tokenActivityAvailableAgents(sessions);
+  if (available.has(tokenActivityAgent)) return available;
+  tokenActivityAgent = available.has('codex') ? 'codex' : 'all';
+  return available;
+}
+
+function buildTokenActivityDaily(sessions, agentKey) {
+  const daily = new Map();
+  let lifetime = 0;
+  let activeSessions = 0;
+  for (const s of sessions) {
+    if (!tokenActivitySessionMatches(s, agentKey)) continue;
+    const day = sessionActivityDay(s);
+    if (!day) continue;
+    const input = sessionNumber(s.prompt_tokens);
+    const output = sessionNumber(s.completion_tokens);
+    const total = sessionNumber(s.total_tokens) || input + output;
+    if (total <= 0) continue;
+    activeSessions += 1;
+    lifetime += total;
+    daily.set(day, (daily.get(day) || 0) + total);
+  }
+  return { daily, lifetime, activeSessions };
+}
+
+function buildTokenActivityWeeks(daily) {
+  const weeks = new Map();
+  for (const [day, value] of daily) {
+    const week = startOfWeekIso(day);
+    weeks.set(week, (weeks.get(week) || 0) + value);
+  }
+  return weeks;
+}
+
+function tokenActivityCellLevel(value, max) {
+  if (value <= 0 || max <= 0) return 0;
+  const ratio = value / max;
+  if (ratio > 0.75) return 5;
+  if (ratio > 0.50) return 4;
+  if (ratio > 0.25) return 3;
+  if (ratio > 0.10) return 2;
+  return 1;
+}
+
+function tokenActivityStatHtml(value, label) {
+  return `
+    <div class="token-activity-stat">
+      <div class="value">${escapeHtml(value)}</div>
+      <div class="label">${escapeHtml(label)}</div>
+    </div>
+  `;
+}
+
+function tokenActivityBuildSeries(daily, todayIso) {
+  const startIso = addIsoDays(startOfWeekIso(todayIso), -(TOKEN_ACTIVITY_WEEKS - 1) * 7);
+  const weeks = buildTokenActivityWeeks(daily);
+  const days = [];
+  let cumulative = 0;
+  for (let i = 0; i < TOKEN_ACTIVITY_DAYS; i += 1) {
+    const day = addIsoDays(startIso, i);
+    const dailyValue = daily.get(day) || 0;
+    cumulative += dailyValue;
+    days.push({
+      day,
+      daily: dailyValue,
+      weekly: weeks.get(startOfWeekIso(day)) || 0,
+      cumulative,
+      future: day > todayIso,
+    });
+  }
+  return { startIso, days };
+}
+
+function tokenActivityValueForCell(cell) {
+  if (!cell) return 0;
+  if (tokenActivityView === 'weekly') return cell.weekly;
+  if (tokenActivityView === 'cumulative') return cell.cumulative;
+  return cell.daily;
+}
+
+function renderTokenActivityControls(sessions) {
+  const available = ensureTokenActivityAgent(sessions);
+  const agentEl = document.getElementById('token-activity-agent');
+  if (agentEl) {
+    for (const btn of agentEl.querySelectorAll('button[data-agent]')) {
+      const agent = btn.dataset.agent;
+      const isAvailable = available.has(agent);
+      btn.disabled = !isAvailable;
+      btn.classList.toggle('active', agent === tokenActivityAgent);
+    }
+  }
+  const viewEl = document.getElementById('token-activity-view');
+  if (viewEl) {
+    for (const btn of viewEl.querySelectorAll('button[data-view]')) {
+      btn.classList.toggle('active', btn.dataset.view === tokenActivityView);
+    }
+  }
+  const title = document.getElementById('token-activity-title');
+  if (title) title.textContent = `${tokenActivityAgentLabel(tokenActivityAgent)} Token Activity`;
+}
+
+function renderTokenActivityMonths(startIso) {
+  const el = document.getElementById('token-activity-months');
+  if (!el) return;
+  el.innerHTML = '';
+  let lastMonth = '';
+  for (let col = 0; col < TOKEN_ACTIVITY_WEEKS; col += 1) {
+    const day = addIsoDays(startIso, col * 7);
+    const month = day.slice(0, 7);
+    if (month === lastMonth && col !== 0) continue;
+    lastMonth = month;
+    const span = document.createElement('span');
+    span.className = 'token-activity-month';
+    span.style.gridColumn = `${col + 1} / span 4`;
+    span.textContent = formatMonthLabel(day);
+    el.appendChild(span);
+  }
+}
+
+function renderTokenActivitySkyline(days, todayIso) {
+  const el = document.getElementById('token-activity-skyline');
+  if (!el) return;
+  const startIso = addIsoDays(todayIso, -(TOKEN_ACTIVITY_SKYLINE_DAYS - 1));
+  const startMs = parseIsoDayMs(startIso);
+  const endMs = parseIsoDayMs(todayIso);
+  const visible = days.filter(cell => {
+    const ms = parseIsoDayMs(cell.day);
+    return ms != null && ms >= startMs && ms <= endMs;
+  });
+  const values = visible.map(tokenActivityValueForCell);
+  const max = Math.max(0, ...values);
+  el.innerHTML = '';
+  for (const cell of visible) {
+    const value = tokenActivityValueForCell(cell);
+    const bar = document.createElement('div');
+    bar.className = 'token-activity-skyline-bar';
+    if (value <= 0) bar.classList.add('empty');
+    bar.style.height = `${Math.max(3, Math.round((value / Math.max(1, max)) * 86))}px`;
+    bar.title = `${formatCompactNumber(value)} tokens, ${formatShortIsoDate(cell.day)}`;
+    el.appendChild(bar);
+  }
+}
+
+function renderTokenActivityHeatmap(days, startIso, todayIso) {
+  const el = document.getElementById('token-activity-heatmap');
+  if (!el) return;
+  renderTokenActivityMonths(startIso);
+  const values = days.filter(cell => !cell.future).map(tokenActivityValueForCell);
+  const max = Math.max(0, ...values);
+  el.innerHTML = '';
+  for (const cell of days) {
+    const value = tokenActivityValueForCell(cell);
+    const div = document.createElement('div');
+    const level = tokenActivityCellLevel(cell.future ? 0 : value, max);
+    div.className = `token-activity-day level-${level}${cell.future ? ' future' : ''}`;
+    div.title = cell.future
+      ? formatShortIsoDate(cell.day)
+      : `${formatCompactNumber(value)} tokens, ${formatShortIsoDate(cell.day)}`;
+    el.appendChild(div);
+  }
+}
+
+function renderTokenActivity(sessions) {
+  const section = document.getElementById('token-activity-section');
+  const statsEl = document.getElementById('token-activity-stats');
+  const heatmapEl = document.getElementById('token-activity-heatmap');
+  const skylineEl = document.getElementById('token-activity-skyline');
+  if (!section || !statsEl || !heatmapEl || !skylineEl) return;
+  if (!Array.isArray(sessions) || sessions.length === 0) {
+    section.style.display = 'none';
+    return;
+  }
+
+  renderTokenActivityControls(sessions);
+  const todayIso = tokenActivityIsoToday();
+  const { daily, lifetime, activeSessions } = buildTokenActivityDaily(sessions, tokenActivityAgent);
+  const activeDays = Array.from(daily.values()).filter(v => v > 0).length;
+  if (activeDays === 0) {
+    section.style.display = 'none';
+    return;
+  }
+
+  let peakDay = null;
+  let peakTokens = 0;
+  let latestDay = null;
+  let latestTokens = 0;
+  for (const [day, tokens] of daily) {
+    if (tokens > peakTokens) {
+      peakTokens = tokens;
+      peakDay = day;
+    }
+    if (day <= todayIso && (!latestDay || day > latestDay)) {
+      latestDay = day;
+      latestTokens = tokens;
+    }
+  }
+
+  statsEl.innerHTML = [
+    tokenActivityStatHtml(formatCompactNumber(lifetime), 'Lifetime'),
+    tokenActivityStatHtml(formatCompactNumber(peakTokens), `Peak ${peakDay ? formatShortIsoDate(peakDay) : ''}`.trim()),
+    tokenActivityStatHtml(activeDays.toLocaleString(), 'Active days'),
+    tokenActivityStatHtml(formatCompactNumber(latestTokens), latestDay ? formatShortIsoDate(latestDay) : 'Latest day'),
+  ].join('');
+
+  const { startIso, days } = tokenActivityBuildSeries(daily, todayIso);
+  renderTokenActivitySkyline(days, todayIso);
+  renderTokenActivityHeatmap(days, startIso, todayIso);
+  section.style.display = 'block';
 }
 
 function renderStatsSummaryCard(title, subtitle, rows) {
@@ -31425,6 +31935,20 @@ function renderDiskUsage(sessions) {
     <span class="value" style="font-weight:600;color:var(--text);border-top:1px solid var(--surface0);padding-top:6px;margin-top:4px">${_fmtBytes(totalBytes)}</span>
   `;
 }
+
+document.getElementById('token-activity-agent')?.addEventListener('click', (event) => {
+  const btn = event.target.closest('button[data-agent]');
+  if (!btn || btn.disabled) return;
+  tokenActivityAgent = btn.dataset.agent || 'codex';
+  renderCachedStatsSessionSections(currentStatsHostKey());
+});
+
+document.getElementById('token-activity-view')?.addEventListener('click', (event) => {
+  const btn = event.target.closest('button[data-view]');
+  if (!btn || btn.disabled) return;
+  tokenActivityView = btn.dataset.view || 'daily';
+  renderCachedStatsSessionSections(currentStatsHostKey());
+});
 
 function focusActivityForSessionEvent(options = {}) {
   const force = !!options.force;
