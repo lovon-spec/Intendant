@@ -203,6 +203,21 @@ fn resolve_external_steer_target_session(
     }
 }
 
+fn external_steer_queue_reason(agent_name: &str, err: &CallerError) -> String {
+    let unsupported = match err {
+        CallerError::ExternalAgent(message) => {
+            message.contains("mid-turn steering not supported")
+                || message.contains("steering not supported")
+        }
+        _ => false,
+    };
+    if unsupported {
+        format!("{agent_name} doesn't support mid-turn steering ({err}); queued as follow-up")
+    } else {
+        format!("{agent_name} native mid-turn steering failed ({err}); queued as follow-up")
+    }
+}
+
 /// Build the [`peer::AuthRequirements`] this daemon advertises in
 /// its own Agent Card from the project's `[server.auth]` config and
 /// the LAN cert dir.
@@ -6035,10 +6050,7 @@ async fn drain_external_agent_events(
                                 });
                             }
                             Err(e) => {
-                                let reason = format!(
-                                    "{} doesn't support mid-turn steering ({}); queued as follow-up",
-                                    agent.name(), e
-                                );
+                                let reason = external_steer_queue_reason(agent.name(), &e);
                                 if let Ok(mut q) = config.context_injection.lock() {
                                     q.push(event::ContextInjection::text_with_steer_id_for_target(
                                         text.clone(),
@@ -12251,6 +12263,34 @@ Also: {"source": "bare"}"#;
             ),
             None
         );
+    }
+
+    #[test]
+    fn external_steer_queue_reason_keeps_unsupported_wording() {
+        let reason = external_steer_queue_reason(
+            "Claude Code",
+            &CallerError::ExternalAgent(
+                "mid-turn steering not supported by this backend".to_string(),
+            ),
+        );
+
+        assert!(reason.contains("Claude Code doesn't support mid-turn steering"));
+        assert!(reason.contains("queued as follow-up"));
+    }
+
+    #[test]
+    fn external_steer_queue_reason_identifies_native_failure() {
+        let reason = external_steer_queue_reason(
+            "Codex",
+            &CallerError::ExternalAgent(
+                "JSON-RPC error -32600: expected active turn id `turn-a` but found `turn-b`"
+                    .to_string(),
+            ),
+        );
+
+        assert!(reason.contains("Codex native mid-turn steering failed"));
+        assert!(!reason.contains("doesn't support"));
+        assert!(reason.contains("queued as follow-up"));
     }
 
     #[test]

@@ -708,8 +708,8 @@ pub enum OutboundEvent {
         id: String,
         reason: String,
     },
-    /// The active backend doesn't support mid-turn steering and the steer
-    /// text was queued for the next turn instead. Paired with a later
+    /// Mid-turn steering could not be delivered natively and the steer text
+    /// was queued for the next turn instead. Paired with a later
     /// `SteerDelivered { mid_turn: false }` once the queue drains.
     SteerQueued {
         #[serde(skip_serializing_if = "Option::is_none")]

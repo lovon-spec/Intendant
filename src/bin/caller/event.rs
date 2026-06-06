@@ -243,8 +243,7 @@ pub enum AppEvent {
         session_id: Option<String>,
         id: String,
         /// Short human-readable explanation of why the queue fallback was
-        /// used (e.g. "Claude Code doesn't support mid-turn steering;
-        /// queued as follow-up").
+        /// used (e.g. "native mid-turn steering failed; queued as follow-up").
         reason: String,
     },
     /// Steering was observed in the agent conversation. `mid_turn = true`
