@@ -12389,6 +12389,70 @@ function stationEffectiveLaunchAgent() {
   return normalizeAgentId(selected) || newSessionConfiguredAgent || '';
 }
 
+function stationLaunchProfileBackend() {
+  return normalizeAgentId(controlCurrentBackend || currentExternalAgent || newSessionConfiguredAgent || '');
+}
+
+function stationLaunchCommandForAgent(agent) {
+  const backend = normalizeAgentId(agent);
+  if (!backend) return '';
+  if (backend === 'codex') return controlCodexConfig.command || commandDefaultForNewSessionAgent('codex') || 'codex';
+  return commandDefaultForNewSessionAgent(backend) || backend;
+}
+
+function stationApplyCodexLaunchDefaultsToDraft() {
+  stationLaunchDraft.managed = newSessionCodexManagedContext || controlCodexConfig.managed_context || 'vanilla';
+  stationLaunchDraft.archive = newSessionCodexContextArchive || controlCodexConfig.context_archive || 'summary';
+  stationLaunchDraft.fast = codexServiceTierIsFast(newSessionCodexDefaultServiceTier || controlCodexConfig.service_tier || '');
+}
+
+function stationSetLaunchDraftAgent(agent, opts = {}) {
+  stationRememberLaunchDraft();
+  const explicitInternal = agent === 'internal';
+  const backend = explicitInternal ? '' : normalizeAgentId(agent);
+  stationLaunchDraft.agent = explicitInternal ? 'internal' : backend;
+  stationLaunchDraft.command = backend ? stationLaunchCommandForAgent(backend) : '';
+  if (backend === 'codex') stationApplyCodexLaunchDefaultsToDraft();
+  if (opts.makeDefault) {
+    stationApplyExternalBackendFromDock(backend, 'sessions');
+  } else {
+    stationRenderSessionsDock(opts.focusId || '');
+  }
+}
+
+function stationUseLaunchDefaultProfile() {
+  stationRememberLaunchDraft();
+  const backend = stationLaunchProfileBackend();
+  stationLaunchDraft.agent = '';
+  stationLaunchDraft.command = backend ? stationLaunchCommandForAgent(backend) : '';
+  if (backend === 'codex') stationApplyCodexLaunchDefaultsToDraft();
+  stationRenderSessionsDock();
+}
+
+function stationRenderLaunchProfileSection(parent) {
+  const section = stationDockSection(parent, 'Launch profile');
+  const backend = stationLaunchProfileBackend();
+  const effectiveAgent = stationEffectiveLaunchAgent();
+  stationDockRow(section, 'default', backend ? prettyAgentName(backend) : 'Internal agent');
+  stationDockRow(section, 'draft', effectiveAgent ? prettyAgentName(effectiveAgent) : 'Current setting');
+  stationDockRow(section, 'binary', stationLaunchDraftValue('command', stationLaunchCommandForAgent(effectiveAgent)) || '--');
+  const select = stationDockSelect(section, 'Default backend', backend, stationExternalBackendOptions(), { id: 'station-launch-default-backend' });
+  select.addEventListener('change', ev => {
+    const next = normalizeAgentId(ev.target.value);
+    stationLaunchDraft.agent = '';
+    stationLaunchDraft.command = next ? stationLaunchCommandForAgent(next) : '';
+    if (next === 'codex') stationApplyCodexLaunchDefaultsToDraft();
+    stationApplyExternalBackendFromDock(next, 'sessions');
+  });
+  stationDockActions(section, [
+    { label: 'Draft default', primary: !stationLaunchDraft.agent, onClick: stationUseLaunchDefaultProfile },
+    { label: 'Draft internal', primary: stationLaunchDraft.agent === 'internal', onClick: () => stationSetLaunchDraftAgent('internal') },
+    { label: 'Draft Codex', primary: stationEffectiveLaunchAgent() === 'codex', onClick: () => stationSetLaunchDraftAgent('codex') },
+    { label: 'Draft Claude', primary: stationEffectiveLaunchAgent() === 'claude-code', onClick: () => stationSetLaunchDraftAgent('claude-code') },
+    { label: 'Draft Gemini', primary: stationEffectiveLaunchAgent() === 'gemini', onClick: () => stationSetLaunchDraftAgent('gemini') },
+  ]);
+}
+
 async function stationStartSessionFromDock() {
   stationRememberLaunchDraft();
   const task = String(stationLaunchDraft.task || '').trim();
@@ -12463,6 +12527,7 @@ async function stationStartSessionFromDock() {
 }
 
 function stationRenderSessionLaunchSection(parent) {
+  stationRenderLaunchProfileSection(parent);
   const section = stationDockSection(parent, 'Launch session');
   const task = stationDockInput(section, 'Task', stationLaunchDraftValue('task', document.getElementById('activity-task-input')?.value || ''), { id: 'station-launch-task', placeholder: 'What should the agent do?', multiline: true, rows: 3 });
   const name = stationDockInput(section, 'Name', stationLaunchDraftValue('name'), { id: 'station-launch-name', placeholder: 'optional' });
@@ -13227,7 +13292,7 @@ function stationExternalBackendOptions() {
   ];
 }
 
-function stationApplyExternalBackendFromDock(value) {
+function stationApplyExternalBackendFromDock(value, renderTarget = 'controls') {
   const backend = normalizeAgentId(value);
   const select = document.getElementById('set-external-agent');
   if (select) select.value = backend || '';
@@ -13238,7 +13303,8 @@ function stationApplyExternalBackendFromDock(value) {
   applyMainBackendStatus();
   dispatchControlMsg({ action: 'set_external_agent', agent: backend || null });
   showControlToast?.('success', `External agent: ${backend ? prettyAgentName(backend) : 'Internal agent'}`);
-  stationRenderControlsDock('launch');
+  if (renderTarget === 'sessions') stationRenderSessionsDock();
+  else stationRenderControlsDock('launch');
 }
 
 function stationRenderExternalBackendEditor(parent, controls) {
