@@ -16155,6 +16155,7 @@ function stationRenderControlsDock(sectionName = 'overview') {
   const live = stationDockSection(body, 'Live surfaces');
   stationDockRow(live, 'display', controls.displayAccess || '--');
   stationDockRow(live, 'voice', `${controls.voiceState || 'idle'}${controls.micActive ? ' / mic' : ''}${controls.videoActive ? ' / video' : ''}`);
+  stationDockRow(live, 'shared view', controls.sharedViewVisible ? (controls.sharedViewTarget || 'active') : 'none');
   stationDockRow(live, 'browser', `${controls.browserWorkspaces} workspaces`);
   stationDockRow(live, 'recording', `${controls.recordings} streams${controls.activeRecording ? ` / ${controls.activeRecording}` : ''}`);
   stationDockRow(live, 'attach', `${controls.pendingAttachments} pending`);
@@ -16163,6 +16164,15 @@ function stationRenderControlsDock(sectionName = 'overview') {
     !controls.activeBrowser ? { label: 'Make active', onClick: () => document.getElementById('makeActiveBtn')?.click() } : null,
     { label: controls.micActive ? 'Mic off' : 'Mic', onClick: () => document.getElementById('micBtn')?.click() },
     { label: controls.videoActive ? 'Video off' : 'Video', onClick: () => document.getElementById('videoBtn')?.click() },
+    {
+      id: 'station-shared-view-take-input',
+      label: 'Take input',
+      primary: controls.sharedViewCanTakeInput,
+      disabled: !controls.sharedViewCanTakeInput,
+      title: controls.sharedViewCanTakeInput ? 'Take input authority for the shared display' : 'No shared-view input request is available',
+      onClick: () => document.querySelector('[data-shared-view-take-input]')?.click(),
+    },
+    controls.sharedViewVisible ? { label: 'Hide shared view', onClick: () => document.querySelector('[data-shared-view-close]')?.click() } : null,
     controls.pendingAttachments > 0 ? { label: 'Clear attach', danger: true, onClick: () => document.querySelector('[data-pending-attachments-clear]')?.click() } : null,
   ]);
 
@@ -17244,6 +17254,14 @@ function stationBuildControlsSummary() {
   const pendingAttachmentText = document.getElementById('pending-attachments-count')?.textContent || '';
   const pendingAttachmentCount = globalAttachmentChips || stationNum(pendingAttachmentText);
   const activeBrowserWorkspaces = stationNum(window.__stationBrowserWorkspaceCount || 0);
+  const sharedViewVisible = !!sharedViewState.visible;
+  const sharedViewTarget = sharedViewVisible
+    ? sharedViewDisplayLabel(sharedViewState.displayId, sharedViewState.displayTarget)
+    : '';
+  const sharedViewCanTakeInput = sharedViewVisible
+    && sharedViewState.action === 'input_request'
+    && sharedViewState.displayId !== null
+    && displaySlots.has(sharedViewState.displayId);
   return {
     backend: backend || 'none',
     command,
@@ -17306,6 +17324,9 @@ function stationBuildControlsSummary() {
     debugScreen: /^active$/i.test(debugStatus),
     debugRecording: !!debugRecordBtn && /stop/i.test(debugRecordBtn.textContent || ''),
     pendingAttachments: pendingAttachmentCount,
+    sharedViewVisible,
+    sharedViewTarget,
+    sharedViewCanTakeInput,
   };
 }
 
