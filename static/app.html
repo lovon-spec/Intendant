@@ -23197,18 +23197,13 @@ function setSessionWindowDetached(sessionId, detached, reason = '') {
 }
 
 function markSessionWindowsDetachedAfterDaemonRestart() {
-  let clearedPromptTarget = false;
+  let detachedAny = false;
   for (const [sid, win] of sessionWindows) {
     if (!externalSourceForSessionWindow(sid, win)) continue;
     setSessionWindowDetached(sid, true, 'daemon restarted');
-    if (foregroundSessionFullId === sid || currentSessionFullId === sid) {
-      discardPromptTargetReference(sid);
-      clearedPromptTarget = true;
-    }
+    detachedAny = true;
   }
-  if (clearedPromptTarget) {
-    updateTaskTargetChip();
-  }
+  if (detachedAny) updateTaskTargetChip();
 }
 
 function sessionWindowIsDetached(sessionId) {
@@ -23529,7 +23524,8 @@ function isPromptTargetSessionUsable(sessionId, options = {}) {
   if (!sid || sid === daemonSessionFullId) return false;
   const win = sessionWindows.get(sid);
   if (!win || win.ended) return false;
-  if (sessionWindowIsDetached(sid) && !options.allowDetached) return false;
+  const allowDetached = options.allowDetached !== false;
+  if (sessionWindowIsDetached(sid) && !allowDetached) return false;
   const meta = sessionMetadataById.get(sid) || {};
   if (meta.ended || promptTargetTerminalStatus(meta)) return false;
   return true;
