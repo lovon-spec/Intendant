@@ -10753,14 +10753,48 @@ let stationPeerDraft = {
   routeCapabilities: 'display',
   routeInstructions: '',
 };
-let stationViewDraft = {
+const STATION_VIEW_KEY = 'intendant_station_view';
+const STATION_VIEW_DEFAULTS = Object.freeze({
   layout: 'orbital',
   mood: 'cockpit',
   fov: 55,
   motion: 1,
   ar: 0.45,
   density: 1,
-};
+});
+
+function stationClampNumber(value, fallback, min, max) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.max(min, Math.min(max, n));
+}
+
+function stationNormalizeViewDraft(raw = {}) {
+  return {
+    layout: raw.layout === 'constellation' ? 'constellation' : STATION_VIEW_DEFAULTS.layout,
+    mood: raw.mood === 'calm' ? 'calm' : STATION_VIEW_DEFAULTS.mood,
+    fov: stationClampNumber(raw.fov, STATION_VIEW_DEFAULTS.fov, 35, 85),
+    motion: stationClampNumber(raw.motion, STATION_VIEW_DEFAULTS.motion, 0, 2),
+    ar: stationClampNumber(raw.ar, STATION_VIEW_DEFAULTS.ar, 0, 1),
+    density: stationClampNumber(raw.density, STATION_VIEW_DEFAULTS.density, 0.5, 1.8),
+  };
+}
+
+function stationLoadViewDraft() {
+  try {
+    return stationNormalizeViewDraft(JSON.parse(localStorage.getItem(STATION_VIEW_KEY) || '{}'));
+  } catch (_) {
+    return stationNormalizeViewDraft();
+  }
+}
+
+function stationSaveViewDraft() {
+  try {
+    localStorage.setItem(STATION_VIEW_KEY, JSON.stringify(stationViewDraft));
+  } catch (_) {}
+}
+
+let stationViewDraft = stationLoadViewDraft();
 let stationLaunchDraft = {
   task: '',
   name: '',
@@ -10948,6 +10982,7 @@ function stationFallbackHotspotDetail(name) {
   if (name === 'system:worktrees') return `${snapshot.sessions.worktrees || 0} scanned · ${snapshot.sessions.worktreeCleanup || 0} cleanup`;
   if (name === 'system:peers') return `${Math.max(0, snapshot.hosts.length - 1)} peers · ${displaySlots.size + peerDisplayConnections.size} displays`;
   if (name === 'system:controls') return `${snapshot.controls.backend || 'agent'} · ${snapshot.controls.sandbox || 'sandbox'}`;
+  if (name === 'system:view') return `${stationViewDraft.layout} · ${stationViewDraft.mood}`;
   return '';
 }
 
@@ -10964,6 +10999,7 @@ function stationApplyViewSettings(showToast = false) {
       Number(stationViewDraft.density) || 1,
     );
   }
+  stationSaveViewDraft();
   stationScheduleUpdate();
   if (showToast) showControlToast?.('success', 'Station view updated');
 }
@@ -10971,11 +11007,34 @@ function stationApplyViewSettings(showToast = false) {
 function stationViewSet(key, value) {
   if (key === 'layout') stationViewDraft.layout = value === 'constellation' ? 'constellation' : 'orbital';
   else if (key === 'mood') stationViewDraft.mood = value === 'calm' ? 'calm' : 'cockpit';
-  else if (key === 'fov') stationViewDraft.fov = Math.max(35, Math.min(85, Number(value) || 55));
-  else if (key === 'motion') stationViewDraft.motion = Math.max(0, Math.min(2, Number(value) || 0));
-  else if (key === 'ar') stationViewDraft.ar = Math.max(0, Math.min(1, Number(value) || 0));
-  else if (key === 'density') stationViewDraft.density = Math.max(0.5, Math.min(1.8, Number(value) || 1));
+  else if (key === 'fov') stationViewDraft.fov = stationClampNumber(value, STATION_VIEW_DEFAULTS.fov, 35, 85);
+  else if (key === 'motion') stationViewDraft.motion = stationClampNumber(value, STATION_VIEW_DEFAULTS.motion, 0, 2);
+  else if (key === 'ar') stationViewDraft.ar = stationClampNumber(value, STATION_VIEW_DEFAULTS.ar, 0, 1);
+  else if (key === 'density') stationViewDraft.density = stationClampNumber(value, STATION_VIEW_DEFAULTS.density, 0.5, 1.8);
   stationApplyViewSettings(false);
+}
+
+function stationViewProfileLabel() {
+  return [
+    stationViewDraft.layout,
+    stationViewDraft.mood,
+    `${Math.round(Number(stationViewDraft.fov) || STATION_VIEW_DEFAULTS.fov)} fov`,
+    `${(Number(stationViewDraft.motion) || 0).toFixed(2)} motion`,
+    `${Math.round((Number(stationViewDraft.ar) || 0) * 100)} ar`,
+    `${(Number(stationViewDraft.density) || STATION_VIEW_DEFAULTS.density).toFixed(2)} density`,
+  ].join(' / ');
+}
+
+function stationRefreshViewSummaryRows() {
+  const dock = document.getElementById('station-dock');
+  if (!dock || dock.dataset.kind !== 'view') return;
+  dock.querySelectorAll('.station-dock-row').forEach(row => {
+    const key = row.querySelector('.station-dock-key')?.textContent || '';
+    const value = row.querySelector('.station-dock-value');
+    if (!value) return;
+    if (key === 'profile') value.textContent = stationViewProfileLabel();
+    if (key === 'persisted') value.textContent = localStorage.getItem(STATION_VIEW_KEY) ? 'yes' : 'defaults';
+  });
 }
 
 function stationViewRange(parent, key, label, min, max, step, formatter) {
@@ -10990,6 +11049,7 @@ function stationViewRange(parent, key, label, min, max, step, formatter) {
   input.addEventListener('input', ev => {
     stationViewSet(key, ev.target.value);
     row.querySelector('.station-dock-value').textContent = formatter(stationViewDraft[key]);
+    stationRefreshViewSummaryRows();
   });
   return input;
 }
@@ -11004,6 +11064,8 @@ function stationRenderViewDock() {
   const layout = stationDockSection(body, 'Scene');
   stationDockRow(layout, 'renderer', stationDomFallback ? 'DOM fallback' : (station?.debug_state?.() || 'canvas'));
   stationDockRow(layout, 'webgpu', stationShouldUseWebgpu() ? (stationWebgpuUnavailable ? 'unavailable' : 'requested') : 'off');
+  stationDockRow(layout, 'profile', stationViewProfileLabel());
+  stationDockRow(layout, 'persisted', localStorage.getItem(STATION_VIEW_KEY) ? 'yes' : 'defaults');
   stationDockActions(layout, [
     { label: 'Orbital', primary: stationViewDraft.layout === 'orbital', onClick: () => { stationViewSet('layout', 'orbital'); stationRenderViewDock(); } },
     { label: 'Constellation', primary: stationViewDraft.layout === 'constellation', onClick: () => { stationViewSet('layout', 'constellation'); stationRenderViewDock(); } },
@@ -11022,7 +11084,8 @@ function stationRenderViewDock() {
   stationViewRange(tuning, 'ar', 'AR', 0, 1, 0.05, value => `${Math.round((Number(value) || 0) * 100)}%`);
   stationViewRange(tuning, 'density', 'Density', 0.5, 1.8, 0.05, value => `${(Number(value) || 1).toFixed(2)}x`);
   stationDockActions(tuning, [
-    { label: 'Reset', onClick: () => { stationViewDraft = { layout: 'orbital', mood: 'cockpit', fov: 55, motion: 1, ar: 0.45, density: 1 }; stationApplyViewSettings(true); stationRenderViewDock(); } },
+    { label: 'Reset', onClick: () => { stationViewDraft = stationNormalizeViewDraft(STATION_VIEW_DEFAULTS); stationApplyViewSettings(true); stationRenderViewDock(); } },
+    { label: 'Store reset', danger: true, onClick: () => { stationViewDraft = stationNormalizeViewDraft(STATION_VIEW_DEFAULTS); stationApplyViewSettings(true); stationRenderViewDock(); } },
   ]);
 
   const hint = stationDockSection(body, 'Prototype affordance');
