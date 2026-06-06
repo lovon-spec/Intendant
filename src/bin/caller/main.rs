@@ -218,6 +218,22 @@ fn external_steer_queue_reason(agent_name: &str, err: &CallerError) -> String {
     }
 }
 
+fn external_steer_error_is_no_active_turn(err: &CallerError) -> bool {
+    match err {
+        CallerError::ExternalAgent(message) => message.contains("no active turn"),
+        _ => false,
+    }
+}
+
+fn external_steer_targets_idle_side_thread(
+    target_kind: ExternalSteerTargetKind,
+    target_session_id: Option<&str>,
+    active_side_turns: &HashSet<String>,
+) -> bool {
+    target_kind == ExternalSteerTargetKind::Side
+        && target_session_id.is_some_and(|id| !active_side_turns.contains(id))
+}
+
 /// Build the [`peer::AuthRequirements`] this daemon advertises in
 /// its own Agent Card from the project's `[server.auth]` config and
 /// the LAN cert dir.
@@ -3496,6 +3512,107 @@ fn claim_active_side_turn_completion(
         .unwrap_or(true)
 }
 
+async fn start_external_side_followup_turn(
+    agent: &mut Box<dyn external_agent::ExternalAgent>,
+    config: &DrainConfig<'_>,
+    side_sessions: &mut Option<&mut ExternalSideSessionState<'_>>,
+    active_side_turns: &mut HashSet<String>,
+    session_id: String,
+    text: String,
+    attachments: UserAttachments,
+    follow_up_id: Option<String>,
+    steer_id: Option<String>,
+) -> bool {
+    let side_turn = if let Some(state) = side_sessions.as_deref_mut() {
+        if state.has_side_thread(&session_id) {
+            let side_round = state.side_rounds.entry(session_id.clone()).or_insert(0);
+            *side_round += 1;
+            let user_turn_revision = state
+                .side_turn_revisions
+                .entry(session_id.clone())
+                .or_default()
+                .record_active_turn(*side_round as u32);
+            Some((*side_round, user_turn_revision))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let Some((side_round, user_turn_revision)) = side_turn else {
+        return false;
+    };
+
+    emit_user_message_log(
+        config.bus,
+        config.session_log,
+        Some(&session_id),
+        Some(side_round as u32),
+        Some(user_turn_revision),
+        None,
+        &text,
+    );
+    let merged = drain_steer_queue_as_followup(
+        config.context_injection,
+        &text,
+        config.bus,
+        Some(&session_id),
+        None,
+    )
+    .unwrap_or_else(|| text.clone());
+    let side_thread = external_agent::AgentThread {
+        thread_id: session_id.clone(),
+    };
+    emit_external_turn_status(
+        config.bus,
+        &config.autonomy,
+        Some(&session_id),
+        side_round,
+        "thinking",
+        format!("{} side turn in progress", agent.name()),
+    )
+    .await;
+    let send_result = if attachments.is_empty() {
+        agent.send_message(&side_thread, &merged).await
+    } else {
+        agent
+            .send_message_with_attachments(&side_thread, &merged, &attachments.items)
+            .await
+    };
+    if let Err(e) = send_result {
+        emit_follow_up_status(
+            config.bus,
+            Some(&session_id),
+            &follow_up_id,
+            Some(&text),
+            "failed",
+            Some("failed to send side follow-up"),
+        );
+        config.bus.send(AppEvent::LoopError(format!(
+            "Failed to send side follow-up: {}",
+            e
+        )));
+        return true;
+    }
+    emit_follow_up_status(
+        config.bus,
+        Some(&session_id),
+        &follow_up_id,
+        Some(&text),
+        "delivered",
+        None,
+    );
+    if let Some(id) = steer_id {
+        config.bus.send(AppEvent::SteerDelivered {
+            session_id: Some(session_id.clone()),
+            id,
+            mid_turn: false,
+        });
+    }
+    active_side_turns.insert(session_id);
+    true
+}
+
 fn scoped_event_targets_config(
     thread_id: &Option<String>,
     session_id: &Option<String>,
@@ -5981,16 +6098,43 @@ async fn drain_external_agent_events(
                         {
                             continue;
                         }
+                        if external_steer_targets_idle_side_thread(
+                            target_kind,
+                            target_session_id.as_deref(),
+                            &active_side_turns,
+                        ) {
+                            let Some(side_session_id) = target_session_id.clone() else {
+                                continue;
+                            };
+                            let reason = format!(
+                                "{} side conversation is idle; sending steer as follow-up",
+                                agent.name()
+                            );
+                            slog(config.session_log, |l| l.info(&reason));
+                            start_external_side_followup_turn(
+                                agent,
+                                config,
+                                &mut side_sessions,
+                                &mut active_side_turns,
+                                side_session_id,
+                                text,
+                                UserAttachments::default(),
+                                None,
+                                Some(id),
+                            )
+                            .await;
+                            continue;
+                        }
                         // Try native mid-turn steering first. On success the
                         // backend/runtime has accepted the steer for the
                         // active turn, but it may only surface to the model at
                         // the backend's next checkpoint. We keep tracking it
                         // until the adapter observes the echoed user message.
-                        // On failure (unsupported or no active turn), fall
-                        // back to queuing onto context_injection — the drain-between-turns path in
-                        // `run_external_agent_mode` / `run_with_presence`
-                        // will flush it as a follow-up prefix on the next
-                        // user message and emit SteerDelivered at that point.
+                        // On failure, fall back to queuing onto
+                        // context_injection for the normal parent-session
+                        // drain-between-turns path. Idle side conversations
+                        // are handled above as real side follow-ups because
+                        // they do not have an automatic empty-turn drain.
                         let activation_error = if target_is_side {
                             match target_session_id.as_deref() {
                                 Some(target) => agent.activate_thread(target).await.err(),
@@ -6050,6 +6194,29 @@ async fn drain_external_agent_events(
                                 });
                             }
                             Err(e) => {
+                                if target_is_side && external_steer_error_is_no_active_turn(&e) {
+                                    let Some(side_session_id) = target_session_id.clone() else {
+                                        continue;
+                                    };
+                                    let reason = format!(
+                                        "{} reported no active side turn; sending steer as follow-up",
+                                        agent.name()
+                                    );
+                                    slog(config.session_log, |l| l.info(&reason));
+                                    start_external_side_followup_turn(
+                                        agent,
+                                        config,
+                                        &mut side_sessions,
+                                        &mut active_side_turns,
+                                        side_session_id,
+                                        text,
+                                        UserAttachments::default(),
+                                        None,
+                                        Some(id),
+                                    )
+                                    .await;
+                                    continue;
+                                }
                                 let reason = external_steer_queue_reason(agent.name(), &e);
                                 if let Ok(mut q) = config.context_injection.lock() {
                                     q.push(event::ContextInjection::text_with_steer_id_for_target(
@@ -6074,88 +6241,18 @@ async fn drain_external_agent_events(
                         attachments,
                         follow_up_id,
                     }) => {
-                        let side_turn = if let Some(state) = side_sessions.as_deref_mut() {
-                            if state.has_side_thread(&session_id) {
-                                let side_round =
-                                    state.side_rounds.entry(session_id.clone()).or_insert(0);
-                                *side_round += 1;
-                                let user_turn_revision = state
-                                    .side_turn_revisions
-                                    .entry(session_id.clone())
-                                    .or_default()
-                                    .record_active_turn(*side_round as u32);
-                                Some((*side_round, user_turn_revision))
-                            } else {
-                                None
-                            }
-                        } else {
-                            None
-                        };
-                        let Some((side_round, user_turn_revision)) = side_turn else {
-                            continue;
-                        };
-
-                        emit_user_message_log(
-                            config.bus,
-                            config.session_log,
-                            Some(&session_id),
-                            Some(side_round as u32),
-                            Some(user_turn_revision),
+                        start_external_side_followup_turn(
+                            agent,
+                            config,
+                            &mut side_sessions,
+                            &mut active_side_turns,
+                            session_id,
+                            text,
+                            UserAttachments::from_items(attachments),
+                            follow_up_id,
                             None,
-                            &text,
-                        );
-                        let attachments = UserAttachments::from_items(attachments);
-                        let merged = drain_steer_queue_as_followup(
-                            config.context_injection,
-                            &text,
-                            config.bus,
-                            Some(&session_id),
-                            None,
-                        )
-                        .unwrap_or_else(|| text.clone());
-                        let side_thread = external_agent::AgentThread {
-                            thread_id: session_id.clone(),
-                        };
-                        emit_external_turn_status(
-                            config.bus,
-                            &config.autonomy,
-                            Some(&session_id),
-                            side_round,
-                            "thinking",
-                            format!("{} side turn in progress", agent.name()),
                         )
                         .await;
-                        let send_result = if attachments.is_empty() {
-                            agent.send_message(&side_thread, &merged).await
-                        } else {
-                            agent
-                                .send_message_with_attachments(&side_thread, &merged, &attachments.items)
-                                .await
-                        };
-                        if let Err(e) = send_result {
-                            emit_follow_up_status(
-                                config.bus,
-                                Some(&session_id),
-                                &follow_up_id,
-                                Some(&text),
-                                "failed",
-                                Some("failed to send side follow-up"),
-                            );
-                            config.bus.send(AppEvent::LoopError(format!(
-                                "Failed to send side follow-up: {}",
-                                e
-                            )));
-                            continue;
-                        }
-                        emit_follow_up_status(
-                            config.bus,
-                            Some(&session_id),
-                            &follow_up_id,
-                            Some(&text),
-                            "delivered",
-                            None,
-                        );
-                        active_side_turns.insert(session_id);
                         continue;
                     }
                     Ok(AppEvent::CodexThreadActionRequested {
@@ -12291,6 +12388,45 @@ Also: {"source": "bare"}"#;
         assert!(reason.contains("Codex native mid-turn steering failed"));
         assert!(!reason.contains("doesn't support"));
         assert!(reason.contains("queued as follow-up"));
+    }
+
+    #[test]
+    fn external_steer_error_identifies_no_active_turn() {
+        assert!(external_steer_error_is_no_active_turn(
+            &CallerError::ExternalAgent("no active turn to steer".to_string())
+        ));
+        assert!(!external_steer_error_is_no_active_turn(
+            &CallerError::ExternalAgent(
+                "JSON-RPC error -32600: expected active turn id `turn-a` but found `turn-b`"
+                    .to_string(),
+            )
+        ));
+    }
+
+    #[test]
+    fn external_steer_targets_idle_side_thread_only_when_side_is_not_active() {
+        let active_side_turns = std::collections::HashSet::from(["active-side".to_string()]);
+
+        assert!(external_steer_targets_idle_side_thread(
+            ExternalSteerTargetKind::Side,
+            Some("idle-side"),
+            &active_side_turns,
+        ));
+        assert!(!external_steer_targets_idle_side_thread(
+            ExternalSteerTargetKind::Side,
+            Some("active-side"),
+            &active_side_turns,
+        ));
+        assert!(!external_steer_targets_idle_side_thread(
+            ExternalSteerTargetKind::Primary,
+            Some("parent"),
+            &active_side_turns,
+        ));
+        assert!(!external_steer_targets_idle_side_thread(
+            ExternalSteerTargetKind::Side,
+            None,
+            &active_side_turns,
+        ));
     }
 
     #[test]
