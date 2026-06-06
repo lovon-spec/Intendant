@@ -132,6 +132,8 @@ pub struct McpAppState {
     session_aliases: std::collections::HashMap<String, std::collections::HashSet<String>>,
     /// Latest backend usage sample by Intendant/backend session id.
     session_usage: std::collections::HashMap<String, frontend::ModelUsageSnapshot>,
+    /// Latest observed phase by Intendant/backend session id.
+    session_status: std::collections::HashMap<String, SessionStatusState>,
     /// Source for the currently active session, when it is known.
     pub active_session_source: Option<String>,
     /// Map Intendant wrapper session IDs and backend session IDs to their external source.
@@ -142,6 +144,13 @@ pub struct McpAppState {
     /// Last successful rewinds that did not reduce backend-reported pressure
     /// below the gate, keyed by Intendant/backend session id.
     insufficient_rewind_notices: std::collections::HashMap<String, InsufficientRewindNotice>,
+}
+
+#[derive(Debug, Clone)]
+struct SessionStatusState {
+    turn: usize,
+    phase: Phase,
+    task: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -211,6 +220,7 @@ impl McpAppState {
             session_codex_managed_context: std::collections::HashMap::new(),
             session_aliases: std::collections::HashMap::new(),
             session_usage: std::collections::HashMap::new(),
+            session_status: std::collections::HashMap::new(),
             active_session_source: None,
             session_sources: std::collections::HashMap::new(),
             pending_rewind_pressure_checks: std::collections::HashMap::new(),
@@ -322,6 +332,17 @@ impl McpAppState {
             .entry(backend_session_id.to_string())
             .or_default()
             .insert(session_id.to_string());
+        if let Some(status) = self
+            .session_status
+            .get(session_id)
+            .cloned()
+            .or_else(|| self.session_status.get(backend_session_id).cloned())
+        {
+            self.session_status
+                .insert(session_id.to_string(), status.clone());
+            self.session_status
+                .insert(backend_session_id.to_string(), status);
+        }
     }
 
     fn session_related_ids(&self, session_id: &str) -> Vec<String> {
@@ -356,6 +377,86 @@ impl McpAppState {
             }
         }
         None
+    }
+
+    fn session_status_for_id(&self, session_id: &str) -> Option<&SessionStatusState> {
+        for related in self.session_related_ids(session_id) {
+            if let Some(status) = self.session_status.get(&related) {
+                return Some(status);
+            }
+        }
+        None
+    }
+
+    fn note_session_phase(
+        &mut self,
+        session_id: Option<&str>,
+        turn: Option<usize>,
+        phase: Phase,
+        task: Option<&str>,
+    ) {
+        let target_id = session_id
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .map(str::to_string)
+            .or_else(|| {
+                let id = self.session_id.trim();
+                (!id.is_empty()).then(|| id.to_string())
+            });
+        let Some(target_id) = target_id else {
+            if let Some(turn) = turn {
+                self.turn = turn;
+            }
+            self.set_phase(phase);
+            if let Some(task) = task.map(str::trim).filter(|task| !task.is_empty()) {
+                self.task_description = task.to_string();
+            }
+            return;
+        };
+
+        let keys = {
+            let related = self.session_related_ids(&target_id);
+            if related.is_empty() {
+                vec![target_id.clone()]
+            } else {
+                related
+            }
+        };
+        let existing = keys
+            .iter()
+            .find_map(|key| self.session_status.get(key))
+            .cloned();
+        let applies_to_current = self.session_id.is_empty()
+            || keys.iter().any(|key| key == &self.session_id)
+            || self
+                .session_related_ids(&self.session_id)
+                .iter()
+                .any(|key| keys.contains(key));
+        let turn = turn
+            .or_else(|| existing.as_ref().map(|status| status.turn))
+            .unwrap_or(self.turn);
+        let task = task
+            .map(str::trim)
+            .filter(|task| !task.is_empty())
+            .map(str::to_string)
+            .or_else(|| existing.as_ref().map(|status| status.task.clone()))
+            .or_else(|| applies_to_current.then(|| self.task_description.clone()))
+            .unwrap_or_default();
+        let status = SessionStatusState {
+            turn,
+            phase: phase.clone(),
+            task: task.clone(),
+        };
+        for key in keys {
+            self.session_status.insert(key, status.clone());
+        }
+        if applies_to_current {
+            self.turn = turn;
+            if !task.is_empty() {
+                self.task_description = task;
+            }
+            self.set_phase(phase);
+        }
     }
 
     fn normalize_main_usage_snapshot(
@@ -3307,6 +3408,21 @@ fn phase_to_str(phase: &Phase) -> &'static str {
     }
 }
 
+fn phase_from_status_str(phase: &str) -> Phase {
+    match phase.trim().to_ascii_lowercase().replace('-', "_").as_str() {
+        "thinking" => Phase::Thinking,
+        "running" | "running_agent" => Phase::RunningAgent,
+        "orchestrating" => Phase::Orchestrating,
+        "waiting_approval" => Phase::WaitingApproval,
+        "waiting_human" => Phase::WaitingHuman,
+        "waiting_follow_up" | "waiting_followup" => Phase::WaitingFollowUp,
+        "done" | "completed" => Phase::Done,
+        "interrupting" => Phase::Interrupting,
+        "interrupted" => Phase::Interrupted,
+        _ => Phase::Idle,
+    }
+}
+
 fn verbosity_to_str(v: Verbosity) -> &'static str {
     match v {
         Verbosity::Quiet => "quiet",
@@ -3360,7 +3476,6 @@ pub fn spawn_event_listener(
                     AppEvent::Key(_) => {} // MCP doesn't handle key events
                     AppEvent::Resize(_, _) => {}
                     AppEvent::ContextSnapshot { .. }
-                    | AppEvent::StatusUpdate { .. }
                     | AppEvent::LogEntry { .. }
                     | AppEvent::UserMessageRewind { .. }
                     | AppEvent::UserMessageLog { .. }
@@ -3500,6 +3615,21 @@ pub fn spawn_event_listener(
                             }
                         }
                     }
+                    AppEvent::StatusUpdate {
+                        turn,
+                        ref phase,
+                        ref session_id,
+                        ref task,
+                        ..
+                    } => {
+                        s.note_session_phase(
+                            Some(session_id),
+                            Some(turn),
+                            phase_from_status_str(phase),
+                            Some(task),
+                        );
+                        resource_changed = Some("intendant://status");
+                    }
                     AppEvent::Quit => {
                         s.should_quit = true;
                         break;
@@ -3508,12 +3638,18 @@ pub fn spawn_event_listener(
                     AppEvent::TurnStarted {
                         turn,
                         budget_pct,
+                        ref session_id,
                         remaining: _,
-                        ..
                     } => {
                         s.turn = turn;
                         s.budget_pct = budget_pct;
                         s.set_phase(Phase::Thinking);
+                        s.note_session_phase(
+                            session_id.as_deref(),
+                            Some(turn),
+                            Phase::Thinking,
+                            None,
+                        );
                         s.push_log(
                             LogLevel::Detail,
                             format!("Turn {} started (budget: {:.1}%)", turn, budget_pct),
@@ -3552,8 +3688,12 @@ pub fn spawn_event_listener(
                         s.push_log(LogLevel::Debug, format!("JSON: {}", preview));
                     }
 
-                    AppEvent::DoneSignal { message, .. } => {
+                    AppEvent::DoneSignal {
+                        ref session_id,
+                        message,
+                    } => {
                         s.set_phase(Phase::Done);
+                        s.note_session_phase(session_id.as_deref(), None, Phase::Done, None);
                         s.push_log(
                             LogLevel::Info,
                             format!("Done: {}", message.as_deref().unwrap_or("task complete")),
@@ -3564,14 +3704,32 @@ pub fn spawn_event_listener(
                     AppEvent::AgentStarted {
                         turn,
                         commands_preview,
+                        ref session_id,
                         ..
                     } => {
                         s.set_phase(Phase::RunningAgent);
+                        s.note_session_phase(
+                            session_id.as_deref(),
+                            Some(turn),
+                            Phase::RunningAgent,
+                            None,
+                        );
                         s.push_log(LogLevel::Agent, format!("[T{}] {}", turn, commands_preview));
                         resource_changed = Some("intendant://status");
                     }
 
-                    AppEvent::AgentOutput { stdout, stderr, .. } => {
+                    AppEvent::AgentOutput {
+                        ref session_id,
+                        stdout,
+                        stderr,
+                        ..
+                    } => {
+                        s.note_session_phase(
+                            session_id.as_deref(),
+                            None,
+                            Phase::RunningAgent,
+                            None,
+                        );
                         let formatted =
                             crate::tui::app::format_agent_output_for_tui(&stdout, &stderr);
                         if !formatted.is_empty() {
@@ -3612,8 +3770,13 @@ pub fn spawn_event_listener(
                         s.push_log(LogLevel::Detail, format!("[T{}] Context management", turn));
                     }
 
-                    AppEvent::TaskComplete { reason, .. } => {
+                    AppEvent::TaskComplete {
+                        ref session_id,
+                        reason,
+                        ..
+                    } => {
                         s.set_phase(Phase::Done);
+                        s.note_session_phase(session_id.as_deref(), None, Phase::Done, None);
                         s.push_log(LogLevel::Info, format!("Task complete: {}", reason));
                         resource_changed = Some("intendant://status");
                     }
@@ -3669,12 +3832,18 @@ pub fn spawn_event_listener(
                     }
 
                     AppEvent::ApprovalRequired {
-                        session_id: _,
+                        ref session_id,
                         id,
                         command_preview,
                         category,
                     } => {
                         s.set_phase(Phase::WaitingApproval);
+                        s.note_session_phase(
+                            session_id.as_deref(),
+                            None,
+                            Phase::WaitingApproval,
+                            None,
+                        );
                         s.push_log(
                             LogLevel::Info,
                             format!("Approval required [{}]: {}", category, command_preview),
@@ -3778,12 +3947,19 @@ pub fn spawn_event_listener(
                     }
 
                     AppEvent::RoundComplete {
+                        ref session_id,
                         round,
                         turns_in_round,
                         ..
                     } => {
                         s.round = round;
                         s.set_phase(Phase::WaitingFollowUp);
+                        s.note_session_phase(
+                            session_id.as_deref(),
+                            Some(round),
+                            Phase::WaitingFollowUp,
+                            None,
+                        );
                         s.push_log(
                             LogLevel::Info,
                             format!(
@@ -3902,6 +4078,12 @@ pub fn spawn_event_listener(
                             s.codex_managed_context = enabled;
                         }
                         s.set_phase(Phase::Thinking);
+                        s.note_session_phase(
+                            Some(session_id),
+                            Some(0),
+                            Phase::Thinking,
+                            task.as_deref(),
+                        );
                         s.push_log(
                             LogLevel::Info,
                             format!(
@@ -3924,6 +4106,7 @@ pub fn spawn_event_listener(
                         ref session_id,
                         ref reason,
                     } => {
+                        s.note_session_phase(Some(session_id), None, Phase::Done, None);
                         if s.session_id == session_id.as_str() {
                             s.set_phase(Phase::Done);
                             s.active_session_source = None;
@@ -4007,13 +4190,24 @@ pub fn spawn_event_listener(
                     } => {
                         s.push_log(LogLevel::Info, format!("Display :{} waiting for OS screen-share approval ({backend} portal)", display_id));
                     }
-                    AppEvent::InterruptRequested { .. } => {
+                    AppEvent::InterruptRequested { ref session_id } => {
                         s.set_phase(Phase::Interrupting);
+                        s.note_session_phase(
+                            session_id.as_deref(),
+                            None,
+                            Phase::Interrupting,
+                            None,
+                        );
                         s.push_log(LogLevel::Info, "Interrupt requested".to_string());
                         resource_changed = Some("intendant://status");
                     }
-                    AppEvent::Interrupted { ref reason, .. } => {
+                    AppEvent::Interrupted {
+                        ref session_id,
+                        ref reason,
+                        ..
+                    } => {
                         s.set_phase(Phase::Interrupted);
+                        s.note_session_phase(session_id.as_deref(), None, Phase::Interrupted, None);
                         s.push_log(LogLevel::Info, format!("Interrupted: {}", reason));
                         resource_changed = Some("intendant://status");
                     }
@@ -4206,6 +4400,22 @@ fn apply_observed_event_to_mcp_state(s: &mut McpAppState, event: &AppEvent) -> b
                 s.codex_managed_context = enabled;
             }
             s.set_phase(Phase::Thinking);
+            s.note_session_phase(Some(session_id), Some(0), Phase::Thinking, task.as_deref());
+            true
+        }
+        AppEvent::StatusUpdate {
+            turn,
+            phase,
+            session_id,
+            task,
+            ..
+        } => {
+            s.note_session_phase(
+                Some(session_id),
+                Some(*turn),
+                phase_from_status_str(phase),
+                Some(task),
+            );
             true
         }
         AppEvent::UsageSnapshot {
@@ -4257,6 +4467,7 @@ fn apply_observed_event_to_mcp_state(s: &mut McpAppState, event: &AppEvent) -> b
             true
         }
         AppEvent::SessionEnded { session_id, .. } => {
+            s.note_session_phase(Some(session_id), None, Phase::Done, None);
             if s.session_id == session_id.as_str() {
                 s.set_phase(Phase::Done);
                 s.active_session_source = None;
@@ -4271,28 +4482,63 @@ fn apply_observed_event_to_mcp_state(s: &mut McpAppState, event: &AppEvent) -> b
             true
         }
         AppEvent::TurnStarted {
-            turn, budget_pct, ..
+            session_id,
+            turn,
+            budget_pct,
+            ..
         } => {
             s.turn = *turn;
             s.budget_pct = *budget_pct;
             s.set_phase(Phase::Thinking);
+            s.note_session_phase(session_id.as_deref(), Some(*turn), Phase::Thinking, None);
             true
         }
-        AppEvent::DoneSignal { .. } | AppEvent::TaskComplete { .. } => {
+        AppEvent::AgentStarted {
+            session_id, turn, ..
+        } => {
+            s.note_session_phase(
+                session_id.as_deref(),
+                Some(*turn),
+                Phase::RunningAgent,
+                None,
+            );
+            true
+        }
+        AppEvent::AgentOutput { session_id, .. } => {
+            s.note_session_phase(session_id.as_deref(), None, Phase::RunningAgent, None);
+            true
+        }
+        AppEvent::DoneSignal { session_id, .. } | AppEvent::TaskComplete { session_id, .. } => {
             s.set_phase(Phase::Done);
+            s.note_session_phase(session_id.as_deref(), None, Phase::Done, None);
             true
         }
-        AppEvent::RoundComplete { round, .. } => {
+        AppEvent::ApprovalRequired { session_id, .. } => {
+            s.set_phase(Phase::WaitingApproval);
+            s.note_session_phase(session_id.as_deref(), None, Phase::WaitingApproval, None);
+            true
+        }
+        AppEvent::RoundComplete {
+            session_id, round, ..
+        } => {
             s.round = *round;
             s.set_phase(Phase::WaitingFollowUp);
+            s.note_session_phase(
+                session_id.as_deref(),
+                Some(*round),
+                Phase::WaitingFollowUp,
+                None,
+            );
             true
         }
-        AppEvent::InterruptRequested { .. } => {
+        AppEvent::InterruptRequested { session_id } => {
             s.set_phase(Phase::Interrupting);
+            s.note_session_phase(session_id.as_deref(), None, Phase::Interrupting, None);
             true
         }
-        AppEvent::Interrupted { .. } => {
+        AppEvent::Interrupted { session_id, .. } => {
             s.set_phase(Phase::Interrupted);
+            s.note_session_phase(session_id.as_deref(), None, Phase::Interrupted, None);
             true
         }
         AppEvent::LoopError(_) => {
@@ -5496,11 +5742,20 @@ impl IntendantServer {
             .filter(|id| !id.is_empty())
             .map(str::to_string)
             .unwrap_or_else(|| s.session_id.clone());
+        let session_status =
+            session_id_override.and_then(|_| s.session_status_for_id(&session_id).cloned());
         let autonomy = s.autonomy.clone();
         // Fill autonomy from shared state
         drop(s);
         let autonomy_level = autonomy.read().await.level;
         snap.autonomy = autonomy_level.to_string().to_lowercase();
+        if let Some(status) = session_status {
+            snap.turn = status.turn;
+            snap.phase = phase_to_str(&status.phase).to_string();
+            if !status.task.is_empty() {
+                snap.task = status.task;
+            }
+        }
         let mut value = serde_json::to_value(&snap).unwrap_or_else(|_| serde_json::json!({}));
         if let Some(obj) = value.as_object_mut() {
             let s = self.state.read().await;
@@ -9234,6 +9489,83 @@ mod tests {
             assert_eq!(
                 value.pointer("/context_pressure/managed_context"),
                 Some(&"managed".into())
+            );
+        });
+    }
+
+    #[test]
+    fn get_status_resolves_backend_phase_through_session_identity_alias() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let state = test_state();
+            {
+                let mut s = state.write().await;
+                s.session_id = "wrapper-session".to_string();
+                s.task_description = "managed Codex task".to_string();
+                s.set_phase(Phase::WaitingFollowUp);
+                apply_observed_event_to_mcp_state(
+                    &mut s,
+                    &AppEvent::SessionIdentity {
+                        session_id: "wrapper-session".to_string(),
+                        source: "codex".to_string(),
+                        backend_session_id: "codex-thread".to_string(),
+                    },
+                );
+                apply_observed_event_to_mcp_state(
+                    &mut s,
+                    &AppEvent::StatusUpdate {
+                        turn: 2,
+                        phase: "thinking".to_string(),
+                        autonomy: "medium".to_string(),
+                        session_id: "codex-thread".to_string(),
+                        task: "Codex turn in progress".to_string(),
+                    },
+                );
+            }
+
+            let server = IntendantServer::new(state.clone(), EventBus::new());
+            let active_status: serde_json::Value =
+                serde_json::from_str(&server.get_status().await).unwrap();
+            assert_eq!(active_status.pointer("/phase"), Some(&"thinking".into()));
+
+            let wrapper_status: serde_json::Value = serde_json::from_str(
+                &server
+                    .get_status_for_session(Some("wrapper-session"), None)
+                    .await,
+            )
+            .unwrap();
+            assert_eq!(wrapper_status.pointer("/phase"), Some(&"thinking".into()));
+            assert_eq!(wrapper_status.pointer("/turn"), Some(&2.into()));
+            assert_eq!(
+                wrapper_status.pointer("/task"),
+                Some(&"Codex turn in progress".into())
+            );
+
+            {
+                let mut s = state.write().await;
+                apply_observed_event_to_mcp_state(
+                    &mut s,
+                    &AppEvent::RoundComplete {
+                        session_id: Some("codex-thread".to_string()),
+                        round: 2,
+                        turns_in_round: 1,
+                        native_message_count: None,
+                    },
+                );
+            }
+
+            let idle_status: serde_json::Value = serde_json::from_str(
+                &server
+                    .get_status_for_session(Some("wrapper-session"), None)
+                    .await,
+            )
+            .unwrap();
+            assert_eq!(
+                idle_status.pointer("/phase"),
+                Some(&"waiting_follow_up".into())
             );
         });
     }
