@@ -1022,6 +1022,107 @@ fn tool_allowed_for_profile(name: &str, managed_context: bool, profile: Option<&
     }
 }
 
+macro_rules! manual_http_tool_definition {
+    ($name:literal, $description:literal, $params:ty) => {{
+        let mut schema = serde_json::to_value(schemars::schema_for!($params)).unwrap_or_default();
+        inline_schema_refs(&mut schema);
+        serde_json::json!({
+            "name": $name,
+            "description": $description,
+            "inputSchema": schema,
+        })
+    }};
+}
+
+fn append_manual_http_tool_definitions(
+    tools: &mut Vec<serde_json::Value>,
+    managed_context: bool,
+    tool_profile: Option<&str>,
+) {
+    let mut push = |name: &'static str, definition: serde_json::Value| {
+        if tool_allowed_for_profile(name, managed_context, tool_profile)
+            && !tools
+                .iter()
+                .any(|tool| tool.get("name").and_then(serde_json::Value::as_str) == Some(name))
+        {
+            tools.push(definition);
+        }
+    };
+
+    push(
+        "rewind_context",
+        manual_http_tool_definition!(
+            "rewind_context",
+            "Schedule a Codex context rewind to an exact item/tool-call anchor. First call list_rewind_anchors and choose one returned item_id; call inspect_rewind_anchor when the compact row is ambiguous. Do not synthesize anchor ids from prior failed tool calls. The current turn will finish, Intendant will roll back Codex to the anchor, inject the primer as developer context, and resume the branch.",
+            RewindContextParams
+        ),
+    );
+    push(
+        "list_rewind_anchors",
+        manual_http_tool_definition!(
+            "list_rewind_anchors",
+            "List valid exact Codex rewind anchors for the current managed session. Supports pagination and query so the model can choose any valid non-management anchor from the rollout, from start to finish. The default catalog hides managed-context maintenance calls such as list_rewind_anchors, inspect_rewind_anchor, rewind_context, and rewind_backout so recovery does not target its own tool calls; pass include_management_tools=true only when intentionally targeting those internals. During rewind-only recovery, Intendant forces recovery_candidates_only=true, hiding anchors known to remain at/above the rewind-only limit unless include_non_recovery=true is explicitly set for audit. Use inspect_rewind_anchor on a candidate when the compact summary is ambiguous, then copy the chosen item_id into rewind_context.",
+            ListRewindAnchorsParams
+        ),
+    );
+    push(
+        "inspect_rewind_anchor",
+        manual_http_tool_definition!(
+            "inspect_rewind_anchor",
+            "Inspect a single exact Codex rewind anchor with a compact before/after context window. Use this before rewind_context when the list_rewind_anchors row is too lossy to choose safely.",
+            InspectRewindAnchorParams
+        ),
+    );
+    push(
+        "rewind_backout",
+        manual_http_tool_definition!(
+            "rewind_backout",
+            "Inspect or restore a previous managed-context rewind/backout record. Restore mutates the active Codex thread in place; fork/backout create a lineage branch when the patched Codex binary is used.",
+            RewindBackoutParams
+        ),
+    );
+    push(
+        "show_shared_view",
+        manual_http_tool_definition!(
+            "show_shared_view",
+            "Open the dashboard shared display view for agent-human collaboration.",
+            ShowSharedViewParams
+        ),
+    );
+    push(
+        "hide_shared_view",
+        manual_http_tool_definition!(
+            "hide_shared_view",
+            "Dismiss the dashboard shared display view banner and focus overlay.",
+            HideSharedViewParams
+        ),
+    );
+    push(
+        "focus_shared_view",
+        manual_http_tool_definition!(
+            "focus_shared_view",
+            "Highlight a normalized region in the active dashboard shared display view.",
+            FocusSharedViewParams
+        ),
+    );
+    push(
+        "request_shared_view_input",
+        manual_http_tool_definition!(
+            "request_shared_view_input",
+            "Ask the user for input authority or human interaction on a shared display target.",
+            RequestSharedViewInputParams
+        ),
+    );
+    push(
+        "capture_shared_view_frame",
+        manual_http_tool_definition!(
+            "capture_shared_view_frame",
+            "Capture one frame from the active dashboard shared display view.",
+            CaptureSharedViewFrameParams
+        ),
+    );
+}
+
 fn apply_session_capabilities_to_mcp_state(
     s: &mut McpAppState,
     session_id: &str,
@@ -5385,7 +5486,7 @@ impl IntendantServer {
             .read()
             .await
             .exposed_codex_managed_context_enabled_for(session_id, managed_context_override);
-        let tools: Vec<serde_json::Value> = self
+        let mut tools: Vec<serde_json::Value> = self
             .tool_router
             .list_all()
             .iter()
@@ -5402,6 +5503,7 @@ impl IntendantServer {
                 })
             })
             .collect();
+        append_manual_http_tool_definitions(&mut tools, managed_context, tool_profile);
         serde_json::json!({ "tools": tools })
     }
 
@@ -8826,6 +8928,7 @@ mod tests {
                 .filter_map(|tool| tool["name"].as_str())
                 .collect();
             assert!(managed_names.contains(&"list_rewind_anchors"));
+            assert!(managed_names.contains(&"inspect_rewind_anchor"));
             assert!(managed_names.contains(&"rewind_context"));
             assert!(managed_names.contains(&"rewind_backout"));
             assert!(!managed_names.contains(&"execute_cu_actions"));
