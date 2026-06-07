@@ -35,11 +35,11 @@ export interface InitOutput {
     readonly stationweb_set_visuals: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => void;
     readonly stationweb_unregister_display_source: (a: number, b: number, c: number) => void;
     readonly stationweb_update_snapshot: (a: number, b: any) => [number, number];
-    readonly wasm_bindgen__closure__destroy__h4b3df25dd6724f54: (a: number, b: number) => void;
     readonly wasm_bindgen__closure__destroy__h8ff424c0d9b28f90: (a: number, b: number) => void;
+    readonly wasm_bindgen__closure__destroy__h4b3df25dd6724f54: (a: number, b: number) => void;
     readonly wasm_bindgen__convert__closures_____invoke__hae2356e5e579fe4c: (a: number, b: number, c: number) => void;
-    readonly wasm_bindgen__convert__closures_____invoke__h5328ece5e87418f0: (a: number, b: number, c: any) => void;
     readonly wasm_bindgen__convert__closures_____invoke__hd862b17e0006a99f: (a: number, b: number, c: any) => void;
+    readonly wasm_bindgen__convert__closures_____invoke__h5328ece5e87418f0: (a: number, b: number, c: any) => void;
     readonly wasm_bindgen__convert__closures_____invoke__h9daa85ed2f27c1ee: (a: number, b: number) => void;
     readonly __wbindgen_malloc: (a: number, b: number) => number;
     readonly __wbindgen_realloc: (a: number, b: number, c: number, d: number) => number;

@@ -11067,6 +11067,26 @@ function stationRenderedSelectPanel(target, message = '') {
   return true;
 }
 
+window.stationProbe = Object.assign(window.stationProbe || {}, {
+  renderedPrimary: () => stationRenderedPrimaryActive(),
+  state: () => station?.debug_state?.() || stationRendererStateLabel(),
+  snapshot: () => buildStationSnapshot(),
+  select: (target) => {
+    station?.select_by_id?.(target ? String(target) : null);
+    return station?.debug_state?.() || '';
+  },
+  update: (snapshot) => {
+    if (!station || !snapshot) return '';
+    station.update_snapshot(snapshot);
+    try {
+      stationLastSnapshotJson = JSON.stringify(snapshot);
+    } catch (_) {
+      stationLastSnapshotJson = '';
+    }
+    return station.debug_state?.() || '';
+  },
+});
+
 function stationLogEventId(c, fallbackIndex = '') {
   const hostId = String(c?.host_id || c?.hostId || selfPeerId || 'local');
   const sessionId = String(c?.session_id || c?.sessionId || '');
@@ -20076,6 +20096,26 @@ function stationHandleManagedAction(action) {
   const idOptionalOps = new Set(['rewind', 'backout', 'refresh', 'use-target', 'copy-status']);
   if (!id && !idOptionalOps.has(op)) return;
   if (sessionId) stationSetManagedSession(sessionId);
+  if (op === 'anchor-inspect') {
+    stationApplyManagedAction('anchor', id, sessionId)
+      .then(() => stationInspectManagedAnchorFromDock())
+      .finally(() => {
+        stationRenderedSelectPanel('system:managed', 'Managed anchor inspected');
+      });
+    return;
+  }
+  if (op === 'record-inspect' || op === 'record-fork') {
+    const mode = op === 'record-fork' ? 'fork' : 'inspect';
+    stationApplyManagedAction('record', id, sessionId)
+      .then(() => {
+        stationRememberManagedDraftValue('backoutMode', mode);
+        return stationSubmitManagedBackoutFromDock(mode);
+      })
+      .finally(() => {
+        stationRenderedSelectPanel('system:managed', `Managed record ${mode} requested`);
+      });
+    return;
+  }
   if (op === 'use-target') {
     managedContextEl?.('managed-context-use-target')?.click();
     if (stationRenderedSelectPanel('system:managed', 'Managed context target updated')) return;

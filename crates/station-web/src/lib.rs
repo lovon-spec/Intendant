@@ -6203,32 +6203,26 @@ impl StationInner {
                 C_SUBTEXT0_CSS,
                 "normal",
             );
-            let button_label = match row.action.as_str() {
-                "anchor" => "use",
-                "record" => "select",
-                "branch" => "claim",
-                _ => "",
-            };
-            if !button_label.is_empty() && !row.id.is_empty() {
-                self.pill_at(
-                    x + panel_w - 78.0,
-                    yy + 15.0,
-                    50.0,
-                    19.0,
-                    button_label,
-                    C_MAUVE_CSS,
-                );
-                self.hit_zones.push(HitZone::new(
-                    x + panel_w - 78.0,
-                    yy + 15.0,
-                    50.0,
-                    19.0,
-                    HitAction::ManagedAction {
-                        action: row.action.clone(),
-                        id: row.id.clone(),
-                        session_id: row.session_id.clone(),
-                    },
-                ));
+            let buttons = managed_row_buttons(row);
+            if !buttons.is_empty() && !row.id.is_empty() {
+                let total_w = buttons.iter().map(|(_, _, w)| *w).sum::<f32>()
+                    + (buttons.len().saturating_sub(1) as f32 * 5.0);
+                let mut bx = x + panel_w - total_w - 28.0;
+                for (label, action, button_w) in buttons {
+                    self.pill_at(bx, yy + 15.0, button_w, 19.0, label, C_MAUVE_CSS);
+                    self.hit_zones.push(HitZone::new(
+                        bx,
+                        yy + 15.0,
+                        button_w,
+                        19.0,
+                        HitAction::ManagedAction {
+                            action: action.to_string(),
+                            id: row.id.clone(),
+                            session_id: row.session_id.clone(),
+                        },
+                    ));
+                    bx += button_w + 5.0;
+                }
             }
             yy += 47.0;
         }
@@ -8655,6 +8649,18 @@ fn display_lane_color_css(kind: &str) -> &'static str {
         "shared_view" => C_GREEN_CSS,
         "operator_target" => C_BLUE_CSS,
         _ => C_OVERLAY1_CSS,
+    }
+}
+
+fn managed_row_buttons(row: &StationDetailRow) -> Vec<(&'static str, &'static str, f32)> {
+    match row.action.as_str() {
+        "anchor" => vec![("use", "anchor", 40.0), ("inspect", "anchor-inspect", 58.0)],
+        "record" => vec![
+            ("inspect", "record-inspect", 58.0),
+            ("fork", "record-fork", 42.0),
+        ],
+        "branch" => vec![("claim", "branch", 50.0)],
+        _ => Vec::new(),
     }
 }
 
