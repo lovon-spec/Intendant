@@ -10648,6 +10648,15 @@ const SHELL_KEY_SEQS = {
 
 // Displays
 const displaySlots = new Map();
+const peerDisplayConnections = new Map(); // sessionKey -> PeerDisplayConnection
+// Session/phase state is read by Station during direct #station boot before
+// the lower dashboard sections finish registering their helpers.
+const sessionsListCache = new Map();
+const sessionsListInflight = new Map();
+const AGENT_ACTIVE_PHASES = new Set([
+  'thinking', 'running', 'running_agent', 'orchestrating',
+  'waiting_approval', 'waiting_human', 'interrupting',
+]);
 const sharedViewState = {
   visible: false,
   displayId: null,
@@ -37616,8 +37625,6 @@ function sendPeerTask(hostId)    { return submitPeerInput(hostId, 'task'); }
 //   element and re-attaches the live MediaStream so the stream
 //   doesn't stutter through the DOM swap.
 
-const peerDisplayConnections = new Map(); // sessionKey → PeerDisplayConnection
-
 function generateSessionId() {
   if (window.crypto && window.crypto.randomUUID) {
     return window.crypto.randomUUID();
@@ -41107,12 +41114,6 @@ async function saveApiKeys() {
 document.getElementById('settings-save-keys').addEventListener('click', saveApiKeys);
 
 // ── All Sessions Usage (in Stats tab) ──
-
-// Per-host cache of the last `/api/sessions` response so switching
-// between hosts in the Stats picker is instant after first fetch.
-// Keyed by host_id; the primary is cached under selfPeerId.
-const sessionsListCache = new Map();
-const sessionsListInflight = new Map();
 
 function fetchSessionsForHost(hostId, options = {}) {
   hostId = hostId || selfPeerId;
@@ -46357,10 +46358,6 @@ window.sendInterrupt = function() {
 // "task running" indicator so they stay in sync. Explicit allowlist; a
 // denylist would wrongly include `waiting` / `waiting_followup` / `idle`-
 // adjacent states that happen between tasks.
-const AGENT_ACTIVE_PHASES = new Set([
-  'thinking', 'running', 'running_agent', 'orchestrating',
-  'waiting_approval', 'waiting_human', 'interrupting',
-]);
 function isAgentActivePhase(phase) {
   return AGENT_ACTIVE_PHASES.has(phaseKey(phase));
 }
