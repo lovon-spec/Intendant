@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -1125,6 +1126,7 @@ pub struct CodexAgent {
     request_trace_temporary: bool,
     context_archive: String,
     context_seen_request_ids: HashSet<String>,
+    context_trace_fingerprint: Option<CodexTraceFingerprint>,
     child: Option<Child>,
     writer: Option<BufWriter<ChildStdin>>,
     event_tx: Option<mpsc::UnboundedSender<AgentEvent>>,
@@ -1164,6 +1166,18 @@ struct CodexContextPressureFloor {
     token_count: u64,
     context_window: u64,
     hard_context_window: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CodexTraceFingerprint {
+    files: Vec<CodexTraceFileFingerprint>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CodexTraceFileFingerprint {
+    path: PathBuf,
+    len: u64,
+    modified: Option<SystemTime>,
 }
 
 /// Knobs that vary per-session and feed into Codex `thread/start` or the
@@ -1407,10 +1421,10 @@ impl CodexAgent {
         &mut self,
         thread_id: Option<&str>,
     ) -> Result<usize, CallerError> {
-        let Some(root) = self.request_trace_root.as_deref() else {
+        let Some(root) = self.request_trace_root.clone() else {
             return Ok(0);
         };
-        let index = read_codex_trace_index(root, thread_id).await?;
+        let index = read_codex_trace_index(&root, thread_id).await?;
         let mut inserted = 0usize;
         for request in index.requests {
             if self
@@ -1419,6 +1433,9 @@ impl CodexAgent {
             {
                 inserted += 1;
             }
+        }
+        if let Ok(fingerprint) = codex_context_trace_fingerprint(&root, thread_id).await {
+            self.context_trace_fingerprint = Some(fingerprint);
         }
         Ok(inserted)
     }
@@ -1593,6 +1610,7 @@ impl CodexAgent {
             request_trace_temporary: false,
             context_archive: "summary".to_string(),
             context_seen_request_ids: HashSet::new(),
+            context_trace_fingerprint: None,
             child: None,
             writer: None,
             event_tx: None,
@@ -2686,6 +2704,28 @@ async fn collect_codex_trace_bundle_dirs(
     }
 
     Ok(bundle_dirs)
+}
+
+async fn codex_context_trace_fingerprint(
+    root: &Path,
+    thread_id: Option<&str>,
+) -> Result<CodexTraceFingerprint, CallerError> {
+    let bundle_dirs = collect_codex_trace_bundle_dirs(root, thread_id).await?;
+    let mut files = Vec::new();
+    for bundle_dir in bundle_dirs {
+        let path = bundle_dir.join("trace.jsonl");
+        let metadata = match tokio::fs::metadata(&path).await {
+            Ok(metadata) => metadata,
+            Err(_) => continue,
+        };
+        files.push(CodexTraceFileFingerprint {
+            path,
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+        });
+    }
+    files.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(CodexTraceFingerprint { files })
 }
 
 fn collect_codex_trace_bundle_dirs_sync(
@@ -5735,6 +5775,7 @@ impl ExternalAgent for CodexAgent {
         self.context_archive =
             crate::project::normalize_codex_context_archive(&config.context_archive);
         self.context_seen_request_ids.clear();
+        self.context_trace_fingerprint = None;
         self.mcp_session_id = config.mcp_session_id;
         self.resume_session = config.resume_session;
         self.codex_home = config.codex_home;
@@ -6056,12 +6097,20 @@ impl ExternalAgent for CodexAgent {
     }
 
     async fn context_snapshots(&mut self) -> Result<Vec<AgentContextSnapshot>, CallerError> {
-        let Some(root) = self.request_trace_root.as_deref() else {
+        let Some(root) = self.request_trace_root.clone() else {
             return Ok(Vec::new());
         };
         let thread_id = self.active_thread_id.lock().await.clone();
+        let fingerprint = match codex_context_trace_fingerprint(&root, thread_id.as_deref()).await {
+            Ok(fingerprint) => fingerprint,
+            Err(err) if codex_context_snapshot_not_ready(&err) => return Ok(Vec::new()),
+            Err(err) => return Err(err),
+        };
+        if self.context_trace_fingerprint.as_ref() == Some(&fingerprint) {
+            return Ok(Vec::new());
+        }
         let traces = match read_codex_context_payloads_excluding(
-            root,
+            &root,
             thread_id.as_deref(),
             &self.context_seen_request_ids,
         )
@@ -6071,6 +6120,7 @@ impl ExternalAgent for CodexAgent {
             Err(err) if codex_context_snapshot_not_ready(&err) => return Ok(Vec::new()),
             Err(err) => return Err(err),
         };
+        self.context_trace_fingerprint = Some(fingerprint);
         let rollout_path = match thread_id.as_deref() {
             Some(thread_id) => self
                 .read_thread_snapshot(thread_id)
@@ -7080,7 +7130,15 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(inserted, 2);
+        let baseline_fingerprint = agent
+            .context_trace_fingerprint
+            .clone()
+            .expect("baseline should seed trace fingerprint");
         assert!(agent.context_snapshots().await.unwrap().is_empty());
+        assert_eq!(
+            agent.context_trace_fingerprint.as_ref(),
+            Some(&baseline_fingerprint)
+        );
 
         std::fs::write(
             trace.join("trace.jsonl"),
@@ -7095,10 +7153,15 @@ mod tests {
 
         let snapshots = agent.context_snapshots().await.unwrap();
         assert_eq!(snapshots.len(), 1);
+        assert_ne!(
+            agent.context_trace_fingerprint.as_ref(),
+            Some(&baseline_fingerprint)
+        );
         assert_eq!(snapshots[0].request_index, Some(3));
         assert!(serde_json::to_string(&snapshots[0].raw)
             .unwrap()
             .contains("third"));
+        assert!(agent.context_snapshots().await.unwrap().is_empty());
     }
 
     #[test]

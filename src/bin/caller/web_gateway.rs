@@ -106,7 +106,7 @@ const DELETED_EXTERNAL_SESSIONS_FILE: &str = "deleted_external_sessions.json";
 const MANAGED_CONTEXT_ANCHOR_TRACE_LIMIT: usize = 64;
 const MANAGED_CONTEXT_ANCHOR_LIMIT: usize = 40;
 const EXTERNAL_CONTEXT_REPLAY_LOG_SCAN_LIMIT: usize = 16;
-const CONTEXT_REPLAY_RAW_SUMMARY_MAX_BYTES: u64 = 512 * 1024;
+const CONTEXT_REPLAY_RAW_SUMMARY_MAX_BYTES: u64 = 128 * 1024;
 const FS_LIST_LIMIT: usize = 500;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2145,6 +2145,12 @@ fn context_snapshot_raw_is_compact(raw: &serde_json::Value) -> bool {
         || raw.get("summary_parts").is_some()
 }
 
+fn context_snapshot_raw_replay_size(raw: &serde_json::Value) -> usize {
+    serde_json::to_vec(raw)
+        .map(|bytes| bytes.len())
+        .unwrap_or_else(|_| raw.to_string().len())
+}
+
 fn compact_context_snapshot_raw_for_replay(entry: &mut serde_json::Value) {
     if entry.get("event").and_then(|v| v.as_str()) != Some("context_snapshot") {
         return;
@@ -2169,6 +2175,33 @@ fn compact_context_snapshot_raw_for_replay(entry: &mut serde_json::Value) {
         .filter(|s| !s.trim().is_empty())
         .unwrap_or("unknown")
         .to_string();
+    let item_count = entry
+        .get("item_count")
+        .and_then(|v| v.as_u64())
+        .map(|v| v as usize);
+
+    let should_omit_compact_raw = snapshot_file.is_some()
+        && entry.get("raw").is_some_and(|raw| {
+            !raw.is_null()
+                && context_snapshot_raw_is_compact(raw)
+                && context_snapshot_raw_replay_size(raw)
+                    > CONTEXT_REPLAY_RAW_SUMMARY_MAX_BYTES as usize
+        });
+    if should_omit_compact_raw {
+        if let Some(raw) = entry.get_mut("raw") {
+            *raw = context_snapshot_omitted_raw(
+                Some(request_id.as_str()),
+                Some(request_index),
+                format.as_str(),
+                item_count,
+                snapshot_file.as_deref(),
+            );
+        }
+        if let Some(snapshot_file) = snapshot_file.as_deref() {
+            annotate_context_snapshot_raw_exact_replay(entry, snapshot_file);
+        }
+        return;
+    }
 
     let Some(raw) = entry.get_mut("raw") else {
         return;
@@ -25292,6 +25325,78 @@ mod tests {
             .get("snapshot_file")
             .and_then(|v| v.as_str())
             .is_some_and(|file| file.contains("_context_")));
+    }
+
+    #[test]
+    fn session_detail_omits_oversized_compact_context_summary_parts() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir
+            .path()
+            .join(".intendant")
+            .join("logs")
+            .join("large-compact-detail-session");
+        let input: Vec<serde_json::Value> = (0..620)
+            .map(|idx| {
+                serde_json::json!({
+                    "role": "user",
+                    "content": format!("compact-sentinel-{idx} {}", "x".repeat(220)),
+                })
+            })
+            .collect();
+        let compact = crate::external_agent::codex::codex_context_archive_payload(
+            serde_json::json!({ "input": input }),
+            "req-large-compact",
+            1,
+            "openai.responses.resolved_request.v1",
+            false,
+        );
+        let compact_size = serde_json::to_vec(&compact).unwrap().len();
+        assert!(compact_size > CONTEXT_REPLAY_RAW_SUMMARY_MAX_BYTES as usize);
+        assert!(
+            compact_size < 512 * 1024,
+            "regression fixture should cover compact summaries that used to be replayed inline"
+        );
+
+        let mut log = crate::session_log::SessionLog::open(log_dir).unwrap();
+        log.context_snapshot(
+            "codex",
+            "Codex resolved request payload",
+            Some(1),
+            "openai.responses.resolved_request.v1",
+            Some(120_000),
+            Some("backend_reported"),
+            Some(128_000),
+            Some(272_000),
+            Some(620),
+            &compact,
+        );
+        drop(log);
+
+        let detail = get_session_detail_from_home(dir.path(), "large-compact-detail-session");
+        assert!(
+            !detail.contains("compact-sentinel-"),
+            "session detail replay should not inline oversized compact summary parts"
+        );
+        let detail: serde_json::Value = serde_json::from_str(&detail).unwrap();
+        let context = detail["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["event"] == "context_snapshot")
+            .expect("context snapshot should be present");
+        assert_eq!(
+            context.pointer("/raw/_intendant_context/raw_omitted"),
+            Some(&serde_json::json!(true))
+        );
+        assert_eq!(
+            context.pointer("/raw/summary/raw_omitted"),
+            Some(&serde_json::json!(true))
+        );
+        assert_eq!(context["exact_replay_available"], true);
+        assert!(context
+            .pointer("/raw/summary_parts")
+            .and_then(|v| v.as_array())
+            .is_some_and(|parts| parts.is_empty()));
     }
 
     #[test]
