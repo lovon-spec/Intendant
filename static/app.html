@@ -10653,6 +10653,9 @@ const peerDisplayConnections = new Map(); // sessionKey -> PeerDisplayConnection
 // the lower dashboard sections finish registering their helpers.
 const sessionsListCache = new Map();
 const sessionsListInflight = new Map();
+let worktreesLoaded = false;
+let _cachedWorktreeScan = null;
+let worktreesLoadInFlight = '';
 const AGENT_ACTIVE_PHASES = new Set([
   'thinking', 'running', 'running_agent', 'orchestrating',
   'waiting_approval', 'waiting_human', 'interrupting',
@@ -17672,6 +17675,20 @@ function stationOperationsActivityLine(event) {
   ].filter(Boolean).join(' / ');
 }
 
+function stationCodexThreadActionButton(sessionId, op, label, opts = {}) {
+  const sid = String(sessionId || '').trim();
+  if (!sid) return null;
+  const state = codexThreadActionStateForSession(sid, op);
+  return {
+    label,
+    primary: !!opts.primary,
+    danger: !!opts.danger,
+    disabled: !state.allowed,
+    title: state.allowed ? `/${op}` : state.reason,
+    onClick: () => stationHandleThreadAction({ op, session_id: sid }),
+  };
+}
+
 function stationOperationsBriefPayload(context, managed, sessions, controls) {
   const event = stationOperationsLatestActivityEvent();
   let targets = [];
@@ -17792,8 +17809,12 @@ function stationRenderOperationsBriefSection(parent, controls) {
   const sessions = stationBuildSessionsSummary();
   const payload = stationOperationsBriefPayload(context, managed, sessions, controls);
   const latestEventId = payload.activity?.id || '';
+  const codexActionId = controls.sessionIsCodex
+    ? String(controls.sessionActionId || controls.sessionId || '').trim()
+    : '';
   const section = stationDockSection(parent, 'Operations brief');
   stationDockRow(section, 'target', `${controls.sessionLabel || controls.sessionSelection || 'daemon'} / ${controls.sessionActive ? 'active' : (controls.sessionDetached ? 'detached' : 'idle')}`);
+  if (codexActionId) stationDockRow(section, 'Codex thread', shortSessionId(codexActionId));
   stationDockRow(section, 'activity', stationOperationsActivityLine(stationOperationsLatestActivityEvent()));
   stationDockRow(section, 'context', stationOperationsContextLine(context, managed));
   stationDockRow(section, 'managed', `${managed.mode || 'vanilla'} / ${stationOperationsManagedReadiness(managed)} / ${managed.anchors || 0} anchors`);
@@ -17806,6 +17827,9 @@ function stationRenderOperationsBriefSection(parent, controls) {
     { label: 'Seed rewind', primary: managed.rewindOnly || !!context.available, disabled: !context.available, onClick: stationSeedManagedFromOperationsBrief },
     { label: 'Sessions', onClick: () => stationRenderSessionsDock(controls.sessionId || '') },
     { label: 'Target controls', onClick: () => stationRenderControlsDock('external') },
+    stationCodexThreadActionButton(codexActionId, 'fast', 'Fast'),
+    stationCodexThreadActionButton(codexActionId, 'compact', 'Compact'),
+    stationCodexThreadActionButton(codexActionId, 'goal-get', 'Goal status'),
     controls.sessionCanFocus ? { label: 'Focus target', onClick: () => stationHandleActivityAction({ action: 'target' }) } : null,
     { label: 'Copy brief', onClick: () => stationCopyOperationsBrief(payload, false) },
     { label: 'Copy JSON', onClick: () => stationCopyOperationsBrief(payload, true) },
@@ -43567,9 +43591,6 @@ function onDebugScreenTornDown() {
 }
 
 // ── Sessions Tab ──
-let worktreesLoaded = false;
-let _cachedWorktreeScan = null;
-let worktreesLoadInFlight = '';
 let worktreesRequestSerial = 0;
 let worktreesActivityClearTimeout = null;
 const pendingWorktreeRemovals = new Set();
