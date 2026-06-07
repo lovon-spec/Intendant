@@ -2752,7 +2752,8 @@ body.context-focus-active {
   white-space: normal;
   overflow-wrap: anywhere;
 }
-.session-window-goal.paused {
+.session-window-goal.paused,
+.session-window-goal.usage-limited {
   border-color: rgba(250, 179, 135, 0.30);
   background: rgba(250, 179, 135, 0.08);
   color: var(--peach);
@@ -26848,6 +26849,7 @@ function normalizeGoalStatus(value) {
   const raw = String(value || '').trim();
   if (!raw) return 'active';
   if (raw === 'budgetLimited' || raw === 'budget_limited') return 'budget-limited';
+  if (raw === 'usageLimited' || raw === 'usage_limited') return 'usage-limited';
   return raw.replace(/_/g, '-').toLowerCase();
 }
 
@@ -27008,6 +27010,7 @@ function formatGoalElapsed(seconds) {
 
 function goalStatusClass(status) {
   if (status === 'budget-limited') return 'budget-limited';
+  if (status === 'usage-limited') return 'usage-limited';
   if (status === 'complete') return 'complete';
   if (status === 'paused') return 'paused';
   return 'active';

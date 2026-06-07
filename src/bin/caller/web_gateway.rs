@@ -1,6 +1,6 @@
 use crate::event::{AppEvent, ControlMsg, EventBus};
 use crate::presence::{self, AgentStateSnapshot};
-use crate::types::LogLevel;
+use crate::types::{LogLevel, SessionGoal};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
@@ -159,6 +159,7 @@ struct CodexSessionListSummary {
     provider: Option<String>,
     usage: SessionUsage,
     usage_events: Vec<CodexUsageEvent>,
+    goal: Option<SessionGoal>,
     task: Option<String>,
     turns: u64,
     file_updated_at: Option<String>,
@@ -4293,7 +4294,18 @@ fn codex_line_may_affect_replay(line: &str) -> bool {
         .as_ref()
         .and_then(|payload| payload.kind.as_deref());
     match (kind.kind.as_deref(), payload_kind) {
-        (_, Some("thread_rolled_back" | "user_message" | "agent_message" | "message")) => true,
+        (Some("session_meta"), _) => true,
+        (
+            _,
+            Some(
+                "thread_rolled_back"
+                | "thread_goal_updated"
+                | "thread_goal_cleared"
+                | "user_message"
+                | "agent_message"
+                | "message",
+            ),
+        ) => true,
         // All response items must reach the parser so item-anchor rewinds can locate
         // their anchor — including non-message items (function_call, reasoning) that
         // render no transcript entry but are the usual targets of a noise-trim rewind.
@@ -4347,6 +4359,72 @@ fn codex_payload_text(payload: &serde_json::Value) -> Option<(String, String)> {
         .to_string();
     let content = payload.get("content")?;
     message_content_text(content).map(|text| (role, text))
+}
+
+fn codex_session_goal_from_value(goal: &serde_json::Value) -> Option<SessionGoal> {
+    if goal.is_null() || goal.as_bool() == Some(false) {
+        return None;
+    }
+    let objective = value_str(goal, "objective")
+        .or_else(|| value_str(goal, "goal"))
+        .or_else(|| value_str(goal, "title"))?
+        .trim()
+        .to_string();
+    if objective.is_empty() {
+        return None;
+    }
+    Some(SessionGoal {
+        objective,
+        status: value_str(goal, "status").filter(|s| !s.trim().is_empty()),
+        elapsed_seconds: goal
+            .get("timeUsedSeconds")
+            .or_else(|| goal.get("elapsedSeconds"))
+            .or_else(|| goal.get("elapsed_seconds"))
+            .or_else(|| goal.get("time_used_seconds"))
+            .and_then(|v| v.as_u64()),
+        tokens_used: goal
+            .get("tokensUsed")
+            .or_else(|| goal.get("tokens_used"))
+            .and_then(|v| v.as_u64()),
+        token_budget: goal
+            .get("tokenBudget")
+            .or_else(|| goal.get("token_budget"))
+            .and_then(|v| v.as_u64()),
+    })
+}
+
+fn codex_session_goal_from_thread_payload(payload: &serde_json::Value) -> Option<SessionGoal> {
+    payload
+        .get("goal")
+        .and_then(codex_session_goal_from_value)
+        .or_else(|| codex_session_goal_from_value(payload))
+}
+
+fn codex_thread_goal_session_id(
+    payload: &serde_json::Value,
+    fallback_session_id: Option<&str>,
+) -> Option<String> {
+    value_str(payload, "threadId")
+        .or_else(|| value_str(payload, "thread_id"))
+        .or_else(|| fallback_session_id.map(str::to_string))
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+fn codex_session_goal_entry(
+    ts: &str,
+    session_id: &str,
+    goal: Option<SessionGoal>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "event": "session_goal",
+        "session_id": session_id,
+        "ts": ts,
+        "data": {
+            "session_id": session_id,
+            "goal": goal,
+        },
+    })
 }
 
 fn codex_event_message_text(payload: &serde_json::Value) -> Option<(String, String)> {
@@ -5578,6 +5656,7 @@ fn codex_session_list_summary_from_file(path: &Path) -> Option<CodexSessionListS
     let mut provider = Some("Codex".to_string());
     let mut usage = SessionUsage::default();
     let mut usage_events = Vec::new();
+    let mut goal: Option<SessionGoal> = None;
     let mut task_started_turns = 0u64;
     let mut saw_user_message_event = false;
     let mut event_user_turns: Vec<Option<String>> = Vec::new();
@@ -5637,6 +5716,12 @@ fn codex_session_list_summary_from_file(path: &Path) -> Option<CodexSessionListS
                                     usage: parsed,
                                 });
                             }
+                        }
+                        "thread_goal_updated" => {
+                            goal = codex_session_goal_from_thread_payload(payload);
+                        }
+                        "thread_goal_cleared" => {
+                            goal = None;
                         }
                         "user_message" => {
                             saw_user_message_event = true;
@@ -5700,6 +5785,7 @@ fn codex_session_list_summary_from_file(path: &Path) -> Option<CodexSessionListS
         provider,
         usage,
         usage_events,
+        goal,
         task,
         turns,
         file_updated_at: file_mtime_string(path),
@@ -5885,6 +5971,12 @@ fn list_codex_sessions_with_limit(home: &Path, scan_limit: usize) -> Vec<serde_j
         let usage =
             codex_incremental_session_usage(&summary, &usage_events_by_id, &exact_parent_baselines);
         apply_session_usage(&mut session, usage, summary.model.as_deref());
+        if let Some(goal) = summary.goal.as_ref() {
+            if let Some(obj) = session.as_object_mut() {
+                obj.insert("goal".to_string(), serde_json::json!(goal));
+                obj.insert("session_goal".to_string(), serde_json::json!(goal));
+            }
+        }
         rows.insert(id, session);
     }
 
@@ -6204,12 +6296,7 @@ fn external_session_detail_from_home_with_limit(
     limit: Option<usize>,
 ) -> Option<String> {
     let mut entries = external_session_entries_from_home(home, source, session_id)?;
-    if let Some(limit) = limit {
-        let limit = limit.clamp(1, SESSION_DETAIL_ENTRY_LIMIT_MAX);
-        if entries.len() > limit {
-            entries = entries.split_off(entries.len() - limit);
-        }
-    }
+    entries = limited_session_detail_entries(entries, limit);
 
     Some(
         serde_json::json!({
@@ -6346,6 +6433,7 @@ fn parse_codex_session_entries(path: &Path) -> Option<Vec<serde_json::Value>> {
     let mut entries: Vec<serde_json::Value> = Vec::new();
     let mut user_turn_revisions = ReplayUserTurnRevisionState::default();
     let mut pending_replacement_for_user_turn: Option<u32> = None;
+    let mut rollout_session_id: Option<String> = None;
     let canonical_user_message_events = codex_session_has_user_message_events(path);
     // (count_before, count_after) entry-count boundaries for each rollout item id,
     // so an item-anchor rewind can supersede exactly the entries after the anchor.
@@ -6363,9 +6451,39 @@ fn parse_codex_session_entries(path: &Path) -> Option<Vec<serde_json::Value>> {
         let Ok(obj) = serde_json::from_str::<serde_json::Value>(trimmed) else {
             continue;
         };
+        if obj.get("type").and_then(|v| v.as_str()) == Some("session_meta") {
+            if let Some(payload) = obj.get("payload") {
+                rollout_session_id = rollout_session_id.or_else(|| value_str(payload, "id"));
+            }
+        }
         if obj.get("type").and_then(|v| v.as_str()) == Some("event_msg") {
             if let Some(payload) = obj.get("payload") {
-                if payload.get("type").and_then(|v| v.as_str()) == Some("thread_rolled_back") {
+                let payload_type = payload.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                if payload_type == "thread_goal_updated" {
+                    if let Some(session_id) =
+                        codex_thread_goal_session_id(payload, rollout_session_id.as_deref())
+                    {
+                        entries.push(codex_session_goal_entry(
+                            &value_str(&obj, "timestamp").unwrap_or_default(),
+                            &session_id,
+                            codex_session_goal_from_thread_payload(payload),
+                        ));
+                    }
+                    continue;
+                }
+                if payload_type == "thread_goal_cleared" {
+                    if let Some(session_id) =
+                        codex_thread_goal_session_id(payload, rollout_session_id.as_deref())
+                    {
+                        entries.push(codex_session_goal_entry(
+                            &value_str(&obj, "timestamp").unwrap_or_default(),
+                            &session_id,
+                            None,
+                        ));
+                    }
+                    continue;
+                }
+                if payload_type == "thread_rolled_back" {
                     let turns = payload
                         .get("num_turns")
                         .and_then(|v| v.as_u64())
@@ -6705,8 +6823,8 @@ fn external_session_activity_replay_from_home_with_attach(
 ) -> Option<String> {
     let source = crate::session_names::normalize_source(source);
     let mut transcript = external_session_entries_from_home(home, &source, session_id)?;
-    if limit > 0 && transcript.len() > limit {
-        transcript = transcript.split_off(transcript.len() - limit);
+    if limit > 0 {
+        transcript = limited_session_detail_entries(transcript, Some(limit));
     }
 
     let mut entries = Vec::with_capacity(transcript.len() + 2);
@@ -6726,6 +6844,17 @@ fn external_session_activity_replay_from_home_with_attach(
     }
 
     for entry in transcript {
+        if entry.get("event").and_then(|v| v.as_str()) == Some("session_goal") {
+            let mut event = entry;
+            if let Some(obj) = event.as_object_mut() {
+                obj.insert(
+                    "replay_semantics".to_string(),
+                    serde_json::json!(EXTERNAL_TRANSCRIPT_SEMANTICS),
+                );
+            }
+            entries.push(event);
+            continue;
+        }
         let content = entry.get("content").and_then(|v| v.as_str()).unwrap_or("");
         if content.is_empty() {
             continue;
@@ -21073,6 +21202,168 @@ mod tests {
     }
 
     #[test]
+    fn list_codex_sessions_exposes_usage_limited_goal() {
+        let _codex_home = EnvVarGuard::unset("CODEX_HOME");
+        let home = tempfile::tempdir().unwrap();
+        let sessions_dir = home
+            .path()
+            .join(".codex")
+            .join("sessions")
+            .join("2026")
+            .join("06")
+            .join("07");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+
+        let id = "019e5c7a-4d05-78d3-a98a-29999cb9898e";
+        let lines = [
+            serde_json::json!({
+                "timestamp": "2026-06-07T15:00:00Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": id,
+                    "timestamp": "2026-06-07T15:00:00Z",
+                    "cwd": "/repo"
+                }
+            }),
+            serde_json::json!({
+                "timestamp": "2026-06-07T15:01:00Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "thread_goal_updated",
+                    "threadId": id,
+                    "goal": {
+                        "threadId": id,
+                        "objective": "Keep the Station goal moving",
+                        "status": "usageLimited",
+                        "tokensUsed": 39449760,
+                        "timeUsedSeconds": 93019
+                    }
+                }
+            }),
+        ];
+        std::fs::write(
+            sessions_dir.join(format!("rollout-2026-06-07T15-00-00-{id}.jsonl")),
+            lines
+                .iter()
+                .map(serde_json::Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+
+        let sessions = list_codex_sessions(home.path());
+        let session = sessions
+            .iter()
+            .find(|s| s.get("session_id").and_then(|v| v.as_str()) == Some(id))
+            .expect("codex session should be listed");
+        assert_eq!(
+            session.pointer("/goal/objective").and_then(|v| v.as_str()),
+            Some("Keep the Station goal moving")
+        );
+        assert_eq!(
+            session.pointer("/goal/status").and_then(|v| v.as_str()),
+            Some("usageLimited")
+        );
+        assert_eq!(
+            session
+                .pointer("/session_goal/tokens_used")
+                .and_then(|v| v.as_u64()),
+            Some(39449760)
+        );
+    }
+
+    #[test]
+    fn external_codex_detail_limit_keeps_usage_limited_goal() {
+        let _codex_home = EnvVarGuard::unset("CODEX_HOME");
+        let home = tempfile::tempdir().unwrap();
+        let sessions_dir = home
+            .path()
+            .join(".codex")
+            .join("sessions")
+            .join("2026")
+            .join("06")
+            .join("07");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+
+        let id = "019e5c7a-4d05-78d3-a98a-29999cb9898e";
+        let mut lines = vec![
+            serde_json::json!({
+                "timestamp": "2026-06-07T15:00:00Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": id,
+                    "timestamp": "2026-06-07T15:00:00Z",
+                    "cwd": "/repo"
+                }
+            }),
+            serde_json::json!({
+                "timestamp": "2026-06-07T15:01:00Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "thread_goal_updated",
+                    "threadId": id,
+                    "goal": {
+                        "threadId": id,
+                        "objective": "Keep the Station goal moving",
+                        "status": "usageLimited",
+                        "tokensUsed": 39449760,
+                        "timeUsedSeconds": 93019
+                    }
+                }
+            }),
+        ];
+        for idx in 0..6 {
+            lines.push(serde_json::json!({
+                "timestamp": format!("2026-06-07T15:02:{idx:02}Z"),
+                "type": "event_msg",
+                "payload": {
+                    "type": "agent_message",
+                    "message": format!("later output {idx}")
+                }
+            }));
+        }
+        std::fs::write(
+            sessions_dir.join(format!("rollout-2026-06-07T15-00-00-{id}.jsonl")),
+            lines
+                .iter()
+                .map(serde_json::Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+
+        let detail =
+            external_session_detail_from_home_with_limit(home.path(), "codex", id, Some(2))
+                .expect("external detail should parse");
+        let detail: serde_json::Value = serde_json::from_str(&detail).unwrap();
+        let entries = detail["entries"].as_array().unwrap();
+        let goal = entries
+            .iter()
+            .find(|entry| entry["event"] == "session_goal")
+            .expect("latest goal metadata should survive detail limiting");
+        assert_eq!(
+            goal.pointer("/data/goal/objective")
+                .and_then(|v| v.as_str()),
+            Some("Keep the Station goal moving")
+        );
+        assert_eq!(
+            goal.pointer("/data/goal/status").and_then(|v| v.as_str()),
+            Some("usageLimited")
+        );
+
+        let replay = external_session_activity_replay_from_home(home.path(), "codex", id, 2)
+            .expect("external replay should parse");
+        let replay: serde_json::Value = serde_json::from_str(&replay).unwrap();
+        assert!(replay["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["event"] == "session_goal"
+                && entry.pointer("/data/goal/status").and_then(|v| v.as_str())
+                    == Some("usageLimited")));
+    }
+
+    #[test]
     fn list_codex_sessions_cache_invalidates_when_file_changes() {
         let home = tempfile::tempdir().unwrap();
         let sessions_dir = home
@@ -25537,6 +25828,7 @@ mod tests {
 
     #[test]
     fn session_detail_limit_keeps_latest_goal_per_nested_session_id() {
+        let _codex_home = EnvVarGuard::unset("CODEX_HOME");
         let entries = vec![
             serde_json::json!({
                 "event": "session_goal",
