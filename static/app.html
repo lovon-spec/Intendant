@@ -11520,6 +11520,12 @@ function stationCommandEntries() {
       run: () => stationRenderManagedDock('backout'),
     },
     {
+      label: 'Lineage runway',
+      detail: 'Review managed anchors, records, and branches in one Station lane',
+      tokens: 'managed lineage runway anchors records branches fission backout rewind',
+      run: () => stationRenderManagedDock('lineage'),
+    },
+    {
       label: 'Search sessions',
       detail: 'Focus Station session filter',
       tokens: 'sessions search filter resume config',
@@ -14389,6 +14395,134 @@ function stationRenderManagedInsightSection(body, managed) {
   stationDockRow(insight, 'readiness', stationManagedActionReadyText(managed) || 'ready');
 }
 
+function stationManagedLineageRunwayPayload(managed, contextSummary) {
+  const rows = [];
+  rows.push({
+    type: 'pressure',
+    id: managed.sessionId || 'managed-context',
+    sessionId: managed.sessionId || '',
+    label: managed.rewindOnly ? 'Rewind-only pressure' : 'Context pressure',
+    value: `${stationCompactNumber(managed.usedTokens)} / ${stationCompactNumber(managed.effectiveWindow)} effective`,
+    detail: [
+      managed.status || 'unknown',
+      contextSummary?.topCategories?.[0]?.label ? `top ${contextSummary.topCategories[0].label}` : '',
+      managed.remainingToRewindOnly !== null && managed.remainingToRewindOnly !== undefined
+        ? `${stationCompactNumber(managed.remainingToRewindOnly)} to rewind-only`
+        : '',
+    ].filter(Boolean).join(' / '),
+  });
+  for (const row of (managed.recentAnchors || []).slice(0, 2)) {
+    rows.push({
+      type: 'anchor',
+      id: row.id || '',
+      sessionId: row.sessionId || managed.sessionId || '',
+      label: row.label || row.id || 'anchor',
+      value: row.value || 'anchor',
+      detail: row.detail || '',
+    });
+  }
+  for (const row of (managed.recentRecords || []).slice(0, 2)) {
+    rows.push({
+      type: 'record',
+      id: row.id || '',
+      sessionId: row.sessionId || managed.sessionId || '',
+      label: row.label || row.id || 'record',
+      value: row.value || 'record',
+      detail: row.detail || '',
+    });
+  }
+  for (const row of (managed.recentBranches || []).slice(0, 3)) {
+    rows.push({
+      type: 'branch',
+      id: row.id || '',
+      sessionId: row.sessionId || '',
+      label: row.label || row.id || 'branch',
+      value: row.value || 'branch',
+      detail: row.detail || '',
+    });
+  }
+  return {
+    generated_at: new Date().toISOString(),
+    session_id: managed.sessionId || '',
+    mode: managed.mode || '',
+    status: managed.status || '',
+    rewind_only: !!managed.rewindOnly,
+    counts: {
+      anchors: managed.anchors || 0,
+      records: managed.records || 0,
+      lineage_groups: managed.lineageGroups || 0,
+      fission_groups: managed.fissionGroups || 0,
+      branches: managed.branches || 0,
+    },
+    rows,
+  };
+}
+
+async function stationCopyManagedLineageRunway(payload) {
+  await copyTextToClipboard(JSON.stringify(payload, null, 2));
+  showControlToast?.('success', 'Managed lineage runway JSON copied');
+}
+
+function stationManagedLineageRunwayActions(row, readOnlyTitle = '') {
+  if (!row) return [];
+  if (row.type === 'pressure') {
+    return [
+      { label: 'Refresh', primary: true, onClick: async () => { await stationApplyManagedAction('refresh', '', row.sessionId); stationRenderManagedDock('lineage'); } },
+      { label: 'Seed rewind', onClick: () => { stationSeedManagedDraftFromContext(); stationRenderManagedDock('rewind'); } },
+    ];
+  }
+  if (row.type === 'anchor') {
+    return [
+      { label: 'Use', primary: true, onClick: async () => { await stationApplyManagedAction('anchor', row.id, row.sessionId); stationRenderManagedDock('rewind'); } },
+      { label: 'Inspect', onClick: async () => { await stationApplyManagedAction('anchor', row.id, row.sessionId); await stationInspectManagedAnchorFromDock(); stationRenderManagedDock('rewind'); } },
+      { label: 'Copy', onClick: () => copyTextToClipboard(row.id) },
+    ];
+  }
+  if (row.type === 'record') {
+    return [
+      { label: 'Select', onClick: async () => { await stationApplyManagedAction('record', row.id, row.sessionId); stationRenderManagedDock('backout'); } },
+      { label: 'Inspect', primary: true, onClick: async () => stationRunManagedRecordBackout(row, 'inspect') },
+      { label: 'Fork', disabled: !!readOnlyTitle, title: readOnlyTitle, onClick: async () => stationRunManagedRecordBackout(row, 'fork') },
+      { label: 'Backout', danger: true, disabled: !!readOnlyTitle, title: readOnlyTitle, onClick: async () => stationRunManagedRecordBackout(row, 'backout') },
+      { label: 'Copy', onClick: () => copyTextToClipboard(row.id) },
+    ];
+  }
+  if (row.type === 'branch') {
+    return [
+      { label: 'Claim', primary: true, onClick: async () => { await stationApplyManagedAction('branch', row.id, row.sessionId); stationRenderManagedDock('lineage'); } },
+    ];
+  }
+  return [];
+}
+
+function stationRenderManagedLineageRunwaySection(parent, managed, contextSummary, readOnlyTitle = '') {
+  const payload = stationManagedLineageRunwayPayload(managed, contextSummary);
+  const section = stationDockSection(parent, 'Lineage runway');
+  stationDockRow(section, 'session', managed.sessionId || '--');
+  stationDockRow(section, 'catalog', `${payload.counts.anchors} anchors / ${payload.counts.records} records / ${payload.counts.branches} branches`);
+  stationDockRow(section, 'groups', `${payload.counts.lineage_groups} lineage / ${payload.counts.fission_groups} fission`);
+  stationDockActions(section, [
+    { label: 'Copy JSON', onClick: () => stationCopyManagedLineageRunway(payload) },
+    { label: 'Prepare rewind', primary: managed.rewindOnly, onClick: () => stationRenderManagedDock('rewind') },
+    { label: 'Backout', onClick: () => stationRenderManagedDock('backout') },
+  ]);
+  if (!payload.rows.length) {
+    stationDockEmpty(section, 'No managed lineage rows are available.');
+    return;
+  }
+  for (const row of payload.rows) {
+    stationDockCard(section, {
+      title: row.label,
+      meta: `${row.type} / ${row.value || '--'}`,
+      detail: row.detail || row.id || row.type,
+      rows: [
+        row.sessionId ? ['session', stationSessionShortLabel(row.sessionId) || shortSessionId(row.sessionId)] : null,
+      ].filter(Boolean),
+      actions: stationManagedLineageRunwayActions(row, readOnlyTitle),
+    });
+  }
+}
+
 function stationRenderManagedDock(mode = '') {
   const context = stationBuildContextSummary();
   const managed = stationBuildManagedSummary(context);
@@ -14431,6 +14565,7 @@ function stationRenderManagedDock(mode = '') {
     stationDockRouteAction('Route managed tab', 'activity', 'managed'),
   ]);
   stationRenderManagedInsightSection(body, managed);
+  stationRenderManagedLineageRunwaySection(body, managed, context, actionReadyText || '');
 
   const form = stationDockSection(body, mode === 'backout' ? 'Backout' : 'Rewind');
   const anchorDefault = stationManagedDraftValue('anchor', 'managed-context-anchor', managed.recentAnchors?.[0]?.id || '');
