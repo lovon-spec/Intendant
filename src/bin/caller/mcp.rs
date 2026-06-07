@@ -6849,12 +6849,27 @@ impl IntendantServer {
         drop(state);
         let mut payload = serde_json::json!({
             "offset": params.offset.unwrap_or(0),
-            "limit": params.limit.unwrap_or(100),
             "reverse": params.reverse,
             "include_management_tools": params.include_management_tools,
             "recovery_candidates_only": recovery_candidates_only,
             "include_non_recovery": params.include_non_recovery,
         });
+        if let Some(limit) = params.limit {
+            if let Some(obj) = payload.as_object_mut() {
+                obj.insert(
+                    "limit".to_string(),
+                    serde_json::Value::Number(serde_json::Number::from(limit)),
+                );
+            }
+        }
+        if params.include_pruning_estimates {
+            if let Some(obj) = payload.as_object_mut() {
+                obj.insert(
+                    "include_pruning_estimates".to_string(),
+                    serde_json::Value::Bool(true),
+                );
+            }
+        }
         if let Some(query) = params
             .query
             .as_deref()
@@ -10118,6 +10133,7 @@ mod tests {
                             assert_eq!(params["limit"], 50);
                             assert_eq!(params["query"], "tool");
                             assert_eq!(params["reverse"], true);
+                            assert_eq!(params["include_pruning_estimates"], true);
                             assert_eq!(params["recovery_candidates_only"], true);
                             assert_eq!(params["include_non_recovery"], false);
                             responder_bus.send(AppEvent::CodexThreadActionResult {
@@ -10142,6 +10158,7 @@ mod tests {
                         "limit": 50,
                         "query": "tool",
                         "reverse": true,
+                        "include_pruning_estimates": true,
                         "recovery_candidates_only": false
                     }),
                     Some("backend-session-1"),
@@ -10157,6 +10174,69 @@ mod tests {
                     .pointer("/content/0/text")
                     .and_then(|value| value.as_str()),
                 Some("{\"anchors\":[]}")
+            );
+            result_task.await.unwrap();
+        });
+    }
+
+    #[test]
+    fn list_rewind_anchors_omits_limit_when_unspecified() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let state = test_state();
+            let bus = EventBus::new();
+            let mut rx = bus.subscribe();
+            let responder_bus = bus.clone();
+            let server = IntendantServer::new(state, bus);
+
+            let result_task = tokio::spawn(async move {
+                loop {
+                    match rx.recv().await {
+                        Ok(AppEvent::ControlCommand(ControlMsg::CodexThreadAction {
+                            session_id,
+                            op,
+                            params,
+                        })) if op == "list_rewind_anchors" => {
+                            assert_eq!(session_id.as_deref(), Some("backend-session-1"));
+                            assert_eq!(params["offset"], 0);
+                            assert!(
+                                params.get("limit").is_none(),
+                                "unspecified limit should let the backend compact default apply: {params}"
+                            );
+                            responder_bus.send(AppEvent::CodexThreadActionResult {
+                                session_id,
+                                action: op,
+                                success: true,
+                                message: "{\"anchors\":[],\"limit\":5}".to_string(),
+                            });
+                            break;
+                        }
+                        Ok(_) => continue,
+                        Err(e) => panic!("event bus closed: {e}"),
+                    }
+                }
+            });
+
+            let result = server
+                .call_tool_by_name_for_session(
+                    "list_rewind_anchors",
+                    serde_json::json!({}),
+                    Some("backend-session-1"),
+                    Some(true),
+                )
+                .await
+                .unwrap();
+
+            assert!(!result.is_error.unwrap_or(false));
+            let result_json = serde_json::to_value(&result).unwrap();
+            assert_eq!(
+                result_json
+                    .pointer("/content/0/text")
+                    .and_then(|value| value.as_str()),
+                Some("{\"anchors\":[],\"limit\":5}")
             );
             result_task.await.unwrap();
         });

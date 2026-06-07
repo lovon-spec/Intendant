@@ -2952,7 +2952,9 @@ struct ContextRewindAnchorCatalogEntry {
     last_item_type: String,
     positions: Vec<&'static str>,
     position_hint: &'static str,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     names: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     roles: Vec<String>,
     summary: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2981,7 +2983,6 @@ struct ContextRewindAnchorCatalogEntry {
 
 #[derive(Debug, Clone, Serialize)]
 struct ContextRewindAnchorCatalog {
-    rollout_path: String,
     total: usize,
     filtered_total: usize,
     offset: usize,
@@ -2992,9 +2993,7 @@ struct ContextRewindAnchorCatalog {
     include_non_recovery: bool,
     recovery_candidates_only: bool,
     pruning_estimates_included: bool,
-    selection_note: String,
     anchors: Vec<ContextRewindAnchorCatalogEntry>,
-    usage: &'static str,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -3142,21 +3141,7 @@ fn list_context_rewind_anchors_from_rollout(
     }
     let next_offset =
         (offset.saturating_add(limit) < filtered_total).then_some(offset.saturating_add(limit));
-    let selection_note = if include_pruning_estimates && reverse {
-        "reverse=true returns newest anchors first. For density compaction, newest post-branch anchors usually prune little or nothing; compare approx_pruned_tokens_after/before and use query, pagination, or inspect_rewind_anchor to target the start of the branch/noisy span you want to discard."
-    } else if include_pruning_estimates {
-        "For density compaction, compare approx_pruned_tokens_after/before; a tiny pruned-token estimate means the anchor preserves most recent history. Use query, pagination, or inspect_rewind_anchor to target the start of the branch/noisy span you want to discard."
-    } else {
-        "Broad catalog listing omits pruning estimates. For density compaction, pass include_pruning_estimates=true, use query, or use reverse=true, then compare approx_pruned_tokens_after/before."
-    }
-    .to_string();
-    let usage = if include_pruning_estimates {
-        "Use exact item_id in rewind_context.anchor.item_id. Default catalogs hide non-recovery/management anchors and narrow positions to valid values; use position_hint or positions. include_non_recovery=true is audit-only. Inspect ambiguous rows. after keeps the item/group; before drops it too. approx_pruned_tokens_after/before estimate discarded context."
-    } else {
-        "Use exact item_id in rewind_context.anchor.item_id. Default catalogs hide non-recovery/management anchors and narrow positions to valid values; use position_hint or positions. include_non_recovery=true is audit-only. Inspect ambiguous rows. after keeps the item/group; before drops it too."
-    };
     let catalog = ContextRewindAnchorCatalog {
-        rollout_path: source_rollout_path.display().to_string(),
         total,
         filtered_total,
         offset,
@@ -3167,9 +3152,7 @@ fn list_context_rewind_anchors_from_rollout(
         include_non_recovery,
         recovery_candidates_only,
         pruning_estimates_included: include_pruning_estimates,
-        selection_note,
         anchors: page,
-        usage,
     };
     serde_json::to_string(&catalog).map_err(|err| err.to_string())
 }
@@ -3724,6 +3707,12 @@ fn truncate_string(value: &mut String, max_chars: usize) {
     }
     *value = value.chars().take(max_chars).collect::<String>();
     value.push_str("...");
+}
+
+fn truncate_string_copy(value: &str, max_chars: usize) -> String {
+    let mut value = value.to_string();
+    truncate_string(&mut value, max_chars);
+    value
 }
 
 fn response_item_content_text(item: &serde_json::Value) -> impl Iterator<Item = &str> {
@@ -5459,7 +5448,7 @@ async fn handle_external_thread_action(
             "Codex thread action /{}: {} — {}",
             op,
             if success { "ok" } else { "FAILED" },
-            message
+            codex_thread_action_log_message(&op, &message)
         ))
     });
     config.bus.send(AppEvent::CodexThreadActionResult {
@@ -5547,6 +5536,36 @@ async fn handle_external_thread_action(
     }
 
     ExternalThreadActionEffect::None
+}
+
+fn codex_thread_action_log_message(op: &str, message: &str) -> String {
+    if !is_context_rewind_anchor_list_action(op) {
+        return message.to_string();
+    }
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(message) else {
+        return truncate_string_copy(message, 320);
+    };
+    let anchor_count = value
+        .get("anchors")
+        .and_then(|anchors| anchors.as_array())
+        .map(Vec::len)
+        .unwrap_or(0);
+    let total = value.get("total").and_then(|v| v.as_u64()).unwrap_or(0);
+    let filtered_total = value
+        .get("filtered_total")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(total);
+    let offset = value.get("offset").and_then(|v| v.as_u64()).unwrap_or(0);
+    let limit = value.get("limit").and_then(|v| v.as_u64()).unwrap_or(0);
+    let next_offset = value
+        .get("next_offset")
+        .and_then(|v| v.as_u64())
+        .map(|offset| offset.to_string())
+        .unwrap_or_else(|| "null".to_string());
+    format!(
+        "{{\"anchors\":{anchor_count},\"total\":{total},\"filtered_total\":{filtered_total},\"offset\":{offset},\"limit\":{limit},\"next_offset\":{next_offset},\"bytes\":{}}}",
+        message.len()
+    )
 }
 
 fn parse_codex_fast_slash_command(
@@ -11192,12 +11211,8 @@ mod tests {
         )
         .expect("newest-first catalog");
         let newest: serde_json::Value = serde_json::from_str(&newest_raw).unwrap();
-        assert!(
-            newest["selection_note"]
-                .as_str()
-                .is_some_and(|note| note.contains("newest anchors first")),
-            "got {newest}"
-        );
+        assert!(newest.get("selection_note").is_none(), "got {newest}");
+        assert!(newest.get("usage").is_none(), "got {newest}");
         let newest_anchor = &newest["anchors"].as_array().unwrap()[0];
         assert_eq!(newest_anchor["item_id"].as_str(), Some("call_post_commit"));
         assert_eq!(
@@ -11944,7 +11959,75 @@ mod tests {
             let summary = anchor["summary"].as_str().unwrap_or_default();
             assert!(summary.len() <= CONTEXT_REWIND_ANCHOR_MERGED_SUMMARY_LIMIT + 3);
         }
+        assert!(catalog.get("rollout_path").is_none());
+        assert!(catalog.get("selection_note").is_none());
+        assert!(catalog.get("usage").is_none());
         assert!(raw.len() < 5_000, "catalog too large: {} bytes", raw.len());
+    }
+
+    #[test]
+    fn context_rewind_anchor_catalog_default_page_is_compact() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rollout.jsonl");
+        let lines = (0..6)
+            .map(|idx| {
+                serde_json::json!({
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call",
+                        "name": "exec_command",
+                        "call_id": format!("call_{idx}"),
+                        "arguments": "{}"
+                    }
+                })
+                .to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&path, lines).unwrap();
+
+        let raw = list_context_rewind_anchors_from_rollout(&path, &serde_json::json!({}))
+            .expect("anchor catalog");
+        let catalog: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(
+            catalog["limit"].as_u64(),
+            Some(CONTEXT_REWIND_ANCHOR_LIST_DEFAULT_LIMIT as u64)
+        );
+        assert_eq!(catalog["next_offset"].as_u64(), Some(5));
+        assert_eq!(
+            catalog["anchors"].as_array().unwrap().len(),
+            CONTEXT_REWIND_ANCHOR_LIST_DEFAULT_LIMIT
+        );
+        assert!(catalog.get("selection_note").is_none());
+        assert!(catalog.get("usage").is_none());
+        assert!(raw.len() < 2_000, "catalog too large: {} bytes", raw.len());
+    }
+
+    #[test]
+    fn codex_thread_action_log_compacts_rewind_anchor_catalog() {
+        let message = serde_json::json!({
+            "total": 42,
+            "filtered_total": 12,
+            "offset": 5,
+            "limit": 5,
+            "next_offset": 10,
+            "anchors": [
+                { "item_id": "call_a", "summary": "a".repeat(500) },
+                { "item_id": "call_b", "summary": "b".repeat(500) }
+            ]
+        })
+        .to_string();
+
+        let compact = codex_thread_action_log_message("list_rewind_anchors", &message);
+        assert_eq!(
+            compact,
+            format!(
+                "{{\"anchors\":2,\"total\":42,\"filtered_total\":12,\"offset\":5,\"limit\":5,\"next_offset\":10,\"bytes\":{}}}",
+                message.len()
+            )
+        );
+        assert!(!compact.contains("call_a"));
+        assert!(!compact.contains(&"a".repeat(20)));
     }
 
     #[test]
@@ -17392,7 +17475,7 @@ async fn run_with_presence(
                         "Codex thread action /{}: {} — {}",
                         op,
                         if success { "ok" } else { "FAILED" },
-                        message
+                        codex_thread_action_log_message(&op, &message)
                     ))
                 });
                 bus.send(AppEvent::CodexThreadActionResult {
