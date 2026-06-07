@@ -1022,6 +1022,7 @@ impl StationInner {
         self.draw_systems_panel();
         self.draw_execution_deck(w, h);
         self.draw_signal_runway(w, h);
+        self.draw_operations_runway(w, h);
         self.draw_command_lane(w, h);
         self.draw_attention_strip(w, h);
         self.draw_corners(w, h);
@@ -2193,6 +2194,202 @@ impl StationInner {
                 .push(HitZone::new(ax, y + 7.0, action.width, 20.0, action.hit));
             ax -= 6.0;
         }
+    }
+
+    fn draw_operations_runway(&mut self, w: f32, h: f32) {
+        if w < 1040.0 || h < 720.0 || self.selected_id.is_some() {
+            return;
+        }
+        let attention_clear = if !self.attention_items().is_empty() && w >= 900.0 && h >= 520.0 {
+            270.0
+        } else {
+            14.0
+        };
+        let x = 246.0;
+        let y = 368.0;
+        let runway_w = (w - x - attention_clear).min(760.0);
+        if runway_w < 420.0 {
+            return;
+        }
+        let runway_h = 154.0;
+        self.round_rect(
+            x,
+            y,
+            runway_w,
+            runway_h,
+            6.0,
+            "rgba(17,17,27,0.72)",
+            "rgba(148,226,213,0.48)",
+        );
+        self.text(
+            "OPERATIONS RUNWAY",
+            x + 12.0,
+            y + 20.0,
+            10.0,
+            C_OVERLAY1_CSS,
+            "bold",
+        );
+        self.text(
+            "sessions / displays / changes",
+            x + 146.0,
+            y + 20.0,
+            9.0,
+            C_SUBTEXT0_CSS,
+            "normal",
+        );
+
+        let controls = self.snapshot.controls.clone();
+        let session_state = if controls.session_detached {
+            "detached"
+        } else if controls.session_active {
+            "active"
+        } else if controls.session_id.is_empty() {
+            "idle"
+        } else {
+            "selected"
+        };
+        let session_value = format!(
+            "{} total / {} active / {} external",
+            self.snapshot.sessions.total,
+            self.snapshot.sessions.active,
+            self.snapshot.sessions.external
+        );
+        let session_detail = truncate(
+            &format!(
+                "{} / {} / {}",
+                nonempty(&controls.session_selection, "no target"),
+                session_state,
+                nonempty(&self.snapshot.sessions.latest_source, "sessions")
+            ),
+            68,
+        );
+        let mut session_actions = vec![
+            RunwayAction::activity("new", "new-session", 44.0, C_TEAL_CSS),
+            RunwayAction::select("panel", "system:sessions", 54.0, C_OVERLAY1_CSS),
+        ];
+        if controls.session_can_attach && !controls.session_id.is_empty() {
+            session_actions.insert(
+                1,
+                RunwayAction::session("attach", "attach", &controls.session_id, 58.0, C_PEACH_CSS),
+            );
+        }
+        if controls.session_can_focus {
+            session_actions.insert(
+                1,
+                RunwayAction::activity("focus", "target", 54.0, C_BLUE_CSS),
+            );
+        }
+        if controls.session_can_interrupt {
+            session_actions.insert(1, RunwayAction::activity("stop", "stop", 46.0, C_RED_CSS));
+        }
+        self.signal_runway_row(
+            x + 10.0,
+            y + 34.0,
+            runway_w - 20.0,
+            "Sessions",
+            &session_value,
+            &session_detail,
+            if self.snapshot.sessions.active > 0 {
+                C_TEAL_CSS
+            } else {
+                C_BLUE_CSS
+            },
+            session_actions,
+        );
+
+        let peer_count = self.snapshot.hosts.len().saturating_sub(1);
+        let display_count = self.display_sources.len();
+        let display_value = format!("{peer_count} peers / {display_count} displays");
+        let display_source = self.display_sources.values().next().map(|source| {
+            (
+                source.host_id.clone(),
+                source.display_id.clone(),
+                truncate(&source.label, 60),
+            )
+        });
+        let display_detail = display_source
+            .as_ref()
+            .map(|(_, _, label)| label.clone())
+            .unwrap_or_else(|| {
+                format!(
+                    "{} / {} / {}",
+                    nonempty(&controls.display_access, "display"),
+                    if controls.shared_view_visible {
+                        "shared view"
+                    } else {
+                        "no shared view"
+                    },
+                    nonempty(&controls.cu_backend, "cu")
+                )
+            });
+        let mut display_actions = vec![
+            RunwayAction::controls("share", "display-toggle", 54.0, C_BLUE_CSS),
+            RunwayAction::select("panel", "system:peers", 54.0, C_OVERLAY1_CSS),
+        ];
+        if let Some((host_id, display_id, _)) = display_source {
+            display_actions.insert(
+                0,
+                RunwayAction::open_display("open", &host_id, &display_id, 48.0, C_PEACH_CSS),
+            );
+        }
+        if controls.shared_view_can_take_input {
+            display_actions.insert(
+                0,
+                RunwayAction::controls("input", "shared-view-take-input", 52.0, C_GREEN_CSS),
+            );
+        }
+        self.signal_runway_row(
+            x + 10.0,
+            y + 74.0,
+            runway_w - 20.0,
+            "Displays",
+            &display_value,
+            &display_detail,
+            if display_count > 0 {
+                C_PEACH_CSS
+            } else {
+                C_BLUE_CSS
+            },
+            display_actions,
+        );
+
+        let changes = self.snapshot.changes.clone();
+        let changes_value = if changes.count > 0 {
+            format!(
+                "{} files / +{} -{}",
+                changes.count,
+                compact_number(changes.total_added as f64),
+                compact_number(changes.total_removed as f64)
+            )
+        } else {
+            nonempty(&changes.status, "clean")
+        };
+        let changes_detail = if changes.latest_path.is_empty() {
+            "No tracked working tree changes".to_string()
+        } else {
+            truncate(
+                &format!("{} {}", changes.latest_kind, changes.latest_path),
+                68,
+            )
+        };
+        self.signal_runway_row(
+            x + 10.0,
+            y + 114.0,
+            runway_w - 20.0,
+            "Changes",
+            &changes_value,
+            &changes_detail,
+            if changes.count > 0 || changes.status == "mismatch" {
+                C_YELLOW_CSS
+            } else {
+                C_GREEN_CSS
+            },
+            vec![
+                RunwayAction::changes("refresh", "refresh", "", 66.0, C_BLUE_CSS),
+                RunwayAction::changes("copy", "copy-paths", "", 50.0, C_TEAL_CSS),
+                RunwayAction::select("panel", "system:changes", 54.0, C_OVERLAY1_CSS),
+            ],
+        );
     }
 
     fn status_chip(&self, x: f32, y: f32, w: f32, label: &str, color: &str) {
@@ -6820,6 +7017,76 @@ impl RunwayAction {
             hit: HitAction::ContextAction {
                 action: action.to_string(),
                 id: String::new(),
+            },
+        }
+    }
+
+    fn controls(
+        label: &'static str,
+        action: &'static str,
+        width: f32,
+        color: &'static str,
+    ) -> Self {
+        Self {
+            label,
+            width,
+            color,
+            hit: HitAction::ControlsAction {
+                action: action.to_string(),
+            },
+        }
+    }
+
+    fn changes(
+        label: &'static str,
+        action: &'static str,
+        path: &str,
+        width: f32,
+        color: &'static str,
+    ) -> Self {
+        Self {
+            label,
+            width,
+            color,
+            hit: HitAction::ChangesAction {
+                action: action.to_string(),
+                path: path.to_string(),
+            },
+        }
+    }
+
+    fn session(
+        label: &'static str,
+        action: &'static str,
+        session_id: &str,
+        width: f32,
+        color: &'static str,
+    ) -> Self {
+        Self {
+            label,
+            width,
+            color,
+            hit: HitAction::SessionAction {
+                action: action.to_string(),
+                session_id: session_id.to_string(),
+            },
+        }
+    }
+
+    fn open_display(
+        label: &'static str,
+        host_id: &str,
+        display_id: &str,
+        width: f32,
+        color: &'static str,
+    ) -> Self {
+        Self {
+            label,
+            width,
+            color,
+            hit: HitAction::OpenDisplay {
+                host_id: host_id.to_string(),
+                display_id: display_id.to_string(),
             },
         }
     }
