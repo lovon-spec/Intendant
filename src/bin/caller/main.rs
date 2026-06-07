@@ -2529,6 +2529,20 @@ fn context_rewind_anchor_prefix_estimate(
     }
 }
 
+fn context_rewind_anchor_restore_usage_for_headroom(
+    anchor: &ContextRewindAnchorCatalogEntry,
+    position: external_agent::RollbackAnchorPosition,
+) -> Option<(&'static str, u64, u64)> {
+    let rewind_only_limit = anchor.rewind_only_limit_at_or_after_anchor?;
+    if position == external_agent::RollbackAnchorPosition::After {
+        if let Some(backend_tokens) = anchor.backend_usage_at_or_after_anchor {
+            return Some(("backend-reported", backend_tokens, rewind_only_limit));
+        }
+    }
+    let prefix_tokens = context_rewind_anchor_prefix_estimate(anchor, position)?;
+    Some(("estimated", prefix_tokens, rewind_only_limit))
+}
+
 fn validate_context_rewind_anchor_restore_headroom(
     source_rollout_path: &Path,
     requested_item_id: &str,
@@ -2546,13 +2560,12 @@ fn validate_context_rewind_anchor_restore_headroom(
         return Ok(());
     };
 
-    let Some(rewind_only_limit) = anchor.rewind_only_limit_at_or_after_anchor else {
+    let Some((usage_kind, used_tokens, rewind_only_limit)) =
+        context_rewind_anchor_restore_usage_for_headroom(&anchor, position)
+    else {
         return Ok(());
     };
-    let Some(prefix_tokens) = context_rewind_anchor_prefix_estimate(&anchor, position) else {
-        return Ok(());
-    };
-    if context_rewind_anchor_has_recovery_headroom(prefix_tokens, rewind_only_limit) {
+    if context_rewind_anchor_has_recovery_headroom(used_tokens, rewind_only_limit) {
         if let Some(outcome) = latest_context_rewind_outcome_for_anchor(
             source_rollout_path,
             requested_item_id,
@@ -2581,9 +2594,10 @@ fn validate_context_rewind_anchor_restore_headroom(
     }
 
     Err(format!(
-        "rewind anchor item_id `{requested_item_id}` is not a valid recovery target: restoring {} item would keep an estimated {} prefix tokens before the injected primer, leaving less than {} normal-tool headroom under the {} token rewind-only limit. Rows returned only with include_non_recovery=true are diagnostic and must not be passed to rewind_context. Call list_rewind_anchors again without include_non_recovery and choose an anchor whose recovery_eligible field is true.",
+        "rewind anchor item_id `{requested_item_id}` is not a valid recovery target: restoring {} item would keep {} {} tokens before the injected primer, leaving less than {} normal-tool headroom under the {} token rewind-only limit. Rows returned only with include_non_recovery=true are diagnostic and must not be passed to rewind_context. Call list_rewind_anchors again without include_non_recovery and choose an anchor whose recovery_eligible field is true.",
         position.as_str(),
-        prefix_tokens,
+        usage_kind,
+        used_tokens,
         CONTEXT_REWIND_RECOVERY_MIN_RESUME_HEADROOM_TOKENS,
         rewind_only_limit
     ))
@@ -3317,7 +3331,7 @@ fn scan_context_rewind_anchor_catalog(
             .is_some_and(|prefix_tokens| {
                 context_rewind_anchor_has_recovery_headroom(prefix_tokens, usage.rewind_only_limit)
             });
-        if !restore_prefix_after_has_headroom {
+        if !backend_has_headroom && !restore_prefix_after_has_headroom {
             anchor.prefix_tokens_after = anchor.prefix_estimated_tokens_after_anchor;
         }
         let latest_rewind_after_outcome = latest_rewind_outcomes
@@ -3349,10 +3363,9 @@ fn scan_context_rewind_anchor_catalog(
                     outcome.rewind_only_limit,
                 )
             });
-        let after_recovery_eligible = backend_has_headroom
-            && restore_prefix_after_has_headroom
-            && latest_rewind_after_has_headroom;
-        let before_recovery_eligible = !restore_prefix_after_has_headroom
+        let after_recovery_eligible = backend_has_headroom && latest_rewind_after_has_headroom;
+        let before_recovery_eligible = !after_recovery_eligible
+            && !restore_prefix_after_has_headroom
             && restore_prefix_before_has_headroom
             && latest_rewind_before_has_headroom;
         anchor.position_hint = if after_recovery_eligible {
@@ -11212,7 +11225,7 @@ mod tests {
     }
 
     #[test]
-    fn context_rewind_anchor_catalog_filters_oversized_restored_prefix() {
+    fn context_rewind_anchor_catalog_trusts_backend_usage_over_oversized_prefix_estimate() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("rollout.jsonl");
         let huge_prior_context = "x".repeat(90_000);
@@ -11299,7 +11312,7 @@ mod tests {
             .iter()
             .filter_map(|anchor| anchor["item_id"].as_str())
             .collect::<Vec<_>>();
-        assert_eq!(ids, vec!["call_fit"]);
+        assert_eq!(ids, vec!["call_fit", "call_after_huge_prefix"]);
 
         let raw = list_context_rewind_anchors_from_rollout(
             &path,
@@ -11317,7 +11330,7 @@ mod tests {
             .iter()
             .filter_map(|anchor| anchor["item_id"].as_str())
             .collect::<Vec<_>>();
-        assert_eq!(ids, vec!["call_fit"]);
+        assert_eq!(ids, vec!["call_fit", "call_after_huge_prefix"]);
         assert_eq!(catalog["include_non_recovery"].as_bool(), Some(false));
         assert_eq!(catalog["recovery_candidates_only"].as_bool(), Some(true));
 
@@ -11342,22 +11355,19 @@ mod tests {
             oversized["backend_usage_at_or_after_anchor"].as_u64(),
             Some(1000)
         );
-        assert_eq!(oversized["recovery_eligible"].as_bool(), Some(false));
+        assert_eq!(oversized["position_hint"].as_str(), Some("after"));
+        assert_eq!(oversized["recovery_eligible"].as_bool(), Some(true));
         assert!(
-            oversized["prefix_tokens_after"]
-                .as_u64()
-                .is_some_and(|tokens| tokens > 22_000),
+            oversized["prefix_tokens_after"].is_null(),
             "got {oversized}"
         );
 
-        let err = validate_context_rewind_anchor_restore_headroom(
+        validate_context_rewind_anchor_restore_headroom(
             &path,
             "call_after_huge_prefix",
             external_agent::RollbackAnchorPosition::After,
         )
-        .expect_err("oversized restored prefix must be rejected");
-        assert!(err.contains("not a valid recovery target"), "got: {err}");
-        assert!(err.contains("recovery_eligible"), "got: {err}");
+        .expect("backend-reported headroom should allow the anchor");
     }
 
     #[test]

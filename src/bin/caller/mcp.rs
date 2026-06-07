@@ -995,7 +995,12 @@ fn tool_allowed_for_profile(name: &str, managed_context: bool, profile: Option<&
                     | "request_shared_view_input"
                     | "capture_shared_view_frame"
                     | "hide_shared_view"
-            ) || (managed_context && managed_context_tool(name))
+            ) || (managed_context
+                && (managed_context_tool(name)
+                    || matches!(
+                        name,
+                        "list_displays" | "take_screenshot" | "execute_cu_actions"
+                    )))
         }
         "screen" | "display" => {
             matches!(
@@ -1125,6 +1130,30 @@ fn append_manual_http_tool_definitions(
             "capture_shared_view_frame",
             "Capture one frame from the active dashboard shared display view.",
             CaptureSharedViewFrameParams
+        ),
+    );
+    push(
+        "list_displays",
+        manual_http_tool_definition!(
+            "list_displays",
+            "Enumerate available displays with their IDs, names, and resolutions.",
+            EmptyToolParams
+        ),
+    );
+    push(
+        "take_screenshot",
+        manual_http_tool_definition!(
+            "take_screenshot",
+            "Take a screenshot of a display. Returns an MCP image content block.",
+            TakeScreenshotParams
+        ),
+    );
+    push(
+        "execute_cu_actions",
+        manual_http_tool_definition!(
+            "execute_cu_actions",
+            "Execute computer-use actions on a display (click, type, scroll, etc). Returns action status plus an MCP image content block for the post-action screenshot. Set coordinate_space to \"normalized_1000\" if coordinates are on a 0-1000 grid.",
+            ExecuteCuActionsParams
         ),
     );
 }
@@ -4771,6 +4800,9 @@ pub fn spawn_http_observation_listener(
 // ---------------------------------------------------------------------------
 // Tool parameter types
 // ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct EmptyToolParams {}
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ApproveParams {
@@ -9050,7 +9082,10 @@ mod tests {
             assert!(managed_names.contains(&"inspect_rewind_anchor"));
             assert!(managed_names.contains(&"rewind_context"));
             assert!(managed_names.contains(&"rewind_backout"));
-            assert!(!managed_names.contains(&"execute_cu_actions"));
+            assert!(managed_names.contains(&"list_displays"));
+            assert!(managed_names.contains(&"take_screenshot"));
+            assert!(managed_names.contains(&"execute_cu_actions"));
+            assert!(!managed_names.contains(&"spawn_live_audio"));
         });
     }
 
