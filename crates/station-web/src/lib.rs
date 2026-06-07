@@ -1024,6 +1024,7 @@ impl StationInner {
         self.draw_signal_runway(w, h);
         self.draw_operations_runway(w, h);
         self.draw_display_switchboard(w, h);
+        self.draw_activity_detail_rail(w, h);
         self.draw_command_lane(w, h);
         self.draw_attention_strip(w, h);
         self.draw_corners(w, h);
@@ -2614,6 +2615,149 @@ impl StationInner {
                 display_id: tile.display_id.clone(),
             },
         ));
+    }
+
+    fn draw_activity_detail_rail(&mut self, w: f32, h: f32) {
+        if w < 1180.0
+            || h < 720.0
+            || self.selected_id.is_some()
+            || !self.attention_items().is_empty()
+        {
+            return;
+        }
+        let panel_w = 264.0;
+        let x = w - panel_w - 14.0;
+        let y = 434.0;
+        let panel_h = (h - y - 102.0).clamp(132.0, 190.0);
+        self.round_rect(
+            x,
+            y,
+            panel_w,
+            panel_h,
+            6.0,
+            "rgba(17,17,27,0.76)",
+            "rgba(148,226,213,0.50)",
+        );
+        self.text(
+            "ACTIVITY DETAIL",
+            x + 12.0,
+            y + 20.0,
+            10.0,
+            C_TEAL_CSS,
+            "bold",
+        );
+        self.text(
+            &format!("{} retained", self.snapshot.events.len()),
+            x + panel_w - 91.0,
+            y + 20.0,
+            9.0,
+            C_SUBTEXT0_CSS,
+            "normal",
+        );
+
+        let actions = [
+            RunwayAction::activity("latest", "bottom", 58.0, C_TEAL_CSS),
+            RunwayAction::activity("copy", "copy-visible", 48.0, C_BLUE_CSS),
+            RunwayAction::select("panel", "system:activity", 52.0, C_OVERLAY1_CSS),
+        ];
+        let mut ax = x + 12.0;
+        for action in actions {
+            self.pill_at(ax, y + 31.0, action.width, 20.0, action.label, action.color);
+            self.hit_zones
+                .push(HitZone::new(ax, y + 31.0, action.width, 20.0, action.hit));
+            ax += action.width + 7.0;
+        }
+
+        let events = self
+            .snapshot
+            .events
+            .iter()
+            .rev()
+            .take(5)
+            .cloned()
+            .collect::<Vec<_>>();
+        if events.is_empty() {
+            self.round_rect(
+                x + 10.0,
+                y + 63.0,
+                panel_w - 20.0,
+                54.0,
+                4.0,
+                "rgba(24,24,37,0.70)",
+                "rgba(49,50,68,0.72)",
+            );
+            self.text(
+                "Waiting for dashboard events",
+                x + 20.0,
+                y + 91.0,
+                10.0,
+                C_SUBTEXT0_CSS,
+                "normal",
+            );
+            return;
+        }
+
+        let row_h = 24.0;
+        let max_rows = ((panel_h - 63.0) / row_h).floor().max(1.0) as usize;
+        for (idx, event) in events.into_iter().rev().take(max_rows).enumerate() {
+            let row_y = y + 63.0 + idx as f32 * row_h;
+            self.activity_detail_row(x + 10.0, row_y, panel_w - 20.0, event);
+        }
+    }
+
+    fn activity_detail_row(&mut self, x: f32, y: f32, w: f32, event: StationEvent) {
+        self.round_rect(
+            x,
+            y,
+            w,
+            20.0,
+            4.0,
+            "rgba(24,24,37,0.64)",
+            "rgba(49,50,68,0.64)",
+        );
+        let color = level_color_css(&event.level);
+        self.ctx.set_fill_style(&JsValue::from_str(color));
+        self.ctx
+            .fill_rect((x + 7.0) as f64, (y + 5.0) as f64, 3.0, 10.0);
+        self.text(
+            &truncate(&nonempty(&event.ts, "--"), 8),
+            x + 16.0,
+            y + 13.0,
+            8.0,
+            C_OVERLAY1_CSS,
+            "normal",
+        );
+        self.text(
+            &truncate(&event.level, 6),
+            x + 62.0,
+            y + 13.0,
+            8.0,
+            color,
+            "bold",
+        );
+        let detail = if event.action.is_empty() {
+            truncate(&event.msg, 34)
+        } else {
+            truncate(&format!("{} / {}", event.action, event.msg), 34)
+        };
+        self.text(
+            &truncate(&nonempty(&event.host_id, "local"), 10),
+            x + 100.0,
+            y + 13.0,
+            8.0,
+            C_PEACH_CSS,
+            "normal",
+        );
+        self.text(&detail, x + 154.0, y + 13.0, 8.0, C_SUBTEXT0_CSS, "normal");
+        let hit = if event.action == "log" && !event.id.is_empty() {
+            HitAction::ActivityAction {
+                action: event.action,
+                id: event.id,
+            }
+        } else {
+            HitAction::Select("system:activity".to_string())
+        };
+        self.hit_zones.push(HitZone::new(x, y, w, 20.0, hit));
     }
 
     fn status_chip(&self, x: f32, y: f32, w: f32, label: &str, color: &str) {
