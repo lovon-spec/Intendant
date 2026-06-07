@@ -11441,6 +11441,15 @@ function stationCommandEntries() {
       },
     },
     {
+      label: 'Execution composer',
+      detail: 'Draft, send, steer, or launch from Station Controls',
+      tokens: 'execute composer prompt send steer follow up launch task',
+      run: () => {
+        stationRenderControlsDock('execution');
+        setTimeout(() => document.getElementById('station-execution-input')?.focus(), 0);
+      },
+    },
+    {
       label: 'New session',
       detail: 'Open the Station launch form',
       tokens: 'new session launch start task',
@@ -11552,7 +11561,7 @@ function stationRunQuickCommand(kind) {
         stationHandleActivityAction({ action: 'send' });
       } else {
         stationHandleHotspot('system:controls');
-        setTimeout(() => input?.focus(), 0);
+        setTimeout(() => (document.getElementById('station-execution-input') || input)?.focus(), 0);
       }
       break;
     }
@@ -17947,10 +17956,117 @@ function stationRenderOperationsBriefSection(parent, controls) {
   ]);
 }
 
+function stationActivityDraftValue() {
+  return document.getElementById('activity-task-input')?.value || '';
+}
+
+function stationSetActivityDraftValue(value) {
+  const input = document.getElementById('activity-task-input');
+  if (!input) return;
+  input.value = value || '';
+  if (typeof resizeTaskTextarea === 'function') resizeTaskTextarea(input);
+}
+
+function stationSetDirectModeFromDock(checked) {
+  const direct = document.getElementById('direct-mode-toggle');
+  if (!direct) return;
+  direct.checked = !!checked;
+  direct.dispatchEvent(new Event('change', { bubbles: true }));
+}
+
+function stationSubmitExecutionFromDock() {
+  const input = document.getElementById('station-execution-input');
+  const text = String(input?.value || stationActivityDraftValue()).trim();
+  if (!text) {
+    showControlToast?.('error', 'Enter a task before sending');
+    input?.focus();
+    return;
+  }
+  if (!app) {
+    showControlToast?.('error', 'Dashboard is not connected to the server');
+    return;
+  }
+  stationSetActivityDraftValue(input?.value || text);
+  window.submitActivityOrSteer?.();
+  requestAnimationFrame(() => {
+    const remaining = stationActivityDraftValue();
+    if (input) input.value = remaining;
+    if (!remaining.trim()) stationRenderControlsDock('execution');
+  });
+}
+
+function stationOpenExecutionLaunchDraft() {
+  const input = document.getElementById('station-execution-input');
+  const text = String(input?.value || stationActivityDraftValue() || '').trim();
+  if (text) {
+    stationSetActivityDraftValue(input?.value || text);
+    stationLaunchDraft.task = input?.value || text;
+  }
+  stationOpenSessionLaunchDock({ useActivityDraft: true });
+}
+
+function stationClearExecutionDraft() {
+  stationSetActivityDraftValue('');
+  const input = document.getElementById('station-execution-input');
+  if (input) {
+    input.value = '';
+    input.focus();
+  }
+  stationRenderControlsDock('execution');
+}
+
+function stationRenderExecutionSection(parent, controls) {
+  const section = stationDockSection(parent, 'Agent execution');
+  const draft = stationActivityDraftValue();
+  const target = controls.sessionLabel || controls.sessionSelection || 'daemon';
+  stationDockRow(section, 'target', target);
+  stationDockRow(section, 'mode', controls.promptMode === 'steer' ? 'mid-turn steer' : (controls.directMode ? 'direct send' : 'orchestrated send'));
+  stationDockRow(section, 'state', controls.sessionActive ? 'active' : (controls.sessionDetached ? 'detached' : 'idle'));
+  stationDockRow(section, 'draft', draft.trim() ? `${draft.trim().length} chars` : '--');
+  if (controls.pendingAttachments) stationDockRow(section, 'attachments', `${controls.pendingAttachments} pending`);
+
+  const input = stationDockInput(section, 'Message', draft, {
+    id: 'station-execution-input',
+    placeholder: 'Send a task or follow-up',
+    multiline: true,
+    rows: 4,
+  });
+  input.addEventListener('input', ev => {
+    stationSetActivityDraftValue(ev.target.value || '');
+  });
+  input.addEventListener('keydown', ev => {
+    if (ev.key !== 'Enter' || (!ev.ctrlKey && !ev.metaKey) || ev.isComposing) return;
+    ev.preventDefault();
+    stationSubmitExecutionFromDock();
+  });
+
+  const direct = stationDockCheckbox(section, 'Direct mode', controls.directMode, { id: 'station-execution-direct' });
+  direct.addEventListener('change', ev => {
+    stationSetDirectModeFromDock(ev.target.checked);
+    stationRenderControlsDock('execution');
+  });
+
+  stationDockActions(section, [
+    {
+      label: controls.promptMode === 'steer' ? 'Steer' : 'Send',
+      primary: true,
+      disabled: !app,
+      title: !app ? 'Dashboard is not connected' : 'Send the Station execution draft',
+      onClick: stationSubmitExecutionFromDock,
+    },
+    { label: 'New session', onClick: stationOpenExecutionLaunchDraft },
+    { label: 'Attach file', onClick: () => document.getElementById('upload-attach-btn')?.click() },
+    controls.sessionCanFocus ? { label: 'Focus target', onClick: () => stationHandleActivityAction({ action: 'target' }) } : null,
+    draft.trim() ? { label: 'Clear draft', danger: true, onClick: stationClearExecutionDraft } : null,
+  ]);
+}
+
 function stationRenderControlsDock(sectionName = 'overview') {
   const controls = stationBuildControlsSummary();
   const body = stationDockBegin('controls', 'Control Surfaces', `${controls.backend || 'agent'} / ${controls.sandbox || 'sandbox'}`);
   if (!body) return;
+  stationRenderExecutionSection(body, controls);
+
   const operator = stationDockSection(body, 'Operator');
   stationDockRow(operator, 'draft', `${controls.draftChars} chars / ${controls.directMode ? 'direct' : 'presence'}`);
   stationDockRow(operator, 'target', controls.sessionLabel || controls.sessionSelection || '--');
