@@ -9620,6 +9620,65 @@ fn managed_context_candidate_log_dirs(
     dirs
 }
 
+fn managed_context_backend_session_id_from_log_dir(log_dir: &Path) -> Option<String> {
+    let session_path = log_dir.join("session.jsonl");
+    let file = std::fs::File::open(session_path).ok()?;
+    let reader = std::io::BufReader::new(file);
+    for line in reader.lines().map_while(Result::ok) {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        if value.get("event").and_then(|v| v.as_str()) == Some("session_identity") {
+            if let Some(id) = value
+                .get("data")
+                .and_then(|data| data.get("backend_session_id"))
+                .and_then(|v| v.as_str())
+                .and_then(clean_external_thread_id)
+            {
+                return Some(id);
+            }
+        }
+        if let Some(id) = value
+            .get("message")
+            .and_then(|v| v.as_str())
+            .and_then(external_agent_thread_id_from_message)
+        {
+            return Some(id);
+        }
+    }
+    None
+}
+
+fn managed_context_push_filter_session_id(filter_session_ids: &mut Vec<String>, id: Option<&str>) {
+    let Some(id) = id.map(str::trim).filter(|id| !id.is_empty()) else {
+        return;
+    };
+    if !filter_session_ids.iter().any(|existing| existing == id) {
+        filter_session_ids.push(id.to_string());
+    }
+}
+
+fn managed_context_extend_candidate_log_dirs(dirs: &mut Vec<PathBuf>, extra_dirs: Vec<PathBuf>) {
+    let mut seen_dirs: HashSet<String> = dirs
+        .iter()
+        .map(|path| {
+            std::fs::canonicalize(path)
+                .unwrap_or_else(|_| path.clone())
+                .to_string_lossy()
+                .to_string()
+        })
+        .collect();
+    for path in extra_dirs {
+        let key = std::fs::canonicalize(&path)
+            .unwrap_or_else(|_| path.clone())
+            .to_string_lossy()
+            .to_string();
+        if seen_dirs.insert(key) {
+            dirs.push(path);
+        }
+    }
+}
+
 fn managed_context_record_matches_session(
     record: &crate::context_rewind::ContextRewindRecord,
     session_id: &str,
@@ -9627,11 +9686,20 @@ fn managed_context_record_matches_session(
     record.thread_id == session_id || record.session_id.as_deref() == Some(session_id)
 }
 
+fn managed_context_record_matches_any_session(
+    record: &crate::context_rewind::ContextRewindRecord,
+    session_ids: &[String],
+) -> bool {
+    session_ids
+        .iter()
+        .any(|session_id| managed_context_record_matches_session(record, session_id))
+}
+
 fn append_managed_context_records_from_dir(
     records: &mut Vec<crate::context_rewind::ContextRewindRecord>,
     seen_dirs: &mut std::collections::HashSet<String>,
     log_dir: &Path,
-    session_id: Option<&str>,
+    session_ids: &[String],
 ) -> std::io::Result<()> {
     let key = std::fs::canonicalize(log_dir)
         .unwrap_or_else(|_| log_dir.to_path_buf())
@@ -9641,8 +9709,8 @@ fn append_managed_context_records_from_dir(
         return Ok(());
     }
     let mut from_dir = crate::context_rewind::list_records(log_dir)?;
-    if let Some(session_id) = session_id {
-        from_dir.retain(|record| managed_context_record_matches_session(record, session_id));
+    if !session_ids.is_empty() {
+        from_dir.retain(|record| managed_context_record_matches_any_session(record, session_ids));
     }
     records.extend(from_dir);
     Ok(())
@@ -9881,23 +9949,56 @@ fn managed_context_records_response_from_home(
 ) -> String {
     let session_id = managed_context_query_session_id(request_line);
     let wrapper_session_id = managed_context_query_wrapper_session_id(request_line);
-    let filter_session_id = session_id.as_deref().or(wrapper_session_id.as_deref());
+    let mut filter_session_ids = Vec::new();
+    managed_context_push_filter_session_id(&mut filter_session_ids, session_id.as_deref());
+    managed_context_push_filter_session_id(&mut filter_session_ids, wrapper_session_id.as_deref());
     let mut records = Vec::new();
     let mut seen_dirs = std::collections::HashSet::new();
 
-    let dirs = managed_context_candidate_log_dirs(
+    let mut dirs = managed_context_candidate_log_dirs(
         home,
         active_log_dir,
         session_id.as_deref(),
         wrapper_session_id.as_deref(),
     );
+    let mut query_log_ids = Vec::new();
+    managed_context_push_filter_session_id(&mut query_log_ids, wrapper_session_id.as_deref());
+    managed_context_push_filter_session_id(&mut query_log_ids, session_id.as_deref());
+    for query_log_id in query_log_ids {
+        let Some(log_dir) = managed_context_named_log_dir(home, &query_log_id) else {
+            continue;
+        };
+        let Some(backend_session_id) = managed_context_backend_session_id_from_log_dir(&log_dir)
+        else {
+            continue;
+        };
+        if filter_session_ids
+            .iter()
+            .any(|existing| existing == &backend_session_id)
+        {
+            continue;
+        }
+        managed_context_push_filter_session_id(
+            &mut filter_session_ids,
+            Some(backend_session_id.as_str()),
+        );
+        managed_context_extend_candidate_log_dirs(
+            &mut dirs,
+            managed_context_candidate_log_dirs(
+                home,
+                active_log_dir,
+                Some(backend_session_id.as_str()),
+                Some(query_log_id.as_str()),
+            ),
+        );
+    }
     if !dirs.is_empty() {
         for log_dir in dirs {
             if let Err(err) = append_managed_context_records_from_dir(
                 &mut records,
                 &mut seen_dirs,
                 &log_dir,
-                filter_session_id,
+                &filter_session_ids,
             ) {
                 return json_error(
                     "500 Internal Server Error",
@@ -9921,7 +10022,7 @@ fn managed_context_records_response_from_home(
             &mut records,
             &mut seen_dirs,
             log_dir,
-            filter_session_id,
+            &filter_session_ids,
         ) {
             return json_error(
                 "500 Internal Server Error",
@@ -19565,6 +19666,59 @@ mod tests {
             .map(|record| record["record_id"].as_str().unwrap())
             .collect();
         assert_eq!(ids, vec!["historical"]);
+    }
+
+    #[test]
+    fn managed_context_records_response_resolves_wrapper_to_backend_thread() {
+        let home = tempfile::tempdir().unwrap();
+        let active = tempfile::tempdir().unwrap();
+        let logs_dir = home.path().join(".intendant").join("logs");
+        let wrapper_log = logs_dir.join("wrapper-session");
+        std::fs::create_dir_all(&wrapper_log).unwrap();
+        std::fs::write(
+            wrapper_log.join("session.jsonl"),
+            serde_json::json!({
+                "event": "debug",
+                "message": "External agent thread: codex-thread-a"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let managed_host_log = logs_dir.join("managed-host");
+        crate::context_rewind::persist_record(
+            &managed_host_log,
+            &managed_context_test_record(
+                "historical-by-thread",
+                Some("managed-host"),
+                "codex-thread-a",
+                "2026-05-27T00:00:00Z",
+            ),
+        )
+        .unwrap();
+        crate::context_rewind::persist_record(
+            &managed_host_log,
+            &managed_context_test_record(
+                "hidden",
+                Some("managed-host"),
+                "other-thread",
+                "2026-05-28T00:00:00Z",
+            ),
+        )
+        .unwrap();
+
+        let response = managed_context_records_response_from_home(
+            "GET /api/managed-context/records?session_id=wrapper-session HTTP/1.1",
+            Some(active.path()),
+            home.path(),
+        );
+        let body = response_json_body(&response);
+        let ids: Vec<_> = body["records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|record| record["record_id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, vec!["historical-by-thread"]);
     }
 
     #[test]
