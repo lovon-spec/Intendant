@@ -11450,6 +11450,12 @@ function stationCommandEntries() {
       },
     },
     {
+      label: 'Draft handoff',
+      detail: 'Load a Station handoff packet into the execution composer',
+      tokens: 'handoff packet operations brief context managed peers displays execution',
+      run: () => stationDraftOperationsHandoff(),
+    },
+    {
       label: 'New session',
       detail: 'Open the Station launch form',
       tokens: 'new session launch start task',
@@ -17755,6 +17761,9 @@ function stationOperationsLatestActivityEvent() {
 }
 
 function stationOperationsManagedReadiness(managed) {
+  if (managed && !managed.sessionId && managed.session_id) {
+    return managed.readiness || managed.status || 'known';
+  }
   const ready = stationManagedReadiness(managed);
   if (ready.base) return ready.base;
   if (managed?.rewindOnly) return 'rewind-only pressure';
@@ -17798,6 +17807,27 @@ function stationCodexThreadActionButton(sessionId, op, label, opts = {}) {
     disabled: !state.allowed,
     title: state.allowed ? `/${op}` : state.reason,
     onClick: () => stationHandleThreadAction({ op, session_id: sid }),
+  };
+}
+
+function stationOperationsDisplayPayload(controls) {
+  const connectedPeers = daemons.filter(d => d.connected).length;
+  return {
+    peers_total: daemons.length,
+    peers_connected: connectedPeers,
+    local_streams: displaySlots.size,
+    peer_streams: peerDisplayConnections.size,
+    local_access: controls.displayAccess || '',
+    shared_view: {
+      visible: !!controls.sharedViewVisible,
+      target: controls.sharedViewTarget || '',
+      action: controls.sharedViewAction || '',
+      note: controls.sharedViewNote || '',
+      can_take_input: !!controls.sharedViewCanTakeInput,
+    },
+    browser_workspaces: controls.browserWorkspaces || 0,
+    voice: controls.voiceState || '',
+    active_browser: !!controls.activeBrowser,
   };
 }
 
@@ -17868,6 +17898,13 @@ function stationOperationsBriefPayload(context, managed, sessions, controls) {
     attachments: {
       pending: controls.pendingAttachments || 0,
     },
+    execution: {
+      mode: controls.promptMode || 'send',
+      direct: !!controls.directMode,
+      draft_chars: controls.draftChars || 0,
+      draft_preview: compactSessionText(stationActivityDraftValue(), 240),
+    },
+    displays: stationOperationsDisplayPayload(controls),
     external: {
       backend: controls.backend || 'none',
       default_command: controls.command || '',
@@ -17883,6 +17920,14 @@ function stationOperationsBriefPayload(context, managed, sessions, controls) {
   };
 }
 
+function stationCurrentOperationsBriefPayload() {
+  const context = stationBuildContextSummary();
+  const managed = stationBuildManagedSummary(context);
+  const sessions = stationBuildSessionsSummary();
+  const controls = stationBuildControlsSummary();
+  return stationOperationsBriefPayload(context, managed, sessions, controls);
+}
+
 function stationOperationsBriefText(payload) {
   const target = payload.target || {};
   const activity = payload.activity || {};
@@ -17890,6 +17935,9 @@ function stationOperationsBriefText(payload) {
   const managed = payload.managed || {};
   const sessions = payload.sessions || {};
   const attachments = payload.attachments || {};
+  const execution = payload.execution || {};
+  const displays = payload.displays || {};
+  const shared = displays.shared_view || {};
   const external = payload.external || {};
   return [
     `Target: ${target.label || shortSessionId(target.id) || 'daemon'} (${target.selection || 'current'}, ${target.state || 'idle'}, ${target.source || 'intendant'})`,
@@ -17897,9 +17945,22 @@ function stationOperationsBriefText(payload) {
     `Context: ${context.available ? `${stationCompactNumber(context.used_tokens)} / ${stationCompactNumber(context.effective_window)} tokens` : 'none'}${context.turn ? `, ${context.turn}` : ''}`,
     `Managed: ${managed.mode || 'vanilla'} / ${managed.status || 'unknown'} / ${managed.readiness || 'unknown'} (${managed.anchors || 0} anchors, ${managed.records || 0} records)`,
     `Sessions: ${sessions.active || 0} active of ${sessions.total || 0}; ${sessions.external || 0} external; latest ${sessions.latest_task || 'none'}`,
+    `Execution: ${execution.mode || 'send'}${execution.direct ? ' direct' : ''}; draft ${execution.draft_chars || 0} chars`,
+    `Displays: ${displays.local_access || 'off'}; ${displays.local_streams || 0} local / ${displays.peer_streams || 0} peer streams; peers ${displays.peers_connected || 0}/${displays.peers_total || 0}; shared ${shared.visible ? (shared.target || 'visible') : 'hidden'}`,
     `Attachments: ${attachments.pending || 0} pending`,
     `External: ${external.backend || 'none'}${external.targets?.length ? `; targets ${external.targets.map(row => `${row.label || shortSessionId(row.id)}:${row.status}`).join(', ')}` : ''}`,
   ].join('\n');
+}
+
+function stationOperationsHandoffText(payload) {
+  const execution = payload.execution || {};
+  return [
+    'Station handoff packet',
+    `Generated: ${payload.generated_at || new Date().toISOString()}`,
+    stationOperationsBriefText(payload),
+    execution.draft_preview ? `Current draft: ${execution.draft_preview}` : '',
+    'Use this Station state to continue with the current target, context pressure, managed-context readiness, session inventory, and display/peer posture in mind.',
+  ].filter(Boolean).join('\n');
 }
 
 async function stationCopyOperationsBrief(payload, asJson = false) {
@@ -17908,6 +17969,22 @@ async function stationCopyOperationsBrief(payload, asJson = false) {
     : stationOperationsBriefText(payload);
   await copyTextToClipboard(text);
   showControlToast?.('success', asJson ? 'Operations JSON copied' : 'Operations brief copied');
+}
+
+async function stationCopyOperationsHandoff(payload) {
+  await copyTextToClipboard(stationOperationsHandoffText(payload));
+  showControlToast?.('success', 'Station handoff copied');
+}
+
+function stationDraftOperationsHandoff(payload = stationCurrentOperationsBriefPayload()) {
+  stationSetActivityDraftValue(stationOperationsHandoffText(payload));
+  stationRenderControlsDock('execution');
+  requestAnimationFrame(() => {
+    const input = document.getElementById('station-execution-input');
+    input?.focus();
+    input?.setSelectionRange?.(input.value.length, input.value.length);
+  });
+  showControlToast?.('success', 'Station handoff loaded into execution draft');
 }
 
 function stationSeedManagedFromOperationsBrief() {
@@ -17921,10 +17998,19 @@ function stationSeedManagedFromOperationsBrief() {
 }
 
 function stationRenderOperationsBriefSection(parent, controls) {
-  const context = stationBuildContextSummary();
-  const managed = stationBuildManagedSummary(context);
-  const sessions = stationBuildSessionsSummary();
-  const payload = stationOperationsBriefPayload(context, managed, sessions, controls);
+  const contextSummary = stationBuildContextSummary();
+  const managedSummary = stationBuildManagedSummary(contextSummary);
+  const sessionsSummary = stationBuildSessionsSummary();
+  const payload = stationOperationsBriefPayload(
+    contextSummary,
+    managedSummary,
+    sessionsSummary,
+    controls
+  );
+  const context = payload.context || {};
+  const managed = payload.managed || {};
+  const sessions = payload.sessions || {};
+  const displays = payload.displays || {};
   const latestEventId = payload.activity?.id || '';
   const codexActionId = controls.sessionIsCodex
     ? String(controls.sessionActionId || controls.sessionId || '').trim()
@@ -17933,24 +18019,29 @@ function stationRenderOperationsBriefSection(parent, controls) {
   stationDockRow(section, 'target', `${controls.sessionLabel || controls.sessionSelection || 'daemon'} / ${controls.sessionActive ? 'active' : (controls.sessionDetached ? 'detached' : 'idle')}`);
   if (codexActionId) stationDockRow(section, 'Codex thread', shortSessionId(codexActionId));
   stationDockRow(section, 'activity', stationOperationsActivityLine(stationOperationsLatestActivityEvent()));
-  stationDockRow(section, 'context', stationOperationsContextLine(context, managed));
-  stationDockRow(section, 'managed', `${managed.mode || 'vanilla'} / ${stationOperationsManagedReadiness(managed)} / ${managed.anchors || 0} anchors`);
+  stationDockRow(section, 'context', stationOperationsContextLine(contextSummary, managedSummary));
+  stationDockRow(section, 'managed', `${managedSummary.mode || 'vanilla'} / ${stationOperationsManagedReadiness(managedSummary)} / ${managedSummary.anchors || 0} anchors`);
   stationDockRow(section, 'sessions', `${sessions.active || 0} active / ${sessions.total || 0} total / ${sessions.external || 0} external`);
+  stationDockRow(section, 'displays', `${displays.local_streams || 0} local / ${displays.peer_streams || 0} peer / ${displays.peers_connected || 0}/${displays.peers_total || 0} peers`);
+  stationDockRow(section, 'live', `${displays.voice || 'idle'} / ${displays.browser_workspaces || 0} browser workspaces`);
   stationDockRow(section, 'attachments', `${controls.pendingAttachments || 0} pending`);
   stationDockRow(section, 'external', `${controls.backend || 'none'} / ${controls.command || controls.sessionCommand || '--'}`);
   stationDockActions(section, [
+    { label: 'Draft handoff', primary: true, onClick: () => stationDraftOperationsHandoff(payload) },
     { label: 'Activity', onClick: () => stationRenderActivityDock(latestEventId) },
     { label: 'Context', onClick: () => stationRenderContextDock(stationSelectedContextPart) },
-    { label: 'Managed', onClick: () => stationRenderManagedDock(managed.rewindOnly ? 'rewind' : '') },
-    { label: 'Seed rewind', primary: managed.rewindOnly || !!context.available, disabled: !context.available, onClick: stationSeedManagedFromOperationsBrief },
+    { label: 'Managed', onClick: () => stationRenderManagedDock(managedSummary.rewindOnly ? 'rewind' : '') },
+    { label: 'Seed rewind', primary: managedSummary.rewindOnly || !!contextSummary.available, disabled: !contextSummary.available, onClick: stationSeedManagedFromOperationsBrief },
     { label: 'Sessions', onClick: () => stationRenderSessionsDock(controls.sessionId || '') },
     { label: 'Target controls', onClick: () => stationRenderControlsDock('external') },
+    { label: 'Peers', onClick: () => stationRenderPeersDock() },
     { label: 'Attach file', onClick: () => document.getElementById('upload-attach-btn')?.click() },
     controls.pendingAttachments > 0 ? { label: 'Clear attach', danger: true, onClick: () => document.querySelector('[data-pending-attachments-clear]')?.click() } : null,
     stationCodexThreadActionButton(codexActionId, 'fast', 'Fast'),
     stationCodexThreadActionButton(codexActionId, 'compact', 'Compact'),
     stationCodexThreadActionButton(codexActionId, 'goal-get', 'Goal status'),
     controls.sessionCanFocus ? { label: 'Focus target', onClick: () => stationHandleActivityAction({ action: 'target' }) } : null,
+    { label: 'Copy handoff', onClick: () => stationCopyOperationsHandoff(payload) },
     { label: 'Copy brief', onClick: () => stationCopyOperationsBrief(payload, false) },
     { label: 'Copy JSON', onClick: () => stationCopyOperationsBrief(payload, true) },
   ]);
