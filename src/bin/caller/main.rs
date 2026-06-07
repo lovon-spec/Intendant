@@ -2947,6 +2947,10 @@ struct ContextRewindAnchorCatalogEntry {
     #[serde(skip_serializing)]
     prefix_estimated_tokens_after_anchor: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    approx_pruned_tokens_before: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    approx_pruned_tokens_after: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     prefix_tokens_after: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     latest_rewind_usage_after_anchor: Option<u64>,
@@ -2968,6 +2972,8 @@ struct ContextRewindAnchorCatalog {
     include_management_tools: bool,
     include_non_recovery: bool,
     recovery_candidates_only: bool,
+    pruning_estimates_included: bool,
+    selection_note: String,
     anchors: Vec<ContextRewindAnchorCatalogEntry>,
     usage: &'static str,
 }
@@ -3064,6 +3070,11 @@ fn list_context_rewind_anchors_from_rollout(
                 .map(str::trim)
                 .is_some_and(|direction| direction.eq_ignore_ascii_case("backward"))
         });
+    let include_pruning_estimates = params
+        .get("include_pruning_estimates")
+        .or_else(|| params.get("includePruningEstimates"))
+        .and_then(|value| value.as_bool())
+        .unwrap_or(reverse || query.is_some());
 
     let mut anchors = scan_context_rewind_anchor_catalog(source_rollout_path).map_err(|err| {
         format!(
@@ -3086,13 +3097,32 @@ fn list_context_rewind_anchors_from_rollout(
         anchors.retain(|anchor| context_rewind_anchor_matches_query(anchor, &needle));
     }
     let filtered_total = anchors.len();
-    let page = anchors
+    let mut page = anchors
         .into_iter()
         .skip(offset)
         .take(limit)
         .collect::<Vec<_>>();
+    if !include_pruning_estimates {
+        for anchor in &mut page {
+            anchor.approx_pruned_tokens_before = None;
+            anchor.approx_pruned_tokens_after = None;
+        }
+    }
     let next_offset =
         (offset.saturating_add(limit) < filtered_total).then_some(offset.saturating_add(limit));
+    let selection_note = if include_pruning_estimates && reverse {
+        "reverse=true returns newest anchors first. For density compaction, newest post-branch anchors usually prune little or nothing; compare approx_pruned_tokens_after/before and use query, pagination, or inspect_rewind_anchor to target the start of the branch/noisy span you want to discard."
+    } else if include_pruning_estimates {
+        "For density compaction, compare approx_pruned_tokens_after/before; a tiny pruned-token estimate means the anchor preserves most recent history. Use query, pagination, or inspect_rewind_anchor to target the start of the branch/noisy span you want to discard."
+    } else {
+        "Broad catalog listing omits pruning estimates. For density compaction, pass include_pruning_estimates=true, use query, or use reverse=true, then compare approx_pruned_tokens_after/before."
+    }
+    .to_string();
+    let usage = if include_pruning_estimates {
+        "Use item_id exactly in rewind_context.anchor.item_id. Model-facing catalogs hide non-recovery and management anchors by default. Never pass recovery_eligible=false audit rows to rewind_context. Inspect ambiguous candidates. position=\"after\" keeps the item/group; position=\"before\" drops it too. approx_pruned_tokens_after/before estimate how much recent rollout context that position discards."
+    } else {
+        "Use item_id exactly in rewind_context.anchor.item_id. Model-facing catalogs hide non-recovery and management anchors by default. Never pass recovery_eligible=false audit rows to rewind_context. Inspect ambiguous candidates. position=\"after\" keeps the item/group; position=\"before\" drops it too."
+    };
     let catalog = ContextRewindAnchorCatalog {
         rollout_path: source_rollout_path.display().to_string(),
         total,
@@ -3104,8 +3134,10 @@ fn list_context_rewind_anchors_from_rollout(
         include_management_tools,
         include_non_recovery,
         recovery_candidates_only,
+        pruning_estimates_included: include_pruning_estimates,
+        selection_note,
         anchors: page,
-        usage: "Use item_id exactly in rewind_context.anchor.item_id. Normal model-facing catalogs hide anchors with recovery_eligible=false; recovery_candidates_only=false is ignored unless include_non_recovery=true. Set include_non_recovery=true only for diagnostics/audit, and never pass a recovery_eligible=false audit row to rewind_context. Management calls are hidden by default; set include_management_tools=true only for internals. Absent recovery_eligible means no nearby backend usage sample. Inspect ambiguous candidates. position=\"after\" keeps the item/group; position=\"before\" drops it too.",
+        usage,
     };
     serde_json::to_string(&catalog).map_err(|err| err.to_string())
 }
@@ -3296,6 +3328,8 @@ fn scan_context_rewind_anchor_catalog(
                 rewind_only_limit_at_or_after_anchor: None,
                 prefix_estimated_tokens_before_anchor: Some(prefix_before_item),
                 prefix_estimated_tokens_after_anchor: Some(prefix_after_item),
+                approx_pruned_tokens_before: None,
+                approx_pruned_tokens_after: None,
                 prefix_tokens_after: None,
                 latest_rewind_usage_after_anchor: None,
                 latest_rewind_limit_after_anchor: None,
@@ -3309,7 +3343,14 @@ fn scan_context_rewind_anchor_catalog(
         }
     }
 
+    let total_prefix_estimated_tokens = prefix_estimated_tokens;
     for anchor in &mut anchors {
+        anchor.approx_pruned_tokens_before = anchor
+            .prefix_estimated_tokens_before_anchor
+            .map(|prefix_tokens| total_prefix_estimated_tokens.saturating_sub(prefix_tokens));
+        anchor.approx_pruned_tokens_after = anchor
+            .prefix_estimated_tokens_after_anchor
+            .map(|prefix_tokens| total_prefix_estimated_tokens.saturating_sub(prefix_tokens));
         let Some(usage) = backend_usage
             .iter()
             .find(|usage| usage.line >= anchor.last_line)
@@ -11051,6 +11092,100 @@ mod tests {
             .filter_map(|anchor| anchor["item_id"].as_str())
             .collect::<Vec<_>>();
         assert_eq!(ids, vec!["call_recovery_list", "call_launch_dashboard"]);
+    }
+
+    #[test]
+    fn context_rewind_anchor_catalog_exposes_compaction_impact() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rollout.jsonl");
+        let large_output = "branch detail ".repeat(400);
+        std::fs::write(
+            &path,
+            [
+                serde_json::json!({
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call",
+                        "name": "exec_command",
+                        "call_id": "call_branch_start",
+                        "arguments": "{\"cmd\":\"rg display runway\"}"
+                    }
+                }),
+                serde_json::json!({
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call_output",
+                        "call_id": "call_branch_start",
+                        "output": large_output
+                    }
+                }),
+                serde_json::json!({
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call",
+                        "name": "exec_command",
+                        "call_id": "call_post_commit",
+                        "arguments": "{\"cmd\":\"git rev-parse HEAD\"}"
+                    }
+                }),
+                serde_json::json!({
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call_output",
+                        "call_id": "call_post_commit",
+                        "output": "ea304cf"
+                    }
+                }),
+            ]
+            .into_iter()
+            .map(|value| value.to_string())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        )
+        .unwrap();
+
+        let newest_raw = list_context_rewind_anchors_from_rollout(
+            &path,
+            &serde_json::json!({ "reverse": true, "limit": 1 }),
+        )
+        .expect("newest-first catalog");
+        let newest: serde_json::Value = serde_json::from_str(&newest_raw).unwrap();
+        assert!(
+            newest["selection_note"]
+                .as_str()
+                .is_some_and(|note| note.contains("newest anchors first")),
+            "got {newest}"
+        );
+        let newest_anchor = &newest["anchors"].as_array().unwrap()[0];
+        assert_eq!(newest_anchor["item_id"].as_str(), Some("call_post_commit"));
+        assert_eq!(
+            newest_anchor["approx_pruned_tokens_after"].as_u64(),
+            Some(0),
+            "post-branch anchors should reveal that they prune nothing"
+        );
+
+        let branch_raw = list_context_rewind_anchors_from_rollout(
+            &path,
+            &serde_json::json!({ "query": "display runway", "limit": 1 }),
+        )
+        .expect("branch-start catalog");
+        let branch: serde_json::Value = serde_json::from_str(&branch_raw).unwrap();
+        let branch_anchor = &branch["anchors"].as_array().unwrap()[0];
+        assert_eq!(branch_anchor["item_id"].as_str(), Some("call_branch_start"));
+        let pruned_before = branch_anchor["approx_pruned_tokens_before"]
+            .as_u64()
+            .expect("branch-start anchor should expose before pruning");
+        let pruned_after = branch_anchor["approx_pruned_tokens_after"]
+            .as_u64()
+            .expect("branch-start anchor should expose after pruning");
+        assert!(
+            pruned_before > 1000,
+            "branch-start anchor should expose meaningful before-position pruning impact: {branch_anchor}"
+        );
+        assert!(
+            pruned_after < pruned_before,
+            "after-position pruning should show that keeping the branch-start call preserves more context: {branch_anchor}"
+        );
     }
 
     #[test]

@@ -1072,7 +1072,7 @@ fn append_manual_http_tool_definitions(
         "list_rewind_anchors",
         manual_http_tool_definition!(
             "list_rewind_anchors",
-            "List valid exact Codex rewind anchors for the current managed session. Supports pagination and query so the model can choose any valid non-management anchor from the rollout, from start to finish. The default catalog hides managed-context maintenance calls such as list_rewind_anchors, inspect_rewind_anchor, rewind_context, and rewind_backout so recovery does not target its own tool calls; pass include_management_tools=true only when intentionally targeting those internals. Normal model-facing results hide anchors known to remain at/above the rewind-only limit or without enough resume headroom; recovery_candidates_only=false alone is ignored. Pass include_non_recovery=true only for diagnostics/audit, and never pass a recovery_eligible=false audit row to rewind_context. Use inspect_rewind_anchor on a candidate when the compact summary is ambiguous, then copy the chosen item_id into rewind_context.",
+            "List valid exact Codex rewind anchors for the current managed session. Supports pagination and query so the model can choose any valid non-management anchor from the rollout, from start to finish. For density compaction, request pruning estimates with query, reverse=true, or include_pruning_estimates=true; then compare approx_pruned_tokens_after/before and target the start of the branch or noisy span to discard. Latest post-branch anchors usually preserve the branch and prune little or nothing, especially when reverse=true. The default catalog hides managed-context maintenance calls such as list_rewind_anchors, inspect_rewind_anchor, rewind_context, and rewind_backout so recovery does not target its own tool calls; pass include_management_tools=true only when intentionally targeting those internals. Normal model-facing results hide anchors known to remain at/above the rewind-only limit or without enough resume headroom; recovery_candidates_only=false alone is ignored. Pass include_non_recovery=true only for diagnostics/audit, and never pass a recovery_eligible=false audit row to rewind_context. Use inspect_rewind_anchor on a candidate when the compact summary is ambiguous, then copy the chosen item_id into rewind_context.",
             ListRewindAnchorsParams
         ),
     );
@@ -4916,9 +4916,16 @@ pub struct ListRewindAnchorsParams {
     /// Optional case-insensitive search over anchor ids, item types, tool names, roles, and summaries.
     #[serde(default)]
     pub query: Option<String>,
-    /// Return anchors from newest to oldest when true.
+    /// Return anchors from newest to oldest when true. Avoid this for density compaction
+    /// unless you specifically need recent anchors; latest post-branch anchors often prune
+    /// little or nothing.
     #[serde(default)]
     pub reverse: bool,
+    /// Include per-anchor rollout-size estimates for how much recent context each
+    /// before/after position would discard. This is included automatically for
+    /// query and reverse listings.
+    #[serde(default, alias = "includePruningEstimates")]
+    pub include_pruning_estimates: bool,
     /// Include managed-context maintenance calls such as list_rewind_anchors or rewind_context.
     /// Omit this during ordinary recovery so discovery does not target its own tool calls.
     #[serde(default, alias = "includeManagementTools")]
@@ -6690,7 +6697,7 @@ impl IntendantServer {
     }
 
     #[tool(
-        description = "List valid exact Codex rewind anchors for the current managed session. Supports pagination and query so the model can choose any valid non-management anchor from the rollout, from start to finish. The default catalog hides managed-context maintenance calls such as list_rewind_anchors, inspect_rewind_anchor, rewind_context, and rewind_backout so recovery does not target its own tool calls; pass include_management_tools=true only when intentionally targeting those internals. Normal model-facing results hide anchors known to remain at/above the rewind-only limit or without enough resume headroom; recovery_candidates_only=false alone is ignored. Pass include_non_recovery=true only for diagnostics/audit, and never pass a recovery_eligible=false audit row to rewind_context. Use inspect_rewind_anchor on a candidate when the compact summary is ambiguous, then copy the chosen item_id into rewind_context."
+        description = "List valid exact Codex rewind anchors for the current managed session. Supports pagination and query so the model can choose any valid non-management anchor from the rollout, from start to finish. For density compaction, request pruning estimates with query, reverse=true, or include_pruning_estimates=true; then compare approx_pruned_tokens_after/before and target the start of the branch or noisy span to discard. Latest post-branch anchors usually preserve the branch and prune little or nothing, especially when reverse=true. The default catalog hides managed-context maintenance calls such as list_rewind_anchors, inspect_rewind_anchor, rewind_context, and rewind_backout so recovery does not target its own tool calls; pass include_management_tools=true only when intentionally targeting those internals. Normal model-facing results hide anchors known to remain at/above the rewind-only limit or without enough resume headroom; recovery_candidates_only=false alone is ignored. Pass include_non_recovery=true only for diagnostics/audit, and never pass a recovery_eligible=false audit row to rewind_context. Use inspect_rewind_anchor on a candidate when the compact summary is ambiguous, then copy the chosen item_id into rewind_context."
     )]
     async fn list_rewind_anchors(
         &self,
