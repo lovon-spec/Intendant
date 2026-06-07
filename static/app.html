@@ -17853,6 +17853,9 @@ function stationOperationsBriefPayload(context, managed, sessions, controls) {
       latest_source: sessions.latestSource || '',
       latest_updated: sessions.latestUpdated || '',
     },
+    attachments: {
+      pending: controls.pendingAttachments || 0,
+    },
     external: {
       backend: controls.backend || 'none',
       default_command: controls.command || '',
@@ -17874,6 +17877,7 @@ function stationOperationsBriefText(payload) {
   const context = payload.context || {};
   const managed = payload.managed || {};
   const sessions = payload.sessions || {};
+  const attachments = payload.attachments || {};
   const external = payload.external || {};
   return [
     `Target: ${target.label || shortSessionId(target.id) || 'daemon'} (${target.selection || 'current'}, ${target.state || 'idle'}, ${target.source || 'intendant'})`,
@@ -17881,6 +17885,7 @@ function stationOperationsBriefText(payload) {
     `Context: ${context.available ? `${stationCompactNumber(context.used_tokens)} / ${stationCompactNumber(context.effective_window)} tokens` : 'none'}${context.turn ? `, ${context.turn}` : ''}`,
     `Managed: ${managed.mode || 'vanilla'} / ${managed.status || 'unknown'} / ${managed.readiness || 'unknown'} (${managed.anchors || 0} anchors, ${managed.records || 0} records)`,
     `Sessions: ${sessions.active || 0} active of ${sessions.total || 0}; ${sessions.external || 0} external; latest ${sessions.latest_task || 'none'}`,
+    `Attachments: ${attachments.pending || 0} pending`,
     `External: ${external.backend || 'none'}${external.targets?.length ? `; targets ${external.targets.map(row => `${row.label || shortSessionId(row.id)}:${row.status}`).join(', ')}` : ''}`,
   ].join('\n');
 }
@@ -17919,6 +17924,7 @@ function stationRenderOperationsBriefSection(parent, controls) {
   stationDockRow(section, 'context', stationOperationsContextLine(context, managed));
   stationDockRow(section, 'managed', `${managed.mode || 'vanilla'} / ${stationOperationsManagedReadiness(managed)} / ${managed.anchors || 0} anchors`);
   stationDockRow(section, 'sessions', `${sessions.active || 0} active / ${sessions.total || 0} total / ${sessions.external || 0} external`);
+  stationDockRow(section, 'attachments', `${controls.pendingAttachments || 0} pending`);
   stationDockRow(section, 'external', `${controls.backend || 'none'} / ${controls.command || controls.sessionCommand || '--'}`);
   stationDockActions(section, [
     { label: 'Activity', onClick: () => stationRenderActivityDock(latestEventId) },
@@ -17927,6 +17933,8 @@ function stationRenderOperationsBriefSection(parent, controls) {
     { label: 'Seed rewind', primary: managed.rewindOnly || !!context.available, disabled: !context.available, onClick: stationSeedManagedFromOperationsBrief },
     { label: 'Sessions', onClick: () => stationRenderSessionsDock(controls.sessionId || '') },
     { label: 'Target controls', onClick: () => stationRenderControlsDock('external') },
+    { label: 'Attach file', onClick: () => document.getElementById('upload-attach-btn')?.click() },
+    controls.pendingAttachments > 0 ? { label: 'Clear attach', danger: true, onClick: () => document.querySelector('[data-pending-attachments-clear]')?.click() } : null,
     stationCodexThreadActionButton(codexActionId, 'fast', 'Fast'),
     stationCodexThreadActionButton(codexActionId, 'compact', 'Compact'),
     stationCodexThreadActionButton(codexActionId, 'goal-get', 'Goal status'),
