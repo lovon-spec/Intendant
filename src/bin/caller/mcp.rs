@@ -149,6 +149,7 @@ pub struct McpAppState {
 #[derive(Debug, Clone)]
 struct SessionStatusState {
     turn: usize,
+    round: usize,
     phase: Phase,
     task: String,
 }
@@ -475,6 +476,10 @@ impl McpAppState {
         let turn = turn
             .or_else(|| existing.as_ref().map(|status| status.turn))
             .unwrap_or(self.turn);
+        let round = existing
+            .as_ref()
+            .map(|status| status.round)
+            .unwrap_or(self.round);
         let task = task
             .map(str::trim)
             .filter(|task| !task.is_empty())
@@ -484,6 +489,7 @@ impl McpAppState {
             .unwrap_or_default();
         let status = SessionStatusState {
             turn,
+            round,
             phase: phase.clone(),
             task: task.clone(),
         };
@@ -496,6 +502,51 @@ impl McpAppState {
                 self.task_description = task;
             }
             self.set_phase(phase);
+        }
+    }
+
+    fn note_session_round(&mut self, session_id: Option<&str>, round: usize) {
+        let target_id = session_id
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .map(str::to_string)
+            .or_else(|| {
+                let id = self.session_id.trim();
+                (!id.is_empty()).then(|| id.to_string())
+            });
+        let Some(target_id) = target_id else {
+            self.round = round;
+            return;
+        };
+
+        let keys = {
+            let related = self.session_related_ids(&target_id);
+            if related.is_empty() {
+                vec![target_id.clone()]
+            } else {
+                related
+            }
+        };
+        for key in &keys {
+            let entry =
+                self.session_status
+                    .entry(key.clone())
+                    .or_insert_with(|| SessionStatusState {
+                        turn: self.turn,
+                        round,
+                        phase: self.phase.clone(),
+                        task: self.task_description.clone(),
+                    });
+            entry.round = round;
+        }
+        if self.session_id.is_empty()
+            || keys.iter().any(|key| key == &self.session_id)
+            || self
+                .session_related_ids(&self.session_id)
+                .iter()
+                .any(|key| keys.contains(key))
+        {
+            self.round = round;
         }
     }
 
@@ -3775,6 +3826,12 @@ fn phase_from_status_str(phase: &str) -> Phase {
     }
 }
 
+fn status_task_is_external_turn_progress(task: &str) -> bool {
+    let normalized = task.trim().to_ascii_lowercase();
+    (normalized.contains("turn") || normalized.contains("round"))
+        && normalized.contains("in progress")
+}
+
 fn verbosity_to_str(v: Verbosity) -> &'static str {
     match v {
         Verbosity::Quiet => "quiet",
@@ -3973,6 +4030,9 @@ pub fn spawn_event_listener(
                             phase_from_status_str(phase),
                             Some(task),
                         );
+                        if status_task_is_external_turn_progress(task) {
+                            s.note_session_round(Some(session_id), turn);
+                        }
                         resource_changed = Some("intendant://status");
                     }
                     AppEvent::Quit => {
@@ -4299,6 +4359,7 @@ pub fn spawn_event_listener(
                     } => {
                         s.round = round;
                         s.set_phase(Phase::WaitingFollowUp);
+                        s.note_session_round(session_id.as_deref(), round);
                         s.note_session_phase(
                             session_id.as_deref(),
                             Some(round),
@@ -4776,6 +4837,9 @@ fn apply_observed_event_to_mcp_state(s: &mut McpAppState, event: &AppEvent) -> b
                 phase_from_status_str(phase),
                 Some(task),
             );
+            if status_task_is_external_turn_progress(task) {
+                s.note_session_round(Some(session_id), *turn);
+            }
             true
         }
         AppEvent::UsageSnapshot {
@@ -4882,6 +4946,7 @@ fn apply_observed_event_to_mcp_state(s: &mut McpAppState, event: &AppEvent) -> b
         } => {
             s.round = *round;
             s.set_phase(Phase::WaitingFollowUp);
+            s.note_session_round(session_id.as_deref(), *round);
             s.note_session_phase(
                 session_id.as_deref(),
                 Some(*round),
@@ -6215,6 +6280,7 @@ impl IntendantServer {
         snap.autonomy = autonomy_level.to_string().to_lowercase();
         if let Some(status) = session_status {
             snap.turn = status.turn;
+            snap.round = status.round;
             snap.phase = phase_to_str(&status.phase).to_string();
             if !status.task.is_empty() {
                 snap.task = status.task;
@@ -11352,11 +11418,12 @@ mod tests {
                 apply_observed_event_to_mcp_state(
                     &mut s,
                     &AppEvent::StatusUpdate {
-                        turn: 2,
+                        turn: 14,
                         phase: "thinking".to_string(),
                         autonomy: "medium".to_string(),
                         session_id: "codex-thread".to_string(),
-                        task: "Codex turn in progress".to_string(),
+                        task: "Codex follow-up round 14 in progress: fix the controller status"
+                            .to_string(),
                     },
                 );
             }
@@ -11365,6 +11432,7 @@ mod tests {
             let active_status: serde_json::Value =
                 serde_json::from_str(&server.get_status().await).unwrap();
             assert_eq!(active_status.pointer("/phase"), Some(&"thinking".into()));
+            assert_eq!(active_status.pointer("/round"), Some(&14.into()));
 
             let wrapper_status: serde_json::Value = serde_json::from_str(
                 &server
@@ -11373,10 +11441,11 @@ mod tests {
             )
             .unwrap();
             assert_eq!(wrapper_status.pointer("/phase"), Some(&"thinking".into()));
-            assert_eq!(wrapper_status.pointer("/turn"), Some(&2.into()));
+            assert_eq!(wrapper_status.pointer("/turn"), Some(&14.into()));
+            assert_eq!(wrapper_status.pointer("/round"), Some(&14.into()));
             assert_eq!(
                 wrapper_status.pointer("/task"),
-                Some(&"Codex turn in progress".into())
+                Some(&"Codex follow-up round 14 in progress: fix the controller status".into())
             );
 
             {
@@ -11385,7 +11454,7 @@ mod tests {
                     &mut s,
                     &AppEvent::RoundComplete {
                         session_id: Some("codex-thread".to_string()),
-                        round: 2,
+                        round: 14,
                         turns_in_round: 1,
                         native_message_count: None,
                     },
@@ -11402,6 +11471,7 @@ mod tests {
                 idle_status.pointer("/phase"),
                 Some(&"waiting_follow_up".into())
             );
+            assert_eq!(idle_status.pointer("/round"), Some(&14.into()));
         });
     }
 

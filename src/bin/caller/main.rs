@@ -8522,6 +8522,20 @@ async fn emit_external_turn_status(
     });
 }
 
+fn external_turn_status_task(agent_name: &str, round: usize, text: &str) -> String {
+    let preview = truncate_string_copy(text.trim(), 160);
+    let prefix = if round <= 1 {
+        format!("{agent_name} initial turn {round} in progress")
+    } else {
+        format!("{agent_name} follow-up round {round} in progress")
+    };
+    if preview.is_empty() {
+        prefix
+    } else {
+        format!("{prefix}: {preview}")
+    }
+}
+
 fn codex_subagent_parent_threads_from_log(log_dir: &std::path::Path) -> HashMap<String, String> {
     let path = log_dir.join("session.jsonl");
     let Ok(contents) = std::fs::read_to_string(path) else {
@@ -18486,7 +18500,11 @@ async fn run_with_presence(
                 session_log_id(&session_log).as_deref(),
                 cumulative_stats.rounds.saturating_add(1),
                 "thinking",
-                format!("{} turn in progress", agent.name()),
+                external_turn_status_task(
+                    agent.name(),
+                    cumulative_stats.rounds.saturating_add(1),
+                    &task_text,
+                ),
             )
             .await;
             let send_result = if envelope.attachment_frame_ids.is_empty() {
@@ -20842,7 +20860,7 @@ async fn run_external_agent_mode(
             live_session_id.as_deref(),
             round,
             "thinking",
-            format!("{} turn in progress", agent.name()),
+            external_turn_status_task(agent.name(), round, user_log_text),
         )
         .await;
         let send_result = if attachments.is_empty() {
