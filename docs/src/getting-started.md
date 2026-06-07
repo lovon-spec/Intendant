@@ -307,12 +307,20 @@ the CLI reveals the one-time enrollment secret, the operator must copy the
 server certificate SHA-256 fingerprint observed in the browser certificate UI
 and paste it into the `intendant lan` terminal. Only after that fingerprint
 matches the local `server.crt` can the browser redeem the secret and download
-`ca.crt` plus `client.p12`. This avoids the unsafe pattern where a MITM page can
+enrollment artifacts. Apple clients get a single `intendant.mobileconfig`
+profile; other clients can download `ca.crt` plus `client.p12` (or the same
+identity as `client.pfx`). This avoids the unsafe pattern where a MITM page can
 steal a secret from an unauthenticated HTTP download page.
+
+The enrollment page uses the browser's User-Agent only to prioritize the
+instructions and download buttons for that device. The authorization decision is
+always the strict terminal-paired session cookie.
 
 The client certificate is exported as `client.p12`, a password-protected
 PKCS#12 bundle for installation on iOS / Android / desktop browsers. The
-password is shown only on the unlocked enrollment page.
+password is shown only on the unlocked enrollment page. The Apple
+`intendant.mobileconfig` profile embeds that same client identity, the LAN CA,
+and the PKCS#12 password, so it is served only after strict pairing succeeds.
 
 #### Apple device requirement for `client.p12`
 

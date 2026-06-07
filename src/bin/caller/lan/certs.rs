@@ -364,7 +364,7 @@ fn write_pem_private_key(path: &Path, key: &KeyPair) -> LanResult<()> {
 }
 
 /// Read a PEM-encoded certificate file and return its DER bytes.
-fn read_cert_der(path: &Path) -> LanResult<Vec<u8>> {
+pub(crate) fn read_cert_der(path: &Path) -> LanResult<Vec<u8>> {
     let bytes = std::fs::read(path)?;
     let pem = pem::parse(&bytes).map_err(|e| LanError(format!("parse cert PEM: {e}")))?;
     Ok(pem.into_contents())

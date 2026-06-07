@@ -42,14 +42,15 @@ fn print_ios(lan_ip: &str, port: u16) {
     println!("      Copy the server certificate's SHA-256 fingerprint into");
     println!("      the Intendant terminal, then enter the enrollment secret.");
     println!();
-    println!("    Step 2 — Install CA certificate:");
-    println!("      Download ca.crt from the unlocked pairing page.");
+    println!("    Step 2 — Install Apple profile:");
+    println!("      Download intendant.mobileconfig from the unlocked pairing page.");
     println!("      Settings → General → VPN & Device Management → Install");
+    println!("      The profile includes the CA and client identity.");
     println!("      Settings → General → About → Certificate Trust Settings → Enable");
     println!();
-    println!("    Step 3 — Install client certificate:");
-    println!("      Download client.p12 from the unlocked pairing page.");
-    println!("      Settings → General → VPN & Device Management → Install");
+    println!("    Manual fallback:");
+    println!("      Download ca.crt and client.p12 separately from the unlocked page.");
+    println!("      Settings → General → About → Certificate Trust Settings → Enable");
     println!();
 }
 
@@ -129,13 +130,17 @@ fn print_chrome_mac(lan_ip: &str, port: u16) {
     println!("      Copy the server certificate's SHA-256 fingerprint into");
     println!("      the Intendant terminal, then enter the enrollment secret.");
     println!();
-    println!("    Step 2 — Install CA certificate:");
-    println!("      Download ca.crt from the unlocked pairing page.");
+    println!("    Step 2 — Install Apple profile:");
+    println!("      Download intendant.mobileconfig from the unlocked pairing page.");
+    println!("      System Settings → Privacy & Security → Profiles → Install");
+    println!("      If needed, set the Intendant CA to Always Trust in Keychain Access.");
     println!();
+    println!("    Manual fallback — install CA certificate:");
+    println!("      Download ca.crt from the unlocked pairing page.");
     println!("      Double-click → opens Keychain Access → add to \"login\" keychain");
     println!("      Find \"Intendant CA\" → Get Info → Trust → \"Always Trust\"");
     println!();
-    println!("    Step 3 — Install client certificate:");
+    println!("    Manual fallback — install client certificate:");
     println!("      Download client.p12 from the unlocked pairing page.");
     println!();
     println!("      Double-click → opens Keychain Access → enter password");

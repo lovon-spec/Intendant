@@ -341,7 +341,7 @@ systemd/launchd) is Unix-specific. Subcommands:
 | `intendant lan recert` | Re-issue certs |
 | `intendant lan remove` | Tear down the proxy and config |
 | `intendant lan list` | List issued client certs |
-| `intendant lan serve-certs` | Run strict HTTPS enrollment for importing `ca.crt` and the client `.p12` onto devices |
+| `intendant lan serve-certs` | Run strict HTTPS enrollment for importing `ca.crt`, client `.p12`/`.pfx`, or Apple `.mobileconfig` onto devices |
 
 ```bash
 intendant lan setup --name nicks-mac --https-port 8443
@@ -358,7 +358,10 @@ Enrollment is not a plain unauthenticated download. The temporary
 not print the expected server fingerprint or the enrollment secret at startup;
 the operator first copies the SHA-256 fingerprint observed in the browser's
 certificate UI into the CLI. Only a match reveals a one-time secret, and only a
-browser that redeems that secret can download the CA and client certificate.
+browser that redeems that secret can download the CA, client certificate, or
+Apple configuration profile. The page detects the browser only to put the most
+likely install path first; all artifacts remain gated by the terminal-paired
+browser session.
 
 ### How auth maps to the Agent Card
 

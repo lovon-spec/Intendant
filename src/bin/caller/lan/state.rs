@@ -1,7 +1,7 @@
 //! Small persistent bits of state the `lan` subcommand reads and writes:
 //! the host label (used as the future multi-host `HostId`) and the .p12
 //! password (so `serve-certs` can show it on the unlocked enrollment
-//! page after strict pairing).
+//! page and embed it in the gated Apple profile after strict pairing).
 
 use std::path::Path;
 
