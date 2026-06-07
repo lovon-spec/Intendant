@@ -373,16 +373,16 @@ fn print_help() {
     println!("    recert        Regenerate server cert after LAN IP change");
     println!("    remove        Tear down nginx config and remove certs");
     println!("    list          Show current setup state");
-    println!("    serve-certs   Run the temporary client cert distribution server");
+    println!("    serve-certs   Run strict HTTPS client cert enrollment");
     println!();
     println!("FLAGS:");
     println!("    --port <N>         HTTPS port exposed to clients (default 8443)");
-    println!("    --cert-port <N>    Port for the client cert distribution server (default 9999)");
+    println!("    --cert-port <N>    Port for the HTTPS enrollment server (default 9999)");
     println!("    --lan-ip <IP>      Override detected LAN IP");
     println!("    --name <LABEL>     Host label shown in cert CN and multi-host dashboard");
     println!("    --backend <ADDR>   Upstream intendant address (default 127.0.0.1:8765)");
     println!("    --force            Skip idempotency checks (regenerate even if current)");
-    println!("    --no-serve-certs   Skip the cert distribution server at the end of setup");
+    println!("    --no-serve-certs   Skip the enrollment server at the end of setup");
     println!();
     println!("SECURITY TIERS:");
     println!("    Trusted LAN    — mTLS (this command)");
@@ -426,19 +426,18 @@ async fn cmd_setup(args: LanArgs) -> LanResult<()> {
     println!();
 
     if args.no_serve_certs {
-        // Host orchestrators (e.g. the Windows batch script) run the cert
-        // distribution server separately so they can intercept the p12
-        // password and display it in the host console instead of the
-        // guest's SSH output.
-        println!("  Skipping cert distribution server (--no-serve-certs).");
+        // Host orchestrators can run strict enrollment separately when
+        // they have an interactive operator channel for fingerprint
+        // verification.
+        println!("  Skipping enrollment server (--no-serve-certs).");
         println!("  Run `intendant lan serve-certs` later to distribute the client cert.");
         println!();
         return Ok(());
     }
 
-    // Start the cert distribution server (blocks until Ctrl+C).
+    // Start strict client enrollment (blocks until Ctrl+C).
     println!(
-        "  Starting client cert distribution server on port {}...",
+        "  Starting HTTPS enrollment server on port {}...",
         args.cert_port
     );
     println!("  Press Ctrl+C when every client has imported the cert.");

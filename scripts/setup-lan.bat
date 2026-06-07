@@ -481,75 +481,25 @@ function Run-Wizard {
     Save-Config
     Info "config saved to $($script:ConfigPath)"
 
-    # --- Certificate installation (interactive, on the Windows console) ---
-    # Read the p12 password the guest just generated, start the cert
-    # distribution server as a background job, show the password on
-    # Windows, and tear down the job when the user confirms.
-    $p12Pass = ""
-    try {
-        $p12Pass = (Invoke-GuestCommand "sudo cat /etc/intendant-lan/p12_password 2>/dev/null").Trim()
-    } catch {}
-
-    if ($p12Pass) {
-        $caUrl   = "http://${hostIp}:$($script:CertPort)/ca.crt"
-        $p12Url  = "http://${hostIp}:$($script:CertPort)/client.p12"
-
-        # Start the cert distribution server as a background job so the
-        # Windows UI can show the password and wait for user input.
-        # `ssh -t` allocates a PTY so SIGHUP propagates to the remote
-        # process when the job is killed, cleaning up `intendant lan
-        # serve-certs` without needing an explicit stop RPC.
-        $certJob = Start-Job -ScriptBlock {
-            param($mode, $intendant, $sshHost, $sshPort, $vmUser, $hostIp, $certPort, $httpsPort)
-            $remoteCmd = "sudo $intendant lan serve-certs --lan-ip $hostIp --cert-port $certPort --port $httpsPort"
-            if ($mode -eq "wsl") {
-                wsl bash -c $remoteCmd
-            } else {
-                $sshArgs = @("-tt")
-                if ($sshPort -ne 22) { $sshArgs += @("-p", $sshPort) }
-                $sshArgs += "$vmUser@$sshHost"
-                ssh @sshArgs $remoteCmd
-            }
-        } -ArgumentList $script:Mode, $script:RemoteIntendant, $script:SshHost, $script:SshPort, $script:VmUser, $hostIp, $script:CertPort, $script:Port
-
-        Write-Host ""
-        Write-Host "========================================================" -ForegroundColor Cyan
-        Write-Host "  Certificate Installation" -ForegroundColor Cyan
-        Write-Host "========================================================" -ForegroundColor Cyan
-        Write-Host ""
-        Write-Host "  Your phone needs two certificates to connect securely."
-        Write-Host "  Open these URLs in the phone's browser:"
-        Write-Host ""
-        Write-Host "  1. CA certificate (trust anchor):" -ForegroundColor White
-        Write-Host "     $caUrl"
-        Write-Host ""
-        Write-Host "  2. Client certificate (identity):" -ForegroundColor White
-        Write-Host "     $p12Url"
-        Write-Host "     Password: $p12Pass" -ForegroundColor Yellow
-        Write-Host ""
-        Write-Host "  After downloading, install both certificates:" -ForegroundColor White
-        Write-Host "    iOS:     Settings `> General `> VPN & Device Mgmt `> Install each"
-        Write-Host "             Settings `> General `> About `> Certificate Trust `> Enable CA"
-        Write-Host "    Android: Settings `> Security `> Install a certificate"
-        Write-Host ""
-
-        $null = Read-Host "  Press Enter when certs are installed on your phone"
-
-        # Stop the background cert distribution job. Killing the job
-        # terminates the ssh -tt / wsl process, which propagates SIGHUP
-        # to the guest's `intendant lan serve-certs` via the PTY.
-        Stop-Job $certJob -ErrorAction SilentlyContinue
-        Remove-Job $certJob -Force -ErrorAction SilentlyContinue
-
-        # Belt and braces: in case PTY propagation didn't work (orphaned
-        # sudo children, broken tty, etc.), explicitly kill any remaining
-        # cert server on the guest.
-        try {
-            Invoke-GuestCommand "sudo pkill -f 'intendant lan serve-certs' 2>/dev/null || true" | Out-Null
-        } catch {}
-    } else {
-        Warn "could not read cert password from guest -- run 'sudo intendant lan serve-certs' on the guest manually"
-    }
+    # --- Certificate installation (strict pairing) ---
+    Write-Host ""
+    Write-Host "========================================================" -ForegroundColor Cyan
+    Write-Host "  Certificate Installation" -ForegroundColor Cyan
+    Write-Host "========================================================" -ForegroundColor Cyan
+    Write-Host ""
+    Write-Host "  Strict enrollment will now start in this console."
+    Write-Host "  Open the printed HTTPS enrollment URL in the client browser,"
+    Write-Host "  copy the browser-observed server certificate SHA-256 fingerprint,"
+    Write-Host "  and paste it into the prompt before any secret is revealed."
+    Write-Host ""
+    Write-Host "  Press Ctrl+C after the client has downloaded and installed ca.crt"
+    Write-Host "  and client.p12."
+    Write-Host ""
+    Invoke-IntendantLan "serve-certs" @(
+        "--lan-ip", "$hostIp"
+        "--cert-port", "$($script:CertPort)"
+        "--port", "$($script:Port)"
+    )
 
     # WSL warning
     if ($script:Mode -eq "wsl") {

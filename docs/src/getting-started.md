@@ -291,18 +291,28 @@ authority:
 intendant lan setup            # install mTLS nginx proxy + generate CA/server/client certs
 intendant lan recert           # regenerate the server cert after a LAN IP change
 intendant lan list             # show current setup state
-intendant lan serve-certs      # run the temporary client-cert distribution server
+intendant lan serve-certs      # run strict HTTPS client-cert enrollment
 intendant lan remove           # tear down the nginx config and remove certs
 ```
 
 Useful flags: `--port <N>` (HTTPS port exposed to clients, default 8443),
-`--cert-port <N>` (cert distribution server, default 9999), `--lan-ip <IP>`,
+`--cert-port <N>` (HTTPS enrollment server, default 9999), `--lan-ip <IP>`,
 `--name <label>`, `--backend <addr>` (upstream intendant, default
 `127.0.0.1:8765`), `--force`, `--no-serve-certs`. (Linux/macOS only; the
 `scripts/setup-lan*.sh` helpers wrap the same flow.)
 
+Client certificate enrollment is deliberately strict. The temporary enrollment
+server is HTTPS, using the same LAN server certificate as the dashboard. Before
+the CLI reveals the one-time enrollment secret, the operator must copy the
+server certificate SHA-256 fingerprint observed in the browser certificate UI
+and paste it into the `intendant lan` terminal. Only after that fingerprint
+matches the local `server.crt` can the browser redeem the secret and download
+`ca.crt` plus `client.p12`. This avoids the unsafe pattern where a MITM page can
+steal a secret from an unauthenticated HTTP download page.
+
 The client certificate is exported as `client.p12`, a password-protected
-PKCS#12 bundle for installation on iOS / Android / desktop browsers.
+PKCS#12 bundle for installation on iOS / Android / desktop browsers. The
+password is shown only on the unlocked enrollment page.
 
 #### Apple device requirement for `client.p12`
 
