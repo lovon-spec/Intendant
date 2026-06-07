@@ -236,6 +236,13 @@ VBoxManage modifyvm <vm> --natpf1 "intendant,tcp,0.0.0.0,8765,,8765"
 
 Then access the dashboard at `http://<host-LAN-IP>:8765`.
 
+That plain-HTTP LAN URL is sufficient for the display transport itself, but not
+for browser APIs that require a secure context. Use HTTPS/mTLS, native `--tls`
+with a trusted cert, or the macOS app wrapper when the same dashboard session
+also needs Station WebGPU, microphone/camera, browser screen capture, or stricter
+clipboard APIs. See
+[Web Dashboard: Secure Browser Contexts](./web-dashboard.md#secure-browser-contexts).
+
 ### TURN relay candidates
 
 On a host with no inbound reachability at all (e.g. a cloud container behind NAT

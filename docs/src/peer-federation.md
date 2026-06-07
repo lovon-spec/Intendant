@@ -326,6 +326,13 @@ intendant --web --tls-cert chain.pem --tls-key key.pem   # explicit PEM (implies
 `--tls-cert` / `--tls-key` must be supplied together; supplying either implies
 `--tls`.
 
+Native HTTPS/WSS is also the direct way to make a remote dashboard origin a
+browser secure context when you need Station WebGPU, microphone/camera, browser
+screen capture, or stricter clipboard APIs. Use a trusted certificate; merely
+clicking through a self-signed certificate warning is not a reliable way to
+unlock these browser APIs. See
+[Web Dashboard: Secure Browser Contexts](./web-dashboard.md#secure-browser-contexts).
+
 ### mTLS reverse proxy — `intendant lan`
 
 `src/bin/caller/lan/` ports the old `setup-lan.sh` script to Rust. `intendant lan
@@ -362,6 +369,11 @@ browser that redeems that secret can download the CA, client certificate, or
 Apple configuration profile. The page detects the browser only to put the most
 likely install path first; all artifacts remain gated by the terminal-paired
 browser session.
+
+The mTLS proxy also solves browser secure-context requirements for LAN clients
+once the CA/client identity are installed. That matters for Station's WebGPU
+renderer, microphone/camera, browser screen capture, and stricter clipboard APIs;
+plain `http://<LAN-IP>:8765` does not expose those features.
 
 ### How auth maps to the Agent Card
 

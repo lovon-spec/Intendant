@@ -119,6 +119,10 @@ The wrapper hosts a `WKWebView` that loads the dashboard over a custom
 `http://localhost` as a secure context, so `navigator.mediaDevices` (microphone
 and camera) would be unavailable. Serving from a registered custom scheme
 restores the secure context the live-voice and camera features need.
+The same secure-context requirement applies to remote browsers using Station's
+WebGPU renderer, microphone/camera features, browser screen capture, and other
+privileged browser APIs; see
+[Web Dashboard: Secure Browser Contexts](./web-dashboard.md#secure-browser-contexts).
 
 ```bash
 ./scripts/bundle-macos.sh           # release build + install to /Applications
@@ -315,6 +319,12 @@ steal a secret from an unauthenticated HTTP download page.
 The enrollment page uses the browser's User-Agent only to prioritize the
 instructions and download buttons for that device. The authorization decision is
 always the strict terminal-paired session cookie.
+
+Use this HTTPS/mTLS path, native `--tls` with a trusted certificate, or the
+macOS app wrapper for dashboard features that require a secure browser context:
+Station WebGPU, microphone/camera, browser screen capture, and stricter
+clipboard APIs. Plain `http://<LAN-IP>:8765` is enough for basic monitoring but
+not for those browser-gated features.
 
 The client certificate is exported as `client.p12`, a password-protected
 PKCS#12 bundle for installation on iOS / Android / desktop browsers. The

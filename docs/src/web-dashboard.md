@@ -27,6 +27,37 @@ a browser.
 > `--mcp`". Earlier docs described `--web` as opt-in and tied to MCP mode —
 > neither is true now.
 
+## Secure Browser Contexts
+
+The dashboard shell, Activity log, Sessions, Settings, and basic display viewing
+can run over ordinary HTTP. Some browser capabilities are different: browsers
+expose them only to a **secure context**.
+
+Use a secure dashboard context when you need:
+
+- **Station WebGPU rendering** (`navigator.gpu`) — otherwise Station falls back
+  to its DOM renderer.
+- **Microphone and camera** (`navigator.mediaDevices`, `getUserMedia`) for live
+  voice, browser-side audio/video capture, or camera recording.
+- **Screen/window capture from the browser** (`getDisplayMedia`) when a browser
+  is the capture source.
+- **Privileged browser APIs** such as the async clipboard in stricter browsers.
+
+Practical rules:
+
+- `https://` with a trusted certificate is the normal secure context for remote
+  browsers.
+- `http://localhost` and `http://127.0.0.1` are treated as secure by most
+  desktop browsers, but not by every embedding. In particular, the macOS
+  `WKWebView` wrapper uses the custom `intendant://` scheme because
+  `http://localhost` there does not expose media devices.
+- `http://<LAN-IP>` is not a secure context. Use native `--tls` with a trusted
+  certificate, the `intendant lan` mTLS proxy/enrollment flow, the macOS app
+  wrapper, or another trusted HTTPS reverse proxy.
+- Clicking through a self-signed certificate warning is not a reliable substitute
+  for installing/trusting the certificate; browsers may still withhold secure
+  APIs.
+
 ### Headless daemon posture
 
 When the dashboard is on, the terminal **TUI does not own the TTY**. The

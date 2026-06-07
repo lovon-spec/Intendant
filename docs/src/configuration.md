@@ -317,6 +317,12 @@ deployments only ever touch `[server.tls]`.
 | `key` | string | — | PEM private key (PKCS#8, PKCS#1, or SEC1) matching `cert` |
 | `hostname` | string | — | Extra SAN hostname for the self-signed cert (in addition to bind IP + `localhost`) |
 
+Use `[server.tls]`, `--tls`, `intendant lan`, the macOS app wrapper, or another
+trusted HTTPS reverse proxy when a remote browser needs secure-context-gated
+features: Station WebGPU, microphone/camera, browser screen capture, or stricter
+clipboard APIs. Plain `http://<LAN-IP>` is not enough for those APIs; see
+[Web Dashboard: Secure Browser Contexts](./web-dashboard.md#secure-browser-contexts).
+
 `[server.auth]` — inbound auth this daemon enforces on federation peers:
 
 | Key | Type | Default | Description |
