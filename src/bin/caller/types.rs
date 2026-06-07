@@ -708,9 +708,9 @@ pub enum OutboundEvent {
         id: String,
         reason: String,
     },
-    /// Mid-turn steering could not be delivered natively and the steer text
-    /// was queued for the next turn instead. Paired with a later
-    /// `SteerDelivered { mid_turn: false }` once the queue drains.
+    /// Mid-turn steering could not be delivered natively and fell back to
+    /// non-native follow-up delivery. Paired with a later
+    /// `SteerDelivered { mid_turn: false }` when the follow-up is sent.
     SteerQueued {
         #[serde(skip_serializing_if = "Option::is_none")]
         session_id: Option<String>,

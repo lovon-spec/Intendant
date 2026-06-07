@@ -4243,6 +4243,46 @@ async fn start_external_side_followup_turn(
     true
 }
 
+async fn start_external_primary_steer_followup_turn(
+    agent: &mut Box<dyn external_agent::ExternalAgent>,
+    config: &DrainConfig<'_>,
+    session_id: String,
+    text: String,
+    steer_id: String,
+    reason: String,
+) -> Result<(), CallerError> {
+    let thread = external_agent::AgentThread {
+        thread_id: session_id.clone(),
+    };
+    let send_result = agent.send_message(&thread, &text).await;
+    match send_result {
+        Ok(()) => {
+            emit_user_message_log(
+                config.bus,
+                config.session_log,
+                Some(&session_id),
+                None,
+                None,
+                None,
+                &text,
+            );
+            slog(config.session_log, |l| l.info(&reason));
+            config.bus.send(AppEvent::SteerQueued {
+                session_id: Some(session_id.clone()),
+                id: steer_id.clone(),
+                reason,
+            });
+            config.bus.send(AppEvent::SteerDelivered {
+                session_id: Some(session_id),
+                id: steer_id,
+                mid_turn: false,
+            });
+            Ok(())
+        }
+        Err(err) => Err(err),
+    }
+}
+
 fn scoped_event_targets_config(
     thread_id: &Option<String>,
     session_id: &Option<String>,
@@ -6965,6 +7005,49 @@ async fn drain_external_agent_events(
                                     )
                                     .await;
                                     continue;
+                                }
+                                if !target_is_side && external_steer_error_is_no_active_turn(&e) {
+                                    let Some(primary_session_id) = target_session_id.clone() else {
+                                        continue;
+                                    };
+                                    let reason = format!(
+                                        "{} reported no active parent turn; sending steer as immediate follow-up",
+                                        agent.name()
+                                    );
+                                    match start_external_primary_steer_followup_turn(
+                                        agent,
+                                        config,
+                                        primary_session_id.clone(),
+                                        text.clone(),
+                                        id.clone(),
+                                        reason,
+                                    )
+                                    .await
+                                    {
+                                        Ok(()) => continue,
+                                        Err(send_err) => {
+                                            let reason = format!(
+                                                "{} native mid-turn steering failed ({}); immediate follow-up failed ({}); queued as follow-up",
+                                                agent.name(),
+                                                e,
+                                                send_err
+                                            );
+                                            if let Ok(mut q) = config.context_injection.lock() {
+                                                q.push(event::ContextInjection::text_with_steer_id_for_target(
+                                                    text.clone(),
+                                                    id.clone(),
+                                                    Some(primary_session_id),
+                                                ));
+                                            }
+                                            slog(config.session_log, |l| l.info(&reason));
+                                            config.bus.send(AppEvent::SteerQueued {
+                                                session_id: target_session_id,
+                                                id,
+                                                reason,
+                                            });
+                                            continue;
+                                        }
+                                    }
                                 }
                                 let reason = external_steer_queue_reason(agent.name(), &e);
                                 if let Ok(mut q) = config.context_injection.lock() {
@@ -13886,6 +13969,146 @@ Also: {"source": "bare"}"#;
                     .to_string(),
             )
         ));
+    }
+
+    struct RecordingExternalAgent {
+        sent: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>,
+        fail_send: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl external_agent::ExternalAgent for RecordingExternalAgent {
+        fn name(&self) -> &str {
+            "codex"
+        }
+
+        async fn initialize(
+            &mut self,
+            _config: external_agent::AgentConfig,
+        ) -> Result<tokio::sync::mpsc::UnboundedReceiver<external_agent::AgentEvent>, CallerError>
+        {
+            let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            Ok(rx)
+        }
+
+        async fn start_thread(&mut self) -> Result<external_agent::AgentThread, CallerError> {
+            Ok(external_agent::AgentThread {
+                thread_id: "thread-1".to_string(),
+            })
+        }
+
+        async fn send_message(
+            &mut self,
+            thread: &external_agent::AgentThread,
+            message: &str,
+        ) -> Result<(), CallerError> {
+            if self.fail_send {
+                return Err(CallerError::ExternalAgent("turn/start failed".to_string()));
+            }
+            self.sent
+                .lock()
+                .unwrap()
+                .push((thread.thread_id.clone(), message.to_string()));
+            Ok(())
+        }
+
+        async fn resolve_approval(
+            &mut self,
+            _request_id: &str,
+            _decision: external_agent::ApprovalDecision,
+        ) -> Result<(), CallerError> {
+            Ok(())
+        }
+
+        async fn shutdown(&mut self) -> Result<(), CallerError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn primary_steer_followup_sends_turn_and_marks_delivered() {
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        let session_log: SharedSessionLog = Arc::new(Mutex::new(
+            session_log::SessionLog::open(log_dir.clone()).unwrap(),
+        ));
+        let approval_registry: event::ApprovalRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let context_injection: event::ContextInjectionQueue = Arc::new(Mutex::new(Vec::new()));
+        let autonomy = autonomy::shared_autonomy(AutonomyState::default());
+        let config = DrainConfig {
+            bus: &bus,
+            web_port: None,
+            session_id: Some("thread-1".to_string()),
+            alias_session_id: None,
+            autonomy,
+            session_log: &session_log,
+            project_root: dir.path(),
+            log_dir: &log_dir,
+            approval_registry: &approval_registry,
+            json_approval: None,
+            agent_source: Some("Codex".to_string()),
+            suppress_agent_started: false,
+            persist_model_responses_inline: true,
+            headless: true,
+            context_injection: &context_injection,
+        };
+        let sent = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut agent: Box<dyn external_agent::ExternalAgent> = Box::new(RecordingExternalAgent {
+            sent: sent.clone(),
+            fail_send: false,
+        });
+
+        start_external_primary_steer_followup_turn(
+            &mut agent,
+            &config,
+            "thread-1".to_string(),
+            "continue on signed main".to_string(),
+            "steer-1".to_string(),
+            "codex reported no active parent turn; sending steer as immediate follow-up"
+                .to_string(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            *sent.lock().unwrap(),
+            vec![(
+                "thread-1".to_string(),
+                "continue on signed main".to_string()
+            )]
+        );
+
+        let mut saw_queued = false;
+        let mut saw_delivered = false;
+        while let Ok(event) = rx.try_recv() {
+            match event {
+                AppEvent::SteerQueued {
+                    session_id,
+                    id,
+                    reason,
+                } => {
+                    saw_queued = true;
+                    assert_eq!(session_id.as_deref(), Some("thread-1"));
+                    assert_eq!(id, "steer-1");
+                    assert!(reason.contains("immediate follow-up"));
+                }
+                AppEvent::SteerDelivered {
+                    session_id,
+                    id,
+                    mid_turn,
+                } => {
+                    saw_delivered = true;
+                    assert_eq!(session_id.as_deref(), Some("thread-1"));
+                    assert_eq!(id, "steer-1");
+                    assert!(!mid_turn);
+                }
+                _ => {}
+            }
+        }
+        assert!(saw_queued, "expected SteerQueued");
+        assert!(saw_delivered, "expected SteerDelivered");
     }
 
     #[test]
@@ -22208,7 +22431,7 @@ async fn main() -> Result<(), CallerError> {
         let _outbound_broadcaster =
             event::spawn_outbound_broadcaster(bus.subscribe(), outbound_tx.clone());
         let _session_log_writer =
-            event::spawn_session_log_writer(bus.subscribe(), session_log.clone());
+            event::spawn_session_log_writer(bus.subscribe_session_log(), session_log.clone());
 
         let (shared_file_watcher, _watcher_handle, _round_snapshot_handle) = {
             let snapshot_dir = log_dir.join("file_snapshots");
@@ -22435,7 +22658,7 @@ async fn main() -> Result<(), CallerError> {
 
         // Wire session log writer: persists bus events that aren't logged inline.
         let _session_log_writer =
-            event::spawn_session_log_writer(bus.subscribe(), session_log.clone());
+            event::spawn_session_log_writer(bus.subscribe_session_log(), session_log.clone());
 
         // File watcher: observes project directory for changes, emits FileChanged events.
         let (shared_file_watcher, _watcher_handle, _round_snapshot_handle) = {
@@ -22902,7 +23125,7 @@ async fn main() -> Result<(), CallerError> {
 
         // Wire session log writer: persists bus events that aren't logged inline.
         let _session_log_writer =
-            event::spawn_session_log_writer(bus.subscribe(), session_log.clone());
+            event::spawn_session_log_writer(bus.subscribe_session_log(), session_log.clone());
 
         // File watcher: observes project directory for changes, emits FileChanged events.
         let (shared_file_watcher, _watcher_handle, _round_snapshot_handle) = {
@@ -23545,7 +23768,7 @@ async fn main() -> Result<(), CallerError> {
 
         // Wire session log writer: persists bus events that aren't logged inline.
         let _session_log_writer =
-            event::spawn_session_log_writer(bus.subscribe(), session_log.clone());
+            event::spawn_session_log_writer(bus.subscribe_session_log(), session_log.clone());
 
         // File watcher: observes project directory for changes, emits FileChanged events.
         let (shared_file_watcher, _watcher_handle, _round_snapshot_handle) = {

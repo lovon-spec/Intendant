@@ -236,9 +236,10 @@ pub enum AppEvent {
         reason: String,
     },
     /// Mid-turn steering could not be delivered natively by the current
-    /// backend and was queued as a follow-up injection instead. Emitted
-    /// after the fallback push to `context_injection`; paired with a later
-    /// `SteerDelivered { mid_turn: false }` once the queue drains.
+    /// backend and fell back to non-native follow-up delivery. For native
+    /// Intendant sessions this means `context_injection`; for external
+    /// backends it may be an immediate follow-up turn. Paired with a later
+    /// `SteerDelivered { mid_turn: false }` when the follow-up is sent.
     SteerQueued {
         session_id: Option<String>,
         id: String,
@@ -1641,21 +1642,45 @@ pub enum ControlMsg {
 #[derive(Clone)]
 pub struct EventBus {
     tx: tokio::sync::broadcast::Sender<AppEvent>,
+    session_log_sinks: Arc<Mutex<Vec<tokio::sync::mpsc::UnboundedSender<AppEvent>>>>,
 }
 
 impl EventBus {
     pub fn new() -> Self {
         let (tx, _) = tokio::sync::broadcast::channel(4096);
-        Self { tx }
+        Self {
+            tx,
+            session_log_sinks: Arc::new(Mutex::new(Vec::new())),
+        }
     }
 
     pub fn send(&self, event: AppEvent) {
+        if app_event_writes_to_session_log(&event) {
+            if let Ok(mut sinks) = self.session_log_sinks.lock() {
+                sinks.retain(|sink| sink.send(event.clone()).is_ok());
+            }
+        }
         let _ = self.tx.send(event);
     }
 
     /// Create a new subscriber that receives all future events.
     pub fn subscribe(&self) -> tokio::sync::broadcast::Receiver<AppEvent> {
         self.tx.subscribe()
+    }
+
+    /// Create a lossless session-log subscriber for durable event capture.
+    ///
+    /// The normal broadcast channel is intentionally bounded for UI/control
+    /// consumers. Session logging must not lose low-volume lifecycle events
+    /// such as `SteerRequested` / `SteerQueued` during high-volume model
+    /// streaming, so the bus keeps a separate unbounded fan-out for just the
+    /// event kinds that the session log writer persists.
+    pub fn subscribe_session_log(&self) -> tokio::sync::mpsc::UnboundedReceiver<AppEvent> {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        if let Ok(mut sinks) = self.session_log_sinks.lock() {
+            sinks.push(tx);
+        }
+        rx
     }
 }
 
@@ -2409,18 +2434,74 @@ pub fn spawn_outbound_broadcaster(
 /// Counterpart to `spawn_outbound_broadcaster` which handles the WebSocket/
 /// control-socket broadcast path.
 pub fn spawn_session_log_writer(
-    mut event_rx: tokio::sync::broadcast::Receiver<AppEvent>,
+    mut event_rx: tokio::sync::mpsc::UnboundedReceiver<AppEvent>,
     session_log: crate::SharedSessionLog,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        loop {
-            match event_rx.recv().await {
-                Ok(event) => write_event_to_session_log(&session_log, &event),
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-            }
+        while let Some(event) = event_rx.recv().await {
+            write_event_to_session_log(&session_log, &event);
         }
     })
+}
+
+fn app_event_writes_to_session_log(event: &AppEvent) -> bool {
+    matches!(
+        event,
+        AppEvent::AgentStarted { .. }
+            | AppEvent::DoneSignal { .. }
+            | AppEvent::TaskComplete { .. }
+            | AppEvent::SteerRequested { .. }
+            | AppEvent::SteerQueued { .. }
+            | AppEvent::SteerAccepted { .. }
+            | AppEvent::SteerDelivered { .. }
+            | AppEvent::SteerCancelled { .. }
+            | AppEvent::InterruptRequested { .. }
+            | AppEvent::Interrupted { .. }
+            | AppEvent::SessionStarted { .. }
+            | AppEvent::SessionIdentity { .. }
+            | AppEvent::SessionRelationship { .. }
+            | AppEvent::SessionCapabilities { .. }
+            | AppEvent::SessionGoal { .. }
+            | AppEvent::SessionAttached { .. }
+            | AppEvent::SessionEnded { .. }
+            | AppEvent::SafetyCapReached
+            | AppEvent::SubAgentResult { .. }
+            | AppEvent::OrchestratorProgress { .. }
+            | AppEvent::RoundComplete { .. }
+            | AppEvent::AutoApproved { .. }
+            | AppEvent::ApprovalResolved { .. }
+            | AppEvent::HumanQuestionDetected { .. }
+            | AppEvent::HumanResponseSent
+            | AppEvent::DisplayReady { .. }
+            | AppEvent::DisplayResize { .. }
+            | AppEvent::DisplayTaken { .. }
+            | AppEvent::DisplayReleased { .. }
+            | AppEvent::DisplayCaptureLost { .. }
+            | AppEvent::DisplayApprovalPending { .. }
+            | AppEvent::SharedView { .. }
+            | AppEvent::UserDisplayGranted { .. }
+            | AppEvent::UserDisplayRevoked { .. }
+            | AppEvent::DebugScreenReady { .. }
+            | AppEvent::DebugScreenTornDown { .. }
+            | AppEvent::RecordingStarted { .. }
+            | AppEvent::RecordingStopped { .. }
+            | AppEvent::RecordingError { .. }
+            | AppEvent::RecordingDeleted { .. }
+            | AppEvent::PresenceLog { .. }
+            | AppEvent::PresenceUsageUpdate { .. }
+            | AppEvent::LiveUsageUpdate { .. }
+            | AppEvent::ContextSnapshot { .. }
+            | AppEvent::LiveAudioStarted { .. }
+            | AppEvent::LiveAudioProgress { .. }
+            | AppEvent::LiveAudioCompleted { .. }
+            | AppEvent::ModelResponse { .. }
+            | AppEvent::FileChanged { .. }
+            | AppEvent::SnapshotCreated { .. }
+            | AppEvent::RolledBack { .. }
+            | AppEvent::Redone { .. }
+            | AppEvent::HistoryPruned { .. }
+            | AppEvent::ConversationRolledBack { .. }
+    )
 }
 
 /// Write a single AppEvent to the session log if it isn't already logged
@@ -4228,6 +4309,46 @@ mod tests {
         assert!(contents.contains("\"event\":\"steer_delivered\""));
         assert!(contents.contains("\"event\":\"steer_cancelled\""));
         assert!(contents.contains("Keep the full body."));
+    }
+
+    #[tokio::test]
+    async fn session_log_subscription_filters_high_volume_events_but_keeps_steers() {
+        let bus = EventBus::new();
+        let mut log_rx = bus.subscribe_session_log();
+
+        for i in 0..5000 {
+            bus.send(AppEvent::ModelResponseDelta {
+                session_id: Some("thread-1".to_string()),
+                text: format!("delta-{i}"),
+            });
+            bus.send(AppEvent::Tick);
+        }
+        bus.send(AppEvent::SteerRequested {
+            session_id: Some("thread-1".to_string()),
+            text: "full steer body".to_string(),
+            id: "steer-1".to_string(),
+        });
+
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), log_rx.recv())
+            .await
+            .expect("session-log event should arrive")
+            .expect("session-log channel should remain open");
+        match event {
+            AppEvent::SteerRequested {
+                session_id,
+                text,
+                id,
+            } => {
+                assert_eq!(session_id.as_deref(), Some("thread-1"));
+                assert_eq!(text, "full steer body");
+                assert_eq!(id, "steer-1");
+            }
+            other => panic!("expected SteerRequested, got {:?}", other),
+        }
+        assert!(
+            log_rx.try_recv().is_err(),
+            "deltas and ticks must not be queued"
+        );
     }
 
     #[test]
