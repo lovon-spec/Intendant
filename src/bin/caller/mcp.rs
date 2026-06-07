@@ -9683,6 +9683,7 @@ mod tests {
                 &wrapper_dir,
                 &crate::session_config::SessionAgentConfig {
                     source: Some("codex".to_string()),
+                    project_root: Some(project_root.to_string_lossy().to_string()),
                     agent_command: Some("/tmp/patched-codex".to_string()),
                     codex_sandbox: Some("danger-full-access".to_string()),
                     codex_approval_policy: Some("never".to_string()),
@@ -9794,6 +9795,7 @@ mod tests {
                 &wrapper_dir,
                 &crate::session_config::SessionAgentConfig {
                     source: Some("codex".to_string()),
+                    project_root: Some(project_root.to_string_lossy().to_string()),
                     agent_command: Some("/tmp/patched-codex".to_string()),
                     codex_sandbox: Some("danger-full-access".to_string()),
                     codex_approval_policy: Some("never".to_string()),

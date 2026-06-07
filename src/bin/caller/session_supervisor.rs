@@ -1056,9 +1056,6 @@ impl SessionSupervisor {
                 Some(trimmed.to_string())
             }
         });
-        let project_root = project_root
-            .map(PathBuf::from)
-            .unwrap_or_else(|| self.config.project_root.clone());
         let external_backend = if source_norm == "intendant" {
             None
         } else {
@@ -1097,6 +1094,23 @@ impl SessionSupervisor {
             }
             config
         });
+        let project_root = if external_backend.is_some() {
+            match resolve_external_resume_project_root(
+                project_root,
+                session_agent_config.as_ref(),
+                &self.config.project_root,
+            ) {
+                Ok(root) => root,
+                Err(e) => {
+                    self.loop_error(format!("Project load failed: {}", e));
+                    return;
+                }
+            }
+        } else {
+            project_root
+                .map(PathBuf::from)
+                .unwrap_or_else(|| self.config.project_root.clone())
+        };
 
         if resume_task.is_none() {
             if let Some(existing_id) = self
@@ -3127,6 +3141,26 @@ fn resolve_project_root_override(
     Ok(canonical)
 }
 
+fn resolve_external_resume_project_root(
+    project_root: Option<String>,
+    config: Option<&crate::session_config::SessionAgentConfig>,
+    default_root: &Path,
+) -> Result<PathBuf, String> {
+    if let Some(root) = project_root
+        .as_deref()
+        .and_then(|root| crate::session_config::normalize_project_root(Some(root)))
+    {
+        return Ok(PathBuf::from(root));
+    }
+    if let Some(root) = config
+        .and_then(|config| config.project_root.as_deref())
+        .and_then(|root| crate::session_config::normalize_project_root(Some(root)))
+    {
+        return resolve_project_root_override(Some(root), default_root);
+    }
+    Ok(default_root.to_path_buf())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum SessionAgentSelection {
     Configured,
@@ -3979,6 +4013,58 @@ mod tests {
 
         let resolved = external_resume_log_dir(wrapper_dir.to_str().unwrap(), false);
         assert_eq!(resolved, wrapper_dir);
+    }
+
+    #[test]
+    fn external_resume_project_root_uses_persisted_launch_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let helper_root = dir.path().join("intendant-helper-main-5770");
+        let station_root = dir.path().join("intendant-station-mainline-123e28c");
+        std::fs::create_dir_all(&helper_root).unwrap();
+        std::fs::create_dir_all(&station_root).unwrap();
+        let mut config = crate::session_config::from_wire(
+            Some("codex"),
+            Some("/tmp/codex"),
+            Some("danger-full-access"),
+            Some("never"),
+            Some("managed"),
+            Some("summary"),
+            None,
+        );
+        config.project_root = Some(station_root.to_string_lossy().to_string());
+
+        let resolved =
+            resolve_external_resume_project_root(None, Some(&config), &helper_root).unwrap();
+        assert_eq!(resolved, station_root.canonicalize().unwrap());
+    }
+
+    #[test]
+    fn external_resume_project_root_prefers_explicit_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let helper_root = dir.path().join("intendant-helper-main-5770");
+        let station_root = dir.path().join("intendant-station-mainline-123e28c");
+        let requested_root = dir.path().join("requested-worktree");
+        std::fs::create_dir_all(&helper_root).unwrap();
+        std::fs::create_dir_all(&station_root).unwrap();
+        std::fs::create_dir_all(&requested_root).unwrap();
+        let mut config = crate::session_config::from_wire(
+            Some("codex"),
+            Some("/tmp/codex"),
+            Some("danger-full-access"),
+            Some("never"),
+            Some("managed"),
+            Some("summary"),
+            None,
+        );
+        config.project_root = Some(station_root.to_string_lossy().to_string());
+
+        let resolved = resolve_external_resume_project_root(
+            Some(requested_root.to_string_lossy().to_string()),
+            Some(&config),
+            &helper_root,
+        )
+        .unwrap();
+        assert_eq!(resolved, requested_root);
     }
 
     #[tokio::test]

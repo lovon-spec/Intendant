@@ -15,6 +15,8 @@ pub struct SessionAgentConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_root: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_command: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub codex_sandbox: Option<String>,
@@ -37,6 +39,7 @@ pub struct SessionAgentConfig {
 impl SessionAgentConfig {
     pub fn is_empty(&self) -> bool {
         self.source.is_none()
+            && self.project_root.is_none()
             && self.agent_command.is_none()
             && self.codex_sandbox.is_none()
             && self.codex_approval_policy.is_none()
@@ -49,6 +52,9 @@ impl SessionAgentConfig {
     pub fn merge_missing_from(&mut self, fallback: SessionAgentConfig) {
         if self.source.is_none() {
             self.source = fallback.source;
+        }
+        if self.project_root.is_none() {
+            self.project_root = fallback.project_root;
         }
         if self.agent_command.is_none() {
             self.agent_command = fallback.agent_command;
@@ -77,6 +83,12 @@ impl SessionAgentConfig {
 pub fn normalize_agent_command(command: Option<&str>) -> Option<String> {
     command
         .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
+pub fn normalize_project_root(root: Option<&str>) -> Option<String> {
+    root.map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToString::to_string)
 }
@@ -141,6 +153,7 @@ pub fn from_wire(
     };
     SessionAgentConfig {
         source,
+        project_root: None,
         agent_command: normalize_agent_command(agent_command),
         codex_sandbox,
         codex_approval_policy,
@@ -155,6 +168,7 @@ pub fn from_project(backend: &AgentBackend, project: &Project) -> SessionAgentCo
     match backend {
         AgentBackend::Codex => SessionAgentConfig {
             source: Some("codex".to_string()),
+            project_root: normalize_project_root(Some(&project.root.to_string_lossy())),
             agent_command: Some(project.config.agent.codex.command.clone()),
             codex_sandbox: Some(crate::project::normalize_sandbox_mode(
                 &project.config.agent.codex.sandbox,
@@ -175,6 +189,7 @@ pub fn from_project(backend: &AgentBackend, project: &Project) -> SessionAgentCo
         },
         AgentBackend::ClaudeCode => SessionAgentConfig {
             source: Some("claude-code".to_string()),
+            project_root: normalize_project_root(Some(&project.root.to_string_lossy())),
             agent_command: Some(project.config.agent.claude_code.command.clone()),
             codex_sandbox: None,
             codex_approval_policy: None,
@@ -185,6 +200,7 @@ pub fn from_project(backend: &AgentBackend, project: &Project) -> SessionAgentCo
         },
         AgentBackend::GeminiCli => SessionAgentConfig {
             source: Some("gemini".to_string()),
+            project_root: normalize_project_root(Some(&project.root.to_string_lossy())),
             agent_command: Some(project.config.agent.gemini_cli.command.clone()),
             codex_sandbox: None,
             codex_approval_policy: None,
@@ -249,8 +265,17 @@ pub fn write_log_dir_config(log_dir: &Path, config: &SessionAgentConfig) -> Resu
 pub fn read_log_dir_config(log_dir: &Path) -> Option<SessionAgentConfig> {
     let raw = std::fs::read_to_string(log_dir.join(SESSION_AGENT_CONFIG_FILE)).ok()?;
     let config: SessionAgentConfig = serde_json::from_str(&raw).ok()?;
-    let config = normalize_session_agent_config(config, None);
+    let mut config = normalize_session_agent_config(config, None);
+    if config.project_root.is_none() {
+        config.project_root = read_log_dir_project_root(log_dir);
+    }
     (!config.is_empty()).then_some(config)
+}
+
+fn read_log_dir_project_root(log_dir: &Path) -> Option<String> {
+    let raw = std::fs::read_to_string(log_dir.join("session_meta.json")).ok()?;
+    let value: Value = serde_json::from_str(&raw).ok()?;
+    normalize_project_root(value.get("project_root").and_then(|v| v.as_str()))
 }
 
 fn normalize_session_agent_config(
@@ -264,6 +289,9 @@ fn normalize_session_agent_config(
     }
     if let Some(source) = config.source.take() {
         config.source = Some(crate::session_names::normalize_source(&source));
+    }
+    if let Some(root) = config.project_root.take() {
+        config.project_root = normalize_project_root(Some(&root));
     }
     if let Some(command) = config.agent_command.take() {
         config.agent_command = normalize_agent_command(Some(&command));
@@ -468,6 +496,16 @@ pub fn apply_config_to_session_json(session: &mut Value, config: &SessionAgentCo
     if let Some(source) = config.source.as_deref() {
         obj.entry("configured_source".to_string())
             .or_insert_with(|| Value::String(source.to_string()));
+    }
+    if let Some(root) = config.project_root.as_deref() {
+        let should_insert = obj
+            .get("project_root")
+            .and_then(|value| value.as_str())
+            .map(str::is_empty)
+            .unwrap_or(true);
+        if should_insert {
+            obj.insert("project_root".to_string(), Value::String(root.to_string()));
+        }
     }
     if let Some(command) = config.agent_command.as_deref() {
         obj.insert(
@@ -735,10 +773,15 @@ mod tests {
             Some("exact"),
             Some("priority"),
         );
+        cfg.project_root = Some("/tmp/intendant-project".to_string());
         cfg.codex_home = Some("  /home/user/.codex-managed  ".to_string());
 
         write_log_dir_config(dir.path(), &cfg).unwrap();
         let loaded = read_log_dir_config(dir.path()).unwrap();
+        assert_eq!(
+            loaded.project_root.as_deref(),
+            Some("/tmp/intendant-project")
+        );
         assert_eq!(
             loaded.codex_home.as_deref(),
             Some("/home/user/.codex-managed")
@@ -751,6 +794,10 @@ mod tests {
             Some("/home/user/.codex-managed")
         );
         assert_eq!(
+            session.get("project_root").and_then(|v| v.as_str()),
+            Some("/tmp/intendant-project")
+        );
+        assert_eq!(
             session.get("codex_sandbox").and_then(|v| v.as_str()),
             Some("danger-full-access")
         );
@@ -759,6 +806,37 @@ mod tests {
                 .get("codex_approval_policy")
                 .and_then(|v| v.as_str()),
             Some("never")
+        );
+    }
+
+    #[test]
+    fn log_config_uses_session_meta_project_root_for_legacy_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = from_wire(
+            Some("codex"),
+            Some("/tmp/codex"),
+            Some("danger-full-access"),
+            Some("never"),
+            Some("managed"),
+            Some("exact"),
+            None,
+        );
+        write_log_dir_config(dir.path(), &cfg).unwrap();
+        std::fs::write(
+            dir.path().join("session_meta.json"),
+            serde_json::json!({
+                "session_id": "wrapper-id",
+                "created_at": "2026-06-07T00:00:00Z",
+                "project_root": "  /home/user/projects/intendant-station-mainline-123e28c  "
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let loaded = read_log_dir_config(dir.path()).unwrap();
+        assert_eq!(
+            loaded.project_root.as_deref(),
+            Some("/home/user/projects/intendant-station-mainline-123e28c")
         );
     }
 
@@ -785,12 +863,18 @@ mod tests {
             None,
         );
         backend.codex_home = Some("/home/user/.codex-managed".to_string());
+        backend.project_root =
+            Some("/home/user/projects/intendant-station-mainline-123e28c".into());
         write_external_overlay(home.path(), "codex", "wrapper-id", &stale_wrapper).unwrap();
         write_external_overlay(home.path(), "codex", "backend-thread", &backend).unwrap();
 
         let loaded =
             load_for_resume(home.path(), "codex", "wrapper-id", Some("backend-thread")).unwrap();
         assert_eq!(loaded.agent_command.as_deref(), Some("/tmp/backend-codex"));
+        assert_eq!(
+            loaded.project_root.as_deref(),
+            Some("/home/user/projects/intendant-station-mainline-123e28c")
+        );
         assert_eq!(
             loaded.codex_home.as_deref(),
             Some("/home/user/.codex-managed")
@@ -817,6 +901,16 @@ mod tests {
             .join("wrapper-id");
         write_log_dir_config(&wrapper_log_dir, &wrapper).unwrap();
         std::fs::write(
+            wrapper_log_dir.join("session_meta.json"),
+            serde_json::json!({
+                "session_id": "wrapper-id",
+                "created_at": "2026-06-07T00:00:00Z",
+                "project_root": "/home/user/projects/intendant-station-mainline-123e28c"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(
             wrapper_log_dir.join("session.jsonl"),
             "debug: External agent thread: backend-thread\n",
         )
@@ -835,6 +929,10 @@ mod tests {
         let loaded =
             load_for_resume(home.path(), "codex", "wrapper-id", Some("backend-thread")).unwrap();
         assert_eq!(loaded.agent_command.as_deref(), Some("/tmp/backend-codex"));
+        assert_eq!(
+            loaded.project_root.as_deref(),
+            Some("/home/user/projects/intendant-station-mainline-123e28c")
+        );
         assert_eq!(
             loaded.codex_home.as_deref(),
             Some("/home/user/.codex-managed")
