@@ -10742,6 +10742,9 @@ let stationCurrentTask = '';
 let stationCurrentApproval = null;
 let stationCurrentHumanQuestion = '';
 const stationLogEvents = [];
+const stationLogAnchorRows = new Map();
+const stationLogAnchorKeys = [];
+const STATION_LOG_ANCHOR_LIMIT = 10000;
 const stationRegisteredSources = new Set();
 let stationLastSnapshotJson = '';
 let stationLastFallbackSnapshot = null;
@@ -13111,7 +13114,7 @@ async function stationCopyActivityEvents(events) {
 
 function stationClearActivityLog() {
   clearLogs();
-  stationLogEvents.length = 0;
+  stationClearLogState();
   stationLastFallbackSnapshot = null;
   stationScheduleUpdate();
   stationRenderActivityDock();
@@ -18617,17 +18620,17 @@ function stationManagedAnchorCount(sessionId) {
     const id = anchor?.item_id || anchor?.itemId;
     if (id) seen.add(String(id));
   }
-  document.querySelectorAll('.log-entry[data-item-id]').forEach(entry => {
-    const sid = entry.dataset.sessionId || '';
-    if (
-      !sessionId ||
-      sid === sessionId ||
-      sessionWindowTargetForLogSession(sid) === sessionId
-    ) {
-      seen.add(entry.dataset.itemId);
-    }
-  });
+  for (const row of stationLogAnchorRows.values()) {
+    if (stationLogAnchorMatchesSession(row, sessionId)) seen.add(row.id);
+  }
   return seen.size;
+}
+
+function stationLogAnchorMatchesSession(row, sessionId) {
+  const target = String(sessionId || '').trim();
+  if (!target) return true;
+  const sid = String(row?.sessionId || '').trim();
+  return sid === target || sessionWindowTargetForLogSession(sid) === target;
 }
 
 function stationManagedAnchorRows(sessionId) {
@@ -18648,16 +18651,13 @@ function stationManagedAnchorRows(sessionId) {
       tone: 'peer',
     });
   };
-  document.querySelectorAll('.log-entry[data-item-id]').forEach(entry => {
-    const sid = entry.dataset.sessionId || '';
-    if (
-      !sessionId ||
-      sid === sessionId ||
-      sessionWindowTargetForLogSession(sid) === sessionId
-    ) {
-      add(entry.dataset.itemId, entry.querySelector('.log-content')?.textContent || entry.textContent || '', 'log', sid);
+  for (let i = stationLogAnchorKeys.length - 1; i >= 0 && rows.length < 8; i--) {
+    const row = stationLogAnchorRows.get(stationLogAnchorKeys[i]);
+    if (!row) continue;
+    if (stationLogAnchorMatchesSession(row, sessionId)) {
+      add(row.id, row.detail, row.value || 'log', row.sessionId);
     }
-  });
+  }
   for (const anchor of managedContextAnchors || []) {
     add(
       anchor.item_id || anchor.itemId,
@@ -19597,6 +19597,54 @@ function stationPushLogEvent(c) {
     msg: c.content || c.source || c.event || '',
   });
   if (stationLogEvents.length > 180) stationLogEvents.splice(0, stationLogEvents.length - 180);
+  stationTrackLogAnchor(c);
+}
+
+function stationTrackLogAnchorRow(itemId, sessionId, detail, value = 'log') {
+  const id = String(itemId || '').trim();
+  if (!id) return;
+  const sid = String(sessionId || '').trim();
+  const key = `${sid}\u001f${id}`;
+  if (!stationLogAnchorRows.has(key)) stationLogAnchorKeys.push(key);
+  stationLogAnchorRows.set(key, {
+    id,
+    sessionId: sid,
+    value: value || 'log',
+    detail: detail || '',
+  });
+  while (stationLogAnchorKeys.length > STATION_LOG_ANCHOR_LIMIT) {
+    const oldestKey = stationLogAnchorKeys.shift();
+    if (!oldestKey) break;
+    stationLogAnchorRows.delete(oldestKey);
+  }
+}
+
+function stationTrackLogAnchor(c) {
+  const itemId = c?.item_id || c?.itemId || '';
+  if (!itemId) return;
+  stationTrackLogAnchorRow(
+    itemId,
+    c?.session_id || c?.sessionId || '',
+    c?.content || c?.summary || c?.message || c?.source || c?.event || '',
+  );
+}
+
+function stationTrackSessionWindowHistoryAnchor(item, fallbackSessionId = '') {
+  const node = item instanceof Node ? item : null;
+  const record = node ? null : sessionWindowHistoryRecord(item);
+  const itemId = record?.item_id || record?.itemId || node?.dataset?.itemId || '';
+  if (!itemId) return;
+  const sessionId = record?.session_id || record?.sessionId || node?.dataset?.sessionId || fallbackSessionId || '';
+  const detail = record
+    ? (record.content || record.summary || record.message || record.source || record.event || '')
+    : (node.querySelector?.('.log-content')?.textContent || node.textContent || '');
+  stationTrackLogAnchorRow(itemId, sessionId, detail, 'log');
+}
+
+function stationClearLogState() {
+  stationLogEvents.length = 0;
+  stationLogAnchorRows.clear();
+  stationLogAnchorKeys.length = 0;
 }
 
 function stationRegisterVideoSource(sourceId, hostId, displayId, label, kind, videoEl) {
@@ -20754,7 +20802,7 @@ function processCommands(cmds) {
       case 'clear_logs':
         flushLogReplayAppendBatch();
         clearLogs({ clearSessionWindows: !processingLogReplay });
-        stationLogEvents.length = 0;
+        stationClearLogState();
         stationScheduleUpdate();
         break;
       case 'add_turn_separator':
@@ -23313,16 +23361,17 @@ function renderManagedContextAnchors() {
   const sid = managedContextCurrentSessionId();
   const seen = new Set();
   const rows = [];
-  Array.from(document.querySelectorAll('.log-entry[data-item-id]'))
-    .filter(entry => !sid || entry.dataset.sessionId === sid || sessionWindowTargetForLogSession(entry.dataset.sessionId || '') === sid)
-    .reverse()
-    .forEach(entry => {
+  for (let i = stationLogAnchorKeys.length - 1; i >= 0 && rows.length < 18; i--) {
+    const row = stationLogAnchorRows.get(stationLogAnchorKeys[i]);
+    if (!row) continue;
+    if (stationLogAnchorMatchesSession(row, sid)) {
       rows.push({
-        itemId: entry.dataset.itemId,
-        sessionId: entry.dataset.sessionId || sid,
-        content: compactSessionText(entry.querySelector('.log-content')?.textContent || entry.textContent || ''),
+        itemId: row.id,
+        sessionId: row.sessionId || sid,
+        content: compactSessionText(row.detail || ''),
       });
-    });
+    }
+  }
   for (const anchor of managedContextAnchors || []) {
     rows.push({
       itemId: anchor.item_id || anchor.itemId,
@@ -27099,7 +27148,9 @@ function appendSessionWindowHistory(win, entry, shouldFollow) {
   if (!win || !entry) return;
   const history = ensureSessionWindowHistory(win);
   const wasRenderingTail = sessionWindowIsRenderingTail(win, history.length);
-  history.push(prepareSessionWindowHistoryItem(entry));
+  const item = prepareSessionWindowHistoryItem(entry);
+  stationTrackSessionWindowHistoryAnchor(item, win.sessionId);
+  history.push(item);
   if (shouldFollow || wasRenderingTail) {
     renderSessionWindowTail(win);
   }
@@ -27112,7 +27163,9 @@ function appendSessionWindowHistoryBatch(win, entries, shouldFollow) {
   const wasRenderingTail = sessionWindowIsRenderingTail(win, history.length);
   for (const entry of entries) {
     if (!entry) continue;
-    history.push(prepareSessionWindowHistoryItem(entry));
+    const item = prepareSessionWindowHistoryItem(entry);
+    stationTrackSessionWindowHistoryAnchor(item, win.sessionId);
+    history.push(item);
   }
   if (shouldFollow || wasRenderingTail) {
     renderSessionWindowTail(win);
