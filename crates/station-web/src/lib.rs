@@ -5053,6 +5053,7 @@ impl StationInner {
             ));
         }
         yy = self.draw_controls_action_pills(x, panel_w, yy - 14.0, &display_actions);
+        yy = self.draw_display_runway_lanes(x, panel_w, yy);
         self.section_title(x, yy, "Hosts");
         yy += 18.0;
         for host in hosts.iter().take(7) {
@@ -5110,6 +5111,182 @@ impl StationInner {
                 ));
                 yy += 20.0;
             }
+        }
+    }
+
+    fn draw_display_runway_lanes(&mut self, x: f32, panel_w: f32, y: f32) -> f32 {
+        let runway = self.snapshot.display_runway.clone();
+        let mut yy = y;
+        self.section_title_color(x, yy, "Display runway", C_PEACH_CSS);
+        yy += 18.0;
+        self.panel_row(
+            x,
+            yy,
+            "streams",
+            &format!(
+                "{} local · {} remote",
+                runway.local_streams, runway.remote_streams
+            ),
+        );
+        yy += 20.0;
+        self.panel_row(
+            x,
+            yy,
+            "selected",
+            &format!(
+                "{} :{}",
+                nonempty(&runway.selected_peer_id, "none"),
+                runway.selected_display_id
+            ),
+        );
+        yy += 24.0;
+        if runway.lanes.is_empty() {
+            self.panel_row(x, yy, "lanes", "no display/session lanes");
+            return yy + 28.0;
+        }
+        for lane in runway.lanes.iter().take(4) {
+            yy = self.display_runway_lane_card(x, yy, panel_w, lane);
+        }
+        yy + 6.0
+    }
+
+    fn display_runway_lane_card(
+        &mut self,
+        x: f32,
+        y: f32,
+        panel_w: f32,
+        lane: &StationDisplayRunwayLane,
+    ) -> f32 {
+        let color = display_lane_color_css(&lane.kind);
+        let card_h = 54.0;
+        self.round_rect(
+            x + 12.0,
+            y - 9.0,
+            panel_w - 24.0,
+            card_h,
+            4.0,
+            if lane.selected {
+                "rgba(49,50,68,0.78)"
+            } else {
+                "rgba(17,17,27,0.76)"
+            },
+            color,
+        );
+        self.ctx.set_fill_style(&JsValue::from_str(color));
+        self.ctx
+            .fill_rect((x + 20.0) as f64, (y - 2.0) as f64, 3.0, 32.0);
+        self.text(
+            &truncate(&nonempty(&lane.title, &lane.kind), 28),
+            x + 30.0,
+            y + 3.0,
+            9.5,
+            color,
+            "bold",
+        );
+        self.text(
+            &truncate(&nonempty(&lane.meta, &lane.kind.replace('_', " ")), 31),
+            x + 30.0,
+            y + 19.0,
+            8.5,
+            C_TEXT_CSS,
+            "normal",
+        );
+        self.text(
+            &truncate(&lane.detail, 38),
+            x + 30.0,
+            y + 35.0,
+            8.0,
+            C_SUBTEXT0_CSS,
+            "normal",
+        );
+        if !lane.id.is_empty() {
+            self.hit_zones.push(HitZone::new(
+                x + 12.0,
+                y - 9.0,
+                panel_w - 24.0,
+                card_h,
+                HitAction::DisplayRunwayAction {
+                    action: "open".to_string(),
+                    lane_id: lane.id.clone(),
+                },
+            ));
+        }
+
+        let actions = self.display_runway_lane_actions(lane);
+        let visible = actions.into_iter().take(3).collect::<Vec<_>>();
+        let total_w = visible
+            .iter()
+            .map(|action| (action.label.len() as f32 * 6.0).clamp(44.0, 70.0))
+            .sum::<f32>()
+            + visible.len().saturating_sub(1) as f32 * 6.0;
+        let mut bx = x + panel_w - 20.0 - total_w;
+        for action in visible {
+            let button_w = (action.label.len() as f32 * 6.0).clamp(44.0, 70.0);
+            self.pill_at(bx, y + 25.0, button_w, 18.0, &action.label, action.color);
+            self.hit_zones
+                .push(HitZone::new(bx, y + 25.0, button_w, 18.0, action.hit));
+            bx += button_w + 6.0;
+        }
+
+        y + card_h + 2.0
+    }
+
+    fn display_runway_lane_actions(&self, lane: &StationDisplayRunwayLane) -> Vec<MenuAction> {
+        let action = |label: &str, op: &str, color: &'static str| {
+            MenuAction::new(
+                label,
+                color,
+                HitAction::DisplayRunwayAction {
+                    action: op.to_string(),
+                    lane_id: lane.id.clone(),
+                },
+            )
+        };
+        match lane.kind.as_str() {
+            "operator_target" => {
+                let mut actions = Vec::new();
+                if !lane.session_id.is_empty() {
+                    actions.push(action("session", "session", C_TEAL_CSS));
+                }
+                if lane.can_focus {
+                    actions.push(action("focus", "focus", C_BLUE_CSS));
+                }
+                if lane.can_interrupt {
+                    actions.push(action("stop", "stop", C_RED_CSS));
+                }
+                actions
+            }
+            "shared_view" => {
+                let mut actions = vec![action("focus", "focus", C_GREEN_CSS)];
+                if lane.can_take_input {
+                    actions.push(action("input", "input", C_TEAL_CSS));
+                }
+                actions.push(action("hide", "hide", C_YELLOW_CSS));
+                actions
+            }
+            "local_stream" => vec![
+                action("video", "open", C_BLUE_CSS),
+                action("input", "input", C_TEAL_CSS),
+                action("attach", "attach", C_PEACH_CSS),
+                action("record", "record", C_RED_CSS),
+                action("full", "fullscreen", C_MAUVE_CSS),
+            ],
+            "remote_stream" => {
+                let mut actions = vec![
+                    action("focus", "focus", C_PEACH_CSS),
+                    action("input", "input", C_TEAL_CSS),
+                ];
+                if !lane.session_id.is_empty() {
+                    actions.push(action("session", "session", C_BLUE_CSS));
+                }
+                actions.push(action("close", "close", C_RED_CSS));
+                actions
+            }
+            "peer_target" => vec![
+                action("open", "open", C_PEACH_CSS),
+                action("select", "select", C_BLUE_CSS),
+            ],
+            _ => vec![action("open", "open", C_OVERLAY1_CSS)],
         }
     }
 
@@ -6543,6 +6720,11 @@ impl StationInner {
                     "host_id": host_id,
                     "display_id": display_id,
             })),
+            HitAction::DisplayRunwayAction { action, lane_id } => Some(serde_json::json!({
+                    "type": "display_runway_action",
+                    "action": action,
+                    "lane_id": lane_id,
+            })),
             HitAction::ContextAction { action, id } => Some(serde_json::json!({
                     "type": "context_action",
                     "action": action,
@@ -7217,6 +7399,7 @@ struct StationSnapshot {
     changes: StationChangesSummary,
     sessions: StationSessionsSummary,
     controls: StationControlsSummary,
+    display_runway: StationDisplayRunwaySummary,
 }
 
 #[derive(Clone, Deserialize)]
@@ -7627,6 +7810,37 @@ impl Default for StationControlsSummary {
     }
 }
 
+#[derive(Clone, Deserialize, Default)]
+#[serde(default)]
+struct StationDisplayRunwaySummary {
+    selected_peer_id: String,
+    selected_display_id: i32,
+    operator_session_id: String,
+    local_streams: u32,
+    remote_streams: u32,
+    shared_view_visible: bool,
+    lanes: Vec<StationDisplayRunwayLane>,
+}
+
+#[derive(Clone, Deserialize, Default)]
+#[serde(default)]
+struct StationDisplayRunwayLane {
+    #[serde(rename = "type")]
+    kind: String,
+    id: String,
+    title: String,
+    meta: String,
+    detail: String,
+    host_id: String,
+    display_id: i32,
+    session_id: String,
+    live_id: String,
+    selected: bool,
+    can_focus: bool,
+    can_interrupt: bool,
+    can_take_input: bool,
+}
+
 #[derive(Clone, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 struct StationBreakdown {
@@ -7764,6 +7978,10 @@ enum HitAction {
     OpenDisplay {
         host_id: String,
         display_id: String,
+    },
+    DisplayRunwayAction {
+        action: String,
+        lane_id: String,
     },
     ContextAction {
         action: String,
@@ -8426,6 +8644,16 @@ fn tone_color_css(tone: &str) -> &'static str {
         "ok" | "green" => C_GREEN_CSS,
         "changes" => C_YELLOW_CSS,
         "peer" | "peach" => C_PEACH_CSS,
+        _ => C_OVERLAY1_CSS,
+    }
+}
+
+fn display_lane_color_css(kind: &str) -> &'static str {
+    match kind {
+        "local_stream" => C_TEAL_CSS,
+        "remote_stream" | "peer_target" => C_PEACH_CSS,
+        "shared_view" => C_GREEN_CSS,
+        "operator_target" => C_BLUE_CSS,
         _ => C_OVERLAY1_CSS,
     }
 }

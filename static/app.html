@@ -11236,6 +11236,8 @@ function handleStationAction(action) {
     }
   } else if (action.type === 'open_display') {
     stationOpenDisplay(action.host_id, action.display_id ?? action.displayId ?? stationPeerDisplayId());
+  } else if (action.type === 'display_runway_action') {
+    stationHandleDisplayRunwayAction(action);
   } else if (action.type === 'thread_action') {
     stationHandleThreadAction(action);
   } else if (action.type === 'session_action') {
@@ -12844,6 +12846,83 @@ function stationDisplayRunwayLaneActions(lane) {
     ];
   }
   return [];
+}
+
+function stationHandleDisplayRunwayAction(action) {
+  const laneId = String(action.lane_id || action.laneId || '').trim();
+  const op = String(action.action || '').trim();
+  if (!laneId || !op) return;
+  const lane = stationDisplayRunwayPayload().lanes.find(item => String(item.id || '') === laneId);
+  if (!lane) return;
+  if (op === 'open' || op === 'focus') {
+    if (lane.type === 'remote_stream' || lane.type === 'peer_target') {
+      stationSetPeerTarget(lane.host_id, lane.display_id);
+      stationOpenDisplay(lane.host_id, lane.display_id);
+      return;
+    }
+    if (lane.type === 'local_stream') {
+      stationForceRouteTo('displays', '');
+      return;
+    }
+    if (lane.type === 'shared_view') {
+      stationFocusSharedViewDisplayFromDock();
+      return;
+    }
+    if (lane.type === 'operator_target' && lane.session_id) {
+      focusSessionWindow(lane.live_id || lane.session_id);
+      return;
+    }
+  }
+  if (op === 'session' && lane.session_id) {
+    if (stationRenderedSelectPanel('system:sessions', 'Display runway session selected')) return;
+    stationRenderSessionsDock(lane.session_id);
+    return;
+  }
+  if (op === 'stop' && lane.type === 'operator_target') {
+    stationHandleActivityAction({ action: 'stop' });
+    return;
+  }
+  if (op === 'select' && lane.type === 'peer_target') {
+    stationSetPeerDisplayTarget(lane.host_id, lane.display_id);
+    stationRenderedSelectPanel('system:peers', 'Peer display target selected');
+    return;
+  }
+  if (lane.type === 'shared_view') {
+    if (op === 'input') {
+      document.querySelector('[data-shared-view-take-input]')?.click();
+      stationScheduleUpdate();
+    } else if (op === 'hide') {
+      document.querySelector('[data-shared-view-close]')?.click();
+      stationScheduleUpdate();
+    }
+    return;
+  }
+  if (lane.type === 'local_stream') {
+    const slot = stationLocalDisplaySlot(lane.display_id);
+    if (!slot) return;
+    if (op === 'input') {
+      if ((slot.authorityState || '') === 'you') slot.releaseBtn?.click();
+      else slot.takeBtn?.click();
+    } else if (op === 'attach') {
+      slot.attachBtn?.click();
+    } else if (op === 'record') {
+      slot.recordBtn?.click();
+    } else if (op === 'fullscreen') {
+      slot.fullscreenBtn?.click();
+    }
+    stationScheduleUpdate();
+    return;
+  }
+  if (lane.type === 'remote_stream') {
+    const conn = stationPeerDisplayConnection(lane.host_id, lane.display_id, lane.session_id);
+    if (op === 'input') {
+      if ((conn?.peerAuthorityState || '') === 'you') conn?.releaseControl?.();
+      else conn?.takeControl?.();
+    } else if (op === 'close') {
+      closePeerDisplaysForHost(lane.host_id);
+    }
+    stationScheduleUpdate();
+  }
 }
 
 function stationRenderDisplayRunwaySection(parent) {
@@ -21201,6 +21280,7 @@ function buildStationSnapshot() {
     changes: stationBuildChangesSummary(),
     sessions: stationBuildSessionsSummary(),
     controls: stationBuildControlsSummary(),
+    displayRunway: stationDisplayRunwayPayload(),
   };
 }
 
