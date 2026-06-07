@@ -1594,8 +1594,8 @@ fn intervention_order_report(run_dir: &std::path::Path) -> serde_json::Value {
 fn collect_controller_loop_status(loop_dir: &std::path::Path) -> serde_json::Value {
     let halt = loop_dir.join("request_halt").exists();
     let halt_after_cycle = loop_dir.join("request_halt_after_cycle").exists();
-    let stop_requested = loop_dir.join("request_stop").exists();
-    let abort_requested = loop_dir.join("request_abort").exists();
+    let mut stop_requested = loop_dir.join("request_stop").exists();
+    let mut abort_requested = loop_dir.join("request_abort").exists();
 
     let lock_dir = loop_dir.join("active.lock");
     let lock_owner_pid = parse_pid_file(&lock_dir.join("pid"));
@@ -1658,6 +1658,21 @@ fn collect_controller_loop_status(loop_dir: &std::path::Path) -> serde_json::Val
         .as_ref()
         .map(|p| p.to_string_lossy().to_string());
     let latest_pid = parse_pid_file(&loop_dir.join("latest.pid"));
+    let latest_pid_alive = latest_pid
+        .map(super::platform::process_alive)
+        .unwrap_or(false);
+    let stale_intervention_cleared = (stop_requested || abort_requested)
+        && controller_loop_intervention_markers_are_stale(
+            lock_owner_alive,
+            latest_pid_alive,
+            &active_wrappers,
+            &active_codex,
+        );
+    if stale_intervention_cleared {
+        clear_loop_intervention_markers(loop_dir).ok();
+        stop_requested = false;
+        abort_requested = false;
+    }
     let intervention_order = latest_target_path
         .as_ref()
         .map(|p| intervention_order_report(p))
@@ -1675,6 +1690,7 @@ fn collect_controller_loop_status(loop_dir: &std::path::Path) -> serde_json::Val
             "halt_after_cycle": halt_after_cycle,
             "stop_requested": stop_requested,
             "abort_requested": abort_requested,
+            "stale_intervention_cleared": stale_intervention_cleared,
         },
         "lock": {
             "present": lock_dir.exists(),
@@ -1695,6 +1711,40 @@ fn collect_controller_loop_status(loop_dir: &std::path::Path) -> serde_json::Val
             "codex": active_codex,
         }
     })
+}
+
+fn controller_loop_intervention_markers_are_stale(
+    lock_owner_alive: bool,
+    latest_pid_alive: bool,
+    active_wrappers: &[serde_json::Value],
+    active_codex: &[serde_json::Value],
+) -> bool {
+    if lock_owner_alive || latest_pid_alive {
+        return false;
+    }
+    if active_wrappers.is_empty() && !active_codex.is_empty() {
+        return false;
+    }
+    active_wrappers
+        .iter()
+        .all(controller_loop_active_wrapper_is_idle_external_app_server)
+}
+
+fn controller_loop_active_wrapper_is_idle_external_app_server(wrapper: &serde_json::Value) -> bool {
+    if wrapper.get("source").and_then(|value| value.as_str()) != Some("external_wrapper_index") {
+        return false;
+    }
+    wrapper
+        .get("session_meta_status")
+        .and_then(|value| value.as_str())
+        .map(controller_loop_state_is_idle)
+        .unwrap_or_else(|| {
+            wrapper
+                .get("status")
+                .and_then(|value| value.as_str())
+                .map(controller_loop_state_is_idle)
+                .unwrap_or(false)
+        })
 }
 
 fn active_external_wrappers_from_index(
@@ -2000,7 +2050,13 @@ fn request_loop_halt_marker(loop_dir: &std::path::Path, persistent: bool) -> Res
 fn clear_loop_halt_markers(loop_dir: &std::path::Path) -> Result<(), String> {
     std::fs::remove_file(loop_dir.join("request_halt")).ok();
     std::fs::remove_file(loop_dir.join("request_halt_after_cycle")).ok();
+    clear_loop_intervention_markers(loop_dir)?;
+    Ok(())
+}
+
+fn clear_loop_intervention_markers(loop_dir: &std::path::Path) -> Result<(), String> {
     std::fs::remove_file(loop_dir.join("request_stop")).ok();
+    std::fs::remove_file(loop_dir.join("request_abort")).ok();
     Ok(())
 }
 
@@ -11575,13 +11631,7 @@ mod tests {
         let intervention =
             request_loop_intervention_marker_for_root(&loop_dir, "stop", u32::MAX).unwrap();
         assert_eq!(intervention.mode, ControllerLoopInterventionMode::Stop);
-        assert_eq!(
-            collect_controller_loop_status(&loop_dir)
-                .get("flags")
-                .and_then(|v| v.get("stop_requested"))
-                .and_then(|v| v.as_bool()),
-            Some(true)
-        );
+        assert!(loop_dir.join("request_stop").exists());
 
         clear_loop_halt_markers(&loop_dir).expect("clear halt should succeed");
 
@@ -11593,6 +11643,100 @@ mod tests {
                 .and_then(|v| v.as_bool()),
             Some(false)
         );
+    }
+
+    #[test]
+    fn controller_loop_status_clears_stale_intervention_markers_without_active_owner() {
+        let dir = tempdir().unwrap();
+        let loop_dir = dir.path().join(".intendant/controller-loop");
+        std::fs::create_dir_all(&loop_dir).unwrap();
+        std::fs::write(loop_dir.join("request_stop"), b"").unwrap();
+        std::fs::write(loop_dir.join("request_abort"), b"").unwrap();
+
+        let status = collect_controller_loop_status(&loop_dir);
+
+        assert!(!loop_dir.join("request_stop").exists());
+        assert!(!loop_dir.join("request_abort").exists());
+        assert_eq!(
+            status
+                .get("flags")
+                .and_then(|v| v.get("stop_requested"))
+                .and_then(|v| v.as_bool()),
+            Some(false)
+        );
+        assert_eq!(
+            status
+                .get("flags")
+                .and_then(|v| v.get("abort_requested"))
+                .and_then(|v| v.as_bool()),
+            Some(false)
+        );
+        assert_eq!(
+            status
+                .get("flags")
+                .and_then(|v| v.get("stale_intervention_cleared"))
+                .and_then(|v| v.as_bool()),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn controller_loop_intervention_markers_are_stale_for_idle_external_app_server_wrapper() {
+        let idle_wrapper = serde_json::json!({
+            "source": "external_wrapper_index",
+            "status": "unknown_running",
+            "session_meta_status": "idle",
+            "process_tree_active": true,
+            "app_server_active": true,
+        });
+        let running_wrapper = serde_json::json!({
+            "source": "external_wrapper_index",
+            "status": "unknown_running",
+            "session_meta_status": "running",
+            "process_tree_active": true,
+            "app_server_active": true,
+        });
+        let controller_loop_wrapper = serde_json::json!({
+            "source": "controller_loop",
+            "pid": std::process::id(),
+        });
+
+        assert!(controller_loop_intervention_markers_are_stale(
+            false,
+            false,
+            &[idle_wrapper],
+            &[serde_json::json!({"pid": 8894})]
+        ));
+        assert!(!controller_loop_intervention_markers_are_stale(
+            false,
+            false,
+            &[running_wrapper],
+            &[serde_json::json!({"pid": 8894})]
+        ));
+        assert!(!controller_loop_intervention_markers_are_stale(
+            false,
+            false,
+            &[controller_loop_wrapper],
+            &[]
+        ));
+        assert!(!controller_loop_intervention_markers_are_stale(
+            false,
+            false,
+            &[],
+            &[serde_json::json!({"pid": 8894})]
+        ));
+        assert!(!controller_loop_intervention_markers_are_stale(
+            true,
+            false,
+            &[],
+            &[]
+        ));
+        assert!(!controller_loop_intervention_markers_are_stale(
+            false,
+            true,
+            &[],
+            &[]
+        ));
     }
 
     #[test]
