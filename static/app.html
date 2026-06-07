@@ -11462,6 +11462,12 @@ function stationCommandEntries() {
       run: () => stationRenderControlsDock('readiness'),
     },
     {
+      label: 'Attention queue',
+      detail: 'Review pending operator actions in Station Controls',
+      tokens: 'attention queue pending approvals human input attachments steer shared view active turn spawn',
+      run: () => stationRenderControlsDock('attention'),
+    },
+    {
       label: 'New session',
       detail: 'Open the Station launch form',
       tokens: 'new session launch start task',
@@ -18155,6 +18161,204 @@ function stationRenderReadinessBoardSection(parent, controls) {
   }
 }
 
+function stationAttentionSteerRows() {
+  const rows = [];
+  for (const [id, entry] of steerRows.entries()) {
+    const el = entry?.el;
+    const status = [...(el?.classList || [])].find(cls => cls !== 'steer-row' && cls !== 'fading') || 'pending';
+    rows.push({
+      id,
+      status,
+      text: entry?.text || el?.querySelector?.('.steer-text')?.textContent || '',
+      reason: el?.querySelector?.('.steer-reason')?.textContent?.replace(/^—\s*/, '') || '',
+      sessionId: entry?.sessionId || '',
+    });
+  }
+  return rows;
+}
+
+function stationAttentionAttachmentNames(limit = 4) {
+  if (!Array.isArray(pendingAttachments)) return [];
+  return pendingAttachments.slice(0, limit).map(att =>
+    compactSessionText(pendingAttachmentDisplayName?.(att) || att?.name || att?.filename || att?.frameId || 'attachment')
+  );
+}
+
+function stationBuildAttentionQueue(controls) {
+  const items = [];
+  const approvals = stationPendingApprovalRows();
+  for (const row of approvals) {
+    items.push({
+      id: `approval:${row.hostId}:${row.approvalId}`,
+      level: 'blocked',
+      title: row.command || 'Approval required',
+      meta: ['approval', row.local ? 'local' : stationHostLabel(row.hostId), row.category].filter(Boolean).join(' / '),
+      detail: row.approvalId,
+      actions: [
+        { label: 'Approve', primary: true, onClick: () => stationResolveDockApproval(row, 'approve') },
+        row.local ? { label: 'All', onClick: () => stationResolveDockApproval(row, 'approve_all') } : null,
+        { label: 'Skip', onClick: () => stationResolveDockApproval(row, 'skip') },
+        { label: 'Deny', danger: true, onClick: () => stationResolveDockApproval(row, 'deny') },
+      ],
+    });
+  }
+
+  const question = stationHumanQuestionText();
+  if (question) {
+    items.push({
+      id: 'human-input',
+      level: 'blocked',
+      title: 'Human input requested',
+      meta: 'agent is waiting',
+      detail: compactSessionText(question, 180),
+      actions: [
+        { label: 'Respond', primary: true, onClick: () => { stationRenderControlsDock('input'); setTimeout(() => document.getElementById('station-human-input')?.focus(), 0); } },
+        stationDockRouteAction('Route Activity', 'activity', 'log', () => document.getElementById('human-input')?.focus()),
+      ],
+    });
+  }
+
+  if (controls.sharedViewCanTakeInput) {
+    items.push({
+      id: 'shared-view-input',
+      level: 'blocked',
+      title: 'Shared view input request',
+      meta: controls.sharedViewTarget || 'shared display',
+      detail: controls.sharedViewNote || controls.sharedViewAction || 'Input authority is available.',
+      actions: [
+        {
+          label: 'Take input',
+          primary: true,
+          onClick: () => {
+            document.querySelector('[data-shared-view-take-input]')?.click();
+            stationScheduleUpdate();
+            stationRenderControlsDock('attention');
+          },
+        },
+        { label: 'Peers', onClick: () => stationRenderPeersDock() },
+      ],
+    });
+  }
+
+  if (newSessionSpawnPending) {
+    items.push({
+      id: 'session-spawn',
+      level: 'warn',
+      title: 'New session spawning',
+      meta: newSessionSpawnName || 'pending start confirmation',
+      detail: stationLaunchNoticeText() || compactSessionText(newSessionSpawnTask, 180) || 'Waiting for session start confirmation.',
+      actions: [
+        { label: 'Launch form', primary: true, onClick: () => stationOpenSessionLaunchDock() },
+        { label: 'Activity', onClick: () => stationRenderActivityDock(stationActivityEvents().at(-1)?.id || '') },
+      ],
+    });
+  }
+
+  if (controls.pendingAttachments > 0) {
+    const names = stationAttentionAttachmentNames();
+    items.push({
+      id: 'attachments',
+      level: 'warn',
+      title: `${controls.pendingAttachments} pending attachment${controls.pendingAttachments === 1 ? '' : 's'}`,
+      meta: names.join(' / ') || 'staged for next send',
+      detail: controls.pendingAttachments > names.length ? `Showing ${names.length} of ${controls.pendingAttachments}` : 'Ready for next task or follow-up.',
+      actions: [
+        { label: 'Attach more', onClick: () => document.getElementById('upload-attach-btn')?.click() },
+        { label: 'Clear attach', danger: true, onClick: () => { document.querySelector('[data-pending-attachments-clear]')?.click(); stationRenderControlsDock('attention'); } },
+      ],
+    });
+  }
+
+  for (const row of stationAttentionSteerRows().slice(0, 6)) {
+    const cancellable = row.id.startsWith('steer-') && !['delivered', 'cancelled', 'failed'].includes(row.status);
+    items.push({
+      id: row.id,
+      level: row.status === 'failed' ? 'blocked' : 'warn',
+      title: `Steer ${row.status}`,
+      meta: row.sessionId ? stationSessionShortLabel(row.sessionId) : row.id,
+      detail: [compactSessionText(row.text, 160), row.reason].filter(Boolean).join(' / '),
+      actions: [
+        row.sessionId ? { label: 'Session', primary: true, onClick: () => stationRenderSessionsDock(row.sessionId) } : null,
+        cancellable ? { label: 'Cancel', danger: true, onClick: () => { cancelSteerRow(row.id); stationRenderControlsDock('attention'); } } : null,
+      ],
+    });
+  }
+
+  if (!controls.activeBrowser) {
+    items.push({
+      id: 'passive-browser',
+      level: 'warn',
+      title: 'Browser is passive',
+      meta: 'voice/video control is elsewhere',
+      detail: 'Make this browser active before using live voice or video controls from Station.',
+      actions: [
+        { label: 'Make active', primary: true, onClick: () => document.getElementById('makeActiveBtn')?.click() },
+      ],
+    });
+  }
+
+  if (controls.sessionCanInterrupt) {
+    items.push({
+      id: 'active-turn',
+      level: 'ready',
+      title: 'Agent turn active',
+      meta: controls.sessionLabel || controls.sessionSelection || 'current target',
+      detail: controls.sessionCanSteer ? 'Steer is available from the execution composer.' : 'Follow-up may be queued until the turn ends.',
+      actions: [
+        { label: 'Composer', primary: true, onClick: () => { stationRenderControlsDock('execution'); setTimeout(() => document.getElementById('station-execution-input')?.focus(), 0); } },
+        { label: 'Stop', danger: true, onClick: () => stationHandleActivityAction({ action: 'stop' }) },
+      ],
+    });
+  }
+
+  return {
+    generated_at: new Date().toISOString(),
+    count: items.length,
+    blocked: items.filter(item => item.level === 'blocked').length,
+    warn: items.filter(item => item.level === 'warn').length,
+    ready: items.filter(item => item.level === 'ready').length,
+    items,
+  };
+}
+
+async function stationCopyAttentionQueue(queue) {
+  await copyTextToClipboard(JSON.stringify({
+    ...queue,
+    items: queue.items.map(item => ({
+      id: item.id,
+      level: item.level,
+      title: item.title,
+      meta: item.meta,
+      detail: item.detail,
+    })),
+  }, null, 2));
+  showControlToast?.('success', 'Station attention queue JSON copied');
+}
+
+function stationRenderAttentionQueueSection(parent, controls) {
+  const queue = stationBuildAttentionQueue(controls);
+  const section = stationDockSection(parent, 'Attention queue');
+  stationDockRow(section, 'pending', `${queue.count} total / ${queue.blocked} blocked / ${queue.warn} watch / ${queue.ready} active`);
+  stationDockActions(section, [
+    { label: 'Refresh', primary: true, onClick: () => { stationRefreshSharedCaches(); stationRenderControlsDock('attention'); } },
+    { label: 'Readiness', onClick: () => stationRenderControlsDock('readiness') },
+    { label: 'Copy JSON', onClick: () => stationCopyAttentionQueue(queue) },
+  ]);
+  if (!queue.items.length) {
+    stationDockEmpty(section, 'No pending operator actions.');
+    return;
+  }
+  for (const item of queue.items) {
+    stationDockCard(section, {
+      title: item.title,
+      meta: item.meta || item.level,
+      detail: item.detail || item.level,
+      rows: [['state', item.level]],
+      actions: item.actions,
+    });
+  }
+}
+
 function stationSeedManagedFromOperationsBrief() {
   stationRenderManagedDock('rewind');
   requestAnimationFrame(() => {
@@ -18337,6 +18541,7 @@ function stationRenderControlsDock(sectionName = 'overview') {
     controls.sessionCanInterrupt ? { label: 'Stop', danger: true, onClick: () => stationHandleActivityAction({ action: 'stop' }) } : null,
   ]);
 
+  stationRenderAttentionQueueSection(body, controls);
   stationRenderReadinessBoardSection(body, controls);
   stationRenderOperationsBriefSection(body, controls);
   stationRenderLiveStatusSection(body, controls);
