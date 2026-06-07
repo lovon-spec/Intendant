@@ -733,6 +733,10 @@ impl McpAppState {
                 "rewind_only_limit": null,
                 "hard_limit": null,
                 "rewind_only": false,
+                "density_pressure": false,
+                "normal_tools_allowed": true,
+                "required_action": "continue",
+                "message": "Backend-reported context pressure is unavailable. Normal tools are allowed unless a later status reports rewind_only=true.",
                 "managed_context": Self::managed_context_mode(managed_context),
                 "last_rewind_insufficient": null,
             });
@@ -750,9 +754,26 @@ impl McpAppState {
         } else if used_tokens >= rewind_only_limit {
             "high"
         } else if used_tokens >= recommended_rewind_limit {
-            "pressure"
+            "watch"
         } else {
             "ok"
+        };
+        let rewind_only = managed_context && (status == "high" || status == "critical");
+        let density_pressure = used_tokens >= recommended_rewind_limit;
+        let normal_tools_allowed = !rewind_only;
+        let required_action = if rewind_only {
+            "rewind_context"
+        } else if density_pressure {
+            "continue_or_rewind_optional"
+        } else {
+            "continue"
+        };
+        let message = if rewind_only {
+            "Managed context is in rewind-only mode. Use rewind_context before ordinary model-facing tools."
+        } else if density_pressure {
+            "Context is above the recommended density threshold but below the rewind-only limit. Normal tools are allowed; rewind is optional for density."
+        } else {
+            "Context is below the recommended density threshold. Normal tools are allowed."
         };
 
         serde_json::json!({
@@ -767,7 +788,11 @@ impl McpAppState {
             "recommended_rewind_limit": recommended_rewind_limit,
             "rewind_only_limit": rewind_only_limit,
             "hard_limit": hard_context_window,
-            "rewind_only": managed_context && (status == "high" || status == "critical"),
+            "rewind_only": rewind_only,
+            "density_pressure": density_pressure,
+            "normal_tools_allowed": normal_tools_allowed,
+            "required_action": required_action,
+            "message": message,
             "managed_context": Self::managed_context_mode(managed_context),
             "last_rewind_insufficient": self.insufficient_rewind_notice_for(session_id).map(|notice| {
                 serde_json::json!({
@@ -8719,7 +8744,7 @@ mod tests {
 
             let pressure = s.context_pressure_snapshot();
             assert_eq!(pressure["source"], "backend_reported");
-            assert_eq!(pressure["status"], "pressure");
+            assert_eq!(pressure["status"], "watch");
             assert_eq!(pressure["used_tokens"], 86_000);
             assert_eq!(pressure["context_window"], 100_000);
             assert_eq!(pressure["effective_context_window"], 100_000);
@@ -8727,6 +8752,9 @@ mod tests {
             assert_eq!(pressure["recommended_rewind_limit"], 85_000);
             assert_eq!(pressure["rewind_only_limit"], 100_000);
             assert_eq!(pressure["rewind_only"], false);
+            assert_eq!(pressure["density_pressure"], true);
+            assert_eq!(pressure["normal_tools_allowed"], true);
+            assert_eq!(pressure["required_action"], "continue_or_rewind_optional");
             assert_eq!(pressure["managed_context"], "vanilla");
         });
     }
@@ -8772,6 +8800,8 @@ mod tests {
             assert_eq!(pressure["hard_limit"], 272_000);
             assert_eq!(pressure["remaining_hard_tokens"], 13_600);
             assert_eq!(pressure["rewind_only"], true);
+            assert_eq!(pressure["normal_tools_allowed"], false);
+            assert_eq!(pressure["required_action"], "rewind_context");
         });
     }
 
@@ -10757,7 +10787,15 @@ mod tests {
             );
             assert_eq!(
                 value.pointer("/context_pressure/status"),
-                Some(&"pressure".into())
+                Some(&"watch".into())
+            );
+            assert_eq!(
+                value.pointer("/context_pressure/normal_tools_allowed"),
+                Some(&true.into())
+            );
+            assert_eq!(
+                value.pointer("/context_pressure/required_action"),
+                Some(&"continue_or_rewind_optional".into())
             );
             assert_eq!(
                 value.pointer("/context_pressure/managed_context"),
@@ -10833,7 +10871,11 @@ mod tests {
             );
             assert_eq!(
                 value.pointer("/context_pressure/status"),
-                Some(&"pressure".into())
+                Some(&"watch".into())
+            );
+            assert_eq!(
+                value.pointer("/context_pressure/normal_tools_allowed"),
+                Some(&true.into())
             );
             assert_eq!(
                 value.pointer("/context_pressure/managed_context"),

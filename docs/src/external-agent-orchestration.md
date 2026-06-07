@@ -191,6 +191,10 @@ features they lack.
   path. A successful `rewind_context` only proves the lineage mutation was
   applied; Intendant and Codex keep normal tools hidden until a later backend
   token report confirms the active thread is below the rewind-only limit.
+  Below the rewind-only threshold, status may be `watch` when density is getting
+  high, but the MCP payload also reports `normal_tools_allowed=true` and
+  `required_action=continue_or_rewind_optional`; that is an advisory density
+  signal, not an emergency recovery state.
 
   Managed Codex relies on the minimal lineage patch separating Codex's thread id
   from the Responses `prompt_cache_key`. Same-thread restore keeps the active

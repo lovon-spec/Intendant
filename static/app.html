@@ -24365,6 +24365,10 @@ function renderManagedContextStats() {
   host.appendChild(managedContextStat('Hard limit usage', hardValue, status));
   host.appendChild(managedContextStat('Soft rewind at', managedContextFormatNumber(rewindOnlyLimit), status));
   host.appendChild(managedContextStat('Rewind-only', pressure.rewind_only ? 'on' : 'off', pressure.rewind_only ? 'critical' : 'ok'));
+  if (pressure.required_action) {
+    const actionTone = pressure.rewind_only ? 'critical' : 'ok';
+    host.appendChild(managedContextStat('Action', pressure.required_action, actionTone));
+  }
   if (fill) {
     fill.style.width = pct === null ? '0%' : Math.min(pct, 100).toFixed(1) + '%';
     fill.title = pct === null
@@ -24372,7 +24376,7 @@ function renderManagedContextStats() {
       : `Effective pressure ${pct.toFixed(1)}%${hardPct === null ? '' : `; hard usage ${hardPct.toFixed(1)}%`}`;
     fill.style.background = status === 'critical'
       ? 'var(--red)'
-      : (status === 'high' || status === 'pressure' || status === 'recovery_required')
+      : (status === 'high' || status === 'watch' || status === 'recovery_required')
         ? 'var(--yellow)'
         : 'var(--green)';
   }
