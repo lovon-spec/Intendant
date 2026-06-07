@@ -363,6 +363,14 @@ shared state (when driven over MCP) → config default → native.
   Changing these mid-session requires a teardown + respawn. The daemon's
   `codex_runtime_config_equal` / `gemini_runtime_config_equal` checks detect drift
   across tasks and force a rebuild when any latched field changes.
+- **Codex resume cwd is thread-stateful.** Intendant sends `cwd` on
+  `thread/resume`, and then sends `thread/settings/update` with the requested
+  project root for resumed Codex threads. A non-running Codex thread can load
+  with that override, but a running app-server thread resumes from its loaded
+  config snapshot and reports that effective cwd back to the client. Intendant
+  logs a warning when Codex reports a different cwd than the requested project
+  root, and logs later `thread/settings/updated` cwd notifications so harness
+  runs do not silently display a requested root as if Codex had accepted it.
 - **Per-session launch config beats global defaults.** Dashboard-created and
   dashboard-configured external sessions persist their binary command and, for
   Codex, `managed_context` mode. Resume/attach first applies explicit dashboard

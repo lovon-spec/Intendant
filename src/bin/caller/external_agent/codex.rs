@@ -1367,6 +1367,32 @@ impl CodexAgent {
         .map_err(|e| CallerError::ExternalAgent(format!("thread/settings/update: {e}")))
     }
 
+    fn emit_resume_cwd_mismatch_if_needed(&self, response: &serde_json::Value) {
+        if self.resume_session.is_none() {
+            return;
+        }
+        let Some(requested) = self.working_dir.as_deref() else {
+            return;
+        };
+        let Some(actual) = codex_response_cwd(response) else {
+            return;
+        };
+        if codex_paths_match(requested, actual) {
+            return;
+        }
+
+        if let Some(event_tx) = self.event_tx.as_ref() {
+            let _ = event_tx.send(AgentEvent::Log {
+                level: "warn".to_string(),
+                message: format!(
+                    "Codex resumed thread cwd differs from Intendant requested project root: requested {}; Codex reported {}. Running Codex threads keep their loaded cwd on thread/resume; thread/settings/update only affects subsequent turns once Codex reports it applied.",
+                    requested.display(),
+                    actual
+                ),
+            });
+        }
+    }
+
     fn cleanup_temporary_request_trace_root(&mut self) {
         if !self.request_trace_temporary {
             return;
@@ -3256,6 +3282,53 @@ async fn update_codex_context_pressure_floor(
                 && existing.token_count >= new_floor.token_count => {}
         _ => *floor = Some(new_floor),
     }
+}
+
+fn codex_response_cwd(value: &serde_json::Value) -> Option<&str> {
+    value
+        .pointer("/cwd")
+        .or_else(|| value.pointer("/thread/cwd"))
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+}
+
+fn codex_thread_settings_cwd(value: &serde_json::Value) -> Option<&str> {
+    value
+        .pointer("/threadSettings/cwd")
+        .or_else(|| value.pointer("/thread_settings/cwd"))
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+}
+
+fn codex_paths_match(requested: &Path, actual: &str) -> bool {
+    codex_path_compare_key(requested) == codex_path_compare_key(Path::new(actual))
+}
+
+fn codex_path_compare_key(path: &Path) -> String {
+    let normalized = codex_lexically_normalize_path(path);
+    let mut key = normalized.to_string_lossy().replace('\\', "/");
+    while key.len() > 1 && key.ends_with('/') && !key.ends_with(":/") {
+        key.pop();
+    }
+    key
+}
+
+fn codex_lexically_normalize_path(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if !out.pop() {
+                    out.push("..");
+                }
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
 }
 
 fn codex_usage_input_tokens(value: &serde_json::Value) -> Option<u64> {
@@ -5488,6 +5561,20 @@ fn translate_notification_with_scope(
         | "configWarning"
         | "remoteControl/status/changed" => {}
 
+        "thread/settings/updated" => {
+            if let Some(cwd) = codex_thread_settings_cwd(params) {
+                send_scoped_agent_event(
+                    event_tx,
+                    thread_id,
+                    turn_id,
+                    AgentEvent::Log {
+                        level: "info".to_string(),
+                        message: format!("Codex thread settings applied: cwd {cwd}"),
+                    },
+                );
+            }
+        }
+
         "mcpServer/startupStatus/updated" => {
             let status = params.get("status").and_then(|v| v.as_str()).unwrap_or("");
             let name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
@@ -5824,6 +5911,7 @@ impl ExternalAgent for CodexAgent {
             .send_request(method, Some(serde_json::Value::Object(params)))
             .await?;
         self.update_service_tier_from_thread_response(&result);
+        self.emit_resume_cwd_mismatch_if_needed(&result);
 
         let thread_id = result
             .pointer("/thread/id")
@@ -9701,6 +9789,47 @@ error: build failed
     }
 
     #[test]
+    fn resume_cwd_mismatch_warning_uses_codex_reported_cwd() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut agent = test_agent();
+        agent.resume_session = Some("019e9f80".to_string());
+        agent.working_dir = Some(PathBuf::from("/home/user/projects/intendant-new"));
+        agent.event_tx = Some(tx);
+
+        agent.emit_resume_cwd_mismatch_if_needed(&serde_json::json!({
+            "thread": {
+                "id": "019e9f80",
+                "cwd": "/home/user/projects/intendant-old"
+            }
+        }));
+
+        match rx.try_recv().unwrap() {
+            AgentEvent::Log { level, message } => {
+                assert_eq!(level, "warn");
+                assert!(message.contains("/home/user/projects/intendant-new"));
+                assert!(message.contains("/home/user/projects/intendant-old"));
+                assert!(message.contains("thread/resume"));
+            }
+            other => panic!("expected cwd mismatch Log, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn resume_cwd_mismatch_warning_ignores_lexically_equivalent_paths() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut agent = test_agent();
+        agent.resume_session = Some("019e9f80".to_string());
+        agent.working_dir = Some(PathBuf::from("/home/user/projects/../projects/intendant/"));
+        agent.event_tx = Some(tx);
+
+        agent.emit_resume_cwd_mismatch_if_needed(&serde_json::json!({
+            "cwd": "/home/user/projects/intendant"
+        }));
+
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
     fn thread_lifecycle_params_disable_approvals_for_danger_full_access() {
         let mut agent = test_agent();
         agent.approval_policy = "on-request".to_string();
@@ -10734,6 +10863,30 @@ error: build failed
             AgentEvent::Log { level, message } => {
                 assert_eq!(level, "info");
                 assert!(message.contains("Ship feature parity"));
+            }
+            other => panic!("expected Log, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn thread_settings_updated_surfaces_effective_cwd() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let params = serde_json::json!({
+            "threadId": "thread-abc",
+            "threadSettings": {
+                "cwd": "/home/user/projects/intendant-original"
+            }
+        });
+
+        translate_notification("thread/settings/updated", &params, &tx);
+
+        match rx.try_recv().unwrap() {
+            AgentEvent::Log { level, message } => {
+                assert_eq!(level, "info");
+                assert_eq!(
+                    message,
+                    "Codex thread settings applied: cwd /home/user/projects/intendant-original"
+                );
             }
             other => panic!("expected Log, got {:?}", other),
         }
