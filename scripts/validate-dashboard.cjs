@@ -57,6 +57,8 @@ Options:
   --cdp-timeout MS           Chromium CDP readiness timeout (default: ${DEFAULT_CDP_TIMEOUT_MS})
   --browser PATH             Chromium/Chrome executable
   --headed                   Run without --headless=new
+  --enable-gpu               Omit the default --disable-gpu Chromium flag
+  --browser-arg ARG          Extra Chromium arg; repeatable
   --sandbox                  Omit default --no-sandbox
   --log-lines N              Bounded browser/page log lines on failure (default: ${DEFAULT_LOG_LINES})
   --diagnostics              On failure, include compact generic DOM/page state
@@ -88,6 +90,8 @@ function parseArgs(argv, env = process.env) {
     dashboardArgs: [],
     dashboardTimeoutMs: DEFAULT_DASHBOARD_TIMEOUT_MS,
     headless: true,
+    enableGpu: false,
+    browserArgs: [],
     noSandbox: true,
     json: false,
     selfTest: false,
@@ -161,6 +165,12 @@ function parseArgs(argv, env = process.env) {
       opts.browser = arg.slice('--browser='.length);
     } else if (arg === '--headed') {
       opts.headless = false;
+    } else if (arg === '--enable-gpu') {
+      opts.enableGpu = true;
+    } else if (arg === '--browser-arg') {
+      opts.browserArgs.push(readValue());
+    } else if (arg.startsWith('--browser-arg=')) {
+      opts.browserArgs.push(arg.slice('--browser-arg='.length));
     } else if (arg === '--sandbox') {
       opts.noSandbox = false;
     } else if (arg === '--log-lines') {
@@ -1045,16 +1055,19 @@ function browserArgs(userDataDir, opts) {
     '--disable-background-networking',
     '--disable-dev-shm-usage',
     '--disable-extensions',
-    '--disable-gpu',
     '--disable-popup-blocking',
     '--window-size=1440,1000',
   ];
+  if (!opts.enableGpu) {
+    args.push('--disable-gpu');
+  }
   if (opts.headless) {
     args.push('--headless=new');
   }
   if (opts.noSandbox) {
     args.push('--no-sandbox');
   }
+  args.push(...opts.browserArgs);
   return args;
 }
 
@@ -2212,6 +2225,10 @@ async function runSelfTest() {
       '--log-lines',
       '3',
       '--diagnostics',
+      '--enable-gpu',
+      '--browser-arg=--ozone-platform=x11',
+      '--browser-arg',
+      '--enable-unsafe-webgpu',
     ],
     {},
   );
@@ -2221,6 +2238,13 @@ async function runSelfTest() {
   assert.strictEqual(parsed.timeoutMs, 2500);
   assert.strictEqual(parsed.logLines, 3);
   assert.strictEqual(parsed.diagnostics, true);
+  assert.strictEqual(parsed.enableGpu, true);
+  assert.deepStrictEqual(parsed.browserArgs, ['--ozone-platform=x11', '--enable-unsafe-webgpu']);
+  assert.ok(browserArgs('/tmp/profile', parseArgs([], {})).includes('--disable-gpu'));
+  const gpuBrowserArgs = browserArgs('/tmp/profile', parsed);
+  assert.ok(!gpuBrowserArgs.includes('--disable-gpu'));
+  assert.ok(gpuBrowserArgs.includes('--ozone-platform=x11'));
+  assert.ok(gpuBrowserArgs.includes('--enable-unsafe-webgpu'));
   assert.strictEqual(staticScriptsOnly(parseArgs(['--check-static-scripts'], {
     INTENDANT_MCP_URL: 'http://127.0.0.1:7777/mcp',
   })), true);
