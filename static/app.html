@@ -11502,6 +11502,12 @@ function stationCommandEntries() {
       },
     },
     {
+      label: 'Display runway',
+      detail: 'Open the Station display/session continuity lanes',
+      tokens: 'display runway continuity peer stream session shared view input',
+      run: () => stationRenderPeersDock('runway'),
+    },
+    {
       label: 'Managed rewind',
       detail: 'Prepare managed-context rewind',
       tokens: 'managed context rewind anchor primer',
@@ -12530,6 +12536,194 @@ async function stationCopyDisplayContinuityPayload() {
   stationRenderPeersDock();
 }
 
+function stationDisplayRunwayPayload() {
+  const controls = stationBuildControlsSummary();
+  const selectedPeer = stationSelectedPeer();
+  const selectedHostId = selectedPeer?.host_id || stationPeerDraft.selectedHostId || stationSelectedPeerHost || '';
+  const selectedDisplayId = selectedHostId
+    ? stationPeerDisplayIdForHost(selectedHostId)
+    : stationPeerDisplayId();
+  const lanes = [];
+  if (controls.sessionId) {
+    lanes.push({
+      type: 'operator_target',
+      id: `session:${controls.sessionId}`,
+      title: controls.sessionLabel || shortSessionId(controls.sessionId) || 'Operator target',
+      meta: `${controls.sessionSource || 'intendant'} / ${controls.sessionActive ? 'active' : (controls.sessionDetached ? 'detached' : 'idle')}`,
+      detail: controls.sessionGoalObjective || controls.sessionCommand || controls.sessionSelection || '',
+      session_id: controls.sessionId,
+      live_id: controls.sessionLiveId || '',
+      can_focus: !!controls.sessionCanFocus,
+      can_interrupt: !!controls.sessionCanInterrupt,
+    });
+  }
+  const shared = stationSharedViewStatusPayload();
+  if (shared.visible) {
+    lanes.push({
+      type: 'shared_view',
+      id: 'shared-view',
+      title: shared.target || 'Shared view',
+      meta: `${shared.action || 'view'}${shared.can_take_input ? ' / input available' : ''}`,
+      detail: [shared.reason, shared.note].filter(Boolean).join(' / '),
+      display_id: shared.display_id,
+      can_take_input: !!shared.can_take_input,
+    });
+  }
+  for (const slot of displaySlots.values()) {
+    lanes.push({
+      type: 'local_stream',
+      id: `local:${slot.displayId}`,
+      title: `${selfHostLabel || 'local'} :${slot.displayId}`,
+      meta: `${slot.connected ? 'connected' : 'connecting'} / input ${slot.authorityState || 'unknown'}`,
+      detail: `${slot.width || 0}x${slot.height || 0} / ${slot.interactive ? 'interactive' : 'view only'}${slot.recording ? ' / recording' : ''}`,
+      display_id: slot.displayId,
+      selected: userDisplayGranted && Number(grantedDisplayId) === Number(slot.displayId),
+    });
+  }
+  for (const conn of peerDisplayConnections.values()) {
+    lanes.push({
+      type: 'remote_stream',
+      id: `remote:${conn.hostId}:${conn.displayId}:${conn.sessionId || ''}`,
+      title: `${stationHostLabel(conn.hostId)} :${conn.displayId}`,
+      meta: `${conn.displayStatusText || 'Connecting...'} / input ${conn.peerAuthorityState || 'unknown'}`,
+      detail: [conn.sessionId || '', conn.advertiseTcpViaUrl ? `via ${conn.advertiseTcpViaUrl}` : ''].filter(Boolean).join(' / '),
+      host_id: conn.hostId || '',
+      display_id: conn.displayId,
+      session_id: conn.sessionId || '',
+      selected: String(conn.hostId || '') === String(selectedHostId || '') && Number(conn.displayId) === Number(selectedDisplayId),
+    });
+  }
+  const selectedStreamActive = lanes.some(lane =>
+    lane.type === 'remote_stream'
+    && String(lane.host_id || '') === String(selectedHostId || '')
+    && Number(lane.display_id) === Number(selectedDisplayId)
+  );
+  if (selectedPeer && peerCanShareDisplay(selectedPeer) && !selectedStreamActive) {
+    lanes.push({
+      type: 'peer_target',
+      id: `target:${selectedPeer.host_id}:${selectedDisplayId}`,
+      title: `${stationPeerDisplayName(selectedPeer) || selectedPeer.host_id} :${selectedDisplayId}`,
+      meta: selectedPeer.connected ? 'ready to open' : 'peer offline',
+      detail: stationPeerCapabilityLabels(selectedPeer).join(', ') || 'selected peer display target',
+      host_id: selectedPeer.host_id,
+      display_id: selectedDisplayId,
+      selected: true,
+    });
+  }
+  return {
+    generated_at: new Date().toISOString(),
+    selected_peer_id: selectedHostId || '',
+    selected_display_id: Number(selectedDisplayId) || 0,
+    operator_session_id: controls.sessionId || '',
+    local_streams: displaySlots.size,
+    remote_streams: peerDisplayConnections.size,
+    shared_view_visible: !!shared.visible,
+    lanes,
+  };
+}
+
+async function stationCopyDisplayRunwayPayload() {
+  await copyTextToClipboard(JSON.stringify(stationDisplayRunwayPayload(), null, 2));
+  stationSetPeerStatus('Display runway JSON copied', 'ok');
+  stationRenderPeersDock('runway');
+}
+
+function stationLocalDisplaySlot(displayId) {
+  return displaySlots.get(Number(displayId));
+}
+
+function stationPeerDisplayConnection(hostId, displayId, sessionId = '') {
+  for (const conn of peerDisplayConnections.values()) {
+    if (String(conn.hostId || '') !== String(hostId || '')) continue;
+    if (Number(conn.displayId) !== Number(displayId)) continue;
+    if (sessionId && String(conn.sessionId || '') !== String(sessionId || '')) continue;
+    return conn;
+  }
+  return null;
+}
+
+function stationDisplayRunwayLaneActions(lane) {
+  if (!lane) return [];
+  if (lane.type === 'operator_target') {
+    return [
+      lane.session_id ? { label: 'Session', primary: true, onClick: () => stationRenderSessionsDock(lane.session_id) } : null,
+      lane.can_focus ? { label: 'Focus target', onClick: () => stationHandleActivityAction({ action: 'target' }) } : null,
+      lane.can_interrupt ? { label: 'Stop', danger: true, onClick: () => stationHandleActivityAction({ action: 'stop' }) } : null,
+    ];
+  }
+  if (lane.type === 'shared_view') {
+    return [
+      { label: 'Focus shared', primary: true, disabled: lane.display_id === null || !displaySlots.has(lane.display_id), onClick: stationFocusSharedViewDisplayFromDock },
+      lane.can_take_input ? { label: 'Take input', onClick: () => { document.querySelector('[data-shared-view-take-input]')?.click(); stationScheduleUpdate(); stationRenderPeersDock('runway'); } } : null,
+      { label: 'Hide shared', danger: true, onClick: () => { document.querySelector('[data-shared-view-close]')?.click(); stationScheduleUpdate(); stationRenderPeersDock('runway'); } },
+    ];
+  }
+  if (lane.type === 'local_stream') {
+    const slot = stationLocalDisplaySlot(lane.display_id);
+    const authority = slot?.authorityState || 'unknown';
+    return [
+      { label: 'Video tab', primary: true, onClick: () => stationForceRouteTo('displays', '') },
+      authority === 'you'
+        ? { label: 'Release input', onClick: () => slot?.releaseBtn?.click() }
+        : { label: 'Take input', onClick: () => slot?.takeBtn?.click() },
+      { label: 'Attach frame', onClick: () => slot?.attachBtn?.click() },
+      { label: slot?.recording ? 'Stop rec' : 'Record', onClick: () => slot?.recordBtn?.click() },
+      { label: 'Fullscreen', onClick: () => slot?.fullscreenBtn?.click() },
+    ];
+  }
+  if (lane.type === 'remote_stream') {
+    const conn = stationPeerDisplayConnection(lane.host_id, lane.display_id, lane.session_id);
+    const authority = conn?.peerAuthorityState || 'unknown';
+    return [
+      { label: 'Focus', primary: true, onClick: () => { stationSetPeerTarget(lane.host_id, lane.display_id); stationOpenDisplay(lane.host_id, lane.display_id); } },
+      authority === 'you'
+        ? { label: 'Release input', onClick: () => conn?.releaseControl?.() }
+        : { label: 'Take input', onClick: () => conn?.takeControl?.() },
+      lane.session_id ? { label: 'Session', onClick: () => stationRenderSessionsDock(lane.session_id) } : null,
+      { label: 'Close', danger: true, onClick: () => closePeerDisplaysForHost(lane.host_id) },
+    ];
+  }
+  if (lane.type === 'peer_target') {
+    return [
+      { label: 'Open display', primary: true, onClick: () => { stationSetPeerTarget(lane.host_id, lane.display_id); stationOpenDisplay(lane.host_id, lane.display_id); } },
+      { label: 'Select', onClick: () => stationSetPeerDisplayTarget(lane.host_id, lane.display_id) },
+    ];
+  }
+  return [];
+}
+
+function stationRenderDisplayRunwaySection(parent) {
+  const payload = stationDisplayRunwayPayload();
+  const section = stationDockSection(parent, 'Display runway');
+  stationDockRow(section, 'selected', payload.selected_peer_id ? `${stationHostLabel(payload.selected_peer_id)} :${payload.selected_display_id}` : '--');
+  stationDockRow(section, 'streams', `${payload.local_streams} local / ${payload.remote_streams} remote`);
+  stationDockRow(section, 'operator', payload.operator_session_id ? stationSessionShortLabel(payload.operator_session_id) : '--');
+  stationDockActions(section, [
+    { label: 'Copy JSON', onClick: stationCopyDisplayRunwayPayload },
+    { label: 'Continuity', onClick: () => stationRenderPeersDock() },
+    { label: userDisplayGranted ? 'Revoke local' : 'Share local', primary: !userDisplayGranted, onClick: () => window.toggleUserDisplay?.() },
+  ]);
+  if (!payload.lanes.length) {
+    stationDockEmpty(section, 'No display/session lanes are active yet.');
+    return;
+  }
+  for (const lane of payload.lanes.slice(0, 10)) {
+    stationDockCard(section, {
+      title: lane.title,
+      meta: lane.meta || lane.type,
+      detail: lane.detail || lane.type,
+      active: !!lane.selected,
+      rows: [
+        ['kind', lane.type.replace(/_/g, ' ')],
+        lane.host_id ? ['host', stationHostLabel(lane.host_id)] : null,
+        lane.display_id !== undefined && lane.display_id !== null ? ['display', `:${lane.display_id}`] : null,
+        lane.session_id ? ['session', stationSessionShortLabel(lane.session_id) || shortSessionId(lane.session_id)] : null,
+      ].filter(Boolean),
+      actions: stationDisplayRunwayLaneActions(lane),
+    });
+  }
+}
+
 function stationRenderDisplayContinuitySection(parent) {
   const payload = stationDisplayContinuityPayload();
   const selectedPeer = stationSelectedPeer();
@@ -12653,7 +12847,7 @@ function stationRenderPeerCommandSection(parent) {
   ]);
 }
 
-function stationRenderPeersDock() {
+function stationRenderPeersDock(focus = '') {
   const body = stationDockBegin('peers', 'Peers and Displays', `${daemons.length} peers / ${displaySlots.size + peerDisplayConnections.size} displays`);
   if (!body) return;
   const peers = stationDockSection(body, 'Peers');
@@ -12730,6 +12924,7 @@ function stationRenderPeersDock() {
     status.textContent = stationPeerStatus;
     overview.appendChild(status);
   }
+  stationRenderDisplayRunwaySection(body);
   stationRenderDisplayContinuitySection(body);
   stationRenderSharedViewSection(body);
   stationRenderLocalDisplayPickerSection(body);
