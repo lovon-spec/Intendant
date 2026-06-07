@@ -822,7 +822,7 @@ impl McpAppState {
         let message = if rewind_only {
             "Managed context is in rewind-only mode. Use rewind_context before ordinary model-facing tools."
         } else if density_pressure {
-            "Context is above the recommended density threshold but below the rewind-only limit. Normal tools are allowed; rewind is optional for density."
+            "Context is above the recommended density threshold but below the rewind-only limit. Normal tools are allowed; before handoff or broad follow-up work, consider exact-anchor density maintenance if it materially improves density."
         } else {
             "Context is below the recommended density threshold. Normal tools are allowed."
         };

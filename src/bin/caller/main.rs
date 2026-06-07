@@ -1579,6 +1579,14 @@ struct ManagedContextRewindOnlyPressure {
     status: &'static str,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ManagedContextDensityPressure {
+    used_tokens: u64,
+    recommended_rewind_limit: u64,
+    rewind_only_limit: u64,
+    hard_context_window: Option<u64>,
+}
+
 impl ExternalToolOutputLimiter {
     fn filter(&mut self, item_id: &str, text: String) -> Option<String> {
         if text.is_empty() {
@@ -4541,6 +4549,29 @@ fn managed_context_rewind_only_pressure(
     managed_context_recovery_pressure(snapshot)
 }
 
+const MANAGED_CONTEXT_DENSITY_THRESHOLD_PCT: f64 = 85.0;
+
+fn managed_context_density_pressure(
+    snapshot: &external_agent::AgentContextSnapshot,
+) -> Option<ManagedContextDensityPressure> {
+    let used_tokens = external_context_snapshot_backend_token_count(snapshot)?;
+    let rewind_only_limit = snapshot.context_window?;
+    if rewind_only_limit == 0 || used_tokens >= rewind_only_limit {
+        return None;
+    }
+    let recommended_rewind_limit =
+        (rewind_only_limit as f64 * MANAGED_CONTEXT_DENSITY_THRESHOLD_PCT / 100.0).floor() as u64;
+    if used_tokens < recommended_rewind_limit {
+        return None;
+    }
+    Some(ManagedContextDensityPressure {
+        used_tokens,
+        recommended_rewind_limit,
+        rewind_only_limit,
+        hard_context_window: snapshot.hard_context_window,
+    })
+}
+
 fn managed_context_rewind_only_pressure_from_usage(
     usage: &external_agent::AgentUsageSnapshot,
 ) -> Option<ManagedContextRewindOnlyPressure> {
@@ -4661,6 +4692,20 @@ fn managed_context_recovery_kickstart_text(
         limit = pressure.rewind_only_limit,
         hard = hard,
         held = held,
+    )
+}
+
+fn managed_context_density_handoff_text(pressure: ManagedContextDensityPressure) -> String {
+    let hard = pressure
+        .hard_context_window
+        .map(|hard| format!(" hard_limit={hard}"))
+        .unwrap_or_default();
+    format!(
+        "<managed_context_density_handoff>\nBackend-reported Codex context pressure is watch ({used}/{limit} tokens, recommended_density_threshold={recommended}{hard}). The previous implementation turn is complete, but the live transcript is above the recommended density threshold. Before handing control back, do a context-management handoff. If an exact managed-context rewind would materially improve density while preserving completed work, use list_rewind_anchors and inspect_rewind_anchor as needed, then call rewind_context with one exact returned item_id, the returned position_hint or a value in positions, and a dense carry-forward primer. If no rewind is worthwhile, do not continue implementation, exploration, or broad ordinary-tool work; reply with a concise handoff that crystallizes durable facts, changed files, verification results, user constraints, and remaining decisions, and state that you are leaving context unchanged. Normal tools are still allowed below rewind_only, but this maintenance turn should avoid ordinary tool use unless needed to inspect current status or anchors. Do not use auto anchors, N-turn rewinds, synthesized item ids, anchors from failed examples, or managed-context maintenance calls as rewind targets.\n</managed_context_density_handoff>",
+        used = pressure.used_tokens,
+        limit = pressure.rewind_only_limit,
+        recommended = pressure.recommended_rewind_limit,
+        hard = hard,
     )
 }
 
@@ -8723,6 +8768,7 @@ struct FollowUpMessage {
     unresolved_attachment_ids: Vec<String>,
     target_session_id: Option<String>,
     managed_context_recovery_kickstart: bool,
+    managed_context_density_handoff: bool,
 }
 
 impl FollowUpMessage {
@@ -8738,6 +8784,7 @@ impl FollowUpMessage {
             unresolved_attachment_ids: Vec::new(),
             target_session_id: None,
             managed_context_recovery_kickstart: false,
+            managed_context_density_handoff: false,
         }
     }
 
@@ -8753,6 +8800,7 @@ impl FollowUpMessage {
             unresolved_attachment_ids: Vec::new(),
             target_session_id: None,
             managed_context_recovery_kickstart: false,
+            managed_context_density_handoff: false,
         }
     }
 
@@ -8768,6 +8816,7 @@ impl FollowUpMessage {
             unresolved_attachment_ids: Vec::new(),
             target_session_id: None,
             managed_context_recovery_kickstart: false,
+            managed_context_density_handoff: false,
         }
     }
 
@@ -8790,6 +8839,7 @@ impl FollowUpMessage {
             unresolved_attachment_ids,
             target_session_id: None,
             managed_context_recovery_kickstart: false,
+            managed_context_density_handoff: false,
         }
     }
 
@@ -8807,6 +8857,11 @@ impl FollowUpMessage {
         self.managed_context_recovery_kickstart = true;
         self
     }
+
+    fn managed_context_density_handoff(mut self) -> Self {
+        self.managed_context_density_handoff = true;
+        self
+    }
 }
 
 const MANAGED_CONTEXT_REWIND_FOLLOWUP_REPLAY_OPEN: &str =
@@ -8817,7 +8872,7 @@ const MANAGED_CONTEXT_REWIND_FOLLOWUP_REPLAY_USER_MARKER: &str = "\n\nUser follo
 const MANAGED_CONTEXT_REWIND_FOLLOWUP_REPLAY_INSTRUCTIONS: &str =
     "A managed-context rewind requested during this queued follow-up has already succeeded. Continue the user's follow-up below from the rewound context. Do not call rewind_context again merely to satisfy any instruction to rewind first; only rewind again if new context pressure or an invalid anchor genuinely requires it.";
 const MANAGED_CONTEXT_REWIND_ACTIVE_RESUME_INSTRUCTIONS: &str =
-    "A managed-context rewind requested during the active follow-up has already succeeded. The active user follow-up is already in the preserved thread history; the model_context_rewind_primer is the authoritative carry-forward summary for the pruned span. Continue with the next unfinished step. Do not repeat already-completed verification, setup, or research steps from the preserved user request, and do not call rewind_context again merely to satisfy any prior instruction to rewind first.";
+    "A managed-context rewind requested during the active follow-up has already succeeded. The active follow-up is already in the preserved thread history; the model_context_rewind_primer is the authoritative carry-forward summary for the pruned span. Continue with the next unfinished step. Do not repeat already-completed verification, setup, or research steps from the preserved request, and do not call rewind_context again merely to satisfy any prior instruction to rewind first.";
 
 fn managed_context_canonical_followup_replay_text(text: &str) -> String {
     let mut current = text.trim();
@@ -8880,10 +8935,11 @@ fn managed_context_followup_replay_after_rewind(
         managed_context_active_followup_resume_text()
     };
 
-    Some(FollowUpMessage::with_attachments(
-        text,
-        active_followup.attachments.clone(),
-    ))
+    let mut followup = FollowUpMessage::with_attachments(text, active_followup.attachments.clone());
+    if active_followup.managed_context_density_handoff {
+        followup = followup.managed_context_density_handoff();
+    }
+    Some(followup)
 }
 
 fn managed_context_sanitize_queued_followup_replay(
@@ -10735,6 +10791,67 @@ mod tests {
     }
 
     #[test]
+    fn managed_context_density_pressure_uses_recommended_threshold_only() {
+        let below = external_agent::AgentContextSnapshot {
+            source: "codex".to_string(),
+            label: "Codex resolved request payload".to_string(),
+            request_id: Some("req-1".to_string()),
+            request_index: Some(1),
+            rollout_path: None,
+            format: "openai.responses.resolved_request.v1".to_string(),
+            token_count: Some(219_639),
+            token_count_kind: Some(external_agent::AgentContextTokenCountKind::BackendReported),
+            context_window: Some(258_400),
+            hard_context_window: Some(272_000),
+            item_count: Some(458),
+            raw: serde_json::json!({}),
+        };
+        assert_eq!(managed_context_density_pressure(&below), None);
+
+        let watch = external_agent::AgentContextSnapshot {
+            token_count: Some(241_746),
+            ..below.clone()
+        };
+        assert_eq!(
+            managed_context_density_pressure(&watch),
+            Some(ManagedContextDensityPressure {
+                used_tokens: 241_746,
+                recommended_rewind_limit: 219_640,
+                rewind_only_limit: 258_400,
+                hard_context_window: Some(272_000),
+            })
+        );
+        assert_eq!(managed_context_rewind_only_pressure(&watch), None);
+
+        let rewind_only = external_agent::AgentContextSnapshot {
+            token_count: Some(258_400),
+            ..below
+        };
+        assert_eq!(managed_context_density_pressure(&rewind_only), None);
+        assert!(managed_context_rewind_only_pressure(&rewind_only).is_some());
+    }
+
+    #[test]
+    fn managed_context_density_handoff_text_preserves_exact_anchor_policy() {
+        let text = managed_context_density_handoff_text(ManagedContextDensityPressure {
+            used_tokens: 241_746,
+            recommended_rewind_limit: 219_640,
+            rewind_only_limit: 258_400,
+            hard_context_window: Some(272_000),
+        });
+
+        assert!(text.contains("context pressure is watch"));
+        assert!(text.contains("recommended_density_threshold=219640"));
+        assert!(text.contains("one exact returned item_id"));
+        assert!(text.contains("crystallizes durable facts"));
+        assert!(text.contains("leaving context unchanged"));
+        assert!(text.contains("Do not use auto anchors"));
+        assert!(text.contains("N-turn rewinds"));
+        assert!(!text.contains("call_"));
+        assert!(!text.contains("rewind N"));
+    }
+
+    #[test]
     fn context_rewind_thread_id_candidates_prefers_session_then_alias() {
         assert_eq!(
             context_rewind_thread_id_candidates(Some("backend-thread"), Some("wrapper-session")),
@@ -10826,7 +10943,7 @@ mod tests {
 
         assert!(continuation
             .text
-            .contains("active user follow-up is already in the preserved thread history"));
+            .contains("active follow-up is already in the preserved thread history"));
         assert!(continuation.text.contains("has already succeeded"));
         assert!(continuation
             .text
@@ -20116,6 +20233,7 @@ async fn run_external_agent_mode(
         let unresolved_attachment_ids = followup.unresolved_attachment_ids;
         let target_session_id = followup.target_session_id.clone();
         let managed_context_recovery_kickstart = followup.managed_context_recovery_kickstart;
+        let managed_context_density_handoff = followup.managed_context_density_handoff;
 
         if let Some(side_thread_id) = target_session_id
             .as_deref()
@@ -20404,6 +20522,7 @@ async fn run_external_agent_mode(
                                 unresolved_attachment_ids: unresolved_attachment_ids.clone(),
                                 target_session_id: target_session_id.clone(),
                                 managed_context_recovery_kickstart: false,
+                                managed_context_density_handoff: false,
                             });
                             emit_follow_up_status(
                                 &bus,
@@ -21030,6 +21149,52 @@ async fn run_external_agent_mode(
                                     });
                                     next_turn = Some(replay);
                                     continue 'outer;
+                                }
+                                if !managed_context_recovery_kickstart
+                                    && !managed_context_density_handoff
+                                {
+                                    if let Some(pressure) =
+                                        managed_context_density_pressure(&snapshot)
+                                    {
+                                        let handoff_text =
+                                            managed_context_density_handoff_text(pressure);
+                                        slog(&session_log, |l| {
+                                            l.info(&format!(
+                                                "Managed Codex completed at density-watch pressure ({}/{} tokens); sending one-shot context handoff before waiting for follow-up",
+                                                pressure.used_tokens,
+                                                pressure.rewind_only_limit
+                                            ))
+                                        });
+                                        bus.send(AppEvent::LogEntry {
+                                            session_id: live_session_id.clone(),
+                                            level: "info".to_string(),
+                                            source: "Intendant".to_string(),
+                                            content: format!(
+                                                "Managed context is above the recommended density threshold ({}/{} tokens, threshold {}). Sending a one-shot context handoff before waiting for follow-up.",
+                                                pressure.used_tokens,
+                                                pressure.rewind_only_limit,
+                                                pressure.recommended_rewind_limit
+                                            ),
+                                            turn: None,
+                                        });
+                                        record_external_round_inline(
+                                            &session_log,
+                                            persist_model_responses_inline,
+                                            round,
+                                            turns_in_round,
+                                        );
+                                        bus.send(AppEvent::RoundComplete {
+                                            session_id: live_session_id.clone(),
+                                            round,
+                                            turns_in_round,
+                                            native_message_count: None,
+                                        });
+                                        next_turn = Some(
+                                            FollowUpMessage::text(handoff_text)
+                                                .managed_context_density_handoff(),
+                                        );
+                                        continue 'outer;
+                                    }
                                 }
                             }
                         }
