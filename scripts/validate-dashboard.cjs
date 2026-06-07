@@ -29,6 +29,8 @@ const DIAGNOSTIC_LIST_LIMIT = 8;
 const DIAGNOSTIC_SELECTOR_MATCH_LIMIT = 8;
 const DIAGNOSTIC_SOURCE_SELECTOR_LIMIT = 8;
 const FORMATTED_DIAGNOSTIC_LINE_LIMIT = 520;
+const FORMATTED_STATION_STATUS_LINE_LIMIT = 2000;
+const STATION_WARNING_LIMIT = 6;
 const PROTECTED_DASHBOARD_PORT = 8765;
 
 const BROWSER_EXECUTABLE_ENVS = [
@@ -1008,7 +1010,12 @@ class BrowserHarness {
   }
 
   async failureDiagnostics(opts) {
-    return this.evaluate(`(${pageDiagnosticsSource()})(${JSON.stringify(failureDiagnosticSelectors(opts))})`);
+    const diagnostics = await this.evaluate(`(${pageDiagnosticsSource()})(${JSON.stringify(failureDiagnosticSelectors(opts))})`);
+    if (isStationFocusedCheck(opts)) {
+      diagnostics.station = await this.evaluate(`(${stationDiagnosticsSource()})()`);
+      diagnostics.station.warnings = stationConsoleWarnings(this.pageLogs.excerpt(LOG_BUFFER_LIMIT));
+    }
+    return diagnostics;
   }
 
   async close() {
@@ -1677,6 +1684,92 @@ function pageDiagnosticsSource() {
   }.toString();
 }
 
+function stationDiagnosticsSource() {
+  return function collectStationDiagnostics() {
+    const status = document.getElementById('station-status');
+    const canvas = document.getElementById('station-hud-canvas');
+    const result = {
+      statusFound: Boolean(status),
+      statusText: status ? String(status.textContent || '') : '',
+      canvasFound: Boolean(canvas),
+    };
+    if (!canvas) {
+      return result;
+    }
+    const rect = canvas.getBoundingClientRect();
+    result.canvas = {
+      attrWidth: Number(canvas.width) || 0,
+      attrHeight: Number(canvas.height) || 0,
+      clientWidth: Number(canvas.clientWidth) || 0,
+      clientHeight: Number(canvas.clientHeight) || 0,
+      rectWidth: Math.round(Number(rect.width) || 0),
+      rectHeight: Math.round(Number(rect.height) || 0),
+      devicePixelRatio: Number(window.devicePixelRatio) || 1,
+    };
+    result.pixels = {
+      sampleWidth: 0,
+      sampleHeight: 0,
+      litCount: 0,
+      total: 0,
+      samples: [],
+    };
+    const width = Number(canvas.width) || Math.round(Number(rect.width) || 0);
+    const height = Number(canvas.height) || Math.round(Number(rect.height) || 0);
+    if (width <= 0 || height <= 0) {
+      result.pixels.error = 'canvas has no readable pixel area';
+      return result;
+    }
+    try {
+      const sampleWidth = Math.max(1, Math.min(12, width));
+      const sampleHeight = Math.max(1, Math.min(12, height));
+      const scratch = document.createElement('canvas');
+      scratch.width = sampleWidth;
+      scratch.height = sampleHeight;
+      const ctx = scratch.getContext('2d');
+      if (!ctx) {
+        result.pixels.error = '2d sample context unavailable';
+        return result;
+      }
+      ctx.drawImage(canvas, 0, 0, width, height, 0, 0, sampleWidth, sampleHeight);
+      const data = ctx.getImageData(0, 0, sampleWidth, sampleHeight).data;
+      let litCount = 0;
+      const samples = [];
+      for (let y = 0; y < sampleHeight; y += 1) {
+        for (let x = 0; x < sampleWidth; x += 1) {
+          const offset = (y * sampleWidth + x) * 4;
+          const rgba = [data[offset], data[offset + 1], data[offset + 2], data[offset + 3]];
+          if (rgba[3] > 0) {
+            litCount += 1;
+            if (samples.length < 4) {
+              samples.push({ x, y, rgba });
+            }
+          }
+        }
+      }
+      result.pixels = {
+        sampleWidth,
+        sampleHeight,
+        litCount,
+        total: sampleWidth * sampleHeight,
+        samples,
+      };
+    } catch (error) {
+      result.pixels.error = error && error.message ? error.message : String(error);
+    }
+    return result;
+  }.toString();
+}
+
+function stationConsoleWarnings(lines) {
+  if (!Array.isArray(lines)) {
+    return [];
+  }
+  return lines
+    .filter((line) => /\[(console\.(warn|warning)|log\.warning|console\.error|exception)\]/i.test(line))
+    .filter((line) => /\b(station|webgpu|canvas|fallback|wasm)\b/i.test(line))
+    .slice(-STATION_WARNING_LIMIT);
+}
+
 function compactResultForOutput(opts, result) {
   const compact = { ...result };
   if (compact.reason) {
@@ -1686,7 +1779,9 @@ function compactResultForOutput(opts, result) {
     compact.logs = compact.logs.map((line) => truncateMiddle(line, RESULT_LOG_LIMIT));
   }
   if (compact.diagnostics) {
-    compact.diagnostics = compactDiagnostics(compact.diagnostics);
+    compact.diagnostics = compactDiagnostics(compact.diagnostics, {
+      suppressControls: isStationFocusedCheck(opts) && !opts.diagnostics,
+    });
   }
   if (compact.status === 'fail') {
     compact.next = validationFailureNextStep(compact);
@@ -1701,7 +1796,7 @@ function validationFailureNextStep(result) {
   return 'retry at most once with --diagnostics --json and a targeted selector/function';
 }
 
-function compactDiagnostics(diagnostics) {
+function compactDiagnostics(diagnostics, options = {}) {
   if (!diagnostics || typeof diagnostics !== 'object') {
     return diagnostics;
   }
@@ -1720,6 +1815,9 @@ function compactDiagnostics(diagnostics) {
   if (diagnostics.bodyText) {
     compact.bodyText = truncateMiddle(diagnostics.bodyText, DIAGNOSTIC_BODY_LIMIT);
   }
+  if (diagnostics.station) {
+    compact.station = compactStationDiagnostics(diagnostics.station);
+  }
 
   const headings = compactStringArray(diagnostics.headings, DIAGNOSTIC_LIST_LIMIT, DIAGNOSTIC_TEXT_LIMIT);
   if (headings.values.length) {
@@ -1729,12 +1827,14 @@ function compactDiagnostics(diagnostics) {
     compact.headingsOmitted = headings.omitted;
   }
 
-  const controls = compactStringArray(diagnostics.controls, DIAGNOSTIC_LIST_LIMIT, DIAGNOSTIC_TEXT_LIMIT);
-  if (controls.values.length) {
-    compact.controls = controls.values;
-  }
-  if (controls.omitted) {
-    compact.controlsOmitted = controls.omitted;
+  if (!options.suppressControls) {
+    const controls = compactStringArray(diagnostics.controls, DIAGNOSTIC_LIST_LIMIT, DIAGNOSTIC_TEXT_LIMIT);
+    if (controls.values.length) {
+      compact.controls = controls.values;
+    }
+    if (controls.omitted) {
+      compact.controlsOmitted = controls.omitted;
+    }
   }
 
   if (Array.isArray(diagnostics.selectorMatches)) {
@@ -1761,6 +1861,54 @@ function compactDiagnostics(diagnostics) {
   return compact;
 }
 
+function compactStationDiagnostics(station) {
+  if (!station || typeof station !== 'object') {
+    return station;
+  }
+  const compact = {
+    statusText: String(station.statusText ?? ''),
+    statusFound: Boolean(station.statusFound),
+    canvasFound: Boolean(station.canvasFound),
+  };
+  if (station.canvas) {
+    compact.canvas = {
+      attrWidth: Number(station.canvas.attrWidth) || 0,
+      attrHeight: Number(station.canvas.attrHeight) || 0,
+      clientWidth: Number(station.canvas.clientWidth) || 0,
+      clientHeight: Number(station.canvas.clientHeight) || 0,
+      rectWidth: Number(station.canvas.rectWidth) || 0,
+      rectHeight: Number(station.canvas.rectHeight) || 0,
+      devicePixelRatio: Number(station.canvas.devicePixelRatio) || 0,
+    };
+  }
+  if (station.pixels) {
+    compact.pixels = {
+      sampleWidth: Number(station.pixels.sampleWidth) || 0,
+      sampleHeight: Number(station.pixels.sampleHeight) || 0,
+      litCount: Number(station.pixels.litCount) || 0,
+      total: Number(station.pixels.total) || 0,
+      samples: Array.isArray(station.pixels.samples)
+        ? station.pixels.samples.slice(0, 4).map((sample) => ({
+            x: Number(sample.x) || 0,
+            y: Number(sample.y) || 0,
+            rgba: Array.isArray(sample.rgba) ? sample.rgba.slice(0, 4).map((n) => Number(n) || 0) : [],
+          }))
+        : [],
+    };
+    if (station.pixels.error) {
+      compact.pixels.error = truncateMiddle(station.pixels.error, DIAGNOSTIC_TEXT_LIMIT);
+    }
+  }
+  const warnings = compactStringArray(station.warnings, STATION_WARNING_LIMIT, DIAGNOSTIC_TEXT_LIMIT);
+  if (warnings.values.length) {
+    compact.warnings = warnings.values;
+  }
+  if (warnings.omitted) {
+    compact.warningsOmitted = warnings.omitted;
+  }
+  return compact;
+}
+
 function compactStringArray(values, limit, textLimit) {
   if (!Array.isArray(values)) {
     return { values: [], omitted: 0 };
@@ -1782,6 +1930,9 @@ function formatDiagnostics(diagnostics) {
   const lines = [
     `diagnostics readyState=${quote(diagnostics.readyState || '')} title=${quote(diagnostics.title || '')} location=${quote(diagnostics.location || '')}`,
   ];
+  if (diagnostics.station) {
+    lines.push(...formatStationDiagnostics(diagnostics.station));
+  }
   if (diagnostics.activeElement) {
     lines.push(`diagnostics active=${quote(diagnostics.activeElement)}`);
   }
@@ -1812,7 +1963,47 @@ function formatDiagnostics(diagnostics) {
   if (diagnostics.selectorMatchesOmitted) {
     lines.push(`diagnostics selectorMatchesOmitted=${diagnostics.selectorMatchesOmitted}`);
   }
-  return lines.map((line) => truncateMiddle(line, FORMATTED_DIAGNOSTIC_LINE_LIMIT));
+  return lines.map((line) => truncateMiddle(
+    line,
+    line.startsWith('station statusFound=')
+      ? FORMATTED_STATION_STATUS_LINE_LIMIT
+      : FORMATTED_DIAGNOSTIC_LINE_LIMIT,
+  ));
+}
+
+function formatStationDiagnostics(station) {
+  if (!station || typeof station !== 'object') {
+    return [];
+  }
+  const lines = [
+    `station statusFound=${Boolean(station.statusFound)} statusText=${quote(station.statusText ?? '')}`,
+  ];
+  if (station.canvas) {
+    lines.push(
+      `station canvasFound=${Boolean(station.canvasFound)} attr=${Number(station.canvas.attrWidth) || 0}x${Number(station.canvas.attrHeight) || 0} client=${Number(station.canvas.clientWidth) || 0}x${Number(station.canvas.clientHeight) || 0} rect=${Number(station.canvas.rectWidth) || 0}x${Number(station.canvas.rectHeight) || 0} dpr=${Number(station.canvas.devicePixelRatio) || 0}`,
+    );
+  } else {
+    lines.push(`station canvasFound=${Boolean(station.canvasFound)}`);
+  }
+  if (station.pixels) {
+    const sampleText = Array.isArray(station.pixels.samples)
+      ? station.pixels.samples
+          .slice(0, 4)
+          .map((sample) => `${Number(sample.x) || 0},${Number(sample.y) || 0}:${(sample.rgba || []).join('/')}`)
+          .join(' ')
+      : '';
+    const errorText = station.pixels.error ? ` error=${quote(station.pixels.error)}` : '';
+    lines.push(
+      `station pixels lit=${Number(station.pixels.litCount) || 0}/${Number(station.pixels.total) || 0} sample=${Number(station.pixels.sampleWidth) || 0}x${Number(station.pixels.sampleHeight) || 0} rgba=${quote(sampleText)}${errorText}`,
+    );
+  }
+  for (const warning of station.warnings || []) {
+    lines.push(`station warning=${quote(warning)}`);
+  }
+  if (station.warningsOmitted) {
+    lines.push(`station warningsOmitted=${station.warningsOmitted}`);
+  }
+  return lines;
 }
 
 function shouldCollectFailureDiagnostics(opts, error) {
@@ -1837,6 +2028,17 @@ function failureDiagnosticSelectors(opts) {
     addDiagnosticSelector(selectors, selector);
   }
   return selectors.slice(0, DIAGNOSTIC_SOURCE_SELECTOR_LIMIT);
+}
+
+function isStationFocusedCheck(opts) {
+  const haystack = [
+    ...(opts.selectors || []),
+    ...(opts.functions || []),
+  ].join('\n').toLowerCase();
+  return haystack.includes('station-status')
+    || haystack.includes('station-hud-canvas')
+    || haystack.includes('station-dock')
+    || haystack.includes('station');
 }
 
 function addDiagnosticSelector(selectors, selector) {
@@ -2088,6 +2290,21 @@ async function runSelfTest() {
   assert.ok(waitFunctionExpression('document.body').includes('typeof candidate'));
   assert.ok(pageDiagnosticsSource().includes('selectorMatches'));
   assert.ok(pageDiagnosticsSource().includes('dataset'));
+  assert.ok(stationDiagnosticsSource().includes('station-hud-canvas'));
+  assert.deepStrictEqual(
+    stationConsoleWarnings([
+      '[console.log] Station ordinary log',
+      '[console.warn] Station WebGPU unavailable; using DOM fallback',
+      '[console.warning] Station canvas alpha sample failed',
+      '[console.warn] unrelated warning',
+      '[log.warning] canvas fallback path selected',
+    ]),
+    [
+      '[console.warn] Station WebGPU unavailable; using DOM fallback',
+      '[console.warning] Station canvas alpha sample failed',
+      '[log.warning] canvas fallback path selected',
+    ],
+  );
   assert.strictEqual(shouldCollectFailureDiagnostics({ diagnostics: true }, new Error('boom')), true);
   assert.strictEqual(
     shouldCollectFailureDiagnostics({ diagnostics: false }, new Error('wait-for-function did not become truthy')),
@@ -2169,6 +2386,77 @@ async function runSelfTest() {
   );
   assert.strictEqual(compactedAutoDiagnosticFailure.diagnosticsAuto, true);
   assert.ok(compactedAutoDiagnosticFailure.next.includes('avoid further broad selector/source dumps'));
+  const longStationStatus = `Station online ${'status-detail '.repeat(80)}ready`;
+  const compactedStationFailure = compactResultForOutput(
+    {
+      diagnostics: false,
+      selectors: ['#station-status'],
+      functions: [],
+    },
+    {
+      status: 'fail',
+      reason: 'selector not found: #station-ready',
+      diagnosticsAuto: true,
+      diagnostics: {
+        readyState: 'complete',
+        title: 'Dashboard',
+        location: 'http://127.0.0.1:1234/',
+        controls: ['button#generic-control "Launch"', 'button#another-control "Stop"'],
+        station: {
+          statusFound: true,
+          statusText: longStationStatus,
+          canvasFound: true,
+          canvas: {
+            attrWidth: 640,
+            attrHeight: 360,
+            clientWidth: 320,
+            clientHeight: 180,
+            rectWidth: 320,
+            rectHeight: 180,
+            devicePixelRatio: 2,
+          },
+          pixels: {
+            sampleWidth: 12,
+            sampleHeight: 12,
+            litCount: 7,
+            total: 144,
+            samples: [{ x: 1, y: 2, rgba: [3, 4, 5, 255] }],
+          },
+          warnings: ['[console.warn] Station WebGPU unavailable; using DOM fallback'],
+        },
+      },
+    },
+  );
+  assert.strictEqual(compactedStationFailure.diagnostics.controls, undefined);
+  assert.strictEqual(compactedStationFailure.diagnostics.station.statusText, longStationStatus);
+  const stationLines = formatDiagnostics(compactedStationFailure.diagnostics);
+  assert.ok(stationLines.some((line) => line.includes(`statusText=${quote(longStationStatus)}`)));
+  assert.ok(stationLines.some((line) => line.includes('station canvasFound=true attr=640x360 client=320x180')));
+  assert.ok(stationLines.some((line) => line.includes('station pixels lit=7/144')));
+  assert.ok(stationLines.some((line) => line.includes('station warning=')));
+  const explicitStationFailure = compactResultForOutput(
+    {
+      diagnostics: true,
+      selectors: ['#station-status'],
+      functions: [],
+    },
+    {
+      status: 'fail',
+      reason: 'selector not found: #station-ready',
+      diagnostics: {
+        readyState: 'complete',
+        title: 'Dashboard',
+        location: 'http://127.0.0.1:1234/',
+        controls: ['button#generic-control "Launch"'],
+        station: {
+          statusFound: false,
+          statusText: '',
+          canvasFound: false,
+        },
+      },
+    },
+  );
+  assert.deepStrictEqual(explicitStationFailure.diagnostics.controls, ['button#generic-control "Launch"']);
   const log = new BoundedLog(2);
   log.push('a', 'first');
   log.push('b', 'second');
