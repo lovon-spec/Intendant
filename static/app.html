@@ -11530,6 +11530,12 @@ function stationCommandEntries() {
       run: () => stationRenderManagedDock('lineage'),
     },
     {
+      label: 'Change runway',
+      detail: 'Review files, diffs, and rollback history from Station',
+      tokens: 'changes diff files rollback history working tree review runway',
+      run: () => stationRenderChangesDock(activeChangesFile || stationSelectedChangePath || ''),
+    },
+    {
       label: 'Search sessions',
       detail: 'Focus Station session filter',
       tokens: 'sessions search filter resume config',
@@ -14927,6 +14933,132 @@ async function stationRunChangesPruneFromDock(selectedPath = stationSelectedChan
   await stationRefreshChangesHistoryForDock(selectedPath);
 }
 
+function stationChangeRunwayPayload(changes, selectedPath = '') {
+  const entries = [...changedFiles.entries()].sort((a, b) => a[0].localeCompare(b[0]));
+  const rows = stationChangesHistoryRows();
+  const currentRound = rows.find(row => row.current) || null;
+  const selected = selectedPath && changedFiles.has(selectedPath)
+    ? [selectedPath, changedFiles.get(selectedPath)]
+    : null;
+  const lanes = [];
+  lanes.push({
+    type: 'working_tree',
+    id: 'working-tree',
+    title: changes.status === 'mismatch' ? 'Target mismatch' : (changes.count ? 'Working tree changes' : 'Working tree clean'),
+    meta: `${changes.count} files / +${stationCompactNumber(changes.totalAdded)} -${stationCompactNumber(changes.totalRemoved)}`,
+    detail: changes.status === 'mismatch'
+      ? changes.latestPath
+      : `${changes.added} added / ${changes.modified} modified / ${changes.deleted} deleted / ${changes.external} external`,
+  });
+  if (selected) {
+    const [path, info] = selected;
+    lanes.push({
+      type: 'selected_file',
+      id: path,
+      title: stationChangesFileName(path),
+      meta: `${stationChangesKindLabel(info?.kind)} / +${stationCompactNumber(info?.lines_added)} -${stationCompactNumber(info?.lines_removed)}`,
+      detail: compactPathLabel(path, true) || path,
+      diff_available: info?.diff_available !== false,
+    });
+  }
+  if (currentRound) {
+    lanes.push({
+      type: 'history_head',
+      id: String(currentRound.id ?? ''),
+      title: `History ${currentRound.label}`,
+      meta: `${currentRound.fileCount} file${currentRound.fileCount === 1 ? '' : 's'} / current`,
+      detail: currentRound.summary || currentRound.files[0] || 'No summary for current history head.',
+    });
+  }
+  for (const [path, info] of entries.slice(0, 5)) {
+    if (path === selectedPath) continue;
+    lanes.push({
+      type: 'file',
+      id: path,
+      title: stationChangesFileName(path),
+      meta: `${stationChangesKindLabel(info?.kind)} / +${stationCompactNumber(info?.lines_added)} -${stationCompactNumber(info?.lines_removed)}`,
+      detail: compactPathLabel(path, true) || path,
+      diff_available: info?.diff_available !== false,
+    });
+  }
+  return {
+    generated_at: new Date().toISOString(),
+    selected_path: selectedPath || '',
+    status: changes.status || 'clean',
+    counts: {
+      files: changes.count || 0,
+      added: changes.added || 0,
+      modified: changes.modified || 0,
+      deleted: changes.deleted || 0,
+      external: changes.external || 0,
+      lines_added: changes.totalAdded || 0,
+      lines_removed: changes.totalRemoved || 0,
+      history_rounds: rows.length,
+      abandoned_branches: Array.isArray(historyCache?.abandoned_branches) ? historyCache.abandoned_branches.length : 0,
+    },
+    current_round: currentRound ? {
+      id: currentRound.id,
+      label: currentRound.label,
+      summary: currentRound.summary,
+      files: currentRound.files,
+    } : null,
+    lanes,
+  };
+}
+
+async function stationCopyChangeRunwayPayload(changes, selectedPath = '') {
+  await copyTextToClipboard(JSON.stringify(stationChangeRunwayPayload(changes, selectedPath), null, 2));
+  showControlToast?.('info', 'Change runway JSON copied');
+}
+
+function stationChangeRunwayActions(lane, selectedPath = '') {
+  if (!lane) return [];
+  if (lane.type === 'working_tree') {
+    return [
+      { label: 'Refresh', primary: true, onClick: async () => { await refreshChangesList({ refreshActive: !!activeChangesFile, quiet: true }); stationRenderChangesDock(activeChangesFile || selectedPath); } },
+      { label: 'Copy paths', disabled: changedFiles.size <= 0, onClick: stationCopyChangedPathsFromDock },
+    ];
+  }
+  if (lane.type === 'selected_file' || lane.type === 'file') {
+    return [
+      { label: 'View', primary: lane.type !== 'selected_file', onClick: () => stationSelectChange(lane.id) },
+      { label: 'Copy diff', disabled: lane.diff_available === false, onClick: async () => stationCopyChangeDiffFromDock(lane.id) },
+      { label: 'Copy path', onClick: () => copyTextToClipboard(lane.id) },
+    ];
+  }
+  if (lane.type === 'history_head') {
+    return [
+      { label: 'History', primary: true, onClick: () => stationRefreshChangesHistoryForDock(selectedPath) },
+      { label: 'Redo', onClick: () => stationRunChangesRedoFromDock(selectedPath) },
+      { label: 'Prune', danger: true, onClick: () => stationRunChangesPruneFromDock(selectedPath) },
+    ];
+  }
+  return [];
+}
+
+function stationRenderChangeRunwaySection(body, changes, selectedPath) {
+  const payload = stationChangeRunwayPayload(changes, selectedPath);
+  const section = stationDockSection(body, 'Change runway');
+  stationDockRow(section, 'state', `${payload.status} / ${payload.counts.files} files`);
+  stationDockRow(section, 'lines', `+${stationCompactNumber(payload.counts.lines_added)} / -${stationCompactNumber(payload.counts.lines_removed)}`);
+  stationDockRow(section, 'history', `${payload.counts.history_rounds} rounds / ${payload.counts.abandoned_branches} abandoned`);
+  stationDockActions(section, [
+    { label: 'Copy JSON', onClick: () => stationCopyChangeRunwayPayload(changes, selectedPath) },
+    { label: 'Refresh', primary: true, onClick: async () => { await refreshChangesList({ refreshActive: !!activeChangesFile, quiet: true }); if (typeof refreshHistory === 'function') await refreshHistory(); stationRenderChangesDock(activeChangesFile || selectedPath); } },
+    { label: 'Route changes tab', route: true, onClick: () => stationForceRouteTo('activity', 'changes') },
+  ]);
+  for (const lane of payload.lanes) {
+    stationDockCard(section, {
+      title: lane.title,
+      meta: lane.meta || lane.type,
+      detail: lane.detail || lane.id || lane.type,
+      active: lane.id && lane.id === selectedPath,
+      rows: [['kind', lane.type.replace(/_/g, ' ')]],
+      actions: stationChangeRunwayActions(lane, selectedPath),
+    });
+  }
+}
+
 function stationRenderChangesHistorySection(body, selectedPath) {
   const section = stationDockSection(body, 'History');
   const rows = stationChangesHistoryRows();
@@ -14979,6 +15111,7 @@ function stationRenderChangesDock(selectedPath = stationSelectedChangePath || ac
     stationDockRouteAction('Route changes tab', 'activity', 'changes'),
   ]);
 
+  stationRenderChangeRunwaySection(body, changes, selectedPath);
   stationRenderChangesHistorySection(body, selectedPath);
 
   const files = stationDockSection(body, 'Changed files');
