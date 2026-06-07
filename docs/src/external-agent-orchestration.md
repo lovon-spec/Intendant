@@ -156,12 +156,14 @@ features they lack.
   node scripts/validate-dashboard.cjs --port <web_port> --selector '<css>'
   node scripts/validate-dashboard.cjs --url http://127.0.0.1:<web_port>/app \
     --wait-for-function '() => Boolean(window.someReadyFlag)'
+  node scripts/validate-dashboard.cjs --port <web_port> \
+    --station-probe rendered --station-probe dock-hidden
   node scripts/validate-dashboard.cjs --launch-dashboard --port <throwaway_port> \
     --selector '<css>'
   ```
 
   The helper launches a fresh isolated headless Chromium, waits for CDP
-  readiness, supports selector/function waits, falls back when Node has no
+  readiness, supports selector/function waits plus named Station probes, falls back when Node has no
   WebSocket module, and prints compact PASS/FAIL output with bounded log
   excerpts on failure. With `--launch-dashboard`, it starts the built intendant
   binary as `--web <port> --no-tui`, waits for HTTP readiness, and stops the

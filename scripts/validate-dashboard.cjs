@@ -49,6 +49,7 @@ Checks:
   --selector CSS              Wait until document.querySelector(CSS) exists
   --wait-for-selector CSS     Alias for --selector
   --wait-for-function JS      Wait until a JS expression/function returns truthy
+  --station-probe NAME        Named Station probe: status, canvas, rendered, dock, dock-hidden, dock-controls, webgpu
 
 Options:
   --host HOST                 Host used with --port (default: 127.0.0.1)
@@ -82,6 +83,7 @@ function parseArgs(argv, env = process.env) {
     path: '/',
     selectors: [],
     functions: [],
+    stationProbes: [],
     timeoutMs: DEFAULT_TIMEOUT_MS,
     cdpTimeoutMs: DEFAULT_CDP_TIMEOUT_MS,
     logLines: DEFAULT_LOG_LINES,
@@ -151,6 +153,10 @@ function parseArgs(argv, env = process.env) {
       opts.functions.push(readValue());
     } else if (arg.startsWith('--wait-for-function=')) {
       opts.functions.push(arg.slice('--wait-for-function='.length));
+    } else if (arg === '--station-probe') {
+      opts.stationProbes.push(normalizeStationProbeName(readValue()));
+    } else if (arg.startsWith('--station-probe=')) {
+      opts.stationProbes.push(normalizeStationProbeName(arg.slice('--station-probe='.length)));
     } else if (arg === '--timeout') {
       opts.timeoutMs = readNumber('--timeout');
     } else if (arg.startsWith('--timeout=')) {
@@ -219,6 +225,26 @@ function parsePositiveInt(raw, name) {
     throw new Error(`${name} must be a positive number`);
   }
   return Math.floor(value);
+}
+
+function normalizeStationProbeName(raw) {
+  const value = String(raw || '').trim().toLowerCase().replace(/_/g, '-');
+  const aliases = new Map([
+    ['ready', 'status'],
+    ['surface', 'rendered'],
+    ['rendered-surface', 'rendered'],
+    ['canvas-rendered', 'rendered'],
+    ['dock-nav', 'dock-controls'],
+    ['controls-dock', 'dock-controls'],
+    ['hidden-dock', 'dock-hidden'],
+    ['gpu', 'webgpu'],
+  ]);
+  const normalized = aliases.get(value) || value;
+  const allowed = new Set(['status', 'canvas', 'rendered', 'dock', 'dock-hidden', 'dock-controls', 'webgpu']);
+  if (!allowed.has(normalized)) {
+    throw new Error(`unknown Station probe '${raw}'; expected one of ${Array.from(allowed).join(', ')}`);
+  }
+  return normalized;
 }
 
 function resolveDashboardUrl(opts, env) {
@@ -374,6 +400,7 @@ async function main() {
       websocket: harness.websocketKind,
       selectors: opts.selectors.length,
       functions: opts.functions.length,
+      stationProbes: opts.stationProbes.length,
       staticScripts: staticScriptResult,
     };
     printResult(opts, result);
@@ -388,6 +415,7 @@ async function main() {
       url: opts.url,
       ms: Date.now() - started,
       reason: error.message || String(error),
+      failureKind: validationFailureKind(error.message || String(error)),
       browser: harness && harness.browserExecutable,
       websocket: harness && harness.websocketKind,
       logs: collectFailureLogs(opts.logLines, dashboard, harness),
@@ -408,7 +436,8 @@ function staticScriptsOnly(opts) {
       && !opts.explicitDashboardTarget
       && !opts.launchDashboard
       && opts.selectors.length === 0
-      && opts.functions.length === 0,
+      && opts.functions.length === 0
+      && opts.stationProbes.length === 0,
   );
 }
 
@@ -499,7 +528,7 @@ function printResult(opts, result) {
   }
   if (displayResult.status === 'pass') {
     console.log(
-      `PASS dashboard-validation url=${quote(displayResult.url)} selectors=${displayResult.selectors} functions=${displayResult.functions} ms=${displayResult.ms} websocket=${displayResult.websocket || 'unknown'}`,
+      `PASS dashboard-validation url=${quote(displayResult.url)} selectors=${displayResult.selectors} functions=${displayResult.functions} stationProbes=${displayResult.stationProbes || 0} ms=${displayResult.ms} websocket=${displayResult.websocket || 'unknown'}`,
     );
     if (displayResult.staticScripts) {
       console.log(formatStaticScriptPass(displayResult.staticScripts));
@@ -507,7 +536,7 @@ function printResult(opts, result) {
     return;
   }
   console.error(
-    `FAIL dashboard-validation url=${quote(displayResult.url)} reason=${quote(displayResult.reason)} ms=${displayResult.ms}`,
+    `FAIL dashboard-validation url=${quote(displayResult.url)} kind=${quote(displayResult.failureKind || 'unknown')} reason=${quote(displayResult.reason)} ms=${displayResult.ms}`,
   );
   for (const line of displayResult.logs || []) {
     console.error(`  ${line}`);
@@ -932,6 +961,9 @@ class BrowserHarness {
       for (const source of opts.functions) {
         await this.waitForFunction(source, opts.timeoutMs);
       }
+      for (const probe of opts.stationProbes) {
+        await this.waitForStationProbe(probe, opts.timeoutMs);
+      }
     } finally {
       this.cdp.off('event', onEvent);
     }
@@ -953,11 +985,14 @@ class BrowserHarness {
 
   async waitForFunction(source, timeoutMs) {
     let lastError = '';
+    let lastValue = '';
     const expression = waitFunctionExpression(source);
     await waitUntil(
       async () => {
         try {
-          return Boolean(await this.evaluate(expression));
+          const value = await this.evaluate(expression);
+          lastValue = summarizeWaitValue(value);
+          return Boolean(value);
         } catch (error) {
           lastError = error.message || String(error);
           return false;
@@ -965,9 +1000,29 @@ class BrowserHarness {
       },
       timeoutMs,
       () => {
-        const suffix = lastError ? ` (last error: ${lastError})` : '';
+        const suffix = waitFailureSuffix(lastError, lastValue);
         return `wait-for-function did not become truthy${suffix}`;
       },
+    );
+  }
+
+  async waitForStationProbe(probe, timeoutMs) {
+    let lastError = '';
+    let lastValue = '';
+    const expression = stationProbeExpression(probe);
+    await waitUntil(
+      async () => {
+        try {
+          const value = await this.evaluate(expression);
+          lastValue = summarizeWaitValue(value);
+          return Boolean(value && value.ok);
+        } catch (error) {
+          lastError = error.message || String(error);
+          return false;
+        }
+      },
+      timeoutMs,
+      () => `station probe ${probe} did not pass${waitFailureSuffix(lastError, lastValue)}`,
     );
   }
 
@@ -1596,6 +1651,41 @@ function waitFunctionExpression(source) {
   })())`;
 }
 
+function stationProbeExpression(probe) {
+  const normalized = normalizeStationProbeName(probe);
+  return `Promise.resolve((() => {
+    const stationDiagnostics = (${stationDiagnosticsSource()})();
+    return (${stationProbeSource()})(${JSON.stringify(normalized)}, stationDiagnostics);
+  })())`;
+}
+
+function summarizeWaitValue(value) {
+  if (value === undefined) {
+    return 'undefined';
+  }
+  let text;
+  try {
+    text = JSON.stringify(value);
+  } catch (_) {
+    text = String(value);
+  }
+  if (text === undefined) {
+    text = String(value);
+  }
+  return truncateMiddle(text, 360);
+}
+
+function waitFailureSuffix(lastError, lastValue) {
+  const details = [];
+  if (lastValue) {
+    details.push(`last value: ${lastValue}`);
+  }
+  if (lastError) {
+    details.push(`last error: ${truncateMiddle(lastError, 260)}`);
+  }
+  return details.length ? ` (${details.join('; ')})` : '';
+}
+
 async function waitUntil(predicate, timeoutMs, failureMessage) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -1773,6 +1863,130 @@ function stationDiagnosticsSource() {
   }.toString();
 }
 
+function stationProbeSource() {
+  return function collectStationProbe(probe, diagnostics) {
+    const statusText = String(diagnostics && diagnostics.statusText ? diagnostics.statusText : '');
+    const canvas = (diagnostics && diagnostics.canvas) || {};
+    const pixels = (diagnostics && diagnostics.pixels) || {};
+    const dock = document.getElementById('station-dock');
+    const controlsNav = document.querySelector('#station-dock-nav [data-station-dock-nav="system:controls"]');
+    const getGlobalLabel = (name) => {
+      try {
+        const fn = globalThis[name];
+        return typeof fn === 'function' ? String(fn() || '') : '';
+      } catch (_) {
+        return '';
+      }
+    };
+    const getDebugState = () => {
+      try {
+        return typeof station !== 'undefined' && station && station.debug_state
+          ? String(station.debug_state() || '')
+          : '';
+      } catch (_) {
+        return '';
+      }
+    };
+    const renderer = getGlobalLabel('stationRendererLabel')
+      || (/renderer=([^ ]+)/i.exec(statusText) || [])[1]
+      || '';
+    const webgpu = getGlobalLabel('stationWebgpuStatusLabel')
+      || (/webgpu=([^ ]+)/i.exec(statusText) || [])[1]
+      || '';
+    const debugState = getDebugState();
+    const canvasArea = Math.max(
+      Number(canvas.attrWidth) * Number(canvas.attrHeight),
+      Number(canvas.clientWidth) * Number(canvas.clientHeight),
+      Number(canvas.rectWidth) * Number(canvas.rectHeight),
+    );
+    const base = {
+      ok: false,
+      probe,
+      failureKind: 'probe',
+      reason: '',
+      statusText,
+      renderer,
+      webgpu,
+      debugState,
+      canvas: {
+        found: Boolean(diagnostics && diagnostics.canvasFound),
+        attr: `${Number(canvas.attrWidth) || 0}x${Number(canvas.attrHeight) || 0}`,
+        client: `${Number(canvas.clientWidth) || 0}x${Number(canvas.clientHeight) || 0}`,
+        rect: `${Number(canvas.rectWidth) || 0}x${Number(canvas.rectHeight) || 0}`,
+      },
+      pixels: {
+        lit: Number(pixels.litCount) || 0,
+        total: Number(pixels.total) || 0,
+        error: pixels.error ? String(pixels.error) : '',
+      },
+      dock: {
+        found: Boolean(dock),
+        hidden: Boolean(dock && dock.classList && dock.classList.contains('hidden')),
+        kind: dock && dock.dataset ? String(dock.dataset.kind || '') : '',
+        controlsNavFound: Boolean(controlsNav),
+      },
+    };
+    const pass = () => ({ ...base, ok: true, reason: 'passed' });
+    const fail = (reason, failureKind = 'probe') => ({ ...base, reason, failureKind });
+
+    if (probe === 'status') {
+      if (base.statusText.trim() && !/\b(initializing|loading|failed)\b/i.test(base.statusText)) {
+        return pass();
+      }
+      return fail(base.statusText ? 'Station status is not ready' : 'Station status text is missing');
+    }
+    if (probe === 'canvas') {
+      if (base.canvas.found && canvasArea > 0) {
+        return pass();
+      }
+      return fail(base.canvas.found ? 'Station canvas has no measured area' : 'Station canvas is missing');
+    }
+    if (probe === 'rendered') {
+      if (base.canvas.found && (Number(pixels.litCount) || 0) > 0) {
+        return pass();
+      }
+      return fail(
+        base.canvas.found ? 'Station rendered surface has no lit canvas pixels' : 'Station canvas is missing',
+        'renderer',
+      );
+    }
+    if (probe === 'dock') {
+      if (base.dock.found) {
+        return pass();
+      }
+      return fail('Station dock is missing');
+    }
+    if (probe === 'dock-hidden') {
+      if (base.dock.found && base.dock.hidden) {
+        return pass();
+      }
+      return fail(base.dock.found ? 'Station dock is visible' : 'Station dock is missing');
+    }
+    if (probe === 'dock-controls') {
+      if (base.dock.found && base.dock.controlsNavFound) {
+        return pass();
+      }
+      return fail(base.dock.found ? 'Station dock controls nav is missing' : 'Station dock is missing');
+    }
+    if (probe === 'webgpu') {
+      const active = /^webgpu$/i.test(base.renderer)
+        || /\bactive\b/i.test(base.webgpu)
+        || /\bgpu=true\b/i.test(`${base.debugState} ${base.statusText}`);
+      if (active) {
+        return pass();
+      }
+      const unavailable = /\b(unavailable|fallback|failed|gpu=false)\b/i.test(
+        `${base.webgpu} ${base.renderer} ${base.debugState} ${base.statusText}`,
+      );
+      return fail(
+        unavailable ? 'Station WebGPU renderer is unavailable or in fallback' : 'Station WebGPU renderer is not active yet',
+        'renderer',
+      );
+    }
+    return fail(`Unknown Station probe: ${probe}`);
+  }.toString();
+}
+
 function stationConsoleWarnings(lines) {
   if (!Array.isArray(lines)) {
     return [];
@@ -1787,6 +2001,9 @@ function compactResultForOutput(opts, result) {
   const compact = { ...result };
   if (compact.reason) {
     compact.reason = truncateMiddle(compact.reason, RESULT_REASON_LIMIT);
+  }
+  if (compact.failureKind) {
+    compact.failureKind = truncateMiddle(compact.failureKind, DIAGNOSTIC_TEXT_LIMIT);
   }
   if (Array.isArray(compact.logs)) {
     compact.logs = compact.logs.map((line) => truncateMiddle(line, RESULT_LOG_LIMIT));
@@ -1803,10 +2020,33 @@ function compactResultForOutput(opts, result) {
 }
 
 function validationFailureNextStep(result) {
+  if (result.failureKind === 'renderer') {
+    return 'treat as renderer validation failure; use the Station diagnostics here instead of repeating broad DOM/source dumps';
+  }
+  if (result.failureKind === 'probe' || result.failureKind === 'assertion') {
+    return 'treat as probe/assertion failure; adjust the targeted condition or report partial validation; avoid further broad selector/source dumps and do not retry the same brittle wait';
+  }
   if (result.diagnostics) {
     return 'fix from these targeted facts or report partial validation; avoid further broad selector/source dumps';
   }
   return 'retry at most once with --diagnostics --json and a targeted selector/function';
+}
+
+function validationFailureKind(reason) {
+  const text = String(reason || '');
+  if (/^station probe .* did not pass/.test(text)) {
+    return text.includes('"failureKind":"renderer"') ? 'renderer' : 'probe';
+  }
+  if (/^wait-for-function did not become truthy/.test(text)) {
+    return 'assertion';
+  }
+  if (/^selector not found: /.test(text)) {
+    return 'selector';
+  }
+  if (/navigation failed|did not become ready|temporary dashboard|Chromium|CDP|WebSocket|browser/i.test(text)) {
+    return 'harness';
+  }
+  return 'unknown';
 }
 
 function compactDiagnostics(diagnostics, options = {}) {
@@ -2029,7 +2269,8 @@ function shouldCollectFailureDiagnostics(opts, error) {
 
 function isWaitFailureReason(reason) {
   return /^selector not found: /.test(String(reason || ''))
-    || /^wait-for-function did not become truthy/.test(String(reason || ''));
+    || /^wait-for-function did not become truthy/.test(String(reason || ''))
+    || /^station probe .* did not pass/.test(String(reason || ''));
 }
 
 function failureDiagnosticSelectors(opts) {
@@ -2040,6 +2281,11 @@ function failureDiagnosticSelectors(opts) {
   for (const selector of diagnosticSelectorsFromWaitFunctions(opts.functions || [])) {
     addDiagnosticSelector(selectors, selector);
   }
+  if ((opts.stationProbes || []).length) {
+    for (const selector of ['#station-status', '#station-hud-canvas', '#station-dock', '#station-dock-nav [data-station-dock-nav="system:controls"]']) {
+      addDiagnosticSelector(selectors, selector);
+    }
+  }
   return selectors.slice(0, DIAGNOSTIC_SOURCE_SELECTOR_LIMIT);
 }
 
@@ -2047,6 +2293,7 @@ function isStationFocusedCheck(opts) {
   const haystack = [
     ...(opts.selectors || []),
     ...(opts.functions || []),
+    ...(opts.stationProbes || []).map((probe) => `station:${probe}`),
   ].join('\n').toLowerCase();
   return haystack.includes('station-status')
     || haystack.includes('station-hud-canvas')
@@ -2221,6 +2468,9 @@ async function runSelfTest() {
       '#root',
       '--wait-for-function',
       '() => true',
+      '--station-probe',
+      'rendered-surface',
+      '--station-probe=dock-hidden',
       '--timeout=2500',
       '--log-lines',
       '3',
@@ -2235,6 +2485,7 @@ async function runSelfTest() {
   assert.strictEqual(parsed.url, 'http://127.0.0.1:1234/app');
   assert.deepStrictEqual(parsed.selectors, ['#root']);
   assert.deepStrictEqual(parsed.functions, ['() => true']);
+  assert.deepStrictEqual(parsed.stationProbes, ['rendered', 'dock-hidden']);
   assert.strictEqual(parsed.timeoutMs, 2500);
   assert.strictEqual(parsed.logLines, 3);
   assert.strictEqual(parsed.diagnostics, true);
@@ -2253,6 +2504,15 @@ async function runSelfTest() {
     '--port',
     '7777',
   ], {})), false);
+  assert.strictEqual(staticScriptsOnly(parseArgs([
+    '--check-static-scripts',
+    '--station-probe',
+    'canvas',
+  ], {})), false);
+  assert.throws(
+    () => parseArgs(['--station-probe', 'everything'], {}),
+    /unknown Station probe/,
+  );
   const launchParsed = parseArgs(
     [
       '--launch-dashboard',
@@ -2312,9 +2572,63 @@ async function runSelfTest() {
     /module inline script syntax check failed.*(SyntaxError|Unexpected token)/,
   );
   assert.ok(waitFunctionExpression('document.body').includes('typeof candidate'));
+  assert.ok(stationProbeExpression('rendered').includes('collectStationProbe'));
+  assert.strictEqual(summarizeWaitValue(false), 'false');
+  assert.ok(waitFailureSuffix('boom', 'false').includes('last value: false'));
+  assert.strictEqual(
+    validationFailureKind('wait-for-function did not become truthy (last value: false)'),
+    'assertion',
+  );
+  assert.strictEqual(
+    validationFailureKind('station probe rendered did not pass (last value: {"failureKind":"renderer"})'),
+    'renderer',
+  );
   assert.ok(pageDiagnosticsSource().includes('selectorMatches'));
   assert.ok(pageDiagnosticsSource().includes('dataset'));
   assert.ok(stationDiagnosticsSource().includes('station-hud-canvas'));
+  const fakeDock = {
+    classList: { contains: (name) => name === 'hidden' },
+    dataset: { kind: 'controls' },
+  };
+  const fakeDocument = {
+    getElementById: (id) => (id === 'station-dock' ? fakeDock : null),
+    querySelector: (selector) => (
+      selector === '#station-dock-nav [data-station-dock-nav="system:controls"]'
+        ? { dataset: { stationDockNav: 'system:controls' } }
+        : null
+    ),
+  };
+  const stationProbe = vm.runInNewContext(`(${stationProbeSource()})`, {
+    document: fakeDocument,
+    stationRendererLabel: () => 'WebGPU',
+    stationWebgpuStatusLabel: () => 'active',
+  });
+  const stationProbeDiagnostics = {
+    statusFound: true,
+    statusText: 'station hosts=1 agents=1 renderer=WebGPU webgpu=active',
+    canvasFound: true,
+    canvas: {
+      attrWidth: 640,
+      attrHeight: 360,
+      clientWidth: 320,
+      clientHeight: 180,
+      rectWidth: 320,
+      rectHeight: 180,
+    },
+    pixels: {
+      litCount: 4,
+      total: 144,
+    },
+  };
+  assert.strictEqual(stationProbe('dock-hidden', stationProbeDiagnostics).ok, true);
+  assert.strictEqual(stationProbe('rendered', stationProbeDiagnostics).ok, true);
+  assert.strictEqual(stationProbe('webgpu', stationProbeDiagnostics).ok, true);
+  const unlitProbe = stationProbe('rendered', {
+    ...stationProbeDiagnostics,
+    pixels: { litCount: 0, total: 144 },
+  });
+  assert.strictEqual(unlitProbe.ok, false);
+  assert.strictEqual(unlitProbe.failureKind, 'renderer');
   assert.deepStrictEqual(
     stationConsoleWarnings([
       '[console.log] Station ordinary log',
@@ -2351,8 +2665,17 @@ async function runSelfTest() {
     failureDiagnosticSelectors({
       selectors: [],
       functions: ['() => document.getElementById("has:colon")'],
+      stationProbes: [],
     }),
     ['[id="has:colon"]'],
+  );
+  assert.deepStrictEqual(
+    failureDiagnosticSelectors({
+      selectors: [],
+      functions: [],
+      stationProbes: ['rendered'],
+    }),
+    ['#station-status', '#station-hud-canvas', '#station-dock', '#station-dock-nav [data-station-dock-nav="system:controls"]'],
   );
   assert.deepStrictEqual(formatDiagnostics(undefined), []);
   assert.deepStrictEqual(formatDiagnostics({ error: 'boom' }), ['diagnostics error="boom"']);
@@ -2399,6 +2722,7 @@ async function runSelfTest() {
     {
       status: 'fail',
       reason: 'wait-for-function did not become truthy',
+      failureKind: 'assertion',
       diagnosticsAuto: true,
       diagnostics: {
         readyState: 'complete',
@@ -2409,6 +2733,7 @@ async function runSelfTest() {
     },
   );
   assert.strictEqual(compactedAutoDiagnosticFailure.diagnosticsAuto, true);
+  assert.strictEqual(compactedAutoDiagnosticFailure.failureKind, 'assertion');
   assert.ok(compactedAutoDiagnosticFailure.next.includes('avoid further broad selector/source dumps'));
   const longStationStatus = `Station online ${'status-detail '.repeat(80)}ready`;
   const compactedStationFailure = compactResultForOutput(
