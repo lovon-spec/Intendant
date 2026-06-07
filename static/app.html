@@ -10485,6 +10485,7 @@ let foregroundSessionFullId = '';
 let maximizedSessionWindowId = '';
 const sessionWindows = new Map();
 const sessionRelationships = new Map();
+const sessionRelationshipHydrationInFlight = new Set();
 let processingLogReplay = false;
 let logReplayAppendBatch = null;
 const sessionMetadataById = new Map();
@@ -28815,6 +28816,79 @@ function sessionRelationshipKey(parentId, childId, kind) {
   return `${kind}\u001f${parentId}\u001f${childId}`;
 }
 
+function sessionRowIds(session) {
+  if (!session || typeof session !== 'object') return [];
+  return [
+    session.session_id,
+    session.resume_id,
+    session.backend_session_id,
+    session.backendSessionId,
+    session.intendant_session_id,
+    session.intendantSessionId,
+  ].map(id => String(id || '').trim()).filter(Boolean);
+}
+
+function sessionRowMatchesId(session, id) {
+  const target = String(id || '').trim();
+  return !!target && sessionRowIds(session).includes(target);
+}
+
+function cachedSessionRowForId(id) {
+  const target = String(id || '').trim();
+  if (!target || !Array.isArray(_cachedSessions)) return null;
+  return _cachedSessions.find(session => sessionRowMatchesId(session, target)) || null;
+}
+
+function sessionRowsReferToSameSession(a, b) {
+  const ids = new Set(sessionRowIds(a));
+  return sessionRowIds(b).some(id => ids.has(id));
+}
+
+function mergeSessionRowsIntoLoadedSessions(rows) {
+  if (!Array.isArray(rows) || rows.length === 0 || !sessionsLoaded) return;
+  const next = Array.isArray(_cachedSessions) ? _cachedSessions.slice() : [];
+  let changed = false;
+  for (const row of rows) {
+    if (!row || typeof row !== 'object') continue;
+    const index = next.findIndex(existing => sessionRowsReferToSameSession(existing, row));
+    if (index >= 0) {
+      next[index] = { ...next[index], ...row };
+    } else {
+      next.unshift(row);
+    }
+    changed = true;
+  }
+  if (!changed) return;
+  _cachedSessions = next;
+  sessionsListCache.set(sessionListCacheKey(selfPeerId), next);
+  updateSessionProjectFilterOptions(next);
+  updateNewSessionProjectPrefills(next);
+  renderSessionsAggregate(next, document.getElementById('sessions-aggregate'));
+  renderSessionsViews();
+}
+
+function hydrateSessionRelationshipRows(rel) {
+  if (!rel || processingLogReplay) return;
+  const ids = Array.from(new Set([rel.parentId, rel.childId].filter(Boolean)));
+  if (ids.length === 0) return;
+  if (ids.every(id => cachedSessionRowForId(id))) return;
+  const key = ids.slice().sort().join('\u001f');
+  if (sessionRelationshipHydrationInFlight.has(key)) return;
+  sessionRelationshipHydrationInFlight.add(key);
+  const url = `/api/sessions?ids=${encodeURIComponent(ids.join(','))}`;
+  authedFetch(url)
+    .then(r => r.ok ? r.json() : Promise.reject(new Error(`${url} returned ${r.status}`)))
+    .then(rows => {
+      if (!Array.isArray(rows)) return;
+      cacheSessionWindowMetadata(rows);
+      mergeSessionRowsIntoLoadedSessions(rows);
+    })
+    .catch(() => {})
+    .finally(() => {
+      sessionRelationshipHydrationInFlight.delete(key);
+    });
+}
+
 function applySessionRelationship(evt = {}) {
   const parentId = String(evt.parent_session_id || evt.parentSessionId || '').trim();
   const childId = String(evt.child_session_id || evt.childSessionId || '').trim();
@@ -28828,6 +28902,7 @@ function applySessionRelationship(evt = {}) {
   };
   sessionRelationships.set(sessionRelationshipKey(parentId, childId, kind), relationship);
   applySessionRelationshipMetadata(relationship);
+  hydrateSessionRelationshipRows(relationship);
   scheduleSessionRelationshipRender();
 }
 
