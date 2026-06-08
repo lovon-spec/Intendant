@@ -6,9 +6,10 @@
 //!   iOS requires ≤825 days since 2020).
 //! - A client cert (10-year validity).
 //! - A password-protected PKCS#12 bundle containing the client key, cert,
-//!   and CA chain, packaged with **modern** algorithms (PBES2 /
-//!   PBKDF2-HMAC-SHA256 / AES-256-CBC + SHA-256 MAC) that iOS 18 /
-//!   macOS 15 import (see `build_modern_p12`).
+//!   and CA chain, packaged with Apple auto-detect-compatible legacy
+//!   algorithms (PBES1 / 3DES-CBC + SHA-1 MAC) that macOS profile
+//!   installation and `security import` accept without explicit format
+//!   hints (see `build_apple_compatible_p12`).
 //!
 //! Everything is idempotent — if certs already exist, the CA and client
 //! cert are preserved and only the server cert is regenerated when the
@@ -17,12 +18,15 @@
 //! Pure-Rust: RSA keys are generated with RustCrypto `rsa`, certs are
 //! signed with `rcgen` via the `ring` backend (no OpenSSL/aws-lc-sys C
 //! toolchain), and the PKCS#12 bundle is built with `p12-keystore`
-//! (RustCrypto PBES2/AES).
+//! (legacy PBES1/3DES for Apple profile-import compatibility).
 
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 
-use p12_keystore::{Certificate as P12Certificate, KeyStore, KeyStoreEntry, PrivateKeyChain};
+use p12_keystore::{
+    Certificate as P12Certificate, EncryptionAlgorithm, KeyStore, KeyStoreEntry, MacAlgorithm,
+    PrivateKeyChain,
+};
 use rcgen::{
     BasicConstraints, Certificate, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa,
     Issuer, KeyPair, KeyUsagePurpose, SanType, PKCS_RSA_SHA256,
@@ -102,7 +106,8 @@ pub fn ensure_certs(
     write_pem_private_key(&cert_dir.join(CLIENT_KEY), &client_key)?;
 
     let password = random_password(12);
-    let p12_bytes = build_modern_p12(&client_key, &client_cert, &[ca_cert], label, &password)?;
+    let p12_bytes =
+        build_apple_compatible_p12(&client_key, &client_cert, &[ca_cert], label, &password)?;
     std::fs::write(cert_dir.join(CLIENT_P12), &p12_bytes)?;
     state::write_p12_password(cert_dir, &password)?;
 
@@ -298,19 +303,14 @@ fn generate_client_cert(
     Ok((cert, key))
 }
 
-/// Build a PKCS#12 bundle using **modern** encryption: PBES2 with
-/// PBKDF2-HMAC-SHA256 and AES-256-CBC, plus a SHA-256 MAC. This is the
-/// algorithm set Apple's modern import path (`SecPKCS12Import`, used by
-/// Keychain Access on macOS 15+ and the iOS 18 profile installer)
-/// accepts. `p12-keystore`'s writer defaults to exactly this
-/// (encryption = `PbeWithHmacSha256AndAes256`, MAC = `HmacSha256`,
-/// 10 000 iterations), so we build with the defaults.
-///
-/// (Older Apple releases that predate iOS 18 / macOS 15 only accept the
-/// legacy RC2-40/3DES + SHA-1 packaging; supporting those is a
-/// deliberately dropped requirement — it was the sole reason OpenSSL was
-/// ever in the tree.)
-fn build_modern_p12(
+/// Build a PKCS#12 bundle using Apple auto-detect-compatible legacy
+/// encryption. The modern `p12-keystore` default (PBES2/AES +
+/// HMAC-SHA256) parses with OpenSSL and `SecPKCS12Import` when the caller
+/// explicitly says "this is PKCS#12", but macOS `security import` and the
+/// profile installer can reject it as a password/MAC authentication error
+/// when they auto-detect the payload. PBES1 3DES + HMAC-SHA1 matches the
+/// shape Apple's importers accept from `.mobileconfig` payloads.
+fn build_apple_compatible_p12(
     key: &KeyPair,
     cert: &Certificate,
     chain: &[Certificate],
@@ -341,9 +341,12 @@ fn build_modern_p12(
     let mut store = KeyStore::new();
     store.add_entry(friendly_name, entry);
 
-    // Writer defaults: PbeWithHmacSha256AndAes256 + HmacSha256 MAC.
     store
         .writer(password)
+        .encryption_algorithm(EncryptionAlgorithm::PbeWithShaAnd3KeyTripleDesCbc)
+        .encryption_iterations(2048)
+        .mac_algorithm(MacAlgorithm::HmacSha1)
+        .mac_iterations(2048)
         .write()
         .map_err(|e| LanError(format!("p12 write: {e}")))
 }
@@ -507,10 +510,9 @@ mod tests {
     /// **Real Apple importer acceptance.** Round-tripping through the
     /// `p12-keystore` crate (see `p12_is_parseable_with_password`) only
     /// proves *we* can read what *we* wrote — it doesn't prove Apple's
-    /// importer accepts our modern PBES2/AES + SHA-256 packaging. This test
-    /// drives the actual OS importer, `SecPKCS12Import` (Security.framework,
-    /// the same call Keychain Access on macOS 15+ and the iOS 18 profile
-    /// installer make), against the generated `client.p12`.
+    /// importer accepts the bundle. This test drives the actual OS importer,
+    /// `SecPKCS12Import` (Security.framework), against the generated
+    /// `client.p12`.
     ///
     /// It imports into a throwaway keychain created in a `TempDir` (never the
     /// user's login keychain) so it leaves no trace and triggers no
@@ -539,8 +541,8 @@ mod tests {
             .create(tmp.path().join("import-test.keychain"))
             .expect("create temporary keychain");
 
-        // Drive Apple's SecPKCS12Import. If our modern PBES2/AES + SHA-256
-        // packaging were not accepted by the real importer, this errors.
+        // Drive Apple's SecPKCS12Import. If the package shape is not accepted
+        // by the real importer, this errors.
         let identities = Pkcs12ImportOptions::new()
             .passphrase(&state.p12_password)
             .keychain(keychain)
@@ -569,10 +571,76 @@ mod tests {
         );
     }
 
+    /// The `.mobileconfig` installer appears to take the same auto-detection
+    /// path as `security import` without `-f pkcs12`. The modern PBES2/AES
+    /// writer output parsed when the format was forced but failed here with
+    /// "MAC verification failed", which surfaced in System Settings as a
+    /// certificate authentication error. Keep this CLI-level assertion because
+    /// `SecPKCS12Import` alone was not enough coverage.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn p12_imports_via_security_cli_auto_detection() {
+        use std::process::Command;
+
+        let tmp = TempDir::new().unwrap();
+        let state = ensure_certs(tmp.path(), "10.0.0.1", "security-import", false).unwrap();
+        let p12_path = tmp.path().join(CLIENT_P12);
+        let keychain_path = tmp.path().join("security-import.keychain");
+
+        let create = Command::new("security")
+            .arg("create-keychain")
+            .arg("-p")
+            .arg("intendant-test-keychain")
+            .arg(&keychain_path)
+            .output()
+            .expect("run security create-keychain");
+        assert!(
+            create.status.success(),
+            "create-keychain failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&create.stdout),
+            String::from_utf8_lossy(&create.stderr)
+        );
+
+        let unlock = Command::new("security")
+            .arg("unlock-keychain")
+            .arg("-p")
+            .arg("intendant-test-keychain")
+            .arg(&keychain_path)
+            .output()
+            .expect("run security unlock-keychain");
+        assert!(
+            unlock.status.success(),
+            "unlock-keychain failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&unlock.stdout),
+            String::from_utf8_lossy(&unlock.stderr)
+        );
+
+        let import = Command::new("security")
+            .arg("import")
+            .arg(&p12_path)
+            .arg("-P")
+            .arg(&state.p12_password)
+            .arg("-k")
+            .arg(&keychain_path)
+            .output()
+            .expect("run security import");
+
+        let _ = Command::new("security")
+            .arg("delete-keychain")
+            .arg(&keychain_path)
+            .output();
+
+        assert!(
+            import.status.success(),
+            "security import auto-detection failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&import.stdout),
+            String::from_utf8_lossy(&import.stderr)
+        );
+    }
+
     /// The generated PKCS#12 parses back with its password, yields the
     /// client identity, and carries the CA in the chain. Uses
-    /// `p12-keystore`'s own reader (which understands the modern
-    /// PBES2/AES + SHA-256 MAC packaging we write).
+    /// `p12-keystore`'s own reader.
     #[test]
     fn p12_is_parseable_with_password() {
         let tmp = TempDir::new().unwrap();
