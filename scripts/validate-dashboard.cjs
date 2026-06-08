@@ -32,6 +32,9 @@ const FORMATTED_DIAGNOSTIC_LINE_LIMIT = 520;
 const FORMATTED_STATION_STATUS_LINE_LIMIT = 2000;
 const STATION_WARNING_LIMIT = 6;
 const PROTECTED_DASHBOARD_PORT = 8765;
+const STALE_BINARY_MTIME_SLOP_MS = 1000;
+const DASHBOARD_BINARY_INPUT_FILES = ['Cargo.toml', 'Cargo.lock'];
+const DASHBOARD_BINARY_INPUT_DIRS = ['src', 'crates', 'static'];
 
 const BROWSER_EXECUTABLE_ENVS = [
   'INTENDANT_BROWSER_WORKSPACE_EXECUTABLE',
@@ -74,7 +77,7 @@ Options:
   --log-lines N              Bounded browser/page log lines on failure (default: ${DEFAULT_LOG_LINES})
   --diagnostics              On failure, include compact generic DOM/page state
   --launch-dashboard         Launch a temporary Intendant dashboard and stop it afterward
-  --dashboard-binary PATH    Intendant binary for --launch-dashboard (default: $INTENDANT or target/{release,debug}/intendant)
+  --dashboard-binary PATH    Intendant binary for --launch-dashboard (default: $INTENDANT or a fresh target/{release,debug}/intendant)
   --dashboard-arg ARG        Extra arg appended to the launched dashboard command; repeatable
   --dashboard-timeout MS     Temporary dashboard readiness timeout (default: ${DEFAULT_DASHBOARD_TIMEOUT_MS})
   --check-static-scripts     Parse inline classic/module scripts in static/app.html without executing them
@@ -87,7 +90,10 @@ INTENDANT_MCP_URL when available. It never defaults to port 8765.
 --check-static-scripts may run by itself without --url/--port.
 
 On Linux, --headed browser runs launched from SSH import graphical session
-variables from systemd --user when DISPLAY/WAYLAND_DISPLAY are absent.`);
+variables from systemd --user when DISPLAY/WAYLAND_DISPLAY are absent.
+
+With --launch-dashboard, HTTP targets add --no-tls and stale worktree target
+binaries are rejected before launch. Rebuild or use $INTENDANT/--dashboard-binary.`);
 }
 
 function parseArgs(argv, env = process.env) {
@@ -460,7 +466,8 @@ class TemporaryDashboard {
     const port = validateDashboardLaunchOptions(opts);
     await assertDashboardPortAvailable(port, opts.url);
     const executable = resolveDashboardBinary(opts.dashboardBinary);
-    const args = dashboardLaunchArgs(port, opts.dashboardArgs);
+    const args = dashboardLaunchArgs(port, opts.dashboardArgs, new URL(opts.url).protocol);
+    assertDashboardBinarySupportsLaunchArgs(executable, args);
     const logs = new BoundedLog(LOG_BUFFER_LIMIT);
     const child = spawn(executable, args, {
       cwd: process.cwd(),
@@ -586,8 +593,13 @@ function collectFailureLogs(lineCount, dashboard, harness) {
   return [...dashboardLogs, ...browserLogs].slice(-lineCount);
 }
 
-function dashboardLaunchArgs(port, extraArgs = []) {
-  return ['--web', String(port), '--no-tui', ...extraArgs];
+function dashboardLaunchArgs(port, extraArgs = [], protocol = 'http:') {
+  const args = ['--web', String(port), '--no-tui'];
+  if (protocol === 'http:' && !dashboardArgsSelectTlsMode(extraArgs)) {
+    args.push('--no-tls');
+  }
+  args.push(...extraArgs);
+  return args;
 }
 
 function dashboardReadyUrl(opts) {
@@ -598,26 +610,172 @@ function dashboardReadyUrl(opts) {
   return url.toString();
 }
 
-function resolveDashboardBinary(explicit) {
+function dashboardArgsSelectTlsMode(args) {
+  return args.some((arg) => {
+    const flag = String(arg).split('=')[0];
+    return ['--no-tls', '--tls', '--mtls', '--tls-cert', '--tls-key', '--mtls-ca'].includes(flag);
+  });
+}
+
+function resolveDashboardBinary(explicit, env = process.env, cwd = process.cwd()) {
   const exeName = process.platform === 'win32' ? 'intendant.exe' : 'intendant';
   const candidates = [];
   if (explicit) {
-    candidates.push(explicit);
+    candidates.push({ path: explicit, source: '--dashboard-binary', strictFreshness: true });
   }
-  if (process.env.INTENDANT) {
-    candidates.push(process.env.INTENDANT);
+  if (env.INTENDANT) {
+    candidates.push({ path: env.INTENDANT, source: 'INTENDANT', strictFreshness: true });
   }
-  candidates.push(path.join(process.cwd(), 'target', 'release', exeName));
-  candidates.push(path.join(process.cwd(), 'target', 'debug', exeName));
-  candidates.push(...whichCandidates([exeName, 'intendant']));
+  candidates.push({
+    path: path.join(cwd, 'target', 'release', exeName),
+    source: 'target/release',
+    strictFreshness: false,
+  });
+  candidates.push({
+    path: path.join(cwd, 'target', 'debug', exeName),
+    source: 'target/debug',
+    strictFreshness: false,
+  });
+  candidates.push(...whichCandidates([exeName, 'intendant']).map((candidate) => ({
+    path: candidate,
+    source: 'PATH',
+    strictFreshness: false,
+  })));
+  const stale = [];
   for (const candidate of candidates) {
-    if (candidate && isExecutableFile(candidate)) {
-      return candidate;
+    if (!candidate.path || !isExecutableFile(candidate.path)) {
+      continue;
     }
+    const staleReason = worktreeTargetFreshnessIssue(candidate.path, cwd);
+    if (staleReason) {
+      stale.push(staleReason);
+      if (candidate.strictFreshness) {
+        throw new Error(formatStaleDashboardBinaryMessage(staleReason));
+      }
+      continue;
+    }
+    return candidate.path;
+  }
+  if (stale.length) {
+    throw new Error(formatStaleDashboardBinaryMessage(stale[0]));
   }
   throw new Error(
     'no intendant binary found for --launch-dashboard; run `cargo build --release` or pass --dashboard-binary',
   );
+}
+
+function worktreeTargetFreshnessIssue(candidate, cwd = process.cwd()) {
+  let binaryPath;
+  let targetRoot;
+  try {
+    binaryPath = fs.realpathSync(candidate);
+    targetRoot = fs.realpathSync(path.join(cwd, 'target'));
+  } catch (_) {
+    return undefined;
+  }
+  if (!pathInside(binaryPath, targetRoot)) {
+    return undefined;
+  }
+  const newestInput = newestDashboardBinaryInput(cwd);
+  if (!newestInput) {
+    return undefined;
+  }
+  const binaryStat = fs.statSync(binaryPath);
+  if (binaryStat.mtimeMs + STALE_BINARY_MTIME_SLOP_MS >= newestInput.mtimeMs) {
+    return undefined;
+  }
+  return {
+    binary: binaryPath,
+    binaryMtimeMs: binaryStat.mtimeMs,
+    input: newestInput.path,
+    inputMtimeMs: newestInput.mtimeMs,
+  };
+}
+
+function pathInside(child, parent) {
+  const relative = path.relative(parent, child);
+  return relative === '' || (relative && !relative.startsWith('..') && !path.isAbsolute(relative));
+}
+
+function newestDashboardBinaryInput(cwd) {
+  let newest;
+  const record = (filePath, stat) => {
+    if (!newest || stat.mtimeMs > newest.mtimeMs) {
+      newest = { path: filePath, mtimeMs: stat.mtimeMs };
+    }
+  };
+  for (const rel of DASHBOARD_BINARY_INPUT_FILES) {
+    const full = path.join(cwd, rel);
+    try {
+      const stat = fs.statSync(full);
+      if (stat.isFile()) {
+        record(full, stat);
+      }
+    } catch (_) {}
+  }
+  for (const rel of DASHBOARD_BINARY_INPUT_DIRS) {
+    scanNewestInput(path.join(cwd, rel), record);
+  }
+  return newest;
+}
+
+function scanNewestInput(root, record) {
+  let entries;
+  try {
+    entries = fs.readdirSync(root, { withFileTypes: true });
+  } catch (_) {
+    return;
+  }
+  for (const entry of entries) {
+    const full = path.join(root, entry.name);
+    if (entry.isDirectory()) {
+      if (entry.name !== 'target' && entry.name !== 'node_modules') {
+        scanNewestInput(full, record);
+      }
+    } else if (entry.isFile()) {
+      try {
+        record(full, fs.statSync(full));
+      } catch (_) {}
+    }
+  }
+}
+
+function formatStaleDashboardBinaryMessage(issue) {
+  return [
+    `refusing stale dashboard binary ${issue.binary}`,
+    `it is older than ${path.relative(process.cwd(), issue.input) || issue.input}`,
+    'run `cargo build --release`, set INTENDANT to the current controller binary, or pass --dashboard-binary <current-intendant>',
+  ].join('; ');
+}
+
+function assertDashboardBinarySupportsLaunchArgs(executable, args) {
+  const requiredFlags = requiredDashboardHelpFlags(args);
+  if (!requiredFlags.length) {
+    return;
+  }
+  const result = spawnSync(executable, ['--help'], {
+    encoding: 'utf8',
+    maxBuffer: 1024 * 1024,
+    timeout: 5000,
+  });
+  if (result.error) {
+    throw new Error(`could not verify dashboard binary ${executable}: ${result.error.message}`);
+  }
+  const output = `${result.stdout || ''}\n${result.stderr || ''}`;
+  const missing = requiredFlags.filter((flag) => !output.includes(flag));
+  if (missing.length) {
+    throw new Error(
+      `dashboard binary ${executable} does not advertise ${missing.join(', ')}; it is likely stale for scripts/validate-dashboard.cjs. Run \`cargo build --release\`, set INTENDANT to the current controller binary, or pass --dashboard-binary <current-intendant>`,
+    );
+  }
+}
+
+function requiredDashboardHelpFlags(args) {
+  const flags = new Set(['--web', '--no-tui']);
+  if (args.includes('--no-tls')) {
+    flags.add('--no-tls');
+  }
+  return Array.from(flags);
 }
 
 async function assertDashboardPortAvailable(port, targetUrl) {
@@ -2743,9 +2901,44 @@ async function runSelfTest() {
     '--web',
     '8893',
     '--no-tui',
+    '--no-tls',
     '--no-presence',
   ]);
+  assert.deepStrictEqual(dashboardLaunchArgs(8893, [], 'https:'), [
+    '--web',
+    '8893',
+    '--no-tui',
+  ]);
+  assert.deepStrictEqual(dashboardLaunchArgs(8893, ['--tls'], 'http:'), [
+    '--web',
+    '8893',
+    '--no-tui',
+    '--tls',
+  ]);
   assert.strictEqual(dashboardReadyUrl(launchParsed), 'http://localhost:8893/');
+  assert.deepStrictEqual(requiredDashboardHelpFlags(dashboardLaunchArgs(8893)), [
+    '--web',
+    '--no-tui',
+    '--no-tls',
+  ]);
+  assert.throws(
+    () => assertDashboardBinarySupportsLaunchArgs(process.execPath, dashboardLaunchArgs(8893)),
+    /does not advertise .*--no-tls/,
+  );
+  await withTempDashboardBinaryTree(async ({ root, binary, touch }) => {
+    touch('Cargo.toml', 1000);
+    touch(path.join('src', 'main.rs'), 3000);
+    touch(path.join('target', 'release', process.platform === 'win32' ? 'intendant.exe' : 'intendant'), 1500);
+    assert.throws(
+      () => resolveDashboardBinary(undefined, {}, root),
+      /refusing stale dashboard binary.*cargo build --release/,
+    );
+    touch(path.join('target', 'release', process.platform === 'win32' ? 'intendant.exe' : 'intendant'), 5000);
+    assert.strictEqual(resolveDashboardBinary(undefined, {}, root), binary);
+    if (process.platform !== 'win32') {
+      assertDashboardBinarySupportsLaunchArgs(binary, dashboardLaunchArgs(8893));
+    }
+  });
   assert.throws(
     () => parseArgs(['--launch-dashboard', '--port', String(PROTECTED_DASHBOARD_PORT)], {}),
     /refuses protected port/,
@@ -3042,6 +3235,38 @@ async function withLoopbackServer(callback) {
   } finally {
     await new Promise((resolve) => server.close(resolve));
   }
+}
+
+async function withTempDashboardBinaryTree(callback) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'validate-dashboard-binary-'));
+  const exeName = process.platform === 'win32' ? 'intendant.exe' : 'intendant';
+  const binary = path.join(root, 'target', 'release', exeName);
+  const touch = (rel, seconds) => {
+    const full = path.join(root, rel);
+    fs.mkdirSync(path.dirname(full), { recursive: true });
+    if (!fs.existsSync(full)) {
+      fs.writeFileSync(full, rel === path.join('target', 'release', exeName)
+        ? dashboardSelfTestBinarySource()
+        : 'self-test\n');
+    }
+    if (rel === path.join('target', 'release', exeName) && process.platform !== 'win32') {
+      fs.chmodSync(full, 0o755);
+    }
+    const date = new Date(seconds * 1000);
+    fs.utimesSync(full, date, date);
+  };
+  try {
+    await callback({ root, binary, touch });
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+}
+
+function dashboardSelfTestBinarySource() {
+  if (process.platform === 'win32') {
+    return '@echo off\r\necho --web --no-tui --no-tls\r\n';
+  }
+  return '#!/bin/sh\necho "--web --no-tui --no-tls"\n';
 }
 
 if (require.main === module) {
