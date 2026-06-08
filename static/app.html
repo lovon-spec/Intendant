@@ -14579,10 +14579,13 @@ function stationRenderManagedActionResult(parent) {
   });
 }
 
-function stationSetValueIfEmpty(id, value) {
+function stationSetManagedDraftValueIfEmpty(key, id, value) {
   const el = document.getElementById(id);
-  if (!el || el.value.trim()) return;
-  el.value = value || '';
+  const current = el ? String(el.value || '').trim() : String(stationManagedDraft[key] || '').trim();
+  if (current) return;
+  const next = value || '';
+  stationRememberManagedDraftValue(key, next);
+  if (el) el.value = next;
 }
 
 function stationSeedManagedDraftFromContext() {
@@ -14598,14 +14601,15 @@ function stationSeedManagedDraftFromContext() {
       ? `Largest items: ${context.topItems.map(item => [item.label, item.value, item.detail].filter(Boolean).join(' ')).join('; ')}.`
       : '',
   ].filter(Boolean);
-  stationSetValueIfEmpty('station-managed-reason', managed.rewindOnly ? 'Context is in rewind-only pressure.' : 'Crystallize current Station context before continuing.');
-  stationSetValueIfEmpty('station-managed-primer', lines.join('\n'));
-  stationSetValueIfEmpty('station-managed-preserve', [
+  stationSetManagedDraftValueIfEmpty('reason', 'station-managed-reason', managed.rewindOnly ? 'Context is in rewind-only pressure.' : 'Crystallize current Station context before continuing.');
+  stationSetManagedDraftValueIfEmpty('primer', 'station-managed-primer', lines.join('\n'));
+  stationSetManagedDraftValueIfEmpty('preserve', 'station-managed-preserve', [
     `Current Station context source: ${context.source || 'unknown'}`,
     `Managed mode/status: ${managed.mode || 'unknown'} / ${managed.status || 'unknown'}`,
   ].join('\n'));
-  stationSetValueIfEmpty('station-managed-next-steps', 'Continue from the preserved Station context summary.');
+  stationSetManagedDraftValueIfEmpty('nextSteps', 'station-managed-next-steps', 'Continue from the preserved Station context summary.');
   stationCopyManagedFormToLegacy();
+  stationScheduleUpdate();
   showControlToast?.('success', 'Station managed-context draft seeded from current context');
 }
 
@@ -20131,12 +20135,18 @@ function stationHandleManagedAction(action) {
   const op = String(action.action || '').trim();
   const id = String(action.id || '').trim();
   const sessionId = String(action.session_id || '').trim();
-  const idOptionalOps = new Set(['rewind', 'backout', 'refresh', 'use-target', 'copy-status', 'clear-activity-signal']);
+  const idOptionalOps = new Set(['rewind', 'backout', 'refresh', 'use-target', 'copy-status', 'seed-context', 'clear-activity-signal']);
   if (!id && !idOptionalOps.has(op)) return;
   if (sessionId) stationSetManagedSession(sessionId);
   if (op === 'clear-activity-signal') {
     stationManagedActivitySignal = null;
     stationRenderedSelectPanel('system:managed', 'Managed activity signal cleared');
+    return;
+  }
+  if (op === 'seed-context') {
+    stationSeedManagedDraftFromContext();
+    if (stationRenderedSelectPanel('system:managed', 'Managed rewind draft seeded from rendered Station')) return;
+    stationRenderManagedDock('rewind');
     return;
   }
   if (op === 'anchor-inspect') {
@@ -20801,9 +20811,12 @@ function stationBuildManagedSummary(contextSummary) {
   summary.actionState = {
     anchor: ready.anchor || '',
     record: ready.record || '',
+    position: stationManagedDraftValue('position', 'managed-context-position', 'after') || 'after',
     backoutMode: stationManagedDraftValue('backoutMode', 'managed-context-backout-mode', 'inspect') || 'inspect',
     readiness: ready.base || ready.rewindTitle || ready.backoutTitle || 'ready',
     result: stationManagedResultText(),
+    hasReason: !!ready.reason,
+    hasPrimer: !!ready.primer,
     canInspect: !!ready.canInspect,
     canRewind: !!ready.canRewind,
     canBackout: !!ready.canBackout,

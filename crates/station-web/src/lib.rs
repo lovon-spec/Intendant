@@ -4910,7 +4910,7 @@ impl StationInner {
         managed: &StationManagedSummary,
     ) -> f32 {
         let action = &managed.action_state;
-        let card_h = 108.0;
+        let card_h = 130.0;
         self.round_rect(
             x + 12.0,
             y - 10.0,
@@ -4956,16 +4956,45 @@ impl StationInner {
             C_SUBTEXT0_CSS,
             "normal",
         );
+        let draft_state = format!(
+            "{} / reason {} / primer {}",
+            nonempty(&action.position, "after"),
+            if action.has_reason { "ready" } else { "missing" },
+            if action.has_primer { "ready" } else { "missing" }
+        );
+        self.text(
+            &truncate(&draft_state, 37),
+            x + 20.0,
+            y + 65.0,
+            8.0,
+            if action.has_reason && action.has_primer {
+                C_GREEN_CSS
+            } else {
+                C_YELLOW_CSS
+            },
+            "normal",
+        );
         self.text(
             &truncate(&nonempty(&action.result, "No action result yet"), 37),
             x + 20.0,
-            y + 65.0,
+            y + 80.0,
             8.0,
             C_OVERLAY1_CSS,
             "normal",
         );
 
         let mut buttons: Vec<(&str, f32, &str, HitAction, bool)> = Vec::new();
+        buttons.push((
+            "seed",
+            46.0,
+            C_GREEN_CSS,
+            HitAction::ManagedAction {
+                action: "seed-context".to_string(),
+                id: String::new(),
+                session_id: managed.session_id.clone(),
+            },
+            !managed.session_id.is_empty(),
+        ));
         buttons.push((
             "inspect",
             58.0,
@@ -5014,15 +5043,21 @@ impl StationInner {
             },
             true,
         ));
-        let mut bx = x + panel_w - 12.0 - 58.0;
-        for (label, button_w, color, hit, enabled) in buttons.into_iter().rev() {
+        let button_gap = 6.0;
+        let total_w = buttons.iter().map(|(_, w, _, _, _)| *w).sum::<f32>()
+            + buttons.len().saturating_sub(1) as f32 * button_gap;
+        let mut bx = (x + panel_w - total_w - 20.0).max(x + 20.0);
+        for (label, button_w, color, hit, enabled) in buttons {
             let draw_color = if enabled { color } else { C_OVERLAY1_CSS };
-            self.pill_at(bx, y + 76.0, button_w, 19.0, label, draw_color);
+            if bx + button_w > x + panel_w - 18.0 {
+                break;
+            }
+            self.pill_at(bx, y + 98.0, button_w, 19.0, label, draw_color);
             if enabled {
                 self.hit_zones
-                    .push(HitZone::new(bx, y + 76.0, button_w, 19.0, hit));
+                    .push(HitZone::new(bx, y + 98.0, button_w, 19.0, hit));
             }
-            bx -= button_w + 6.0;
+            bx += button_w + button_gap;
         }
         y + card_h + 4.0
     }
@@ -8390,9 +8425,12 @@ impl Default for StationManagedSummary {
 struct StationManagedActionState {
     anchor: String,
     record: String,
+    position: String,
     backout_mode: String,
     readiness: String,
     result: String,
+    has_reason: bool,
+    has_primer: bool,
     can_inspect: bool,
     can_rewind: bool,
     can_backout: bool,
