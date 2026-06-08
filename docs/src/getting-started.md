@@ -210,7 +210,7 @@ want the classic in-terminal TUI, run `intendant --no-web "task"`.
 ./target/release/intendant --web
 ./target/release/intendant --web 9000
 
-# Serve the dashboard over HTTPS/WSS (auto self-signed cert)
+# Serve the dashboard over HTTPS/WSS (installed LAN certs when present)
 ./target/release/intendant --tls
 
 # Classic terminal TUI (dashboard off)
@@ -250,9 +250,11 @@ value is missing.
 | `--no-presence` | — | Disable the presence layer (talk to the worker agent directly) |
 | `--web` | `[port]` | Start the web dashboard. **On by default**; optional numeric port (default 8765) |
 | `--no-web` | — | Disable the web dashboard; use the terminal TUI when interactive |
-| `--tls` | — | Serve the dashboard over HTTPS/WSS with an auto self-signed cert |
-| `--tls-cert` | `<path>` | PEM cert (chain) overriding the self-signed cert; implies `--tls` (pair with `--tls-key`) |
+| `--tls` | — | Serve the dashboard over HTTPS/WSS; uses installed LAN certs when present, otherwise falls back to an auto self-signed cert |
+| `--tls-cert` | `<path>` | PEM cert (chain) overriding the default cert selection; implies `--tls` (pair with `--tls-key`) |
 | `--tls-key` | `<path>` | PEM private key matching `--tls-cert`; implies `--tls` |
+| `--mtls` | — | Require browser/client certificates signed by the Intendant LAN CA; implies `--tls` |
+| `--mtls-ca` | `<path>` | PEM CA bundle for `--mtls` client certificate verification |
 | `--transcription` | — | Enable server-side speech transcription (overrides `[transcription] enabled`) |
 | `--record-display` | `<id>` | Record an existing X11 display, e.g. `50` for `:50` (repeatable) |
 | `--agent` | `<backend>` | Use an external coding-agent backend: `codex` or `claude-code` |
@@ -278,12 +280,26 @@ Two independent ways to reach the dashboard from other devices on your network:
 ```
 
 With `--tls` (or `[server.tls] enabled = true` in `intendant.toml`) the gateway
-serves HTTPS/WSS directly. With no cert override it mints a self-signed
-certificate at startup (SAN = bind IP + `localhost`, plus an optional
-configured hostname). The TLS stack is pure Rust (`rustls` + `rcgen`) — no
-OpenSSL, no nginx — and works on Windows too. See
+serves HTTPS/WSS directly. With no explicit cert override it first uses the
+installed Intendant LAN server certificate (`server.crt` / `server.key`) when
+present, then falls back to minting a self-signed certificate at startup (SAN =
+bind IP + `localhost`, plus an optional configured hostname). The TLS stack is
+pure Rust (`rustls` + `rcgen`) — no OpenSSL, no nginx — and works on Windows
+too. See
 [Configuration](./configuration.md) for `[server.tls]` and `--tls-cert` /
 `--tls-key`.
+
+For stricter LAN access control, require client certificates:
+
+```bash
+./target/release/intendant --mtls
+```
+
+`--mtls` implies `--tls` and verifies browser/client certificates against the
+installed Intendant LAN CA (`ca.crt`) unless `--mtls-ca` or `[server.mtls] ca`
+overrides it. This is native mTLS on the dashboard port; unlike plain `--tls`,
+clients without the installed client identity cannot complete the TLS
+handshake.
 
 ### 2. mTLS reverse proxy (`intendant lan setup`)
 

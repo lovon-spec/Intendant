@@ -9320,14 +9320,20 @@ struct CliFlags {
     web_port: u16,
     /// --tls: Serve the `--web` dashboard over HTTPS/WSS. Off by default
     /// (plain HTTP). ORs with `[server.tls] enabled` in intendant.toml.
-    /// With no cert/key override, a self-signed cert is minted at startup
-    /// (SAN = bind IP + localhost, optional config hostname).
+    /// With no cert/key override, installed LAN certs are preferred when
+    /// present, otherwise a self-signed cert is minted at startup.
     tls: bool,
-    /// --tls-cert <PATH>: PEM cert (chain) overriding the auto self-signed
-    /// cert. Must be paired with `--tls-key`. Implies `--tls`.
+    /// --tls-cert <PATH>: PEM cert (chain) overriding default cert selection.
+    /// Must be paired with `--tls-key`. Implies `--tls`.
     tls_cert: Option<String>,
     /// --tls-key <PATH>: PEM private key matching `--tls-cert`.
     tls_key: Option<String>,
+    /// --mtls: Require a browser/client certificate signed by the configured
+    /// client CA. Implies `--tls`.
+    mtls: bool,
+    /// --mtls-ca <PATH>: PEM CA bundle used to verify client certs.
+    /// Defaults to the installed LAN CA when present.
+    mtls_ca: Option<String>,
     /// --transcription: Enable user speech transcription.
     transcription: bool,
     /// --record-display <ID>: Record an existing X11 display (repeatable).
@@ -9370,11 +9376,13 @@ fn print_help() {
     println!("    --direct              Force single-agent mode (skip orchestrator/sub-agent delegation)");
     println!("    --no-presence         Disable the presence layer (direct agent interaction)");
     println!("    --web [PORT]          Web dashboard (default: on, port 8765; idle starts daemon/no TUI)");
-    println!(
-        "    --tls                 Serve the web dashboard over HTTPS/WSS (auto self-signed cert)"
-    );
-    println!("    --tls-cert <PATH>     PEM cert overriding the self-signed cert (with --tls-key; implies --tls)");
+    println!("    --tls                 Serve the web dashboard over HTTPS/WSS (uses installed LAN certs when present)");
+    println!("    --tls-cert <PATH>     PEM cert overriding default cert selection (with --tls-key; implies --tls)");
     println!("    --tls-key <PATH>      PEM private key matching --tls-cert");
+    println!(
+        "    --mtls                Require client certificates signed by the Intendant LAN CA (implies --tls)"
+    );
+    println!("    --mtls-ca <PATH>      PEM CA bundle for --mtls client certificate verification");
     println!("    --no-web              Disable web dashboard; use terminal TUI when interactive");
     println!("    --transcription       Enable user speech transcription");
     println!(
@@ -9522,12 +9530,14 @@ async fn bind_dual_stack_or_v4(port: u16) -> std::io::Result<tokio::net::TcpList
 
 /// Build the optional TLS acceptor for the `--web` dashboard.
 ///
-/// TLS is enabled when either the CLI `--tls` flag is set or
-/// `[server.tls] enabled = true` is in intendant.toml. When enabled, the
-/// cert source is resolved in priority order:
+/// TLS is enabled when the CLI `--tls` / `--mtls` flag is set, or
+/// `[server.tls] enabled = true` / `[server.mtls] enabled = true` is in
+/// intendant.toml. When enabled, the cert source is resolved in priority order:
 ///   1. Explicit PEM files — CLI `--tls-cert`/`--tls-key` first, else
 ///      `[server.tls] cert`/`key`. Both halves of a pair must be present.
-///   2. Otherwise a self-signed cert minted by `rcgen`, with the listener
+///   2. Installed LAN certs (`server.crt` / `server.key`) from the platform's
+///      `intendant lan` cert directory.
+///   3. Otherwise a self-signed cert minted by `rcgen`, with the listener
 ///      bind IP plus `localhost` (and optional `[server.tls] hostname`) in
 ///      the SAN list.
 ///
@@ -9538,9 +9548,11 @@ async fn bind_dual_stack_or_v4(port: u16) -> std::io::Result<tokio::net::TcpList
 fn build_web_tls_acceptor(
     flags: &CliFlags,
     server_cfg: &project::ServerTlsConfig,
+    mtls_cfg: &project::ServerMutualTlsConfig,
     bind_addr: Option<std::net::SocketAddr>,
 ) -> Result<Option<tokio_rustls::TlsAcceptor>, CallerError> {
-    let enabled = flags.tls || server_cfg.enabled;
+    let mtls_enabled = flags.mtls || mtls_cfg.enabled;
+    let enabled = flags.tls || server_cfg.enabled || mtls_enabled;
     if !enabled {
         return Ok(None);
     }
@@ -9562,15 +9574,114 @@ fn build_web_tls_acceptor(
                     .to_string(),
             ));
         }
-        (None, None) => web_tls::TlsCertSource::SelfSigned {
-            bind_ip: bind_addr.map(|a| a.ip()),
-            hostname: server_cfg.hostname.clone(),
+        (None, None) => match installed_lan_tls_cert_source()? {
+            Some(source) => source,
+            None => web_tls::TlsCertSource::SelfSigned {
+                bind_ip: bind_addr.map(|a| a.ip()),
+                hostname: server_cfg.hostname.clone(),
+            },
         },
     };
 
-    let acceptor = web_tls::build_acceptor(&source)
+    let client_auth = if mtls_enabled {
+        let ca_path = flags
+            .mtls_ca
+            .clone()
+            .or_else(|| mtls_cfg.ca.clone())
+            .map(PathBuf::from)
+            .or_else(installed_lan_mtls_ca_path);
+        let Some(ca_path) = ca_path else {
+            return Err(CallerError::Config(
+                "mTLS requested, but no client CA was configured and no installed LAN CA \
+                 was found. Run `intendant lan setup` or pass --mtls-ca <ca.crt>."
+                    .to_string(),
+            ));
+        };
+        web_tls::ClientAuth::RequireCa { ca_path }
+    } else {
+        web_tls::ClientAuth::None
+    };
+
+    match &source {
+        web_tls::TlsCertSource::Files {
+            cert_path,
+            key_path,
+        } => {
+            eprintln!(
+                "[web_gateway] TLS certificate source: {} / {}",
+                cert_path.display(),
+                key_path.display()
+            );
+        }
+        web_tls::TlsCertSource::SelfSigned { .. } => {
+            eprintln!("[web_gateway] TLS certificate source: ephemeral self-signed certificate");
+        }
+    }
+    if let web_tls::ClientAuth::RequireCa { ca_path } = &client_auth {
+        eprintln!("[web_gateway] mTLS client CA: {}", ca_path.display());
+    }
+
+    let acceptor = web_tls::build_acceptor_with_client_auth(&source, &client_auth)
         .map_err(|e| CallerError::Config(format!("TLS setup failed: {e}")))?;
     Ok(Some(acceptor))
+}
+
+fn installed_lan_cert_dir() -> PathBuf {
+    lan::backend::select_backend().cert_dir()
+}
+
+fn installed_lan_tls_cert_source() -> Result<Option<web_tls::TlsCertSource>, CallerError> {
+    let cert_dir = installed_lan_cert_dir();
+    installed_lan_tls_cert_source_from_dir(&cert_dir)
+}
+
+fn installed_lan_tls_cert_source_from_dir(
+    cert_dir: &Path,
+) -> Result<Option<web_tls::TlsCertSource>, CallerError> {
+    let cert_path = cert_dir.join("server.crt");
+    let key_path = cert_dir.join("server.key");
+    let cert_exists = cert_path.exists();
+    let key_exists = key_path.exists();
+    match (cert_exists, key_exists) {
+        (true, true) => Ok(Some(web_tls::TlsCertSource::Files {
+            cert_path,
+            key_path,
+        })),
+        (false, false) => Ok(None),
+        _ => Err(CallerError::Config(format!(
+            "Installed LAN TLS certs are incomplete in {} (expected both server.crt and \
+             server.key). Run `intendant lan setup --force` or pass --tls-cert/--tls-key.",
+            cert_dir.display()
+        ))),
+    }
+}
+
+fn installed_lan_mtls_ca_path() -> Option<PathBuf> {
+    installed_lan_mtls_ca_path_from_dir(&installed_lan_cert_dir())
+}
+
+fn installed_lan_mtls_ca_path_from_dir(cert_dir: &Path) -> Option<PathBuf> {
+    let ca_path = cert_dir.join("ca.crt");
+    ca_path.exists().then_some(ca_path)
+}
+
+fn web_tui_display_url(
+    web_tls_acceptor: &Option<tokio_rustls::TlsAcceptor>,
+    web_port: u16,
+) -> String {
+    let scheme = if web_tls_acceptor.is_some() {
+        "https"
+    } else {
+        "http"
+    };
+    format!("{scheme}://0.0.0.0:{web_port}")
+}
+
+fn web_tui_log_line(web_tls_acceptor: &Option<tokio_rustls::TlsAcceptor>, web_port: u16) -> String {
+    format!(
+        "Web TUI: {}",
+        web_tui_display_url(web_tls_acceptor, web_port)
+    )
 }
 
 fn parse_cli_flags() -> Result<CliFlags, CallerError> {
@@ -9596,6 +9707,8 @@ fn parse_cli_flags() -> Result<CliFlags, CallerError> {
         tls: false,
         tls_cert: None,
         tls_key: None,
+        mtls: false,
+        mtls_ca: None,
         transcription: false,
         record_displays: Vec::new(),
 
@@ -9717,8 +9830,8 @@ fn parse_cli_flags() -> Result<CliFlags, CallerError> {
                 }
             }
             "--tls" => {
-                // Serve the dashboard over HTTPS/WSS. Auto self-signed
-                // cert unless --tls-cert/--tls-key are also given.
+                // Serve the dashboard over HTTPS/WSS. Installed LAN certs
+                // are preferred unless --tls-cert/--tls-key override them.
                 flags.tls = true;
                 i += 1;
             }
@@ -9741,6 +9854,23 @@ fn parse_cli_flags() -> Result<CliFlags, CallerError> {
                 } else {
                     return Err(CallerError::Config(
                         "Missing value for --tls-key".to_string(),
+                    ));
+                }
+            }
+            "--mtls" => {
+                flags.mtls = true;
+                flags.tls = true; // mTLS necessarily implies TLS.
+                i += 1;
+            }
+            "--mtls-ca" => {
+                if i + 1 < args.len() {
+                    flags.mtls_ca = Some(args[i + 1].clone());
+                    flags.mtls = true;
+                    flags.tls = true;
+                    i += 2;
+                } else {
+                    return Err(CallerError::Config(
+                        "Missing value for --mtls-ca".to_string(),
                     ));
                 }
             }
@@ -14686,6 +14816,8 @@ Also: {"source": "bare"}"#;
             tls: false,
             tls_cert: None,
             tls_key: None,
+            mtls: false,
+            mtls_ca: None,
             transcription: false,
             record_displays: Vec::new(),
             agent_backend: None,
@@ -14734,6 +14866,8 @@ Also: {"source": "bare"}"#;
             tls: false,
             tls_cert: None,
             tls_key: None,
+            mtls: false,
+            mtls_ca: None,
             transcription: false,
             record_displays: Vec::new(),
 
@@ -14782,6 +14916,8 @@ Also: {"source": "bare"}"#;
             tls: false,
             tls_cert: None,
             tls_key: None,
+            mtls: false,
+            mtls_ca: None,
             transcription: false,
             record_displays: Vec::new(),
 
@@ -14818,6 +14954,8 @@ Also: {"source": "bare"}"#;
             tls: false,
             tls_cert: None,
             tls_key: None,
+            mtls: false,
+            mtls_ca: None,
             transcription: false,
             record_displays: Vec::new(),
 
@@ -14829,6 +14967,59 @@ Also: {"source": "bare"}"#;
         };
         assert!(flags.web);
         assert_eq!(flags.web_port, 9000);
+    }
+
+    #[test]
+    fn installed_lan_tls_source_uses_complete_server_pair() {
+        let dir = tempfile::tempdir().unwrap();
+        let cert_path = dir.path().join("server.crt");
+        let key_path = dir.path().join("server.key");
+        std::fs::write(&cert_path, b"cert").unwrap();
+        std::fs::write(&key_path, b"key").unwrap();
+
+        let source = installed_lan_tls_cert_source_from_dir(dir.path())
+            .unwrap()
+            .expect("LAN cert pair should be discovered");
+        match source {
+            web_tls::TlsCertSource::Files {
+                cert_path: c,
+                key_path: k,
+            } => {
+                assert_eq!(c, cert_path);
+                assert_eq!(k, key_path);
+            }
+            other => panic!("expected file source, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn installed_lan_tls_source_ignores_absent_pair() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(installed_lan_tls_cert_source_from_dir(dir.path())
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn installed_lan_tls_source_errors_on_partial_pair() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("server.crt"), b"cert").unwrap();
+        let err = installed_lan_tls_cert_source_from_dir(dir.path()).unwrap_err();
+        assert!(
+            err.to_string().contains("incomplete"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn installed_lan_mtls_ca_uses_ca_crt_when_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let ca_path = dir.path().join("ca.crt");
+        std::fs::write(&ca_path, b"ca").unwrap();
+        assert_eq!(
+            installed_lan_mtls_ca_path_from_dir(dir.path()).as_deref(),
+            Some(ca_path.as_path())
+        );
     }
 
     #[test]
@@ -24086,14 +24277,25 @@ async fn main() -> Result<(), CallerError> {
     // feeds the self-signed cert's SAN list.
     let web_tls_acceptor = if use_web {
         let bind_addr = web_listener.as_ref().and_then(|l| l.local_addr().ok());
-        build_web_tls_acceptor(&flags, &project.config.server.tls, bind_addr)?
+        build_web_tls_acceptor(
+            &flags,
+            &project.config.server.tls,
+            &project.config.server.mtls,
+            bind_addr,
+        )?
     } else {
         None
     };
     if web_tls_acceptor.is_some() {
+        let mtls_enabled = flags.mtls || project.config.server.mtls.enabled;
         eprintln!(
             "[web_gateway] TLS enabled — dashboard is HTTPS/WSS-only on port {web_port} \
-             (cleartext HTTP/WS connections are refused)"
+             (cleartext HTTP/WS connections are refused){}",
+            if mtls_enabled {
+                "; mTLS client certificates are required"
+            } else {
+                ""
+            }
         );
     }
 
@@ -24322,7 +24524,7 @@ async fn main() -> Result<(), CallerError> {
             )?,
             web_tls_acceptor.clone(),
         );
-        eprintln!("Web TUI: http://0.0.0.0:{}", web_port);
+        eprintln!("{}", web_tui_log_line(&web_tls_acceptor, web_port));
 
         let shared_codex_config: control_plane::SharedCodexConfig = {
             let cfg = &project.config.agent.codex;
@@ -24556,9 +24758,9 @@ async fn main() -> Result<(), CallerError> {
                 web_tls_acceptor.clone(),
             );
             slog(&session_log, |l| {
-                l.info(&format!("Web TUI: http://0.0.0.0:{}", web_port))
+                l.info(&web_tui_log_line(&web_tls_acceptor, web_port))
             });
-            eprintln!("Web TUI: http://0.0.0.0:{}", web_port);
+            eprintln!("{}", web_tui_log_line(&web_tls_acceptor, web_port));
             Some(handle)
         } else {
             None
@@ -25165,7 +25367,7 @@ async fn main() -> Result<(), CallerError> {
             );
             app.log(
                 types::LogLevel::Info,
-                format!("Web TUI: http://0.0.0.0:{}", web_port),
+                web_tui_log_line(&web_tls_acceptor, web_port),
             );
             Some(handle)
         } else {
@@ -25477,7 +25679,7 @@ async fn main() -> Result<(), CallerError> {
                 app.set_control_socket(tx.clone());
                 tx
             });
-            eprintln!("Web TUI: http://0.0.0.0:{}", web_port);
+            eprintln!("{}", web_tui_log_line(&web_tls_acceptor, web_port));
             let mut web_tui = tui::web::WebTui::new(120, 40, broadcast_tx)
                 .map_err(|e| CallerError::Tui(format!("Failed to initialize Web TUI: {}", e)))?;
             let cmd_rx = web_tui_rx.expect("web_tui_rx must exist in web mode");
@@ -25680,7 +25882,7 @@ async fn main() -> Result<(), CallerError> {
                 )?,
                 web_tls_acceptor.clone(),
             );
-            eprintln!("Web TUI: http://0.0.0.0:{}", web_port);
+            eprintln!("{}", web_tui_log_line(&web_tls_acceptor, web_port));
             Some(shared_session)
         } else {
             None

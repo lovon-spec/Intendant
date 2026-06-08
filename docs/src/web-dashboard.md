@@ -317,20 +317,24 @@ and written to the session log. See
 ### HTTPS / TLS
 
 ```bash
-./target/release/intendant --tls                 # auto self-signed cert
+./target/release/intendant --tls                 # installed LAN certs when present; else self-signed
+./target/release/intendant --mtls                # require client certificates
 ./target/release/intendant --tls-cert c.pem --tls-key k.pem   # bring your own
 ```
 
 `--tls` (or `[server.tls] enabled = true`) makes the gateway serve HTTPS/WSS
-directly. The gateway demuxes per connection: a first byte of `0x16` (a TLS
-ClientHello) is wrapped in the rustls acceptor, while raw WebRTC ICE-TCP/UDP
-media is left untouched. The TLS stack is pure Rust (`rustls` + `rcgen`) and
-works on every platform including Windows — no nginx, no OpenSSL. See the
+directly. With no explicit cert/key override, Intendant uses installed LAN
+server certs when present and falls back to an auto self-signed certificate.
+The gateway demuxes per connection: a first byte of `0x16` (a TLS ClientHello)
+is wrapped in the rustls acceptor, while raw WebRTC ICE-TCP/UDP media is left
+untouched. The TLS stack is pure Rust (`rustls` + `rcgen`) and works on every
+platform including Windows — no nginx, no OpenSSL. See the
 `[server.tls]` keys under
 [Configuration → `[server]`](./configuration.md#server-daemon-and-federation).
 
 For mutual-TLS with client certificates (only enrolled devices can connect), use
-`intendant lan setup` — see
+native `--mtls` / `[server.mtls]`, or use the `intendant lan setup` reverse
+proxy path — see
 [Getting Started → LAN access](./getting-started.md#lan-access) and
 [Peer Federation](./peer-federation.md). For the daemon posture and remote
 control surface, see [Control Plane & Daemon](./control-plane-and-daemon.md).

@@ -19,7 +19,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use rustls::ServerConfig;
+use rustls::{RootCertStore, ServerConfig};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio_rustls::TlsAcceptor;
 
@@ -137,13 +137,29 @@ pub enum TlsCertSource {
     },
 }
 
+/// Client certificate policy for the dashboard TLS acceptor.
+#[derive(Debug, Clone)]
+pub enum ClientAuth {
+    /// Do not request or require a browser/client certificate.
+    None,
+    /// Require a client certificate chaining to the supplied CA bundle.
+    RequireCa { ca_path: std::path::PathBuf },
+}
+
 /// Build a [`TlsAcceptor`] from the requested certificate source.
 ///
 /// The returned acceptor wraps an `Arc<ServerConfig>` configured with the
-/// `ring` provider, no client-cert verification (this is server-auth TLS
-/// for a browser dashboard, not mTLS), and ALPN advertising `http/1.1`
-/// (the gateway speaks HTTP/1.1 + WebSocket only — no HTTP/2).
+/// `ring` provider and ALPN advertising `http/1.1` (the gateway speaks
+/// HTTP/1.1 + WebSocket only — no HTTP/2).
 pub fn build_acceptor(source: &TlsCertSource) -> Result<TlsAcceptor, String> {
+    build_acceptor_with_client_auth(source, &ClientAuth::None)
+}
+
+/// Build a [`TlsAcceptor`] with an explicit client-certificate policy.
+pub fn build_acceptor_with_client_auth(
+    source: &TlsCertSource,
+    client_auth: &ClientAuth,
+) -> Result<TlsAcceptor, String> {
     let (cert_chain, key) = match source {
         TlsCertSource::SelfSigned { bind_ip, hostname } => {
             generate_self_signed(*bind_ip, hostname.as_deref())?
@@ -154,7 +170,7 @@ pub fn build_acceptor(source: &TlsCertSource) -> Result<TlsAcceptor, String> {
         } => load_pem_cert_and_key(cert_path, key_path)?,
     };
 
-    let config = server_config_from(cert_chain, key)?;
+    let config = server_config_from(cert_chain, key, client_auth)?;
     Ok(TlsAcceptor::from(Arc::new(config)))
 }
 
@@ -166,12 +182,28 @@ pub fn build_acceptor(source: &TlsCertSource) -> Result<TlsAcceptor, String> {
 fn server_config_from(
     cert_chain: Vec<rustls::pki_types::CertificateDer<'static>>,
     key: rustls::pki_types::PrivateKeyDer<'static>,
+    client_auth: &ClientAuth,
 ) -> Result<ServerConfig, String> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let mut config = ServerConfig::builder_with_provider(provider)
+    let builder = ServerConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
-        .map_err(|e| format!("rustls protocol version setup failed: {e}"))?
-        .with_no_client_auth()
+        .map_err(|e| format!("rustls protocol version setup failed: {e}"))?;
+    let builder = match client_auth {
+        ClientAuth::None => builder.with_no_client_auth(),
+        ClientAuth::RequireCa { ca_path } => {
+            let roots = load_ca_roots(ca_path)?;
+            let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(roots))
+                .build()
+                .map_err(|e| {
+                    format!(
+                        "rustls client certificate verifier setup failed for {}: {e}",
+                        ca_path.display()
+                    )
+                })?;
+            builder.with_client_cert_verifier(verifier)
+        }
+    };
+    let mut config = builder
         .with_single_cert(cert_chain, key)
         .map_err(|e| format!("rustls server config (cert/key) failed: {e}"))?;
     // The dashboard speaks HTTP/1.1 and upgrades to WebSocket; advertise
@@ -179,6 +211,34 @@ fn server_config_from(
     // hand-rolled HTTP/1 handler doesn't implement).
     config.alpn_protocols = vec![b"http/1.1".to_vec()];
     Ok(config)
+}
+
+fn load_ca_roots(ca_path: &std::path::Path) -> Result<RootCertStore, String> {
+    use rustls::pki_types::pem::PemObject;
+
+    let ca_bytes = std::fs::read(ca_path)
+        .map_err(|e| format!("reading mTLS client CA {}: {e}", ca_path.display()))?;
+    let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+        rustls::pki_types::CertificateDer::pem_slice_iter(&ca_bytes)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("parsing mTLS client CA {}: {e}", ca_path.display()))?;
+    if certs.is_empty() {
+        return Err(format!(
+            "no certificates found in mTLS client CA {} (expected PEM)",
+            ca_path.display()
+        ));
+    }
+
+    let mut roots = RootCertStore::empty();
+    let (accepted, ignored) = roots.add_parsable_certificates(certs);
+    if accepted == 0 {
+        return Err(format!(
+            "mTLS client CA {} did not contain a usable root certificate \
+             ({ignored} certificate(s) ignored)",
+            ca_path.display()
+        ));
+    }
+    Ok(roots)
 }
 
 /// Mint a fresh self-signed certificate + key with `rcgen`.
@@ -360,5 +420,45 @@ mod tests {
             key_path,
         };
         assert!(build_acceptor(&src).is_ok());
+    }
+
+    #[test]
+    fn acceptor_builds_with_required_lan_client_ca() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::lan::certs::ensure_certs(dir.path(), "127.0.0.1", "native-mtls-test", false)
+            .unwrap();
+
+        let src = TlsCertSource::Files {
+            cert_path: dir.path().join("server.crt"),
+            key_path: dir.path().join("server.key"),
+        };
+        let client_auth = ClientAuth::RequireCa {
+            ca_path: dir.path().join("ca.crt"),
+        };
+        assert!(build_acceptor_with_client_auth(&src, &client_auth).is_ok());
+    }
+
+    #[test]
+    fn required_client_ca_must_be_pem() {
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let cert_path = dir.path().join("cert.pem");
+        let key_path = dir.path().join("key.pem");
+        let ca_path = dir.path().join("ca.crt");
+
+        std::fs::write(&cert_path, cert.cert.pem()).unwrap();
+        std::fs::write(&key_path, cert.signing_key.serialize_pem()).unwrap();
+        std::fs::write(&ca_path, b"not a certificate").unwrap();
+
+        let src = TlsCertSource::Files {
+            cert_path,
+            key_path,
+        };
+        let client_auth = ClientAuth::RequireCa { ca_path };
+        let err = match build_acceptor_with_client_auth(&src, &client_auth) {
+            Ok(_) => panic!("invalid client CA should not build an acceptor"),
+            Err(err) => err,
+        };
+        assert!(err.contains("mTLS client CA"), "err: {err}");
     }
 }

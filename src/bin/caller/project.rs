@@ -529,6 +529,11 @@ pub struct ServerConfig {
     /// here or `--tls` is passed on the CLI.
     #[serde(default)]
     pub tls: ServerTlsConfig,
+
+    /// Native client-certificate auth for the `--web` dashboard. See
+    /// [`ServerMutualTlsConfig`].
+    #[serde(default)]
+    pub mtls: ServerMutualTlsConfig,
 }
 
 /// Native HTTPS/WSS for the `--web` dashboard, lives under `[server.tls]`
@@ -552,7 +557,7 @@ pub struct ServerConfig {
 /// ```toml
 /// [server.tls]
 /// enabled = true
-/// # optional explicit cert/key (PEM); omit for an auto self-signed cert
+/// # optional explicit cert/key (PEM); omit for installed LAN certs or self-signed fallback
 /// # cert = "/etc/intendant/server.crt"
 /// # key  = "/etc/intendant/server.key"
 /// # extra SAN hostname beyond the bind IP + localhost
@@ -566,7 +571,7 @@ pub struct ServerTlsConfig {
     pub enabled: bool,
 
     /// Optional path to a PEM-encoded certificate (chain) overriding the
-    /// auto-generated self-signed cert. Must be paired with `key`.
+    /// default cert selection. Must be paired with `key`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cert: Option<String>,
 
@@ -580,6 +585,36 @@ pub struct ServerTlsConfig {
     /// explicit `cert`/`key` pair is supplied.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hostname: Option<String>,
+}
+
+/// Native browser/client certificate verification for the `--web` dashboard,
+/// lives under `[server.mtls]` in intendant.toml.
+///
+/// This is intentionally separate from [`ServerTlsConfig`]: TLS controls
+/// encryption and browser secure-context behavior, while mTLS controls client
+/// authentication. Enabling this section implies native TLS. When `ca` is not
+/// configured, Intendant uses the installed LAN CA from the platform-specific
+/// `intendant lan` cert directory.
+///
+/// Example:
+/// ```toml
+/// [server.mtls]
+/// enabled = true
+/// # optional CA override; omit to use the installed Intendant LAN CA
+/// # ca = "/etc/intendant-lan/ca.crt"
+/// ```
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ServerMutualTlsConfig {
+    /// Require clients to present a certificate signed by the configured
+    /// client CA. The CLI `--mtls` flag ORs into this at runtime and implies
+    /// TLS.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Optional PEM CA bundle for verifying client certificates. When absent,
+    /// native mTLS uses the installed Intendant LAN CA (`ca.crt`) if present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ca: Option<String>,
 }
 
 /// Auth requirements this daemon enforces on inbound peer connections.

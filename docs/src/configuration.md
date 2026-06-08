@@ -313,9 +313,26 @@ deployments only ever touch `[server.tls]`.
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `enabled` | bool | `false` | Serve the dashboard over HTTPS/WSS |
-| `cert` | string | auto self-signed | PEM cert (chain) overriding the self-signed cert; pair with `key` |
+| `cert` | string | installed LAN certs, then auto self-signed | PEM cert (chain) overriding the default cert selection; pair with `key` |
 | `key` | string | — | PEM private key (PKCS#8, PKCS#1, or SEC1) matching `cert` |
 | `hostname` | string | — | Extra SAN hostname for the self-signed cert (in addition to bind IP + `localhost`) |
+
+When TLS is enabled and `cert`/`key` are omitted, Intendant first looks for the
+installed LAN server certificate in the platform cert directory
+(`server.crt` / `server.key`, normally created by `intendant lan setup`). If
+that pair is absent, it falls back to an ephemeral self-signed certificate.
+
+`[server.mtls]` — native client-certificate authentication for the dashboard
+(ORed with the `--mtls` flag; implies native TLS):
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `enabled` | bool | `false` | Require browser/client certificates during the TLS handshake |
+| `ca` | string | installed LAN CA | PEM CA bundle used to verify client certificates |
+
+Use `[server.mtls]` only when the dashboard port itself should require a valid
+client identity. Plain `[server.tls]` is enough for browser secure-context APIs;
+`[server.mtls]` adds access control.
 
 Use `[server.tls]`, `--tls`, `intendant lan`, the macOS app wrapper, or another
 trusted HTTPS reverse proxy when a remote browser needs secure-context-gated

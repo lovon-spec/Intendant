@@ -319,12 +319,14 @@ ClientHello, wraps the socket in a `TlsAcceptor` before handing the decrypted
 stream to the existing HTTP/WebSocket handling.
 
 ```bash
-intendant --web --tls                          # auto self-signed cert
-intendant --web --tls-cert chain.pem --tls-key key.pem   # explicit PEM (implies --tls)
+intendant --tls                                # installed LAN certs when present; else self-signed
+intendant --mtls                               # same, plus required client certs
+intendant --tls-cert chain.pem --tls-key key.pem   # explicit PEM (implies --tls)
 ```
 
 `--tls-cert` / `--tls-key` must be supplied together; supplying either implies
-`--tls`.
+`--tls`. `--mtls` implies `--tls` and verifies clients against the installed
+Intendant LAN CA unless `--mtls-ca` or `[server.mtls] ca` overrides it.
 
 Native HTTPS/WSS is also the direct way to make a remote dashboard origin a
 browser secure context when you need Station WebGPU, microphone/camera, browser
