@@ -144,7 +144,8 @@ pub struct McpAppState {
     /// below the gate, keyed by Intendant/backend session id.
     insufficient_rewind_notices: std::collections::HashMap<String, InsufficientRewindNotice>,
     /// Successful managed-context rewinds that satisfied the current density
-    /// handoff/follow-up requirement, keyed by Intendant/backend session id.
+    /// handoff/follow-up requirement until the round completes or pressure
+    /// reaches rewind-only, keyed by Intendant/backend session id.
     density_maintenance_satisfied:
         std::collections::HashMap<String, DensityMaintenanceSatisfaction>,
 }
@@ -971,7 +972,7 @@ impl McpAppState {
         let message = if rewind_only {
             "Managed context is in rewind-only mode. Use rewind_context before ordinary model-facing tools."
         } else if density_maintenance_satisfied.is_some() {
-            "Managed context is above the recommended density threshold but below the rewind-only limit. A successful managed-context rewind already satisfied the current density handoff; continue the concrete follow-up work, and only repeat density maintenance after meaningful new context growth or if pressure reaches rewind-only."
+            "Managed context is above the recommended density threshold but below the rewind-only limit. A successful managed-context rewind already satisfied the current density handoff; continue the concrete follow-up work, and only repeat density maintenance after the round completes or if pressure reaches rewind-only."
         } else if density_pressure {
             if managed_context {
                 "Managed context is above the recommended density threshold but below the rewind-only limit. Normal tools remain allowed for status/anchor inspection and one narrow in-flight validation or build to finish, but before broad follow-up work perform exact-anchor density maintenance when it materially improves density, or produce a concise no-rewind density handoff."
@@ -11939,7 +11940,7 @@ mod tests {
     }
 
     #[test]
-    fn successful_rewind_then_watch_usage_satisfies_current_density_handoff() {
+    fn successful_rewind_then_watch_usage_satisfies_current_density_handoff_across_growth() {
         let mut s = McpAppState::new(
             "none".to_string(),
             "none".to_string(),
@@ -12004,11 +12005,12 @@ mod tests {
 
         let pressure = s.context_pressure_snapshot();
         assert_eq!(pressure["status"], "watch");
-        assert_eq!(pressure["density_maintenance_recommended"], true);
-        assert_eq!(pressure["broad_followup_allowed"], false);
+        assert_eq!(pressure["density_maintenance_recommended"], false);
+        assert_eq!(pressure["broad_followup_allowed"], true);
+        assert_eq!(pressure["required_action"], "continue_after_density_rewind");
         assert_eq!(
-            pressure["density_maintenance_satisfied"],
-            serde_json::Value::Null
+            pressure.pointer("/density_maintenance_satisfied/record_id"),
+            Some(&serde_json::Value::String("rewind-density".to_string()))
         );
     }
 
