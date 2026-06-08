@@ -11053,6 +11053,7 @@ function stationLastSnapshotForFallback() {
     hosts: [],
     agents: [],
     events: [],
+    activity: { retainedCount: 0, shownCount: 0, verbosity: 'normal', visibleEvents: [] },
     context: { available: false, tokens: 0 },
     managed: { mode: 'managed', status: 'unknown' },
     changes: { count: 0, status: 'clean' },
@@ -11246,6 +11247,49 @@ function stationActivityEvents() {
   for (const event of stationLogEvents) add(event);
   for (const event of stationSessionWindowHistoryEvents()) add(event);
   return events.slice(-80);
+}
+
+function stationBuildActivitySummary(allEventsInput = null) {
+  const state = stationActivityFilteredEvents();
+  if (Array.isArray(allEventsInput)) {
+    state.allEvents = allEventsInput;
+    const hostFilter = String(stationActivityDockHost || activeHostFilter || '').trim();
+    const levelFilter = String(stationActivityDockLevel || '').trim();
+    const sourceFilter = String(stationActivityDockSource || '').trim();
+    const query = stationActivityDockFilter.trim().toLowerCase();
+    state.hostFilter = hostFilter;
+    state.levelFilter = levelFilter;
+    state.sourceFilter = sourceFilter;
+    state.query = query;
+    state.events = allEventsInput.filter(ev => {
+      if (hostFilter && String(ev.hostId || ev.host_id || '') !== hostFilter) return false;
+      if (levelFilter && stationActivityLevelFor(ev) !== levelFilter) return false;
+      if (sourceFilter && stationActivitySourceFor(ev) !== sourceFilter) return false;
+      if (!query) return true;
+      return [ev.id, ev.hostId, ev.host_id, ev.sessionId, ev.source, ev.level, ev.ts, ev.msg]
+        .join(' ')
+        .toLowerCase()
+        .includes(query);
+    });
+  }
+  const allEvents = state.allEvents || [];
+  const events = state.events || [];
+  return {
+    retainedCount: allEvents.length,
+    shownCount: events.length,
+    hostFilter: state.hostFilter || '',
+    levelFilter: state.levelFilter || '',
+    sourceFilter: state.sourceFilter || '',
+    query: state.query || '',
+    verbosity: document.getElementById('verbosity-select')?.value || 'normal',
+    visibleEvents: events.slice(-24),
+    topLevels: stationActivityTopSummary(events, stationActivityLevelFor),
+    topSources: stationActivityTopSummary(events, stationActivitySourceFor),
+    topHosts: stationActivityTopSummary(events, ev => {
+      const hostId = ev.hostId || ev.host_id || selfPeerId || 'local';
+      return stationHostLabel(hostId) || hostId;
+    }),
+  };
 }
 
 function handleStationAction(action) {
@@ -13643,6 +13687,7 @@ function stationClearActivityTriage(focusId = '') {
   stationActivityDockLevel = '';
   stationActivityDockSource = '';
   stationRenderActivityDock(focusId);
+  stationScheduleUpdate();
 }
 
 function stationApplyActivityHostFilter(hostId) {
@@ -20295,6 +20340,25 @@ function stationHandleActivityAction(action) {
   const eventForId = () => stationActivityEvents().find(row => stationActivityEventKey(row) === id);
   if (op.startsWith('verbosity:')) {
     stationSetActivityVerbosity(op.slice('verbosity:'.length));
+    stationScheduleUpdate();
+    return;
+  }
+  if (op.startsWith('level:')) {
+    stationActivityDockLevel = op.slice('level:'.length).trim();
+    stationRenderActivityDock(id);
+    stationScheduleUpdate();
+    if (typeof showControlToast === 'function') {
+      showControlToast('success', stationActivityDockLevel ? `Activity level: ${stationActivityDockLevel}` : 'Activity level filter cleared');
+    }
+    return;
+  }
+  if (op.startsWith('source:')) {
+    stationActivityDockSource = op.slice('source:'.length).trim();
+    stationRenderActivityDock(id);
+    stationScheduleUpdate();
+    if (typeof showControlToast === 'function') {
+      showControlToast('success', stationActivityDockSource ? `Activity source: ${stationActivityDockSource}` : 'Activity source filter cleared');
+    }
     return;
   }
   if (op === 'send') {
@@ -20321,6 +20385,8 @@ function stationHandleActivityAction(action) {
   }
   if (op === 'host:all') {
     stationClearActivityHostFilter();
+    stationRenderActivityDock(id);
+    stationScheduleUpdate();
     return;
   }
   if (op === 'bottom') {
@@ -21643,10 +21709,13 @@ function buildStationSnapshot() {
 
   const context = stationBuildContextSummary();
   const controls = stationBuildControlsSummary();
+  const activityEvents = stationActivityEvents();
+  const activity = stationBuildActivitySummary(activityEvents);
   return {
     hosts,
     agents,
-    events: stationActivityEvents(),
+    events: activity.visibleEvents?.length || activity.retainedCount ? activity.visibleEvents : activityEvents,
+    activity,
     context,
     managed: stationBuildManagedSummary(context),
     changes: stationBuildChangesSummary(),

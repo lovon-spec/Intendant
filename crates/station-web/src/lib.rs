@@ -2179,11 +2179,21 @@ impl StationInner {
         );
 
         let latest_event = self.snapshot.events.last();
+        let activity = &self.snapshot.activity;
+        let retained = activity_retained_count(&self.snapshot);
+        let shown = activity_shown_count(&self.snapshot);
         let activity_value = latest_event
             .map(|ev| format!("{} {}", ev.level, nonempty(&ev.ts, "--")))
-            .unwrap_or_else(|| format!("{} events", self.snapshot.events.len()));
+            .unwrap_or_else(|| format!("{shown}/{retained} events"));
         let activity_detail = latest_event
-            .map(|ev| truncate(&ev.msg, 68))
+            .map(|ev| {
+                let filter = activity_filter_label(activity);
+                if filter.is_empty() {
+                    truncate(&ev.msg, 68)
+                } else {
+                    truncate(&format!("{filter} / {}", ev.msg), 68)
+                }
+            })
             .unwrap_or_else(|| "Waiting for retained activity".to_string());
         self.signal_runway_row(
             x + 10.0,
@@ -2791,8 +2801,10 @@ impl StationInner {
             C_TEAL_CSS,
             "bold",
         );
+        let retained = activity_retained_count(&self.snapshot);
+        let shown = activity_shown_count(&self.snapshot);
         self.text(
-            &format!("{} retained", self.snapshot.events.len()),
+            &format!("{shown}/{retained} shown"),
             x + panel_w - 91.0,
             y + 20.0,
             9.0,
@@ -4146,17 +4158,31 @@ impl StationInner {
         let managed = self.snapshot.managed.clone();
         let display_source = self.display_sources.values().next();
         match id {
-            "system:activity" => Some((
-                "Activity log".to_string(),
-                C_TEAL_CSS,
-                vec![
+            "system:activity" => Some(("Activity log".to_string(), C_TEAL_CSS, {
+                let mut actions = vec![
+                    MenuAction::activity("Show errors", "level:error", C_RED_CSS),
+                    MenuAction::activity("Show warnings", "level:warn", C_YELLOW_CSS),
+                    MenuAction::activity("Show info", "level:info", C_TEAL_CSS),
+                ];
+                for source in activity_summary_labels(&self.snapshot.activity.top_sources)
+                    .into_iter()
+                    .take(2)
+                {
+                    actions.push(MenuAction::activity(
+                        &format!("Source {source}"),
+                        &format!("source:{source}"),
+                        C_BLUE_CSS,
+                    ));
+                }
+                actions.extend([
                     MenuAction::activity("Latest event", "bottom", C_TEAL_CSS),
                     MenuAction::activity("Copy visible log", "copy-visible", C_BLUE_CSS),
                     MenuAction::activity("Clear triage", "clear-triage", C_YELLOW_CSS),
                     MenuAction::activity("Clear log", "clear-log", C_RED_CSS),
                     MenuAction::select("Open activity detail", "system:activity", C_OVERLAY1_CSS),
-                ],
-            )),
+                ]);
+                actions
+            })),
             "system:context" => Some((
                 "Context window".to_string(),
                 C_BLUE_CSS,
@@ -4584,9 +4610,12 @@ impl StationInner {
 
     fn draw_activity_info(&mut self, x: f32, y: f32, panel_w: f32) {
         let events = self.snapshot.events.clone();
+        let activity = self.snapshot.activity.clone();
+        let retained = activity_retained_count(&self.snapshot);
+        let shown = activity_shown_count(&self.snapshot);
         self.text("activity", x + 12.0, y + 25.0, 10.0, C_TEAL_CSS, "bold");
         self.text(
-            &format!("{} events", events.len()),
+            &format!("{shown} shown"),
             x + 92.0,
             y + 25.0,
             13.0,
@@ -4594,7 +4623,24 @@ impl StationInner {
             "bold",
         );
         let mut yy = y + 58.0 - self.panel_scroll;
-        self.panel_row(x, yy, "retained", &events.len().to_string());
+        self.panel_row(x, yy, "retained", &retained.to_string());
+        yy += 22.0;
+        self.panel_row(x, yy, "filtered", &shown.to_string());
+        yy += 22.0;
+        let filter_label = activity_filter_label(&activity);
+        self.panel_row(
+            x,
+            yy,
+            "triage",
+            &truncate(&nonempty(&filter_label, "all activity"), 42),
+        );
+        yy += 22.0;
+        self.panel_row(
+            x,
+            yy,
+            "verbosity",
+            &truncate(&nonempty(&activity.verbosity, "normal"), 18),
+        );
         yy += 22.0;
         let latest = events.last();
         self.panel_row_color(
@@ -4611,33 +4657,109 @@ impl StationInner {
         if !events.is_empty() {
             yy += 12.0;
         }
+        if !activity.top_levels.is_empty() || !activity.top_sources.is_empty() {
+            self.section_title_color(x, yy, "Triage summary", C_YELLOW_CSS);
+            yy += 20.0;
+            self.panel_row(x, yy, "levels", &truncate(&activity.top_levels, 42));
+            yy += 20.0;
+            self.panel_row(x, yy, "sources", &truncate(&activity.top_sources, 42));
+            yy += 24.0;
+            self.panel_row(x, yy, "hosts", &truncate(&activity.top_hosts, 42));
+            yy += 28.0;
+        }
         self.section_title_color(x, yy, "Log controls", C_TEAL_CSS);
         yy += 22.0;
-        let log_actions = [
-            ("verbosity:normal", "normal", 66.0),
-            ("verbosity:verbose", "verbose", 74.0),
-            ("verbosity:debug", "debug", 58.0),
-            ("host:all", "all hosts", 76.0),
-            ("copy-visible", "copy visible", 96.0),
-            ("clear-triage", "clear triage", 96.0),
-            ("bottom", "bottom", 62.0),
-            ("clear-log", "clear log", 76.0),
+        let mut log_actions = vec![
+            (
+                "level:error".to_string(),
+                "errors".to_string(),
+                62.0,
+                C_RED_CSS,
+            ),
+            (
+                "level:warn".to_string(),
+                "warn".to_string(),
+                54.0,
+                C_YELLOW_CSS,
+            ),
+            (
+                "level:info".to_string(),
+                "info".to_string(),
+                50.0,
+                C_TEAL_CSS,
+            ),
+            (
+                "clear-triage".to_string(),
+                "clear triage".to_string(),
+                96.0,
+                C_YELLOW_CSS,
+            ),
         ];
+        for source in activity_summary_labels(&activity.top_sources)
+            .into_iter()
+            .take(2)
+        {
+            log_actions.push((
+                format!("source:{source}"),
+                truncate(&source, 12),
+                (source.len() as f32 * 6.0 + 28.0).clamp(48.0, 92.0),
+                C_BLUE_CSS,
+            ));
+        }
+        log_actions.extend([
+            (
+                "verbosity:normal".to_string(),
+                "normal".to_string(),
+                66.0,
+                C_TEAL_CSS,
+            ),
+            (
+                "verbosity:verbose".to_string(),
+                "verbose".to_string(),
+                74.0,
+                C_TEAL_CSS,
+            ),
+            (
+                "verbosity:debug".to_string(),
+                "debug".to_string(),
+                58.0,
+                C_TEAL_CSS,
+            ),
+            (
+                "host:all".to_string(),
+                "all hosts".to_string(),
+                76.0,
+                C_TEAL_CSS,
+            ),
+            (
+                "copy-visible".to_string(),
+                "copy visible".to_string(),
+                96.0,
+                C_BLUE_CSS,
+            ),
+            ("bottom".to_string(), "bottom".to_string(), 62.0, C_TEAL_CSS),
+            (
+                "clear-log".to_string(),
+                "clear log".to_string(),
+                76.0,
+                C_RED_CSS,
+            ),
+        ]);
         let mut ax = x + 14.0;
         let mut ay = yy - 14.0;
-        for (action, label, width) in log_actions {
+        for (action, label, width, color) in log_actions {
             if ax + width > x + panel_w - 14.0 {
                 ax = x + 14.0;
                 ay += 25.0;
             }
-            self.pill_at(ax, ay, width, 21.0, label, C_TEAL_CSS);
+            self.pill_at(ax, ay, width, 21.0, &label, color);
             self.hit_zones.push(HitZone::new(
                 ax,
                 ay,
                 width,
                 21.0,
                 HitAction::ActivityAction {
-                    action: action.to_string(),
+                    action,
                     id: String::new(),
                 },
             ));
@@ -9263,6 +9385,7 @@ struct StationSnapshot {
     hosts: Vec<StationHost>,
     agents: Vec<StationAgent>,
     events: Vec<StationEvent>,
+    activity: StationActivitySummary,
     context: StationContextSummary,
     managed: StationManagedSummary,
     changes: StationChangesSummary,
@@ -9270,6 +9393,21 @@ struct StationSnapshot {
     controls: StationControlsSummary,
     attention_queue: StationAttentionQueueSummary,
     display_runway: StationDisplayRunwaySummary,
+}
+
+#[derive(Clone, Deserialize, Default)]
+#[serde(default, rename_all = "camelCase")]
+struct StationActivitySummary {
+    retained_count: usize,
+    shown_count: usize,
+    host_filter: String,
+    level_filter: String,
+    source_filter: String,
+    query: String,
+    verbosity: String,
+    top_levels: String,
+    top_sources: String,
+    top_hosts: String,
 }
 
 #[derive(Clone, Deserialize)]
@@ -10686,6 +10824,63 @@ fn activity_event_is_managed(event: &StationEvent) -> bool {
     ]
     .iter()
     .any(|needle| text.contains(needle))
+}
+
+fn activity_retained_count(snapshot: &StationSnapshot) -> usize {
+    snapshot.activity.retained_count.max(snapshot.events.len())
+}
+
+fn activity_shown_count(snapshot: &StationSnapshot) -> usize {
+    if snapshot.activity.retained_count > 0 || snapshot.activity.shown_count > 0 {
+        snapshot.activity.shown_count
+    } else {
+        snapshot.events.len()
+    }
+}
+
+fn activity_filter_label(activity: &StationActivitySummary) -> String {
+    let mut parts = Vec::new();
+    if !activity.host_filter.is_empty() {
+        parts.push(format!("host {}", activity.host_filter));
+    }
+    if !activity.level_filter.is_empty() {
+        parts.push(format!("level {}", activity.level_filter));
+    }
+    if !activity.source_filter.is_empty() {
+        parts.push(format!("source {}", activity.source_filter));
+    }
+    if !activity.query.is_empty() {
+        parts.push(format!("query {}", activity.query));
+    }
+    parts.join(" / ")
+}
+
+fn activity_summary_labels(summary: &str) -> Vec<String> {
+    summary
+        .split('/')
+        .filter_map(|part| {
+            let label = part.trim();
+            if label.is_empty() || label == "--" {
+                return None;
+            }
+            let trimmed = label
+                .rsplit_once(" (")
+                .map(|(name, tail)| {
+                    if tail.ends_with(')')
+                        && tail[..tail.len().saturating_sub(1)]
+                            .chars()
+                            .all(|c| c.is_ascii_digit())
+                    {
+                        name
+                    } else {
+                        label
+                    }
+                })
+                .unwrap_or(label)
+                .trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_string())
+        })
+        .collect()
 }
 
 fn activity_count_summary<F>(events: &[StationEvent], mut label_for: F) -> String
