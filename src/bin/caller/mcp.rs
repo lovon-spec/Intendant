@@ -1668,6 +1668,20 @@ fn intervention_order_report(run_dir: &std::path::Path) -> serde_json::Value {
 }
 
 fn collect_controller_loop_status(loop_dir: &std::path::Path) -> serde_json::Value {
+    collect_controller_loop_status_inner(loop_dir, None)
+}
+
+fn collect_controller_loop_status_for_mcp_state(
+    loop_dir: &std::path::Path,
+    state: &McpAppState,
+) -> serde_json::Value {
+    collect_controller_loop_status_inner(loop_dir, Some((state, current_unix_timestamp_secs())))
+}
+
+fn collect_controller_loop_status_inner(
+    loop_dir: &std::path::Path,
+    live_state: Option<(&McpAppState, u64)>,
+) -> serde_json::Value {
     let halt = loop_dir.join("request_halt").exists();
     let halt_after_cycle = loop_dir.join("request_halt_after_cycle").exists();
     let mut stop_requested = loop_dir.join("request_stop").exists();
@@ -1719,6 +1733,9 @@ fn collect_controller_loop_status(loop_dir: &std::path::Path) -> serde_json::Val
         loop_dir,
         &process_tree_codex_pids,
     ));
+    if let Some((state, now_secs)) = live_state {
+        enrich_controller_loop_wrappers_with_mcp_state(&mut active_wrappers, state, now_secs);
+    }
 
     let latest_run_id = read_trimmed(&loop_dir.join("latest.run_id"));
     let latest_status_file = read_json_file(&loop_dir.join("latest.status.json"));
@@ -1903,6 +1920,9 @@ where
                 .and_then(project_root_from_process_cwd)
                 .map(|path| path.to_string_lossy().to_string())
                 .or_else(|| record.project_root.clone());
+            let updated_at_secs =
+                fresh_external_wrapper_updated_at_secs(std::path::Path::new(&record.log_path))
+                    .max(record.updated_at_secs);
             wrappers.push(serde_json::json!({
                 "run_id": serde_json::Value::Null,
                 "pid": serde_json::Value::Null,
@@ -1919,7 +1939,7 @@ where
                 "status": effective_status,
                 "session_meta_status": status,
                 "process_tree_active": process_tree_active,
-                "updated_at_secs": record.updated_at_secs,
+                "updated_at_secs": updated_at_secs,
             }));
         }
         if wrappers.len() >= live_codex_pids.len() {
@@ -1991,7 +2011,172 @@ fn latest_status_from_active_wrappers(wrappers: &[serde_json::Value]) -> Option<
         "process_tree_active": wrapper.get("process_tree_active").cloned().unwrap_or(serde_json::Value::Null),
         "app_server_pid": wrapper.get("app_server_pid").cloned().unwrap_or_else(|| wrapper.get("codex_pid").cloned().unwrap_or(serde_json::Value::Null)),
         "app_server_active": wrapper.get("app_server_active").cloned().unwrap_or_else(|| wrapper.get("process_tree_active").cloned().unwrap_or(serde_json::Value::Null)),
+        "phase": wrapper.get("phase").cloned().unwrap_or(serde_json::Value::Null),
+        "turn": wrapper.get("turn").cloned().unwrap_or(serde_json::Value::Null),
+        "round": wrapper.get("round").cloned().unwrap_or(serde_json::Value::Null),
+        "task": wrapper.get("task").cloned().unwrap_or(serde_json::Value::Null),
+        "updated_at_secs": wrapper.get("updated_at_secs").cloned().unwrap_or(serde_json::Value::Null),
+        "live_status_source": wrapper.get("live_status_source").cloned().unwrap_or(serde_json::Value::Null),
     }))
+}
+
+async fn collect_controller_loop_status_with_state(
+    loop_dir: &std::path::Path,
+    state: &SharedMcpState,
+) -> serde_json::Value {
+    let s = state.read().await;
+    collect_controller_loop_status_for_mcp_state(loop_dir, &s)
+}
+
+fn enrich_controller_loop_status_with_mcp_state_at(
+    status: &mut serde_json::Value,
+    state: &McpAppState,
+    now_secs: u64,
+) {
+    let current_latest = status
+        .pointer("/latest/status")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let latest = {
+        let Some(wrappers) = status
+            .pointer_mut("/active/wrappers")
+            .and_then(serde_json::Value::as_array_mut)
+        else {
+            return;
+        };
+
+        enrich_controller_loop_wrappers_with_mcp_state(wrappers, state, now_secs);
+
+        controller_loop_latest_status(current_latest, wrappers)
+    };
+    if let Some(latest_obj) = status
+        .pointer_mut("/latest")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        latest_obj.insert("status".to_string(), latest);
+    }
+}
+
+fn enrich_controller_loop_wrappers_with_mcp_state(
+    wrappers: &mut [serde_json::Value],
+    state: &McpAppState,
+    now_secs: u64,
+) {
+    for wrapper in wrappers {
+        enrich_controller_loop_wrapper_with_mcp_state(wrapper, state, now_secs);
+    }
+}
+
+fn enrich_controller_loop_wrapper_with_mcp_state(
+    wrapper: &mut serde_json::Value,
+    state: &McpAppState,
+    now_secs: u64,
+) {
+    if wrapper.get("source").and_then(|value| value.as_str()) != Some("external_wrapper_index") {
+        return;
+    }
+    let live_status = [
+        wrapper
+            .get("intendant_session_id")
+            .and_then(serde_json::Value::as_str),
+        wrapper
+            .get("backend_session_id")
+            .and_then(serde_json::Value::as_str),
+    ]
+    .into_iter()
+    .flatten()
+    .find_map(|session_id| state.session_status_for_id(session_id).cloned());
+    let Some(live_status) = live_status else {
+        return;
+    };
+
+    let phase = phase_to_str(&live_status.phase);
+    let Some(obj) = wrapper.as_object_mut() else {
+        return;
+    };
+    obj.insert(
+        "phase".to_string(),
+        serde_json::Value::String(phase.to_string()),
+    );
+    obj.insert(
+        "turn".to_string(),
+        serde_json::Value::Number(serde_json::Number::from(live_status.turn as u64)),
+    );
+    obj.insert(
+        "round".to_string(),
+        serde_json::Value::Number(serde_json::Number::from(live_status.round as u64)),
+    );
+    if !live_status.task.is_empty() {
+        obj.insert(
+            "task".to_string(),
+            serde_json::Value::String(live_status.task),
+        );
+    }
+    obj.insert(
+        "live_status_source".to_string(),
+        serde_json::Value::String("mcp_state".to_string()),
+    );
+
+    if !controller_loop_phase_is_active_turn(&live_status.phase) {
+        return;
+    }
+
+    let raw_meta_status = obj
+        .get("session_meta_status")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    obj.entry("raw_session_meta_status".to_string())
+        .or_insert(raw_meta_status);
+    let wrapper_index_updated_at_secs = obj
+        .get("updated_at_secs")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    obj.entry("wrapper_index_updated_at_secs".to_string())
+        .or_insert(wrapper_index_updated_at_secs);
+    obj.insert(
+        "status".to_string(),
+        serde_json::Value::String(phase.to_string()),
+    );
+    obj.insert(
+        "session_meta_status".to_string(),
+        serde_json::Value::String(phase.to_string()),
+    );
+    obj.insert(
+        "updated_at_secs".to_string(),
+        serde_json::Value::Number(serde_json::Number::from(now_secs)),
+    );
+}
+
+fn controller_loop_phase_is_active_turn(phase: &Phase) -> bool {
+    matches!(
+        phase,
+        Phase::Thinking
+            | Phase::RunningAgent
+            | Phase::Orchestrating
+            | Phase::WaitingApproval
+            | Phase::WaitingHuman
+            | Phase::Interrupting
+    )
+}
+
+fn fresh_external_wrapper_updated_at_secs(log_dir: &std::path::Path) -> u64 {
+    file_mtime_secs(&log_dir.join("session.jsonl")).max(file_mtime_secs(log_dir))
+}
+
+fn current_unix_timestamp_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
+}
+
+fn file_mtime_secs(path: &std::path::Path) -> u64 {
+    path.metadata()
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
 }
 
 fn controller_loop_home(loop_dir: &std::path::Path) -> Option<std::path::PathBuf> {
@@ -3292,7 +3477,7 @@ async fn handle_control_command_mcp(
             let persistent = persistent.unwrap_or(true);
             match request_loop_halt_marker(&loop_dir, persistent) {
                 Ok(()) => {
-                    let data = collect_controller_loop_status(&loop_dir);
+                    let data = collect_controller_loop_status_with_state(&loop_dir, state).await;
                     emit_control_result(
                         control_tx,
                         "request_controller_loop_halt",
@@ -3315,7 +3500,7 @@ async fn handle_control_command_mcp(
             let loop_dir = controller_loop_dir();
             match clear_loop_halt_markers(&loop_dir) {
                 Ok(()) => {
-                    let data = collect_controller_loop_status(&loop_dir);
+                    let data = collect_controller_loop_status_with_state(&loop_dir, state).await;
                     emit_control_result(
                         control_tx,
                         "clear_controller_loop_halt",
@@ -3334,7 +3519,8 @@ async fn handle_control_command_mcp(
             let loop_dir = controller_loop_dir();
             match request_loop_intervention_marker(&loop_dir, &mode) {
                 Ok(intervention) => {
-                    let mut data = collect_controller_loop_status(&loop_dir);
+                    let mut data =
+                        collect_controller_loop_status_with_state(&loop_dir, state).await;
                     add_controller_loop_intervention_report(&mut data, &intervention);
                     emit_control_result(
                         control_tx,
@@ -3352,7 +3538,7 @@ async fn handle_control_command_mcp(
         }
         ControlMsg::GetControllerLoopStatus => {
             let loop_dir = controller_loop_dir();
-            let data = collect_controller_loop_status(&loop_dir);
+            let data = collect_controller_loop_status_with_state(&loop_dir, state).await;
             emit_control_result(
                 control_tx,
                 "get_controller_loop_status",
@@ -7381,7 +7567,9 @@ impl IntendantServer {
         description = "Get normalized controller-loop health: latest run pointers, halt/intervention flags, lock owner, and active wrapper/codex PID counts."
     )]
     async fn get_controller_loop_status(&self) -> String {
-        collect_controller_loop_status(&controller_loop_dir()).to_string()
+        collect_controller_loop_status_with_state(&controller_loop_dir(), &self.state)
+            .await
+            .to_string()
     }
 
     #[tool(
@@ -12368,6 +12556,179 @@ mod tests {
                 .and_then(|value| value.as_bool()),
             Some(true)
         );
+    }
+
+    #[test]
+    fn controller_loop_status_enriches_index_wrapper_from_live_mcp_state() {
+        let mut app_state = McpAppState::new(
+            "openai".to_string(),
+            "gpt-5.2-codex".to_string(),
+            autonomy::shared_autonomy(AutonomyState::default()),
+            std::path::PathBuf::from("/tmp/test-session"),
+        );
+        app_state.link_session_aliases("wrapper-session", "codex-thread");
+        app_state.note_session_phase(
+            Some("codex-thread"),
+            Some(14),
+            Phase::RunningAgent,
+            Some("Codex follow-up round 14 in progress: fix the controller status"),
+        );
+        app_state.note_session_round(Some("codex-thread"), 14);
+
+        let mut status = serde_json::json!({
+            "latest": {
+                "status": {
+                    "run_id": "stale-run",
+                    "state": "idle"
+                }
+            },
+            "active": {
+                "wrappers": [{
+                    "run_id": null,
+                    "pid": null,
+                    "codex_pid": 8892,
+                    "app_server_pid": 8892,
+                    "app_server_active": true,
+                    "source": "external_wrapper_index",
+                    "backend_source": "codex",
+                    "backend_session_id": "codex-thread",
+                    "intendant_session_id": "wrapper-session",
+                    "log_path": "/tmp/test-session",
+                    "status": "unknown_running",
+                    "session_meta_status": "idle",
+                    "process_tree_active": true,
+                    "updated_at_secs": 10
+                }]
+            }
+        });
+
+        enrich_controller_loop_status_with_mcp_state_at(&mut status, &app_state, 12345);
+
+        let wrapper = status.pointer("/active/wrappers/0").unwrap();
+        assert_eq!(
+            wrapper.get("status").and_then(|value| value.as_str()),
+            Some("running_agent")
+        );
+        assert_eq!(
+            wrapper
+                .get("session_meta_status")
+                .and_then(|value| value.as_str()),
+            Some("running_agent")
+        );
+        assert_eq!(
+            wrapper
+                .get("raw_session_meta_status")
+                .and_then(|value| value.as_str()),
+            Some("idle")
+        );
+        assert_eq!(
+            wrapper.get("turn").and_then(|value| value.as_u64()),
+            Some(14)
+        );
+        assert_eq!(
+            wrapper.get("round").and_then(|value| value.as_u64()),
+            Some(14)
+        );
+        assert_eq!(
+            wrapper
+                .get("updated_at_secs")
+                .and_then(|value| value.as_u64()),
+            Some(12345)
+        );
+        assert_eq!(
+            status
+                .pointer("/latest/status/state")
+                .and_then(|value| value.as_str()),
+            Some("running_agent")
+        );
+        assert_eq!(
+            status
+                .pointer("/latest/status/turn")
+                .and_then(|value| value.as_u64()),
+            Some(14)
+        );
+        assert!(!controller_loop_intervention_markers_are_stale(
+            false,
+            false,
+            &[wrapper.clone()],
+            &[serde_json::json!({"pid": 8892})]
+        ));
+    }
+
+    #[test]
+    fn controller_loop_status_preserves_idle_app_server_residency_after_round() {
+        let mut app_state = McpAppState::new(
+            "openai".to_string(),
+            "gpt-5.2-codex".to_string(),
+            autonomy::shared_autonomy(AutonomyState::default()),
+            std::path::PathBuf::from("/tmp/test-session"),
+        );
+        app_state.link_session_aliases("wrapper-session", "codex-thread");
+        app_state.note_session_phase(
+            Some("codex-thread"),
+            Some(14),
+            Phase::WaitingFollowUp,
+            Some("Codex follow-up round 14 complete"),
+        );
+        app_state.note_session_round(Some("codex-thread"), 14);
+
+        let mut status = serde_json::json!({
+            "latest": {
+                "status": {
+                    "run_id": "stale-run",
+                    "state": "idle"
+                }
+            },
+            "active": {
+                "wrappers": [{
+                    "run_id": null,
+                    "pid": null,
+                    "codex_pid": 8892,
+                    "app_server_pid": 8892,
+                    "app_server_active": true,
+                    "source": "external_wrapper_index",
+                    "backend_source": "codex",
+                    "backend_session_id": "codex-thread",
+                    "intendant_session_id": "wrapper-session",
+                    "log_path": "/tmp/test-session",
+                    "status": "unknown_running",
+                    "session_meta_status": "idle",
+                    "process_tree_active": true,
+                    "updated_at_secs": 10
+                }]
+            }
+        });
+
+        enrich_controller_loop_status_with_mcp_state_at(&mut status, &app_state, 12345);
+
+        let wrapper = status.pointer("/active/wrappers/0").unwrap();
+        assert_eq!(
+            wrapper.get("phase").and_then(|value| value.as_str()),
+            Some("waiting_follow_up")
+        );
+        assert_eq!(
+            wrapper.get("status").and_then(|value| value.as_str()),
+            Some("unknown_running")
+        );
+        assert_eq!(
+            wrapper
+                .get("session_meta_status")
+                .and_then(|value| value.as_str()),
+            Some("idle")
+        );
+        assert!(wrapper.get("raw_session_meta_status").is_none());
+        assert_eq!(
+            wrapper
+                .get("updated_at_secs")
+                .and_then(|value| value.as_u64()),
+            Some(10)
+        );
+        assert!(controller_loop_intervention_markers_are_stale(
+            false,
+            false,
+            &[wrapper.clone()],
+            &[serde_json::json!({"pid": 8892})]
+        ));
     }
 
     #[test]
