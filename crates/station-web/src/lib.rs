@@ -6574,6 +6574,52 @@ impl StationInner {
             "none".to_string()
         };
         self.panel_row(x, yy, "shared", &shared_view_label);
+        yy += 22.0;
+        self.panel_row(
+            x,
+            yy,
+            "target",
+            &truncate(
+                &nonempty(
+                    &controls.selected_display_label,
+                    &nonempty(&controls.selected_display_target, "--"),
+                ),
+                34,
+            ),
+        );
+        yy += 22.0;
+        self.panel_row(
+            x,
+            yy,
+            "input",
+            &truncate(
+                &format!(
+                    "{} / {}",
+                    nonempty(&controls.selected_display_authority, "unknown"),
+                    nonempty(&controls.selected_display_status, "idle")
+                ),
+                34,
+            ),
+        );
+        yy += 22.0;
+        self.panel_row(
+            x,
+            yy,
+            "capture",
+            &truncate(
+                &format!(
+                    "{}{}{}",
+                    nonempty(&controls.selected_display_capture, "no frame"),
+                    if controls.selected_display_freshness.is_empty() {
+                        ""
+                    } else {
+                        " / "
+                    },
+                    controls.selected_display_freshness
+                ),
+                34,
+            ),
+        );
         yy += 30.0;
         self.section_title_color(x, yy, "Display controls", C_PEACH_CSS);
         yy += 22.0;
@@ -6600,7 +6646,49 @@ impl StationInner {
                 94.0,
                 C_TEAL_CSS.to_string(),
             ),
+            (
+                "display-target-copy".to_string(),
+                "copy target".to_string(),
+                94.0,
+                C_TEAL_CSS.to_string(),
+            ),
         ];
+        if controls.selected_display_can_open {
+            display_actions.push((
+                "display-target-open".to_string(),
+                "open target".to_string(),
+                98.0,
+                C_PEACH_CSS.to_string(),
+            ));
+        }
+        if controls.selected_display_can_focus {
+            display_actions.push((
+                "display-target-focus".to_string(),
+                "focus target".to_string(),
+                102.0,
+                C_BLUE_CSS.to_string(),
+            ));
+        }
+        if controls.selected_display_can_take_input || controls.selected_display_can_release_input {
+            display_actions.push((
+                "display-target-input".to_string(),
+                if controls.selected_display_can_release_input {
+                    "release input".to_string()
+                } else {
+                    "take input".to_string()
+                },
+                98.0,
+                C_GREEN_CSS.to_string(),
+            ));
+        }
+        if controls.selected_display_can_capture || controls.selected_display_can_attach_frame {
+            display_actions.push((
+                "display-target-capture".to_string(),
+                "attach frame".to_string(),
+                98.0,
+                C_MAUVE_CSS.to_string(),
+            ));
+        }
         if controls.shared_view_visible {
             display_actions.push((
                 "shared-view-focus".to_string(),
@@ -7134,6 +7222,56 @@ impl StationInner {
         yy += 22.0;
         self.panel_row(x, yy, "display", &nonempty(&controls.display_access, "--"));
         yy += 22.0;
+        let selected_display_id = controls
+            .selected_display_id
+            .map(|id| format!(":{}", id))
+            .unwrap_or_else(|| "--".to_string());
+        self.panel_row(
+            x,
+            yy,
+            "target",
+            &truncate(
+                &nonempty(
+                    &controls.selected_display_label,
+                    &nonempty(&controls.selected_display_target, &selected_display_id),
+                ),
+                42,
+            ),
+        );
+        yy += 22.0;
+        self.panel_row(
+            x,
+            yy,
+            "input",
+            &truncate(
+                &format!(
+                    "{} / {}",
+                    nonempty(&controls.selected_display_authority, "unknown"),
+                    nonempty(&controls.selected_display_status, "idle")
+                ),
+                42,
+            ),
+        );
+        yy += 22.0;
+        self.panel_row(
+            x,
+            yy,
+            "capture",
+            &truncate(
+                &format!(
+                    "{}{}{}",
+                    nonempty(&controls.selected_display_capture, "no frame"),
+                    if controls.selected_display_freshness.is_empty() {
+                        ""
+                    } else {
+                        " / "
+                    },
+                    controls.selected_display_freshness
+                ),
+                42,
+            ),
+        );
+        yy += 22.0;
         let shared_view_label = if controls.shared_view_visible {
             nonempty(&controls.shared_view_target, "active")
         } else {
@@ -7179,9 +7317,39 @@ impl StationInner {
             x,
             yy,
             "browser",
-            &format!("{} workspaces", controls.browser_workspaces),
+            &truncate(
+                &format!(
+                    "{} workspaces / {}",
+                    controls.browser_workspaces,
+                    nonempty(&controls.browser_workspace_status, "idle")
+                ),
+                42,
+            ),
         );
         yy += 22.0;
+        if !controls.browser_workspace_latest.is_empty()
+            || !controls.browser_workspace_detail.is_empty()
+        {
+            self.panel_row(
+                x,
+                yy,
+                "browser op",
+                &truncate(
+                    &format!(
+                        "{}{}{}",
+                        nonempty(&controls.browser_workspace_latest, "workspace"),
+                        if controls.browser_workspace_lease.is_empty() {
+                            ""
+                        } else {
+                            " / "
+                        },
+                        controls.browser_workspace_lease
+                    ),
+                    42,
+                ),
+            );
+            yy += 22.0;
+        }
         self.panel_row(
             x,
             yy,
@@ -7227,6 +7395,12 @@ impl StationInner {
                 C_BLUE_CSS.to_string(),
             ),
             (
+                "display-target-copy".to_string(),
+                "copy target".to_string(),
+                94.0,
+                C_TEAL_CSS.to_string(),
+            ),
+            (
                 "debug-screen".to_string(),
                 if controls.debug_screen {
                     "hide debug".to_string()
@@ -7237,6 +7411,42 @@ impl StationInner {
                 C_PEACH_CSS.to_string(),
             ),
         ];
+        if controls.selected_display_can_open {
+            surface_actions.push((
+                "display-target-open".to_string(),
+                "open target".to_string(),
+                98.0,
+                C_PEACH_CSS.to_string(),
+            ));
+        }
+        if controls.selected_display_can_focus {
+            surface_actions.push((
+                "display-target-focus".to_string(),
+                "focus target".to_string(),
+                102.0,
+                C_BLUE_CSS.to_string(),
+            ));
+        }
+        if controls.selected_display_can_take_input || controls.selected_display_can_release_input {
+            surface_actions.push((
+                "display-target-input".to_string(),
+                if controls.selected_display_can_release_input {
+                    "release input".to_string()
+                } else {
+                    "take input".to_string()
+                },
+                98.0,
+                C_GREEN_CSS.to_string(),
+            ));
+        }
+        if controls.selected_display_can_capture || controls.selected_display_can_attach_frame {
+            surface_actions.push((
+                "display-target-capture".to_string(),
+                "attach frame".to_string(),
+                98.0,
+                C_MAUVE_CSS.to_string(),
+            ));
+        }
         if !controls.active_browser {
             surface_actions.push((
                 "voice-active".to_string(),
@@ -7312,6 +7522,47 @@ impl StationInner {
         yy += 22.0;
         self.panel_row(x, yy, "backend", &nonempty(&controls.cu_backend, "auto"));
         yy += 30.0;
+        self.panel_row(
+            x,
+            yy,
+            "validation",
+            &truncate(
+                &format!(
+                    "{} / {}",
+                    nonempty(&controls.cu_validation_state, "idle"),
+                    nonempty(&controls.cu_validation_detail, "settings only")
+                ),
+                44,
+            ),
+        );
+        yy += 22.0;
+        if !controls.latest_operational_activity.is_empty() {
+            self.panel_row(
+                x,
+                yy,
+                &truncate(
+                    &nonempty(&controls.latest_operational_activity_label, "latest"),
+                    11,
+                ),
+                &truncate(&controls.latest_operational_activity, 44),
+            );
+            yy += 22.0;
+        }
+        let cu_actions = vec![
+            (
+                "browser-open".to_string(),
+                "browser ops".to_string(),
+                94.0,
+                C_BLUE_CSS.to_string(),
+            ),
+            (
+                "cu-settings".to_string(),
+                "cu settings".to_string(),
+                92.0,
+                C_MAUVE_CSS.to_string(),
+            ),
+        ];
+        yy = self.draw_controls_action_pills(x, panel_w, yy - 14.0, &cu_actions);
 
         self.section_title_color(x, yy, "Active target", C_PEACH_CSS);
         yy += 22.0;
@@ -10639,11 +10890,17 @@ struct StationControlsSummary {
     video_active: bool,
     active_browser: bool,
     browser_workspaces: u32,
+    browser_workspace_status: String,
+    browser_workspace_detail: String,
+    browser_workspace_latest: String,
+    browser_workspace_lease: String,
     recordings: u32,
     active_recording: String,
     cu_provider: String,
     cu_model: String,
     cu_backend: String,
+    cu_validation_state: String,
+    cu_validation_detail: String,
     debug_screen: bool,
     debug_recording: bool,
     pending_attachments: u32,
@@ -10652,6 +10909,25 @@ struct StationControlsSummary {
     shared_view_action: String,
     shared_view_note: String,
     shared_view_can_take_input: bool,
+    selected_display_kind: String,
+    selected_display_label: String,
+    selected_display_target: String,
+    selected_display_host_id: String,
+    selected_display_id: Option<i32>,
+    selected_display_lane_id: String,
+    selected_display_status: String,
+    selected_display_authority: String,
+    selected_display_capture: String,
+    selected_display_freshness: String,
+    selected_display_telemetry: String,
+    selected_display_can_open: bool,
+    selected_display_can_focus: bool,
+    selected_display_can_take_input: bool,
+    selected_display_can_release_input: bool,
+    selected_display_can_attach_frame: bool,
+    selected_display_can_capture: bool,
+    latest_operational_activity: String,
+    latest_operational_activity_label: String,
 }
 
 impl Default for StationControlsSummary {
@@ -10722,11 +10998,17 @@ impl Default for StationControlsSummary {
             video_active: false,
             active_browser: true,
             browser_workspaces: 0,
+            browser_workspace_status: String::new(),
+            browser_workspace_detail: String::new(),
+            browser_workspace_latest: String::new(),
+            browser_workspace_lease: String::new(),
             recordings: 0,
             active_recording: String::new(),
             cu_provider: String::new(),
             cu_model: String::new(),
             cu_backend: String::new(),
+            cu_validation_state: String::new(),
+            cu_validation_detail: String::new(),
             debug_screen: false,
             debug_recording: false,
             pending_attachments: 0,
@@ -10735,6 +11017,25 @@ impl Default for StationControlsSummary {
             shared_view_action: String::new(),
             shared_view_note: String::new(),
             shared_view_can_take_input: false,
+            selected_display_kind: String::new(),
+            selected_display_label: String::new(),
+            selected_display_target: String::new(),
+            selected_display_host_id: String::new(),
+            selected_display_id: None,
+            selected_display_lane_id: String::new(),
+            selected_display_status: String::new(),
+            selected_display_authority: String::new(),
+            selected_display_capture: String::new(),
+            selected_display_freshness: String::new(),
+            selected_display_telemetry: String::new(),
+            selected_display_can_open: false,
+            selected_display_can_focus: false,
+            selected_display_can_take_input: false,
+            selected_display_can_release_input: false,
+            selected_display_can_attach_frame: false,
+            selected_display_can_capture: false,
+            latest_operational_activity: String::new(),
+            latest_operational_activity_label: String::new(),
         }
     }
 }
