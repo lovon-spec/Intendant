@@ -2783,7 +2783,7 @@ impl StationInner {
         let panel_w = 264.0;
         let x = w - panel_w - 14.0;
         let y = 434.0;
-        let panel_h = (h - y - 102.0).clamp(132.0, 190.0);
+        let panel_h = (h - y - 102.0).clamp(156.0, 214.0);
         self.round_rect(
             x,
             y,
@@ -2833,6 +2833,7 @@ impl StationInner {
             .take(5)
             .cloned()
             .collect::<Vec<_>>();
+        let latest_event = events.first().cloned();
         if events.is_empty() {
             self.round_rect(
                 x + 10.0,
@@ -2854,10 +2855,44 @@ impl StationInner {
             return;
         }
 
+        if let Some(event) = latest_event {
+            let mut latest_actions: Vec<(&str, &str, f32, &str)> = vec![
+                ("show-log", "log", 38.0, C_TEAL_CSS),
+                ("copy-id", "id", 30.0, C_BLUE_CSS),
+                ("copy-event-json", "json", 42.0, C_MAUVE_CSS),
+            ];
+            if !event.session_id.is_empty() {
+                latest_actions.push(("activity-context", "ctx", 36.0, C_BLUE_CSS));
+            }
+            if activity_event_is_managed(&event) {
+                latest_actions.push(("activity-managed", "mgd", 40.0, C_MAUVE_CSS));
+            }
+            let mut latest_x = x + 12.0;
+            let latest_y = y + 55.0;
+            for (action, label, width, color) in latest_actions {
+                if latest_x + width > x + panel_w - 12.0 {
+                    break;
+                }
+                self.pill_at(latest_x, latest_y, width, 18.0, label, color);
+                self.hit_zones.push(HitZone::new(
+                    latest_x,
+                    latest_y,
+                    width,
+                    18.0,
+                    HitAction::ActivityAction {
+                        action: action.to_string(),
+                        id: event.id.clone(),
+                    },
+                ));
+                latest_x += width + 6.0;
+            }
+        }
+
         let row_h = 24.0;
-        let max_rows = ((panel_h - 63.0) / row_h).floor().max(1.0) as usize;
+        let row_start = y + 83.0;
+        let max_rows = ((panel_h - 83.0) / row_h).floor().max(1.0) as usize;
         for (idx, event) in events.into_iter().rev().take(max_rows).enumerate() {
-            let row_y = y + 63.0 + idx as f32 * row_h;
+            let row_y = row_start + idx as f32 * row_h;
             self.activity_detail_row(x + 10.0, row_y, panel_w - 20.0, event);
         }
     }
@@ -2955,14 +2990,57 @@ impl StationInner {
             C_MAUVE_CSS,
             "bold",
         );
-        self.text(
-            "context / managed",
-            x + 133.0,
-            y + 19.0,
-            9.0,
-            C_SUBTEXT0_CSS,
-            "normal",
-        );
+        let controls = self.snapshot.controls.clone();
+        let selected_session = nonempty(&controls.session_id, &controls.session_action_id);
+        let thread_id = nonempty(&controls.session_action_id, &controls.session_backend_id);
+        let identity = if selected_session.is_empty() && thread_id.is_empty() {
+            "context / managed".to_string()
+        } else {
+            truncate(
+                &format!(
+                    "{} {} / thread {}",
+                    nonempty(&controls.session_source, "session"),
+                    short_id(&selected_session),
+                    short_id(&thread_id)
+                ),
+                46,
+            )
+        };
+        self.text(&identity, x + 133.0, y + 19.0, 9.0, C_SUBTEXT0_CSS, "normal");
+        if !selected_session.is_empty() {
+            let mut actions = vec![
+                RunwayAction::session("mgd", "managed-jump", &selected_session, 40.0, C_MAUVE_CSS),
+                RunwayAction::session("ctx", "context-jump", &selected_session, 36.0, C_BLUE_CSS),
+                RunwayAction::session("wrap", "copy-intendant", &selected_session, 42.0, C_PEACH_CSS),
+                RunwayAction::session("backend", "copy-backend", &selected_session, 60.0, C_TEAL_CSS),
+                RunwayAction::session("sid", "copy", &selected_session, 34.0, C_BLUE_CSS),
+            ];
+            if controls.session_is_codex && !thread_id.is_empty() {
+                actions.insert(
+                    0,
+                    RunwayAction {
+                        label: "fork",
+                        width: 38.0,
+                        color: C_MAUVE_CSS,
+                        hit: HitAction::ThreadAction {
+                            op: "fork".to_string(),
+                            session_id: thread_id.clone(),
+                        },
+                    },
+                );
+            }
+            let mut ax = x + bar_w - 10.0;
+            for action in actions.into_iter().rev() {
+                ax -= action.width;
+                if ax < x + 338.0 {
+                    break;
+                }
+                self.pill_at(ax, y + 5.0, action.width, 18.0, action.label, action.color);
+                self.hit_zones
+                    .push(HitZone::new(ax, y + 5.0, action.width, 18.0, action.hit));
+                ax -= 6.0;
+            }
+        }
 
         let card_gap = 8.0;
         let card_y = y + 30.0;
@@ -3053,11 +3131,25 @@ impl StationInner {
                 )
             });
         self.text(&detail, x + 16.0, y + 32.0, 8.5, C_SUBTEXT0_CSS, "normal");
+        if h > 72.0 {
+            let identity = truncate(
+                &format!(
+                    "{} / {}",
+                    nonempty(&ctx.session_label, &short_id(&ctx.session_id)),
+                    nonempty(&ctx.exact_status, &ctx.replay_mode)
+                ),
+                42,
+            );
+            self.text(&identity, x + 16.0, y + 49.0, 8.0, C_OVERLAY1_CSS, "normal");
+        }
         self.meter(x + 16.0, y + h - 4.0, w - 32.0, pct, color);
 
         let actions = [
+            RunwayAction::context("exact", "load-exact", 42.0, C_MAUVE_CSS),
+            RunwayAction::context("seed", "seed-managed", 40.0, C_TEAL_CSS),
+            RunwayAction::context("snap", "copy-snapshot", 42.0, C_TEAL_CSS),
+            RunwayAction::context("packet", "copy-continuity", 52.0, C_PEACH_CSS),
             RunwayAction::context("live", "live", 42.0, C_BLUE_CSS),
-            RunwayAction::context("copy", "copy-snapshot", 44.0, C_TEAL_CSS),
             RunwayAction::select("panel", "system:context", 48.0, C_OVERLAY1_CSS),
         ];
         let mut ax = x + w - 8.0;
@@ -3122,25 +3214,61 @@ impl StationInner {
             )
         };
         self.text(&detail, x + 16.0, y + 32.0, 8.5, C_SUBTEXT0_CSS, "normal");
+        if h > 72.0 {
+            let latest = if !managed.latest_rewind.id.is_empty() || !managed.latest_backout.id.is_empty()
+            {
+                format!(
+                    "rewind {} / backout {}",
+                    short_id(&managed.latest_rewind.id),
+                    short_id(&managed.latest_backout.id)
+                )
+            } else {
+                format!(
+                    "{} / {}",
+                    nonempty(&managed.session_label, &short_id(&managed.session_id)),
+                    nonempty(&managed.action_state.readiness, "ready")
+                )
+            };
+            self.text(&truncate(&latest, 42), x + 16.0, y + 49.0, 8.0, C_OVERLAY1_CSS, "normal");
+        }
         self.meter(x + 16.0, y + h - 4.0, w - 32.0, pct, color);
 
-        let actions = [
-            RunwayAction::managed(
-                "target",
-                "use-target",
-                "",
-                &managed.session_id,
-                52.0,
-                C_TEAL_CSS,
-            ),
+        let rewind_action = if managed.action_state.can_rewind {
             RunwayAction::managed(
                 "rewind",
-                "rewind",
-                "",
+                "dispatch-rewind",
+                &managed.action_state.anchor,
                 &managed.session_id,
                 56.0,
                 C_MAUVE_CSS,
-            ),
+            )
+        } else {
+            RunwayAction::managed("prep", "rewind", "", &managed.session_id, 42.0, C_MAUVE_CSS)
+        };
+        let backout_action = if managed.action_state.can_backout {
+            RunwayAction::managed(
+                "run",
+                "run-backout",
+                &managed.action_state.record,
+                &managed.session_id,
+                34.0,
+                C_TEAL_CSS,
+            )
+        } else {
+            RunwayAction::managed(
+                "inspect",
+                "anchor-inspect",
+                &managed.action_state.anchor,
+                &managed.session_id,
+                56.0,
+                C_PEACH_CSS,
+            )
+        };
+        let actions = [
+            rewind_action,
+            backout_action,
+            RunwayAction::managed("refresh", "refresh", "", &managed.session_id, 58.0, C_BLUE_CSS),
+            RunwayAction::managed("copy", "copy-status", "", &managed.session_id, 40.0, C_TEAL_CSS),
             RunwayAction::select("panel", "system:managed", 48.0, C_OVERLAY1_CSS),
         ];
         let mut ax = x + w - 8.0;
