@@ -336,7 +336,7 @@ Management**; if that pane is hidden, search System Settings for "Profiles".
 If macOS reports that the profile certificate could not be verified, install
 `ca.crt` and `client.p12` manually from the same unlocked page, or regenerate
 older LAN cert material with `intendant lan setup --force` so the Apple profile
-uses profile-compatible RSA certificate payloads with client-auth extensions.
+uses an Apple-compatible client identity bundle and certificate payloads.
 
 #### Apple device requirement for `client.p12`
 

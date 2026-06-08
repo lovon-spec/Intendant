@@ -809,7 +809,7 @@ fn unlocked_platform_steps(
 <li>If macOS does not fully trust the root automatically, open Keychain Access and set the Intendant CA to Always Trust.</li>
 <li>Open <code>{dashboard}</code>.</li>
 </ol>
-<p class="warn">The profile includes the client identity password. Keep it on the paired device only. If macOS reports that the certificate could not be verified, use the manual downloads below and regenerate old LAN certs with <code>intendant lan setup --force</code> so the Apple profile uses profile-compatible RSA certificate payloads.</p>
+<p class="warn">The profile includes the client identity password. Keep it on the paired device only. If macOS reports that the certificate could not be verified, use the manual downloads below and regenerate old LAN certs with <code>intendant lan setup --force</code> so the Apple profile uses an Apple-compatible client identity bundle.</p>
 </div>"#
         ),
         ClientPlatform::Android => format!(
@@ -1005,7 +1005,7 @@ fn ensure_apple_profile_cert_compatible(
 
 fn apple_profile_regen_message(label: &str, reason: &str) -> String {
     format!(
-        "{label} {reason}. macOS may reject Apple configuration profiles for this legacy LAN cert directory; install ca.crt and client.p12 manually or regenerate old LAN certs with `intendant lan setup --force`."
+        "{label} {reason}. macOS may reject Apple configuration profiles for this legacy LAN cert directory; install ca.crt and client.p12 manually or regenerate old LAN certs with `intendant lan setup --force` so the Apple profile uses an Apple-compatible client identity bundle."
     )
 }
 
