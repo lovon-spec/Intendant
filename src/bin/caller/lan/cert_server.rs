@@ -2,7 +2,7 @@
 //!
 //! This is intentionally a pairing ceremony, not a trust-on-first-use
 //! download page. The server starts HTTPS using the same LAN server cert
-//! as the mTLS proxy. The operator must copy the certificate fingerprint
+//! as the native TLS dashboard. The operator must copy the certificate fingerprint
 //! observed by the browser into this CLI process. Only after it matches
 //! the local `server.crt` does the CLI reveal a one-time enrollment secret.
 //! The browser redeems that secret over the verified HTTPS connection to
@@ -27,7 +27,7 @@ use uuid::Uuid;
 use crate::peer::transport::pinning::{format_fingerprint, parse_fingerprint};
 use crate::web_tls::{build_acceptor, TlsCertSource};
 
-use super::{certs::CertState, instructions, LanError, LanResult};
+use super::{certs::CertState, LanError, LanResult};
 
 const ENROLL_COOKIE: &str = "intendant_lan_enroll";
 const MAX_REQUEST_BYTES: usize = 16 * 1024;
@@ -336,7 +336,7 @@ where
                 }
                 Err(e) => {
                     let body = format!("failed to build mobileconfig: {e}");
-                    let status = if e.contains("legacy LAN cert directory") {
+                    let status = if e.contains("Apple configuration profile") {
                         "409 Conflict"
                     } else {
                         "500 Internal Server Error"
@@ -1262,23 +1262,20 @@ fn print_client_setup_banner(lan_ip: &str, cert_port: u16, https_port: u16) {
     println!("  Strict client enrollment");
     println!("============================================================");
     println!();
-    println!("  On the client browser/device, open:");
+    println!("  Open this URL on the client browser/device:");
     println!("    https://{lan_ip}:{cert_port}/");
     println!();
-    println!("  The browser will warn because the Intendant CA is not");
-    println!("  installed yet. Before entering any secret, inspect the");
-    println!("  browser-observed server certificate and copy its SHA-256");
-    println!("  fingerprint into this terminal.");
+    println!("  The browser may warn because the Intendant CA is not installed yet.");
+    println!("  Before entering any secret, inspect the browser-observed server");
+    println!("  certificate and paste its SHA-256 fingerprint into this terminal.");
     println!();
-    println!("  This terminal intentionally does not print the expected");
-    println!("  fingerprint. It will only reveal a one-time enrollment");
-    println!("  secret after the pasted fingerprint matches the live");
-    println!("  Intendant server certificate.");
+    println!("  This terminal intentionally does not print the expected fingerprint.");
+    println!("  It will reveal a one-time enrollment secret only after the pasted");
+    println!("  fingerprint matches the local Intendant server certificate.");
     println!();
-    println!("  After enrollment, the dashboard lives at:");
+    println!("  After pairing, follow the browser page's device-specific install steps.");
+    println!("  Dashboard URL after enrollment:");
     println!("    https://{lan_ip}:{https_port}");
-    println!();
-    instructions::print_all(lan_ip, cert_port);
     println!();
 }
 

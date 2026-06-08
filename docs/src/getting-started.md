@@ -361,7 +361,7 @@ Intendant CA to **Always Trust**; installing the profile is not enough unless
 the CA is trusted for websites.
 If macOS reports that the profile certificate could not be verified, install
 `ca.crt` and `client.p12` manually from the same unlocked page, or regenerate
-older LAN cert material with `intendant lan setup --force` so the Apple profile
+LAN cert material with `intendant lan setup --force` so the Apple profile
 uses an Apple-compatible client identity bundle and certificate payloads.
 
 #### Apple device requirement for `client.p12`

@@ -21,8 +21,6 @@ pub mod backend;
 pub mod cert_server;
 #[cfg_attr(target_os = "windows", allow(dead_code))]
 pub mod certs;
-#[cfg(not(target_os = "windows"))]
-pub mod instructions;
 pub mod state;
 #[cfg(not(target_os = "windows"))]
 pub mod wizard;
@@ -205,10 +203,9 @@ impl From<rcgen::Error> for LanError {
 pub type LanResult<T> = Result<T, LanError>;
 
 /// Parsed `intendant lan <action> [flags]` invocation.
-// The `intendant lan` subcommand (arg parsing + setup/recert/remove/list/
-// serve-certs actions) drives the OpenSSL cert machinery, so the whole
-// command surface is gated off Windows. Only the lookup helpers above
-// (`resolve_host_label`, `routable_local_addrs`) remain on Windows.
+// The interactive setup/enrollment command surface is still gated off
+// Windows. Only the lookup helpers above (`resolve_host_label`,
+// `routable_local_addrs`) remain on Windows.
 #[cfg(not(target_os = "windows"))]
 #[derive(Debug)]
 pub struct LanArgs {
@@ -400,7 +397,7 @@ async fn cmd_setup(args: LanArgs) -> LanResult<()> {
 
     println!();
     println!("============================================================");
-    println!("  Setup complete!");
+    println!("  LAN certs ready");
     println!("============================================================");
     println!();
     println!("  Native LAN certs: {}", cert_dir.display());
@@ -416,18 +413,19 @@ async fn cmd_setup(args: LanArgs) -> LanResult<()> {
         // Host orchestrators can run strict enrollment separately when
         // they have an interactive operator channel for fingerprint
         // verification.
-        println!("  Skipping enrollment server (--no-serve-certs).");
-        println!("  Run `intendant lan serve-certs` later to distribute the client cert.");
+        println!("  Enrollment server was not started (--no-serve-certs).");
+        println!("  Run `intendant lan serve-certs` later to enroll devices.");
         println!();
         return Ok(());
     }
 
     // Start strict client enrollment (blocks until Ctrl+C).
     println!(
-        "  Starting HTTPS enrollment server on port {}...",
+        "  Starting strict HTTPS enrollment on port {}.",
         args.cert_port
     );
-    println!("  Press Ctrl+C when every client has imported the cert.");
+    println!("  The enrollment page contains the device-specific install steps.");
+    println!("  Press Ctrl+C here when all devices are enrolled.");
     println!();
     cert_server::serve(&state, args.cert_port, &lan_ip, args.https_port).await?;
 
