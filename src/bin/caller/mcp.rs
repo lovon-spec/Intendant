@@ -429,6 +429,15 @@ impl McpAppState {
         None
     }
 
+    fn session_source_for_id(&self, session_id: &str) -> Option<&str> {
+        for related in self.session_related_ids(session_id) {
+            if let Some(source) = self.session_sources.get(&related) {
+                return Some(source.as_str());
+            }
+        }
+        None
+    }
+
     fn note_session_phase(
         &mut self,
         session_id: Option<&str>,
@@ -7046,7 +7055,9 @@ impl IntendantServer {
                     PersistedStartTarget::NotFound | PersistedStartTarget::NonExternal => {}
                 }
             }
-            if let Some(phase) = target_phase.filter(|phase| !target_phase_accepts_follow_up(phase))
+            if let Some(phase) = target_phase
+                .as_ref()
+                .filter(|phase| !target_phase_accepts_follow_up(phase))
             {
                 return format!(
                     "Cannot start task: session {} is not active (phase {}); use restart/resume before sending a follow-up",
@@ -7056,7 +7067,7 @@ impl IntendantServer {
             }
             self.bus
                 .send(AppEvent::ControlCommand(ControlMsg::StartTask {
-                    session_id: Some(session_id),
+                    session_id: Some(session_id.clone()),
                     task: params.task,
                     orchestrate: params.orchestrate,
                     direct: None,
@@ -7065,6 +7076,21 @@ impl IntendantServer {
                     attachments: vec![],
                     follow_up_id: None,
                 }));
+            if target_phase
+                .as_ref()
+                .is_some_and(target_phase_is_active_turn)
+            {
+                let source = self.target_session_source(&session_id).await;
+                if source
+                    .as_deref()
+                    .is_some_and(|source| source.eq_ignore_ascii_case("codex"))
+                {
+                    return "ok (follow-up queued for next turn; active Codex turn is still running)"
+                        .to_string();
+                }
+                return "ok (follow-up queued for next turn; active turn is still running)"
+                    .to_string();
+            }
             return "ok (task dispatched)".to_string();
         }
 
@@ -7099,10 +7125,33 @@ impl IntendantServer {
             .map(|status| status.phase.clone())
             .or_else(|| (s.session_id == session_id).then(|| s.phase.clone()))
     }
+
+    async fn target_session_source(&self, session_id: &str) -> Option<String> {
+        let s = self.state.read().await;
+        s.session_source_for_id(session_id)
+            .map(str::to_string)
+            .or_else(|| {
+                (s.session_id == session_id)
+                    .then(|| s.active_session_source.clone())
+                    .flatten()
+            })
+    }
 }
 
 fn target_phase_accepts_follow_up(phase: &Phase) -> bool {
     !matches!(phase, Phase::Idle | Phase::Done | Phase::Interrupted)
+}
+
+fn target_phase_is_active_turn(phase: &Phase) -> bool {
+    matches!(
+        phase,
+        Phase::Thinking
+            | Phase::RunningAgent
+            | Phase::Orchestrating
+            | Phase::WaitingApproval
+            | Phase::WaitingHuman
+            | Phase::Interrupting
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -10565,6 +10614,79 @@ mod tests {
             match prior_userprofile {
                 Some(value) => std::env::set_var("USERPROFILE", value),
                 None => std::env::remove_var("USERPROFILE"),
+            }
+        });
+    }
+
+    #[test]
+    fn start_task_targeting_running_codex_reports_follow_up_queued() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let wrapper_session_id = "17ea6240-138a-4db6-8954-22f11437aa0d";
+            let backend_session_id = "019e9fa2-active-turn";
+            let state = test_state();
+            {
+                let mut s = state.write().await;
+                apply_observed_event_to_mcp_state(
+                    &mut s,
+                    &AppEvent::SessionIdentity {
+                        session_id: wrapper_session_id.to_string(),
+                        source: "codex".to_string(),
+                        backend_session_id: backend_session_id.to_string(),
+                    },
+                );
+                apply_observed_event_to_mcp_state(
+                    &mut s,
+                    &AppEvent::StatusUpdate {
+                        turn: 9,
+                        phase: "thinking".to_string(),
+                        autonomy: "medium".to_string(),
+                        session_id: wrapper_session_id.to_string(),
+                        task: "active managed Codex turn".to_string(),
+                    },
+                );
+            }
+            let bus = EventBus::new();
+            let mut rx = bus.subscribe();
+            let server = IntendantServer::new(state, bus);
+
+            let result = server
+                .call_tool_by_name_for_session(
+                    "start_task",
+                    serde_json::json!({
+                        "task": "please prioritize the harness status fix"
+                    }),
+                    Some(wrapper_session_id),
+                    None,
+                )
+                .await
+                .expect("tool should queue active-turn follow-up");
+            assert!(!result.is_error.unwrap_or(false));
+            let rendered = format!("{result:?}");
+            assert!(
+                rendered.contains(
+                    "ok (follow-up queued for next turn; active Codex turn is still running)"
+                ),
+                "got: {rendered}"
+            );
+            assert!(
+                !rendered.contains("ok (task dispatched)"),
+                "active-turn follow-up must not look actively dispatched: {rendered}"
+            );
+
+            match timeout(Duration::from_secs(1), rx.recv()).await {
+                Ok(Ok(AppEvent::ControlCommand(ControlMsg::StartTask {
+                    session_id,
+                    task,
+                    ..
+                }))) => {
+                    assert_eq!(session_id.as_deref(), Some(wrapper_session_id));
+                    assert_eq!(task, "please prioritize the harness status fix");
+                }
+                other => panic!("expected queued StartTask control event, got {other:?}"),
             }
         });
     }
