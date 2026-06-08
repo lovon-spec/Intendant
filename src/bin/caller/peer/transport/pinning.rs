@@ -232,13 +232,26 @@ impl ServerCertVerifier for PinnedFingerprintVerifier {
 /// `use_preconfigured_tls`) when the peer's `auth.transport` is
 /// `PinnedMutualTls`.
 pub fn pinned_client_config(verifier: PinnedFingerprintVerifier) -> rustls::ClientConfig {
+    pinned_client_config_with_client_auth(verifier, None)
+        .expect("pinned client config without client auth is valid")
+}
+
+/// Build a rustls `ClientConfig` with server-cert pinning and optional client
+/// certificate authentication.
+pub fn pinned_client_config_with_client_auth(
+    verifier: PinnedFingerprintVerifier,
+    client_identity: Option<crate::web_tls::RustlsIdentity>,
+) -> Result<rustls::ClientConfig, RustlsError> {
     let provider = verifier.provider.clone();
-    rustls::ClientConfig::builder_with_provider(provider)
+    let builder = rustls::ClientConfig::builder_with_provider(provider)
         .with_protocol_versions(rustls::DEFAULT_VERSIONS)
         .expect("default rustls protocol versions are valid")
         .dangerous()
-        .with_custom_certificate_verifier(Arc::new(verifier))
-        .with_no_client_auth()
+        .with_custom_certificate_verifier(Arc::new(verifier));
+    match client_identity {
+        Some((cert_chain, key)) => builder.with_client_auth_cert(cert_chain, key),
+        None => Ok(builder.with_no_client_auth()),
+    }
 }
 
 #[cfg(test)]

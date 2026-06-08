@@ -35,6 +35,7 @@ use crate::peer::card::{AgentCard, TransportSpec};
 use crate::peer::event::{PeerEvent, TaggedPeerEvent};
 use crate::peer::handle::{spawn_peer, PeerHandle, PeerSnapshot};
 use crate::peer::id::PeerId;
+use crate::peer::transport::tls_client::{self, ClientIdentityPaths};
 use crate::peer::transport::IntendantWsTransport;
 use crate::peer::PeerError;
 use std::collections::HashMap;
@@ -253,10 +254,41 @@ impl PeerRegistry {
         override_pinned_fingerprints: Vec<String>,
         browser_tcp_via_url: Option<String>,
     ) -> Result<PeerId, PeerError> {
+        self.add_peer_with_credentials_and_client_identity(
+            card_url,
+            via_urls,
+            bearer_token,
+            override_pinned_fingerprints,
+            browser_tcp_via_url,
+            None,
+        )
+        .await
+    }
+
+    /// Same as [`PeerRegistry::add_peer_with_credentials`], but with an
+    /// explicit mTLS client identity for this peer. Used by config-driven
+    /// peers that point at a peer-issued `client.crt` / `client.key`.
+    pub async fn add_peer_with_credentials_and_client_identity(
+        &self,
+        card_url: &str,
+        via_urls: Vec<String>,
+        bearer_token: Option<String>,
+        override_pinned_fingerprints: Vec<String>,
+        browser_tcp_via_url: Option<String>,
+        explicit_client_identity: Option<ClientIdentityPaths>,
+    ) -> Result<PeerId, PeerError> {
+        let card_client_identity = if tls_client::url_uses_tls(card_url) {
+            explicit_client_identity
+                .clone()
+                .or_else(|| client_identity_for_url(card_url))
+        } else {
+            None
+        };
         let mut card = fetch_card(
             card_url,
             bearer_token.as_deref(),
             &override_pinned_fingerprints,
+            card_client_identity.as_ref(),
         )
         .await?;
         // Apply the via-URL override to the initial card so the
@@ -279,8 +311,14 @@ impl PeerRegistry {
                 server_cert_fingerprints: override_pinned_fingerprints,
             };
         }
-        self.add_peer_with_card_and_auth(card, via_urls, bearer_token, browser_tcp_via_url)
-            .await
+        self.add_peer_with_card_and_auth_and_client_identity(
+            card,
+            via_urls,
+            bearer_token,
+            browser_tcp_via_url,
+            explicit_client_identity,
+        )
+        .await
     }
 
     /// Variant of [`add_peer`] that accepts a pre-fetched or
@@ -316,6 +354,24 @@ impl PeerRegistry {
         bearer_token: Option<String>,
         browser_tcp_via_url: Option<String>,
     ) -> Result<PeerId, PeerError> {
+        self.add_peer_with_card_and_auth_and_client_identity(
+            card,
+            via_urls,
+            bearer_token,
+            browser_tcp_via_url,
+            None,
+        )
+        .await
+    }
+
+    async fn add_peer_with_card_and_auth_and_client_identity(
+        &self,
+        card: AgentCard,
+        via_urls: Vec<String>,
+        bearer_token: Option<String>,
+        browser_tcp_via_url: Option<String>,
+        explicit_client_identity: Option<ClientIdentityPaths>,
+    ) -> Result<PeerId, PeerError> {
         if self.inner.peers.read().unwrap().contains_key(&card.id) {
             return Err(PeerError::Rejected {
                 code: "already_registered".into(),
@@ -333,6 +389,13 @@ impl PeerRegistry {
                 card.id, card.transports
             )));
         }
+        let client_identity = if transports_use_tls(&supported_specs) {
+            explicit_client_identity
+                .clone()
+                .or_else(|| client_identity_for_transports(&supported_specs))
+        } else {
+            None
+        };
 
         // Parse pinned fingerprints once, surface parse errors at
         // registry-add time rather than at first connect. Empty
@@ -358,8 +421,8 @@ impl PeerRegistry {
             log_sink,
             move |events_tx| {
                 // Build one concrete transport per supported spec (each
-                // gets its own clone of `events_tx`, `bearer_token`, and
-                // `pinned_fingerprints`) and wrap them in a
+                // gets its own clone of `events_tx`, `bearer_token`,
+                // `pinned_fingerprints`, and `client_identity`) and wrap them in a
                 // `MultiTransport` that probes them in order on connect.
                 let candidates: Vec<Box<dyn crate::peer::traits::PeerTransport>> = supported_specs
                     .iter()
@@ -369,6 +432,7 @@ impl PeerRegistry {
                             events_tx.clone(),
                             bearer_token.clone(),
                             pinned_fingerprints.clone(),
+                            client_identity.clone(),
                         )
                     })
                     .collect();
@@ -536,19 +600,10 @@ async fn fetch_card(
     card_url: &str,
     bearer_token: Option<&str>,
     pinned_fingerprints: &[String],
+    client_identity: Option<&ClientIdentityPaths>,
 ) -> Result<AgentCard, PeerError> {
-    let mut client_builder = reqwest::Client::builder().timeout(CARD_FETCH_TIMEOUT);
-    if !pinned_fingerprints.is_empty() {
-        let verifier = crate::peer::transport::pinning::PinnedFingerprintVerifier::from_strings(
-            pinned_fingerprints,
-        )
-        .map_err(|e| PeerError::Auth(format!("invalid pinned fingerprint: {e}")))?;
-        let config = crate::peer::transport::pinning::pinned_client_config(verifier);
-        client_builder = client_builder.use_preconfigured_tls(config);
-    }
-    let client = client_builder
-        .build()
-        .map_err(|e| PeerError::CardFetch(format!("build http client: {e}")))?;
+    let parsed_pins = parse_pinned_fingerprint_strings(pinned_fingerprints)?;
+    let client = tls_client::reqwest_client(CARD_FETCH_TIMEOUT, &parsed_pins, client_identity)?;
     let mut request = client.get(card_url);
     if let Some(token) = bearer_token {
         request = request.bearer_auth(token);
@@ -596,6 +651,7 @@ fn build_transport(
     events_tx: mpsc::Sender<crate::peer::event::PeerEvent>,
     bearer_token: Option<String>,
     pinned_fingerprints: Vec<crate::peer::transport::pinning::Fingerprint>,
+    client_identity: Option<ClientIdentityPaths>,
 ) -> Box<dyn crate::peer::traits::PeerTransport> {
     match spec {
         TransportSpec::IntendantWs { url } => Box::new(IntendantWsTransport::with_credentials(
@@ -604,6 +660,7 @@ fn build_transport(
             crate::peer::transport::intendant::TransportCredentials {
                 bearer_token,
                 pinned_fingerprints,
+                client_identity,
             },
         )),
         other => {
@@ -615,6 +672,41 @@ fn build_transport(
             panic!("unsupported transport spec reached build_transport: {other:?}")
         }
     }
+}
+
+fn client_identity_for_url(url: &str) -> Option<ClientIdentityPaths> {
+    if tls_client::url_uses_tls(url) {
+        tls_client::installed_access_client_identity_paths()
+    } else {
+        None
+    }
+}
+
+fn client_identity_for_transports(specs: &[TransportSpec]) -> Option<ClientIdentityPaths> {
+    if transports_use_tls(specs) {
+        tls_client::installed_access_client_identity_paths()
+    } else {
+        None
+    }
+}
+
+fn transports_use_tls(specs: &[TransportSpec]) -> bool {
+    specs.iter().any(|spec| match spec {
+        TransportSpec::IntendantWs { url } => tls_client::url_uses_tls(url),
+        _ => false,
+    })
+}
+
+fn parse_pinned_fingerprint_strings(
+    pinned_fingerprints: &[String],
+) -> Result<Vec<crate::peer::transport::pinning::Fingerprint>, PeerError> {
+    let mut out = Vec::with_capacity(pinned_fingerprints.len());
+    for s in pinned_fingerprints {
+        let fp = crate::peer::transport::pinning::parse_fingerprint(s)
+            .map_err(|e| PeerError::Auth(format!("invalid pinned fingerprint {s:?}: {e}")))?;
+        out.push(fp);
+    }
+    Ok(out)
 }
 
 /// Parse pinned fingerprints from a card's `TransportAuth`.

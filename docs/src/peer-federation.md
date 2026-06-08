@@ -398,10 +398,19 @@ helpers:
 | `none()` | `None` | — | Trusted network: loopback, tailnet, LAN behind a firewall (the phase-1 default) |
 | `mutual_tls()` | `MutualTls` | — | Normal federation behind `intendant access setup` |
 
+For daemon-to-daemon mTLS, the connecting daemon presents a client certificate
+during the HTTPS/WSS handshake. Config-driven peers can set
+`[[peer]] client_cert` and `client_key` to a client identity issued by the
+remote peer's access CA. If those fields are absent, Intendant tries the
+installed local access `client.crt` / `client.key` for TLS peer URLs; that works
+only when the remote peer trusts the same issuing CA. Independent daemons still
+need a pairing/provisioning step that gives each side a peer-issued client
+identity.
+
 `PinnedMutualTls` is the stricter transport form when an operator pins a server
 certificate fingerprint out of band. Bearer `ApplicationAuth` still exists in the
-wire format and code for legacy deployments and non-browser clients that cannot
-present a client certificate yet, but it should not be the normal dashboard UX.
+wire format and code for legacy deployments, but it should not be the normal
+dashboard or daemon-to-daemon UX.
 
 ## See Also
 

@@ -392,6 +392,16 @@ fn build_and_hydrate_peer_registry(
         let bearer_token = cfg.bearer_token.clone();
         let pinned_fingerprints = cfg.pinned_fingerprints.clone();
         let browser_tcp_via_url = cfg.browser_tcp_via_url.clone();
+        let explicit_client_identity = match peer_client_identity_from_config(cfg) {
+            Ok(identity) => identity,
+            Err(e) => {
+                eprintln!(
+                    "intendant: failed to register peer from intendant.toml \
+                     ({card_url}): {e}"
+                );
+                continue;
+            }
+        };
         tokio::spawn(async move {
             // Vec::new() for via_urls (could be threaded through
             // PeerConfig later if config-driven via overrides become
@@ -406,12 +416,13 @@ fn build_and_hydrate_peer_registry(
             // same URL (primary-side localhost tunnel, split
             // browser/primary machines, etc.).
             if let Err(e) = registry_for_task
-                .add_peer_with_credentials(
+                .add_peer_with_credentials_and_client_identity(
                     &card_url,
                     Vec::new(),
                     bearer_token,
                     pinned_fingerprints,
                     browser_tcp_via_url,
+                    explicit_client_identity,
                 )
                 .await
             {
@@ -423,6 +434,22 @@ fn build_and_hydrate_peer_registry(
         });
     }
     registry
+}
+
+fn peer_client_identity_from_config(
+    cfg: &project::PeerConfig,
+) -> Result<Option<peer::transport::tls_client::ClientIdentityPaths>, CallerError> {
+    match (&cfg.client_cert, &cfg.client_key) {
+        (Some(cert), Some(key)) => Ok(Some(peer::transport::tls_client::ClientIdentityPaths {
+            cert_path: PathBuf::from(cert),
+            key_path: PathBuf::from(key),
+        })),
+        (None, None) => Ok(None),
+        (Some(_), None) | (None, Some(_)) => Err(CallerError::Config(format!(
+            "[[peer]] card_url={} must set client_cert and client_key together",
+            cfg.card_url
+        ))),
+    }
 }
 
 /// Emit a "[runtime] Task dispatched" log entry from a backend task acceptance
@@ -11253,6 +11280,41 @@ mod tests {
             Vec::<String>::new(),
         )
         .unwrap()
+    }
+
+    fn peer_config_with_client_identity(
+        client_cert: Option<&str>,
+        client_key: Option<&str>,
+    ) -> project::PeerConfig {
+        project::PeerConfig {
+            card_url: "https://peer.example/.well-known/agent-card.json".to_string(),
+            label: None,
+            bearer_token: None,
+            client_cert: client_cert.map(str::to_string),
+            client_key: client_key.map(str::to_string),
+            pinned_fingerprints: Vec::new(),
+            browser_tcp_via_url: None,
+        }
+    }
+
+    #[test]
+    fn peer_client_identity_config_requires_cert_and_key() {
+        let cfg =
+            peer_config_with_client_identity(Some("/tmp/client.crt"), Some("/tmp/client.key"));
+        let identity = peer_client_identity_from_config(&cfg).unwrap().unwrap();
+        assert_eq!(identity.cert_path, PathBuf::from("/tmp/client.crt"));
+        assert_eq!(identity.key_path, PathBuf::from("/tmp/client.key"));
+
+        assert!(
+            peer_client_identity_from_config(&peer_config_with_client_identity(None, None))
+                .unwrap()
+                .is_none()
+        );
+        let err =
+            peer_client_identity_from_config(&peer_config_with_client_identity(Some("x"), None))
+                .unwrap_err()
+                .to_string();
+        assert!(err.contains("client_cert and client_key together"));
     }
 
     /// `build_local_advertised_auth` with the default config (all

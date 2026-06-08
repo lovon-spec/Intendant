@@ -2283,6 +2283,7 @@ dependencies = [
  "rsa",
  "rtc",
  "rustls",
+ "rustls-native-certs",
  "schemars",
  "screencapturekit",
  "security-framework",

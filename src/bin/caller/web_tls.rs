@@ -22,6 +22,11 @@ use rustls::{RootCertStore, ServerConfig};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio_rustls::TlsAcceptor;
 
+pub type RustlsIdentity = (
+    Vec<rustls::pki_types::CertificateDer<'static>>,
+    rustls::pki_types::PrivateKeyDer<'static>,
+);
+
 /// A stream with a replayed prefix in front of an inner async stream.
 ///
 /// The gateway's demux reads the first chunk of the (decrypted, for TLS)
@@ -212,7 +217,7 @@ fn server_config_from(
     Ok(config)
 }
 
-fn load_ca_roots(ca_path: &std::path::Path) -> Result<RootCertStore, String> {
+pub fn load_ca_roots(ca_path: &std::path::Path) -> Result<RootCertStore, String> {
     use rustls::pki_types::pem::PemObject;
 
     let ca_bytes = std::fs::read(ca_path)
@@ -236,6 +241,33 @@ fn load_ca_roots(ca_path: &std::path::Path) -> Result<RootCertStore, String> {
              ({ignored} certificate(s) ignored)",
             ca_path.display()
         ));
+    }
+    Ok(roots)
+}
+
+pub fn load_native_root_store() -> Result<RootCertStore, String> {
+    let result = rustls_native_certs::load_native_certs();
+    let mut roots = RootCertStore::empty();
+    let mut ignored = 0usize;
+    for cert in result.certs {
+        if roots.add(cert).is_err() {
+            ignored += 1;
+        }
+    }
+    if roots.is_empty() {
+        let errors = result
+            .errors
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(if errors.is_empty() {
+            format!("no native root certificates loaded ({ignored} certificate(s) ignored)")
+        } else {
+            format!(
+                "no native root certificates loaded ({ignored} certificate(s) ignored): {errors}"
+            )
+        });
     }
     Ok(roots)
 }
@@ -295,16 +327,10 @@ fn generate_self_signed(
 ///
 /// Accepts PKCS#8, PKCS#1 (RSA), and SEC1 (EC) private keys, returning
 /// whichever appears first in the key file.
-fn load_pem_cert_and_key(
+pub fn load_pem_cert_and_key(
     cert_path: &std::path::Path,
     key_path: &std::path::Path,
-) -> Result<
-    (
-        Vec<rustls::pki_types::CertificateDer<'static>>,
-        rustls::pki_types::PrivateKeyDer<'static>,
-    ),
-    String,
-> {
+) -> Result<RustlsIdentity, String> {
     use rustls::pki_types::pem::{Error as PemError, PemObject};
 
     let cert_bytes = std::fs::read(cert_path)

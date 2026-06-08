@@ -61,6 +61,10 @@ tokio-tungstenite = { version = "0.29", features = ["rustls-tls-native-roots"] }
 # keeps the whole TLS stack on `ring`. `tls12` + `logging` preserve the
 # feature set the default would have given us.
 rustls = { version = "0.23", default-features = false, features = ["ring", "tls12", "logging"] }
+# Direct because daemon-to-daemon peer WebSocket clients build a custom rustls
+# ClientConfig when presenting the installed access client certificate; the
+# default tokio-tungstenite connector otherwise hides native-root loading.
+rustls-native-certs = "0.8"
 # Server-side TLS for the `--web` dashboard. `tokio-rustls` wraps an accepted
 # `TcpStream` into a `TlsStream` once the demux detects a TLS ClientHello;
 # `rcgen` mints a self-signed cert+key at startup (SAN = bind IP + localhost,

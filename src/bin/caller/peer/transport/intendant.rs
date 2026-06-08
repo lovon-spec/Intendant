@@ -69,6 +69,7 @@ use crate::event::ControlMsg;
 use crate::peer::card::{AgentCard, TransportSpec};
 use crate::peer::event::{ApprovalDecision, MessageContent, MessageId, PeerEvent, TaskId};
 use crate::peer::traits::{check_feature, PeerOp, PeerOpAck, PeerTransport, TransportFeatures};
+use crate::peer::transport::tls_client::ClientIdentityPaths;
 use crate::peer::upcast::WireEventUpcaster;
 use crate::peer::PeerError;
 use crate::types::OutboundEvent;
@@ -93,9 +94,10 @@ pub struct IntendantWsTransport {
     ws_write: Option<WsSink>,
     reader_handle: Option<JoinHandle<()>>,
     card: Option<AgentCard>,
-    /// Per-peer auth credentials (bearer token + pinned cert
-    /// fingerprints). Sourced from operator config (bearer) and the
-    /// peer's Agent Card (pinning). See [`TransportCredentials`].
+    /// Per-peer auth credentials (bearer token, pinned server cert
+    /// fingerprints, and optional mTLS client identity). Sourced from
+    /// operator config, the peer's Agent Card, and the installed access
+    /// cert store. See [`TransportCredentials`].
     creds: TransportCredentials,
     /// Monotonic counter for synthetic `MessageId`/`TaskId` values
     /// returned from `send`. Intendant's `/ws` control plane is
@@ -108,9 +110,8 @@ pub struct IntendantWsTransport {
 }
 
 /// Per-peer auth credentials carried by [`IntendantWsTransport`].
-/// Bundled into a struct rather than additional constructor args
-/// so future additions (per-peer client cert, per-peer signing
-/// key, etc.) extend cleanly.
+/// Bundled into a struct rather than additional constructor args so future
+/// additions (per-peer signing key, issued scoped certs, etc.) extend cleanly.
 #[derive(Clone, Debug, Default)]
 pub struct TransportCredentials {
     /// Outbound bearer token sent as `Authorization: Bearer <token>`
@@ -128,6 +129,12 @@ pub struct TransportCredentials {
     /// at registry-add time; the registry parses string fingerprints
     /// from the card and passes the bytes here.
     pub pinned_fingerprints: Vec<crate::peer::transport::pinning::Fingerprint>,
+    /// PEM client certificate and private key this daemon presents when
+    /// connecting to a peer over HTTPS/WSS. Defaults to the installed access
+    /// `client.crt` / `client.key` when present, so daemon-to-daemon federation
+    /// can satisfy the same mTLS gate as browsers without a dashboard-only
+    /// bearer token.
+    pub client_identity: Option<ClientIdentityPaths>,
 }
 
 impl IntendantWsTransport {
@@ -168,6 +175,7 @@ impl IntendantWsTransport {
             TransportCredentials {
                 bearer_token,
                 pinned_fingerprints: Vec::new(),
+                client_identity: None,
             },
         )
     }
@@ -216,17 +224,11 @@ impl IntendantWsTransport {
         let http_base = super::ws_url_to_http_base(&ws_url);
         let card_url = format!("{http_base}/.well-known/agent-card.json");
 
-        let mut client_builder = reqwest::Client::builder().timeout(CARD_FETCH_TIMEOUT);
-        if !self.creds.pinned_fingerprints.is_empty() {
-            let verifier = super::pinning::PinnedFingerprintVerifier::new(
-                self.creds.pinned_fingerprints.clone(),
-            );
-            let config = super::pinning::pinned_client_config(verifier);
-            client_builder = client_builder.use_preconfigured_tls(config);
-        }
-        let client = client_builder
-            .build()
-            .map_err(|e| PeerError::CardFetch(format!("build http client: {e}")))?;
+        let client = super::tls_client::reqwest_client(
+            CARD_FETCH_TIMEOUT,
+            &self.creds.pinned_fingerprints,
+            self.creds.client_identity.as_ref(),
+        )?;
 
         let mut request = client.get(&card_url);
         if let Some(token) = &self.creds.bearer_token {
@@ -262,14 +264,10 @@ impl IntendantWsTransport {
     /// `?token=...` on the URL because it can't natively set headers
     /// on `WebSocket` opens.)
     ///
-    /// When credentials specify pinned fingerprints, the connect
-    /// goes through `connect_async_tls_with_config` with a custom
-    /// rustls Connector whose verifier requires the server cert's
-    /// SHA-256 fingerprint to match one of the pinned values. For
-    /// `ws://` URLs (no TLS layer at all), the connector is
-    /// irrelevant — pinning silently doesn't apply, which is the
-    /// correct behavior for operators using `ws://` for trusted-LAN
-    /// connections.
+    /// When credentials specify pinned fingerprints or an mTLS client
+    /// identity, the connect goes through `connect_async_tls_with_config` with
+    /// a custom rustls Connector. For `ws://` URLs (no TLS layer at all), the
+    /// connector is irrelevant, so trusted-LAN cleartext tests keep working.
     async fn open_ws(&self) -> Result<(WsSink, JoinHandle<()>), PeerError> {
         use tokio_tungstenite::tungstenite::client::IntoClientRequest;
         use tokio_tungstenite::Connector;
@@ -296,15 +294,11 @@ impl IntendantWsTransport {
             request.headers_mut().insert("Authorization", value);
         }
 
-        let connector: Option<Connector> = if !self.creds.pinned_fingerprints.is_empty() {
-            let verifier = super::pinning::PinnedFingerprintVerifier::new(
-                self.creds.pinned_fingerprints.clone(),
-            );
-            let config = super::pinning::pinned_client_config(verifier);
-            Some(Connector::Rustls(std::sync::Arc::new(config)))
-        } else {
-            None
-        };
+        let connector: Option<Connector> = super::tls_client::rustls_client_config(
+            &self.creds.pinned_fingerprints,
+            self.creds.client_identity.as_ref(),
+        )?
+        .map(|config| Connector::Rustls(std::sync::Arc::new(config)));
 
         let (ws_stream, _response) =
             tokio_tungstenite::connect_async_tls_with_config(request, None, false, connector)

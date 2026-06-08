@@ -731,6 +731,8 @@ impl Default for ServerAuthConfig {
 /// `bearer_token` is an advanced compatibility credential this daemon
 /// sends when connecting out to legacy peers that still require
 /// `[server.auth] bearer_token`.
+/// `client_cert` / `client_key` are the normal explicit mTLS path for
+/// daemon-to-daemon peers when the peer issued this daemon a client identity.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PeerConfig {
     /// URL of the peer's Agent Card. Typically
@@ -760,6 +762,20 @@ pub struct PeerConfig {
     /// ```
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bearer_token: Option<String>,
+    /// Peer-issued mTLS client certificate PEM presented when connecting to
+    /// this peer over HTTPS/WSS. Must be paired with `client_key`.
+    ///
+    /// The certificate must chain to the CA the peer configured for
+    /// `[server.mtls]` / `--mtls-ca`; a local daemon's own access client cert
+    /// only works when the peer trusts that issuing CA. When absent, TLS peer
+    /// connections fall back to the installed access `client.crt` / `client.key`
+    /// if present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_cert: Option<String>,
+    /// Private key PEM for `client_cert`. Must be supplied together with
+    /// `client_cert`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_key: Option<String>,
     /// Operator-supplied pinned SHA-256 cert fingerprints. When
     /// non-empty, REPLACES whatever the peer's own card declares for
     /// `auth.transport` — eliminates the TOFU window for operators
@@ -1052,6 +1068,8 @@ card_url = "http://127.0.0.1:9000/.well-known/agent-card.json"
                     card_url: "http://a.local/.well-known/agent-card.json".into(),
                     label: Some("A".into()),
                     bearer_token: None,
+                    client_cert: None,
+                    client_key: None,
                     pinned_fingerprints: Vec::new(),
                     browser_tcp_via_url: None,
                 },
@@ -1059,6 +1077,8 @@ card_url = "http://127.0.0.1:9000/.well-known/agent-card.json"
                     card_url: "http://b.local/.well-known/agent-card.json".into(),
                     label: None,
                     bearer_token: Some("secret-for-b".into()),
+                    client_cert: Some("/secrets/b-client.crt".into()),
+                    client_key: Some("/secrets/b-client.key".into()),
                     pinned_fingerprints: vec![
                         "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899".into(),
                     ],
@@ -1076,6 +1096,8 @@ card_url = "http://127.0.0.1:9000/.well-known/agent-card.json"
         assert_eq!(parsed.peers[1].card_url, original.peers[1].card_url);
         assert!(parsed.peers[1].label.is_none());
         assert_eq!(parsed.peers[1].bearer_token, original.peers[1].bearer_token);
+        assert_eq!(parsed.peers[1].client_cert, original.peers[1].client_cert);
+        assert_eq!(parsed.peers[1].client_key, original.peers[1].client_key);
         assert_eq!(
             parsed.peers[1].pinned_fingerprints,
             original.peers[1].pinned_fingerprints
