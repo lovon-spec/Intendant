@@ -207,9 +207,10 @@ features they lack.
   the first compares the served embedded app/WASM/JS assets with this worktree's
   `static/` files so a stale controller on the target port fails clearly, the
   second fails if Station sessions, events, managed context, and peers are all
-  empty, the managed-context requirement fails if Station has no active
-  managed/context session state, and the provider requirement fails if Station
-  only exposes placeholder/no-provider session state instead of a non-placeholder
+  empty, the managed-context requirement fails unless Station exposes active
+  live managed/context session state rather than historical, stopped, idle,
+  unknown, or stale state, and the provider requirement fails if Station only
+  exposes placeholder/no-provider session state instead of a non-placeholder
   provider, model, and session id.
   The external-agent requirement then verifies that same real Station session is
   backed by Codex, so native/default-provider sessions cannot satisfy Codex QA.

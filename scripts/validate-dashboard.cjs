@@ -3133,24 +3133,49 @@ function stationStateSummarySource() {
     const managedContextState = (snapshot, managedCount) => {
       const managed = snapshot.managed && typeof snapshot.managed === 'object' ? snapshot.managed : {};
       const context = snapshot.context && typeof snapshot.context === 'object' ? snapshot.context : {};
+      const controls = snapshot.controls && typeof snapshot.controls === 'object' ? snapshot.controls : {};
       const sessionId = sessionIdText(
         managed.sessionId || managed.session_id || context.sessionId || context.session_id ||
-        managed.intendantSessionId || managed.intendant_session_id || context.intendantSessionId || context.intendant_session_id
+        managed.intendantSessionId || managed.intendant_session_id || context.intendantSessionId || context.intendant_session_id ||
+        controls.sessionLiveId || controls.session_live_id || controls.sessionId || controls.session_id
       );
-      const status = asText(managed.status || managed.phase || managed.contextStatus || managed.context_status || context.status || context.phase || context.contextStatus || context.context_status);
-      const live = Boolean(managed.live || managed.active || context.live || context.active);
+      const managedStatus = asText(managed.status || managed.phase || managed.contextStatus || managed.context_status);
+      const contextStatus = asText(context.status || context.phase || context.contextStatus || context.context_status || context.exactStatus || context.exact_status);
+      const controlsStatus = asText(controls.sessionLivePhase || controls.session_live_phase || controls.sessionStatus || controls.session_status);
+      const status = managedStatus || contextStatus || controlsStatus;
+      const mode = asText(
+        managed.mode || managed.managedMode || managed.managed_mode || managed.configuredMode || managed.configured_mode ||
+        context.managedMode || context.managed_mode ||
+        controls.sessionManagedContext || controls.session_managed_context
+      );
+      const replayMode = asText(
+        managed.replayMode || managed.replay_mode || context.replayMode || context.replay_mode
+      );
+      const active = Boolean(
+        managed.active || context.active || controls.sessionActive || controls.session_active
+      );
+      const live = Boolean(managed.live || context.live || active);
       const counts = managedCountDetails(managed);
-      const stopped = /\b(stopped|inactive|ended|complete|completed|done|idle|unavailable|empty)\b/i.test(status);
-      const ok = live || Boolean(sessionId && !stopped);
+      const normalizedStatus = asText(status).toLowerCase().replace(/[_\s]+/g, '-');
+      const normalizedMode = asText(mode).toLowerCase().replace(/[_\s]+/g, '-');
+      const normalizedReplayMode = asText(replayMode).toLowerCase().replace(/[_\s]+/g, '-');
+      const terminalStatus = !normalizedStatus || /^(?:-|--|n\/a|na|null|undefined|unknown|none|stale|historical|history|archived|replay|snapshot|stopped|inactive|ended|complete|completed|done|idle|detached|unavailable|empty|missing|closed|finished|orphaned)$/.test(normalizedStatus);
+      const staleStatus = /\b(?:stale|historical|archived|replay|snapshot|stopped|inactive|ended|complete|completed|done|idle|detached|unavailable|empty|missing|closed|finished|orphaned)\b/i.test(status);
+      const liveReplay = !normalizedReplayMode || normalizedReplayMode === 'live';
+      const managedMode = normalizedMode === 'managed';
+      const ok = Boolean(sessionId && managedMode && live && liveReplay && !terminalStatus && !staleStatus);
       return {
         ok,
         live,
+        active,
         sessionId,
         status,
+        mode,
+        replayMode,
         counts,
         reason: ok
           ? 'passed'
-          : `no active managed/context state (live=${live}, sessionId=${sessionId || 'none'}, status=${status || 'none'}, managedCount=${managedCount})`,
+          : `no active live managed/context state (live=${live}, active=${active}, sessionId=${sessionId || 'none'}, mode=${mode || 'none'}, status=${status || 'none'}, replayMode=${replayMode || 'none'}, managedCount=${managedCount})`,
       };
     };
     try {
@@ -3262,8 +3287,11 @@ function compactManagedContextState(state) {
   return {
     ok: Boolean(state.ok),
     live: Boolean(state.live),
+    active: Boolean(state.active),
     sessionId: truncateMiddle(state.sessionId || '', DIAGNOSTIC_TEXT_LIMIT),
     status: truncateMiddle(state.status || '', DIAGNOSTIC_TEXT_LIMIT),
+    mode: truncateMiddle(state.mode || '', DIAGNOSTIC_TEXT_LIMIT),
+    replayMode: truncateMiddle(state.replayMode || '', DIAGNOSTIC_TEXT_LIMIT),
     counts: {
       records: Number(counts.records) || 0,
       anchors: Number(counts.anchors) || 0,
@@ -4307,8 +4335,9 @@ async function runSelfTest() {
   })();
   assert.strictEqual(populatedStationStateSummary.nonEmpty, true);
   assert.strictEqual(populatedStationStateSummary.liveAgentSession.ok, false);
-  assert.strictEqual(populatedStationStateSummary.managedContextState.ok, true);
+  assert.strictEqual(populatedStationStateSummary.managedContextState.ok, false);
   assert.strictEqual(populatedStationStateSummary.managedContextState.sessionId, 'abc');
+  assert.ok(populatedStationStateSummary.managedContextState.reason.includes('live=false'));
   assert.deepStrictEqual(JSON.parse(JSON.stringify(populatedStationStateSummary.counts)), {
     sessions: 4,
     events: 1,
@@ -4349,7 +4378,8 @@ async function runSelfTest() {
       agents: [{ id: 'primary-agent' }],
       events: [{ id: 'event-1' }],
       activity: { retainedCount: 1, shownCount: 1 },
-      managed: { sessionId: 'stopped-managed', status: 'stopped', records: 2, anchors: 1 },
+      managed: { sessionId: 'stopped-managed', live: true, mode: 'managed', status: 'stopped', records: 2, anchors: 1 },
+      controls: { sessionActive: true, sessionLiveId: 'stopped-managed', sessionManagedContext: 'managed' },
       sessions: { total: 1, recent: [{ id: 'stopped-managed', status: 'stopped', source: 'codex' }] },
     }),
     daemons: [],
@@ -4362,6 +4392,50 @@ async function runSelfTest() {
   })();
   assert.strictEqual(stoppedManagedStateSummary.nonEmpty, true);
   assert.strictEqual(stoppedManagedStateSummary.managedContextState.ok, false);
+  assert.strictEqual(stoppedManagedStateSummary.managedContextState.live, true);
+  assert.strictEqual(stoppedManagedStateSummary.managedContextState.status, 'stopped');
+  const historicalManagedStateSummary = vm.runInNewContext(`(${stationStateSummarySource()})`, {
+    buildStationSnapshot: () => ({
+      hosts: [{ id: 'local' }],
+      agents: [{ id: 'primary-agent' }],
+      events: [{ id: 'event-1' }],
+      activity: { retainedCount: 1, shownCount: 1 },
+      managed: { sessionId: 'historical-managed', live: false, mode: 'managed', status: 'historical', records: 4, anchors: 2 },
+      context: { replayMode: 'replay' },
+      sessions: { total: 1, recent: [{ id: 'historical-managed', status: 'done', source: 'codex' }] },
+    }),
+    daemons: [],
+    Map,
+    Set,
+    Array,
+    Object,
+    Number,
+    String,
+  })();
+  assert.strictEqual(historicalManagedStateSummary.managedContextState.ok, false);
+  assert.strictEqual(historicalManagedStateSummary.managedContextState.status, 'historical');
+  assert.strictEqual(historicalManagedStateSummary.managedContextState.replayMode, 'replay');
+  const unknownManagedStateSummary = vm.runInNewContext(`(${stationStateSummarySource()})`, {
+    buildStationSnapshot: () => ({
+      hosts: [{ id: 'local' }],
+      agents: [{ id: 'primary-agent' }],
+      events: [{ id: 'event-1' }],
+      activity: { retainedCount: 1, shownCount: 1 },
+      managed: { sessionId: 'unknown-managed', live: true, mode: 'managed', status: 'unknown', records: 1, anchors: 1 },
+      controls: { sessionActive: true, sessionLiveId: 'unknown-managed', sessionManagedContext: 'managed' },
+      sessions: { total: 1, recent: [{ id: 'unknown-managed', status: 'running', source: 'codex' }] },
+    }),
+    daemons: [],
+    Map,
+    Set,
+    Array,
+    Object,
+    Number,
+    String,
+  })();
+  assert.strictEqual(unknownManagedStateSummary.managedContextState.ok, false);
+  assert.strictEqual(unknownManagedStateSummary.managedContextState.live, true);
+  assert.strictEqual(unknownManagedStateSummary.managedContextState.status, 'unknown');
   const nativeProviderStationStateSummary = vm.runInNewContext(`(${stationStateSummarySource()})`, {
     buildStationSnapshot: () => ({
       hosts: [{ id: 'local' }],
@@ -4396,7 +4470,9 @@ async function runSelfTest() {
       agents: [{ id: 'primary-agent', provider: 'openai', model: 'gpt-5.2-codex', status: 'running' }],
       events: [{ id: 'event-1' }],
       activity: { retainedCount: 1, shownCount: 1 },
-      managed: { sessionId: 'sess-live', records: 1, anchors: 0 },
+      managed: { sessionId: 'sess-live', live: true, mode: 'managed', status: 'watch', records: 1, anchors: 0 },
+      context: { replayMode: 'live' },
+      controls: { sessionActive: true, sessionLiveId: 'sess-live', sessionLivePhase: 'running', sessionManagedContext: 'managed' },
       sessions: {
         total: 1,
         latestTask: 'real managed Station session',
@@ -4422,6 +4498,9 @@ async function runSelfTest() {
   assert.strictEqual(liveProviderStationStateSummary.externalAgentSession.ok, true);
   assert.strictEqual(liveProviderStationStateSummary.externalAgentSession.sessionId, 'sess-live');
   assert.strictEqual(liveProviderStationStateSummary.externalAgentSession.agent, 'codex');
+  assert.strictEqual(liveProviderStationStateSummary.managedContextState.ok, true);
+  assert.strictEqual(liveProviderStationStateSummary.managedContextState.mode, 'managed');
+  assert.strictEqual(liveProviderStationStateSummary.managedContextState.status, 'watch');
   const codexTargetStationStateSummary = vm.runInNewContext(`(${stationStateSummarySource()})`, {
     buildStationSnapshot: () => ({
       hosts: [{ id: 'local' }],
