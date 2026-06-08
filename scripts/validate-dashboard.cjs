@@ -45,6 +45,14 @@ const STATIC_IDENTITY_ASSETS = [
   { urlPath: '/audio-processor.js', file: path.join('static', 'audio-processor.js'), kind: 'text' },
   { urlPath: '/icon-128.png', file: path.join('static', 'icon-128.png'), kind: 'binary' },
 ];
+const APP_HTML_CACHEBUSTED_ASSET_PATHS = [
+  '/wasm-web/presence_web.js',
+  '/wasm-web/presence_web_bg.wasm',
+  '/wasm-station/station_web.js',
+  '/wasm-station/station_web_bg.wasm',
+  '/three.module.min.js',
+  '/icon-128.png',
+];
 
 const BROWSER_EXECUTABLE_ENVS = [
   'INTENDANT_BROWSER_WORKSPACE_EXECUTABLE',
@@ -1003,11 +1011,16 @@ function normalizeStaticIdentityBytes(bytes, asset) {
 }
 
 function normalizeAppHtmlForIdentity(text) {
-  return String(text || '')
-    .replace(/(\/wasm-web\/presence_web(?:_bg\.wasm|\.js))\?v=[A-Za-z0-9._:-]+/g, '$1')
-    .replace(/(\/wasm-station\/station_web(?:_bg\.wasm|\.js))\?v=[A-Za-z0-9._:-]+/g, '$1')
-    .replace(/(\/three\.module\.min\.js)\?v=[A-Za-z0-9._:-]+/g, '$1')
-    .replace(/(\/icon-128\.png)\?v=[A-Za-z0-9._:-]+/g, '$1');
+  let normalized = String(text || '');
+  for (const assetPath of APP_HTML_CACHEBUSTED_ASSET_PATHS) {
+    const pattern = new RegExp(`(${escapeRegExp(assetPath)})\\?[^"'\\s<>\`)]*`, 'g');
+    normalized = normalized.replace(pattern, '$1');
+  }
+  return normalized;
+}
+
+function escapeRegExp(value) {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
 function dashboardAssetUrl(targetUrl, urlPath) {
@@ -4036,6 +4049,20 @@ async function runSelfTest() {
     '<script src="/wasm-station/station_web.js"></script>',
   );
   assert.strictEqual(
+    normalizeAppHtmlForIdentity('<script src="/wasm-station/station_web.js?cachebuster=abc%2F123&v=ignored"></script>'),
+    '<script src="/wasm-station/station_web.js"></script>',
+  );
+  await withTempStaticIdentityTree(async ({ root, responses, localAppHtml, servedAppHtml }) => {
+    assert.notStrictEqual(sha256Hex(Buffer.from(servedAppHtml)), sha256Hex(Buffer.from(localAppHtml)));
+    assert.strictEqual(normalizeAppHtmlForIdentity(servedAppHtml), normalizeAppHtmlForIdentity(localAppHtml));
+    await withStaticIdentityServer(responses, async (port) => {
+      const identity = await validateCurrentStaticIdentity(`http://127.0.0.1:${port}/app?passive=1#station`, root);
+      const appItem = identity.items.find((item) => item.path === '/app');
+      assert.ok(appItem);
+      assert.strictEqual(appItem.hash, sha256Hex(Buffer.from(normalizeAppHtmlForIdentity(localAppHtml))));
+    });
+  });
+  assert.strictEqual(
     dashboardAssetUrl('http://127.0.0.1:8912/app?passive=1#station', '/wasm-station/station_web.js'),
     'http://127.0.0.1:8912/wasm-station/station_web.js',
   );
@@ -4287,6 +4314,68 @@ async function withLoopbackServer(callback) {
   } finally {
     await new Promise((resolve) => server.close(resolve));
   }
+}
+
+async function withStaticIdentityServer(responses, callback) {
+  const server = http.createServer((req, res) => {
+    const pathname = new URL(req.url || '/', 'http://127.0.0.1').pathname;
+    if (!responses.has(pathname)) {
+      res.writeHead(404);
+      res.end('not found');
+      return;
+    }
+    res.writeHead(200);
+    res.end(responses.get(pathname));
+  });
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  try {
+    const address = server.address();
+    await callback(address.port);
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+  }
+}
+
+async function withTempStaticIdentityTree(callback) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'validate-dashboard-static-'));
+  const localAppHtml = [
+    '<link rel="icon" href="/icon-128.png">',
+    '<script type="module" src="/wasm-web/presence_web.js"></script>',
+    '<script type="module" src="/wasm-station/station_web.js"></script>',
+    '<script>const presence = "/wasm-web/presence_web_bg.wasm";</script>',
+    '<script>const station = "/wasm-station/station_web_bg.wasm";</script>',
+    '<script type="module" src="/three.module.min.js"></script>',
+  ].join('\n');
+  const servedAppHtml = cachebustedAppHtml(localAppHtml);
+  const responses = new Map();
+  try {
+    for (const asset of STATIC_IDENTITY_ASSETS) {
+      const localPath = path.join(root, asset.file);
+      fs.mkdirSync(path.dirname(localPath), { recursive: true });
+      if (asset.urlPath === '/app') {
+        fs.writeFileSync(localPath, localAppHtml);
+        responses.set(asset.urlPath, Buffer.from(servedAppHtml));
+      } else {
+        const payload = Buffer.from(`fixture:${asset.urlPath}\n`);
+        fs.writeFileSync(localPath, payload);
+        responses.set(asset.urlPath, payload);
+      }
+    }
+    await callback({ root, responses, localAppHtml, servedAppHtml });
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+}
+
+function cachebustedAppHtml(html) {
+  let output = String(html || '');
+  for (const assetPath of APP_HTML_CACHEBUSTED_ASSET_PATHS) {
+    output = output.replaceAll(assetPath, `${assetPath}?cachebuster=served%2Fidentity&v=ignored`);
+  }
+  return output;
 }
 
 async function withTempDashboardBinaryTree(callback) {
