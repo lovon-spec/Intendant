@@ -1633,15 +1633,26 @@ impl StationInner {
             nonempty(&controls.sandbox, "sandbox"),
             nonempty(&controls.approval_policy, "approval")
         );
-        let status_b = format!(
-            "managed {} / context {} / changes {}",
-            nonempty(&controls.managed_context, "unknown"),
-            pct_label(percent(
-                self.snapshot.context.tokens,
-                self.snapshot.context.effective_window,
-            )),
-            nonempty(&self.snapshot.changes.status, "clean")
-        );
+        let external_turn =
+            controls.external_turn_state != "internal" && !controls.external_turn_state.is_empty();
+        let status_b = if external_turn {
+            format!(
+                "external {} / {} / {}",
+                nonempty(&controls.external_turn_label, "agent"),
+                nonempty(&controls.external_turn_state, "idle"),
+                nonempty(&controls.session_command, &controls.command)
+            )
+        } else {
+            format!(
+                "managed {} / context {} / changes {}",
+                nonempty(&controls.managed_context, "unknown"),
+                pct_label(percent(
+                    self.snapshot.context.tokens,
+                    self.snapshot.context.effective_window,
+                )),
+                nonempty(&self.snapshot.changes.status, "clean")
+            )
+        };
         if dense {
             self.text(
                 &truncate(&status_a, 48),
@@ -1661,7 +1672,17 @@ impl StationInner {
             );
         } else {
             self.status_chip(x + 112.0, y + 8.0, 230.0, &status_a, C_TEAL_CSS);
-            self.status_chip(x + 352.0, y + 8.0, 250.0, &status_b, C_MAUVE_CSS);
+            self.status_chip(
+                x + 352.0,
+                y + 8.0,
+                250.0,
+                &status_b,
+                if external_turn {
+                    external_turn_color_css(&controls.external_turn_state)
+                } else {
+                    C_MAUVE_CSS
+                },
+            );
             let session = if controls.session_active {
                 "active"
             } else if controls.session_detached {
@@ -1697,6 +1718,31 @@ impl StationInner {
         ];
         if controls.session_can_focus {
             actions.push(LaneAction::activity("focus", "target", 58.0, C_PEACH_CSS));
+        }
+        if controls.session_can_attach && !controls.session_id.is_empty() {
+            actions.push(LaneAction::session(
+                "attach",
+                "attach",
+                &controls.session_id,
+                62.0,
+                C_TEAL_CSS,
+            ));
+        }
+        if controls.session_can_config && !controls.session_id.is_empty() {
+            actions.push(LaneAction::session(
+                "config",
+                "config",
+                &controls.session_id,
+                62.0,
+                C_MAUVE_CSS,
+            ));
+            actions.push(LaneAction::session(
+                "save cfg",
+                "config-save",
+                &controls.session_id,
+                72.0,
+                C_GREEN_CSS,
+            ));
         }
         if controls.session_can_interrupt {
             actions.push(LaneAction::activity("stop", "stop", 50.0, C_RED_CSS));
@@ -4162,6 +4208,40 @@ impl StationInner {
                 if controls.session_can_interrupt {
                     actions.push(MenuAction::activity("Stop target", "stop", C_RED_CSS));
                 }
+                if controls.session_can_config && !controls.session_id.is_empty() {
+                    actions.push(MenuAction::session(
+                        "Launch config",
+                        "config",
+                        &controls.session_id,
+                        C_MAUVE_CSS,
+                    ));
+                    actions.push(MenuAction::session(
+                        "Save launch config",
+                        "config-save",
+                        &controls.session_id,
+                        C_GREEN_CSS,
+                    ));
+                    actions.push(MenuAction::session(
+                        "Save and restart",
+                        "config-save-restart",
+                        &controls.session_id,
+                        C_PEACH_CSS,
+                    ));
+                    actions.push(MenuAction::session(
+                        "Restart saved config",
+                        "restart",
+                        &controls.session_id,
+                        C_RED_CSS,
+                    ));
+                }
+                if !controls.session_id.is_empty() {
+                    actions.push(MenuAction::session(
+                        "Copy target id",
+                        "copy",
+                        &controls.session_id,
+                        C_BLUE_CSS,
+                    ));
+                }
                 Some(("Sessions".to_string(), C_TEAL_CSS, actions))
             }
             "system:controls" => {
@@ -4185,6 +4265,34 @@ impl StationInner {
                 }
                 if controls.session_can_interrupt {
                     actions.push(MenuAction::activity("Stop target", "stop", C_RED_CSS));
+                }
+                if controls.session_can_attach && !controls.session_id.is_empty() {
+                    actions.push(MenuAction::session(
+                        "Attach target",
+                        "attach",
+                        &controls.session_id,
+                        C_TEAL_CSS,
+                    ));
+                }
+                if controls.session_can_config && !controls.session_id.is_empty() {
+                    actions.push(MenuAction::session(
+                        "Target launch config",
+                        "config",
+                        &controls.session_id,
+                        C_MAUVE_CSS,
+                    ));
+                    actions.push(MenuAction::session(
+                        "Save target config",
+                        "config-save",
+                        &controls.session_id,
+                        C_GREEN_CSS,
+                    ));
+                    actions.push(MenuAction::session(
+                        "Save and restart target",
+                        "config-save-restart",
+                        &controls.session_id,
+                        C_PEACH_CSS,
+                    ));
                 }
                 if controls.shared_view_can_take_input {
                     actions.push(MenuAction::controls(
