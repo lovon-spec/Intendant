@@ -73,6 +73,9 @@ static EXTERNAL_TRANSCRIPT_CACHE: OnceLock<Mutex<HashMap<String, ExternalTranscr
     OnceLock::new();
 static SESSION_LIST_RESPONSE_CACHE: OnceLock<Mutex<Option<SessionListResponseCacheEntry>>> =
     OnceLock::new();
+static SESSION_LIST_LIMITED_RESPONSE_CACHE: OnceLock<
+    Mutex<HashMap<usize, SessionListResponseCacheEntry>>,
+> = OnceLock::new();
 static SESSION_LIST_ROW_CACHE: OnceLock<Mutex<HashMap<String, SessionListRowCacheEntry>>> =
     OnceLock::new();
 static CODEX_SESSION_LIST_CACHE: OnceLock<Mutex<HashMap<String, CodexSessionListCacheEntry>>> =
@@ -99,6 +102,8 @@ const SESSION_LIST_ROW_CACHE_LIMIT: usize = 8_192;
 const SESSION_LIST_LIMIT: usize = 5_000;
 const SESSION_LIST_RESPONSE_CACHE_TTL_SECS: u64 = 30;
 const SESSION_DETAIL_ENTRY_LIMIT_MAX: usize = 1_000;
+const WEBSOCKET_BOOTSTRAP_REPLAY_ENTRY_LIMIT: usize = 250;
+const WEBSOCKET_BOOTSTRAP_REPLAY_TEXT_LIMIT_BYTES: usize = 16 * 1024;
 const SESSION_SOURCE_FLOOR: usize = 100;
 const SESSION_LOG_SEARCH_SNIPPETS_PER_SESSION: usize = 3;
 const SESSION_LOG_SEARCH_SNIPPET_CHARS: usize = 220;
@@ -2230,6 +2235,61 @@ fn compact_context_snapshot_entries_for_replay(entries: &mut [serde_json::Value]
     }
 }
 
+fn truncate_string_to_utf8_byte_limit(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value.to_string();
+    }
+    let mut end = max_bytes.min(value.len());
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut out = value[..end].to_string();
+    out.push_str("...");
+    out
+}
+
+fn compact_replay_entry_text_fields_for_websocket(entry: &mut serde_json::Value) {
+    let Some(obj) = entry.as_object_mut() else {
+        return;
+    };
+    for key in [
+        "content",
+        "stdout",
+        "stderr",
+        "message",
+        "summary",
+        "reasoning_summary",
+        "reasoningSummary",
+    ] {
+        let Some(value) = obj.get_mut(key) else {
+            continue;
+        };
+        let Some(text) = value.as_str() else {
+            continue;
+        };
+        if text.len() > WEBSOCKET_BOOTSTRAP_REPLAY_TEXT_LIMIT_BYTES {
+            *value = serde_json::Value::String(truncate_string_to_utf8_byte_limit(
+                text,
+                WEBSOCKET_BOOTSTRAP_REPLAY_TEXT_LIMIT_BYTES,
+            ));
+        }
+    }
+}
+
+fn prepare_websocket_bootstrap_replay_entries(
+    mut entries: Vec<serde_json::Value>,
+    limit: usize,
+) -> Vec<serde_json::Value> {
+    entries.retain(|entry| {
+        entry.get("event").and_then(|v| v.as_str()) != Some("context_snapshot")
+    });
+    entries = limited_session_detail_entries(entries, Some(limit));
+    for entry in &mut entries {
+        compact_replay_entry_text_fields_for_websocket(entry);
+    }
+    entries
+}
+
 fn annotate_context_snapshot_raw_exact_replay(entry: &mut serde_json::Value, snapshot_file: &str) {
     let Some(raw) = entry.get_mut("raw") else {
         return;
@@ -2268,7 +2328,17 @@ fn annotate_context_snapshot_raw_value_exact_replay(
 fn session_log_replay_payload_from_dir(
     log_dir: &std::path::Path,
 ) -> Option<(String, Option<String>)> {
+    session_log_replay_payload_from_dir_with_limit(log_dir, None)
+}
+
+fn session_log_replay_payload_from_dir_with_limit(
+    log_dir: &std::path::Path,
+    limit: Option<usize>,
+) -> Option<(String, Option<String>)> {
     let (mut entries, external_session_id) = session_log_replay_entries_from_dir(log_dir)?;
+    if let Some(limit) = limit {
+        entries = prepare_websocket_bootstrap_replay_entries(entries, limit);
+    }
     compact_context_snapshot_entries_for_replay(&mut entries);
     Some((
         serde_json::json!({
@@ -2871,6 +2941,8 @@ fn resume_session_activity_replay_from_home(
         &source_norm,
         replay_id,
         limit,
+        false,
+        true,
         false,
     )
 }
@@ -5171,25 +5243,26 @@ fn push_unique_session(
     }
 }
 
-fn truncate_sessions_preserving_sources(sessions: &mut Vec<serde_json::Value>) {
-    if sessions.len() <= SESSION_LIST_LIMIT {
+fn truncate_sessions_preserving_sources_to(sessions: &mut Vec<serde_json::Value>, limit: usize) {
+    if sessions.len() <= limit {
         return;
     }
 
-    let mut out = Vec::with_capacity(SESSION_LIST_LIMIT);
+    let mut out = Vec::with_capacity(limit);
     let mut seen = HashSet::new();
+    let source_floor = SESSION_SOURCE_FLOOR.min((limit / 4).max(1));
     for source in ["intendant", "codex", "claude-code", "gemini"] {
         for session in sessions
             .iter()
             .filter(|session| session_source(session) == source)
-            .take(SESSION_SOURCE_FLOOR)
+            .take(source_floor)
         {
             push_unique_session(&mut out, &mut seen, session);
         }
     }
 
     for session in sessions.iter() {
-        if out.len() >= SESSION_LIST_LIMIT {
+        if out.len() >= limit {
             break;
         }
         push_unique_session(&mut out, &mut seen, session);
@@ -5197,6 +5270,10 @@ fn truncate_sessions_preserving_sources(sessions: &mut Vec<serde_json::Value>) {
 
     sort_sessions_newest_first(&mut out);
     *sessions = out;
+}
+
+fn truncate_sessions_preserving_sources(sessions: &mut Vec<serde_json::Value>) {
+    truncate_sessions_preserving_sources_to(sessions, SESSION_LIST_LIMIT)
 }
 
 fn codex_usage_bucket<'a>(
@@ -6792,26 +6869,30 @@ pub(crate) fn external_session_entries_from_home(
     external_session_entries_from_file(&source, session_id, &path)
 }
 
-fn external_session_activity_replay(
-    source: &str,
-    session_id: &str,
-    limit: usize,
-) -> Option<String> {
-    external_session_activity_replay_from_home(
-        &crate::platform::home_dir(),
-        source,
-        session_id,
-        limit,
-    )
-}
-
 fn external_session_activity_replay_from_home(
     home: &Path,
     source: &str,
     session_id: &str,
     limit: usize,
 ) -> Option<String> {
-    external_session_activity_replay_from_home_with_attach(home, source, session_id, limit, true)
+    external_session_activity_replay_from_home_with_attach(
+        home, source, session_id, limit, true, true, false,
+    )
+}
+
+fn external_session_activity_replay_for_websocket(
+    source: &str,
+    session_id: &str,
+) -> Option<String> {
+    external_session_activity_replay_from_home_with_attach(
+        &crate::platform::home_dir(),
+        source,
+        session_id,
+        WEBSOCKET_BOOTSTRAP_REPLAY_ENTRY_LIMIT,
+        true,
+        false,
+        true,
+    )
 }
 
 fn external_session_activity_replay_from_home_with_attach(
@@ -6820,9 +6901,16 @@ fn external_session_activity_replay_from_home_with_attach(
     session_id: &str,
     limit: usize,
     include_attached: bool,
+    include_context_snapshots: bool,
+    compact_for_websocket: bool,
 ) -> Option<String> {
     let source = crate::session_names::normalize_source(source);
     let mut transcript = external_session_entries_from_home(home, &source, session_id)?;
+    if compact_for_websocket {
+        transcript.retain(|entry| {
+            entry.get("event").and_then(|v| v.as_str()) != Some("context_snapshot")
+        });
+    }
     if limit > 0 {
         transcript = limited_session_detail_entries(transcript, Some(limit));
     }
@@ -6859,6 +6947,16 @@ fn external_session_activity_replay_from_home_with_attach(
         if content.is_empty() {
             continue;
         }
+        let content = if compact_for_websocket
+            && content.len() > WEBSOCKET_BOOTSTRAP_REPLAY_TEXT_LIMIT_BYTES
+        {
+            truncate_string_to_utf8_byte_limit(
+                content,
+                WEBSOCKET_BOOTSTRAP_REPLAY_TEXT_LIMIT_BYTES,
+            )
+        } else {
+            content.to_string()
+        };
         entries.push(serde_json::json!({
             "event": "log_entry",
             "session_id": session_id,
@@ -6891,7 +6989,9 @@ fn external_session_activity_replay_from_home_with_attach(
                 .and_then(|v| v.as_str()),
         }));
     }
-    append_external_context_snapshot_replay_entries(home, &source, session_id, &mut entries);
+    if include_context_snapshots {
+        append_external_context_snapshot_replay_entries(home, &source, session_id, &mut entries);
+    }
     compact_context_snapshot_entries_for_replay(&mut entries);
 
     Some(
@@ -7182,6 +7282,11 @@ fn list_sessions() -> String {
     list_sessions_from_home(&crate::platform::home_dir())
 }
 
+fn cached_limited_session_list_cache(
+) -> &'static Mutex<HashMap<usize, SessionListResponseCacheEntry>> {
+    SESSION_LIST_LIMITED_RESPONSE_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 fn cached_list_sessions() -> String {
     let cache = SESSION_LIST_RESPONSE_CACHE.get_or_init(|| Mutex::new(None));
     {
@@ -7208,6 +7313,46 @@ fn cached_list_sessions() -> String {
         generated_at: std::time::Instant::now(),
         body: body.clone(),
     });
+    body
+}
+
+fn cached_list_sessions_with_limit(limit: usize) -> String {
+    let limit = limit.clamp(1, SESSION_LIST_LIMIT);
+    if limit >= SESSION_LIST_LIMIT {
+        return cached_list_sessions();
+    }
+
+    let cache = cached_limited_session_list_cache();
+    {
+        let guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(entry) = guard.get(&limit) {
+            if entry.generated_at.elapsed()
+                <= std::time::Duration::from_secs(SESSION_LIST_RESPONSE_CACHE_TTL_SECS)
+            {
+                return entry.body.clone();
+            }
+        }
+    }
+
+    let body = list_sessions_from_home_with_limit(&crate::platform::home_dir(), Some(limit));
+    let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(entry) = guard.get(&limit) {
+        if entry.generated_at.elapsed()
+            <= std::time::Duration::from_secs(SESSION_LIST_RESPONSE_CACHE_TTL_SECS)
+        {
+            return entry.body.clone();
+        }
+    }
+    if guard.len() >= 16 && !guard.contains_key(&limit) {
+        guard.clear();
+    }
+    guard.insert(
+        limit,
+        SessionListResponseCacheEntry {
+            generated_at: std::time::Instant::now(),
+            body: body.clone(),
+        },
+    );
     body
 }
 
@@ -7239,7 +7384,18 @@ fn session_row_matches_any_id(row: &serde_json::Value, ids: &HashSet<String>) ->
     ]
     .into_iter()
     .filter_map(|key| row.get(key).and_then(|v| v.as_str()))
-    .any(|id| ids.contains(id))
+    .any(|id| session_id_matches_any_requested(id, ids))
+}
+
+fn session_id_matches_any_requested(candidate: &str, requested_ids: &HashSet<String>) -> bool {
+    let candidate = candidate.trim();
+    if candidate.is_empty() {
+        return false;
+    }
+    requested_ids.iter().any(|requested| {
+        let requested = requested.trim();
+        !requested.is_empty() && (candidate == requested || candidate.starts_with(requested))
+    })
 }
 
 fn filter_session_list_by_ids(body: &str, ids: &[String]) -> String {
@@ -7319,7 +7475,10 @@ fn hydrate_codex_session_goal_for_row(
         return;
     }
     let row_ids = session_row_id_values(row);
-    if !row_ids.iter().any(|id| requested_ids.contains(id)) {
+    if !row_ids
+        .iter()
+        .any(|id| session_id_matches_any_requested(id, requested_ids))
+    {
         return;
     }
     for id in row_ids {
@@ -7399,12 +7558,122 @@ fn cached_list_sessions_for_ids(ids: &[String]) -> String {
     cached_list_sessions_for_ids_from_home(&crate::platform::home_dir(), ids)
 }
 
+fn push_unique_session_row_for_ids(
+    rows: &mut Vec<serde_json::Value>,
+    seen: &mut HashSet<String>,
+    row: serde_json::Value,
+    requested_ids: &HashSet<String>,
+) {
+    if !session_row_matches_any_id(&row, requested_ids) {
+        return;
+    }
+    let key = session_unique_key(&row);
+    if seen.insert(key) {
+        rows.push(row);
+    }
+}
+
+fn targeted_intendant_session_rows_from_home(
+    home: &Path,
+    requested_ids: &HashSet<String>,
+    rows: &mut Vec<serde_json::Value>,
+    seen: &mut HashSet<String>,
+) {
+    let logs_dir = home.join(".intendant").join("logs");
+    let mut seen_dirs = HashSet::new();
+    for requested_id in requested_ids {
+        if !session_lookup_id_is_safe(requested_id) {
+            continue;
+        }
+        let exact = logs_dir.join(requested_id);
+        if exact.is_dir() {
+            seen_dirs.insert(session_list_path_key(&exact));
+        }
+    }
+    if let Ok(entries) = std::fs::read_dir(&logs_dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if requested_ids
+                .iter()
+                .any(|requested| !requested.is_empty() && name.starts_with(requested))
+            {
+                let path = entry.path();
+                if path.is_dir() {
+                    seen_dirs.insert(session_list_path_key(&path));
+                }
+            }
+        }
+    }
+
+    for dir_key in seen_dirs {
+        let dir = PathBuf::from(&dir_key);
+        let Some(session_id) = dir.file_name().map(|n| n.to_string_lossy().to_string()) else {
+            continue;
+        };
+        if let Some(row) = intendant_session_list_row_from_dir(&dir, &session_id) {
+            push_unique_session_row_for_ids(rows, seen, row, requested_ids);
+        }
+    }
+}
+
+fn targeted_external_session_rows_from_home(
+    home: &Path,
+    requested_ids: &HashSet<String>,
+    rows: &mut Vec<serde_json::Value>,
+    seen: &mut HashSet<String>,
+) {
+    let mut external_sessions = Vec::new();
+    external_sessions.extend(list_codex_sessions_with_limit(
+        home,
+        EXTERNAL_SESSION_SCAN_LIMIT,
+    ));
+    external_sessions.extend(list_claude_sessions_with_limit(
+        home,
+        EXTERNAL_SESSION_SCAN_LIMIT,
+    ));
+    external_sessions.extend(list_gemini_sessions_with_limit(
+        home,
+        EXTERNAL_SESSION_SCAN_LIMIT,
+    ));
+    let deleted_external_sessions = read_deleted_external_sessions(home);
+    if !deleted_external_sessions.is_empty() {
+        external_sessions.retain(|session| {
+            !session_matches_deleted_external(session, &deleted_external_sessions)
+        });
+    }
+    crate::session_names::apply_session_name_overlays(home, &mut external_sessions);
+    crate::session_config::apply_overlays_to_sessions(home, &mut external_sessions);
+    for row in external_sessions {
+        push_unique_session_row_for_ids(rows, seen, row, requested_ids);
+    }
+}
+
+fn targeted_session_list_for_ids_from_home(home: &Path, ids: &[String]) -> String {
+    let requested_ids: HashSet<String> = ids
+        .iter()
+        .map(|id| id.trim())
+        .filter(|id| session_lookup_id_is_safe(id))
+        .map(ToString::to_string)
+        .collect();
+    if requested_ids.is_empty() {
+        return "[]".to_string();
+    }
+
+    let mut rows = Vec::new();
+    let mut seen = HashSet::new();
+    targeted_intendant_session_rows_from_home(home, &requested_ids, &mut rows, &mut seen);
+    targeted_external_session_rows_from_home(home, &requested_ids, &mut rows, &mut seen);
+    apply_external_wrapper_index_to_sessions(home, &mut rows);
+    sort_sessions_newest_first(&mut rows);
+    let body = serde_json::to_string(&rows).unwrap_or_else(|_| "[]".to_string());
+    hydrate_codex_session_goals_for_ids(home, &body, ids)
+}
+
 fn cached_list_sessions_for_ids_from_home(home: &Path, ids: &[String]) -> String {
     if ids.is_empty() {
         return "[]".to_string();
     }
-    let body = cached_list_sessions();
-    filter_session_list_by_ids_with_codex_goal_hydration(home, &body, ids)
+    targeted_session_list_for_ids_from_home(home, ids)
 }
 
 fn cached_intendant_log_dirs_for_session_id(session_id: &str) -> Vec<PathBuf> {
@@ -8482,17 +8751,30 @@ fn apply_external_context_to_intendant_wrapper(
 }
 
 fn list_sessions_from_home(home_path: &Path) -> String {
-    list_sessions_from_home_impl(home_path, true, EXTERNAL_SESSION_SCAN_LIMIT)
+    list_sessions_from_home_impl(home_path, true, EXTERNAL_SESSION_SCAN_LIMIT, None)
+}
+
+fn list_sessions_from_home_with_limit(home_path: &Path, limit: Option<usize>) -> String {
+    let limit = limit.map(|limit| limit.clamp(1, SESSION_LIST_LIMIT));
+    let external_scan_limit = limit
+        .map(|limit| {
+            limit
+                .saturating_add(SESSION_SOURCE_FLOOR * 3)
+                .clamp(SESSION_SOURCE_FLOOR, EXTERNAL_SESSION_SCAN_LIMIT)
+        })
+        .unwrap_or(EXTERNAL_SESSION_SCAN_LIMIT);
+    list_sessions_from_home_impl(home_path, true, external_scan_limit, limit)
 }
 
 fn list_sessions_for_deep_search_from_home(home_path: &Path) -> String {
-    list_sessions_from_home_impl(home_path, false, usize::MAX)
+    list_sessions_from_home_impl(home_path, false, usize::MAX, None)
 }
 
 fn list_sessions_from_home_impl(
     home_path: &Path,
     truncate_for_list_view: bool,
     external_scan_limit: usize,
+    requested_limit: Option<usize>,
 ) -> String {
     let logs_dir = home_path.join(".intendant").join("logs");
     let mut external_sessions = Vec::new();
@@ -8532,11 +8814,28 @@ fn list_sessions_from_home_impl(
         Err(_) => return "[]".to_string(),
     };
 
-    for entry in entries.flatten() {
-        let dir = entry.path();
-        if !dir.is_dir() {
-            continue;
+    let mut dirs = entries
+        .flatten()
+        .filter_map(|entry| {
+            let dir = entry.path();
+            if !dir.is_dir() {
+                return None;
+            }
+            let mtime = file_mtime_secs(&dir);
+            Some((dir, mtime))
+        })
+        .collect::<Vec<_>>();
+    if truncate_for_list_view {
+        dirs.sort_by(|a, b| b.1.cmp(&a.1));
+        if let Some(limit) = requested_limit {
+            let scan_limit = limit
+                .saturating_add(SESSION_SOURCE_FLOOR * 3)
+                .clamp(limit, SESSION_LIST_LIMIT);
+            dirs.truncate(scan_limit);
         }
+    }
+
+    for (dir, _) in dirs {
         let session_id = dir
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
@@ -8577,7 +8876,9 @@ fn list_sessions_from_home_impl(
     apply_external_wrapper_index_to_sessions(home_path, &mut sessions);
 
     sort_sessions_newest_first(&mut sessions);
-    if truncate_for_list_view {
+    if let Some(limit) = requested_limit {
+        truncate_sessions_preserving_sources_to(&mut sessions, limit);
+    } else if truncate_for_list_view {
         truncate_sessions_preserving_sources(&mut sessions);
     }
 
@@ -13368,7 +13669,10 @@ pub fn spawn_web_gateway(
                     let mut replayed_external_session_ids: HashSet<String> = HashSet::new();
                     if let Some(ref log_dir) = replay_log_dir {
                         if let Some((replay, external_session_id)) =
-                            session_log_replay_payload_from_dir(log_dir)
+                            session_log_replay_payload_from_dir_with_limit(
+                                log_dir,
+                                Some(WEBSOCKET_BOOTSTRAP_REPLAY_ENTRY_LIMIT),
+                            )
                         {
                             if let Some(external_session_id) = external_session_id {
                                 replayed_external_session_ids.insert(external_session_id);
@@ -13395,11 +13699,9 @@ pub fn spawn_web_gateway(
                         if replayed_external_session_ids.contains(&session_id) {
                             continue;
                         }
-                        if let Some(replay) = external_session_activity_replay(
-                            &source,
-                            &session_id,
-                            EXTERNAL_ACTIVITY_REPLAY_LIMIT,
-                        ) {
+                        if let Some(replay) =
+                            external_session_activity_replay_for_websocket(&source, &session_id)
+                        {
                             let _ = direct_tx.send(replay);
                         }
                     }
@@ -17545,7 +17847,10 @@ pub fn spawn_web_gateway(
                         let body = match tokio::task::spawn_blocking(move || {
                             let body = match ids_filter {
                                 Some(ids) => cached_list_sessions_for_ids(&ids),
-                                None => cached_list_sessions(),
+                                None => match limit {
+                                    Some(limit) => cached_list_sessions_with_limit(limit),
+                                    None => cached_list_sessions(),
+                                },
                             };
                             limit_session_list_body(&body, limit)
                         })
@@ -21474,6 +21779,104 @@ mod tests {
     }
 
     #[test]
+    fn targeted_codex_session_list_accepts_prefix_and_hydrates_goal() {
+        let _codex_home = EnvVarGuard::unset("CODEX_HOME");
+        let home = tempfile::tempdir().unwrap();
+        let sessions_dir = home
+            .path()
+            .join(".codex")
+            .join("sessions")
+            .join("2026")
+            .join("06")
+            .join("07");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+
+        let id = "019e5c7a-4d05-78d3-a98a-29999cb9898e";
+        let lines = [
+            serde_json::json!({
+                "timestamp": "2026-06-07T15:00:00Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": id,
+                    "timestamp": "2026-06-07T15:00:00Z",
+                    "cwd": "/repo"
+                }
+            }),
+            serde_json::json!({
+                "timestamp": "2026-06-07T15:01:00Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "thread_goal_updated",
+                    "threadId": id,
+                    "goal": {
+                        "threadId": id,
+                        "objective": "Keep the Station goal moving",
+                        "status": "usageLimited"
+                    }
+                }
+            }),
+        ];
+        std::fs::write(
+            sessions_dir.join(format!("rollout-2026-06-07T15-00-00-{id}.jsonl")),
+            lines
+                .iter()
+                .map(serde_json::Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+
+        let body = cached_list_sessions_for_ids_from_home(home.path(), &["019e5c7a".to_string()]);
+        let sessions: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap();
+        assert_eq!(sessions.len(), 1);
+        let session = &sessions[0];
+        assert_eq!(session.get("session_id").and_then(|v| v.as_str()), Some(id));
+        assert_eq!(
+            session.pointer("/goal/objective").and_then(|v| v.as_str()),
+            Some("Keep the Station goal moving")
+        );
+    }
+
+    #[test]
+    fn targeted_intendant_session_list_accepts_prefix() {
+        let home = tempfile::tempdir().unwrap();
+        let session_id = "abcdef12-3456-7890-abcd-ef1234567890";
+        let log_dir = home.path().join(".intendant").join("logs").join(session_id);
+        std::fs::create_dir_all(&log_dir).unwrap();
+        std::fs::write(
+            log_dir.join("session_meta.json"),
+            serde_json::json!({
+                "created_at": "2026-06-07T15:00:00Z",
+                "task": "targeted prefix task",
+                "status": "idle"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            log_dir.join("session.jsonl"),
+            serde_json::json!({
+                "ts": "2026-06-07T15:00:00Z",
+                "event": "session_start"
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let body = cached_list_sessions_for_ids_from_home(home.path(), &["abcdef12".to_string()]);
+        let sessions: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(
+            sessions[0].get("session_id").and_then(|v| v.as_str()),
+            Some(session_id)
+        );
+        assert_eq!(
+            sessions[0].get("task").and_then(|v| v.as_str()),
+            Some("targeted prefix task")
+        );
+    }
+
+    #[test]
     fn external_codex_detail_limit_keeps_usage_limited_goal() {
         let _codex_home = EnvVarGuard::unset("CODEX_HOME");
         let home = tempfile::tempdir().unwrap();
@@ -22988,6 +23391,41 @@ mod tests {
 
         assert_eq!(ids, vec!["newest", "middle"]);
         assert_eq!(limit_session_list_body(&body, None), body);
+    }
+
+    #[test]
+    fn list_sessions_from_home_with_limit_returns_requested_count() {
+        let home = tempfile::tempdir().unwrap();
+        let logs_dir = home.path().join(".intendant").join("logs");
+        std::fs::create_dir_all(&logs_dir).unwrap();
+        for idx in 0..3 {
+            let session_id = format!("limit-session-{idx}");
+            let log_dir = logs_dir.join(&session_id);
+            std::fs::create_dir_all(&log_dir).unwrap();
+            std::fs::write(
+                log_dir.join("session_meta.json"),
+                serde_json::json!({
+                    "created_at": format!("2026-06-07T15:0{idx}:00Z"),
+                    "task": format!("limit task {idx}"),
+                    "status": "idle"
+                })
+                .to_string(),
+            )
+            .unwrap();
+            std::fs::write(
+                log_dir.join("session.jsonl"),
+                serde_json::json!({
+                    "ts": format!("2026-06-07T15:0{idx}:00Z"),
+                    "event": "session_start"
+                })
+                .to_string(),
+            )
+            .unwrap();
+        }
+
+        let body = list_sessions_from_home_with_limit(home.path(), Some(2));
+        let sessions: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap();
+        assert_eq!(sessions.len(), 2);
     }
 
     #[test]
@@ -26076,6 +26514,55 @@ mod tests {
             })
             .collect();
         assert_eq!(goals, vec!["latest target goal", "other goal"]);
+    }
+
+    #[test]
+    fn websocket_bootstrap_replay_omits_context_and_caps_history() {
+        let _codex_home = EnvVarGuard::unset("CODEX_HOME");
+        let mut entries = vec![
+            serde_json::json!({"event": "replay_start"}),
+            serde_json::json!({
+                "event": "context_snapshot",
+                "raw": {"instructions": "large historical context"}
+            }),
+            serde_json::json!({
+                "event": "session_goal",
+                "data": {
+                    "session_id": "target-session",
+                    "goal": {
+                        "objective": "latest goal",
+                        "status": "active"
+                    }
+                }
+            }),
+        ];
+        for n in 0..40 {
+            entries.push(serde_json::json!({
+                "event": "model_response",
+                "summary": format!("tail {n}")
+            }));
+        }
+        entries.push(serde_json::json!({
+            "event": "model_response",
+            "summary": "x".repeat(WEBSOCKET_BOOTSTRAP_REPLAY_TEXT_LIMIT_BYTES + 1024)
+        }));
+
+        let limited = prepare_websocket_bootstrap_replay_entries(entries, 10);
+
+        assert!(!limited.iter().any(|entry| {
+            entry.get("event").and_then(|v| v.as_str()) == Some("context_snapshot")
+        }));
+        assert!(limited.len() <= 12);
+        assert!(limited.iter().any(|entry| {
+            entry.pointer("/data/goal/objective").and_then(|v| v.as_str()) == Some("latest goal")
+        }));
+        let oversized_summary = limited
+            .last()
+            .and_then(|entry| entry.get("summary"))
+            .and_then(|v| v.as_str())
+            .expect("tail summary should remain");
+        assert!(oversized_summary.ends_with("..."));
+        assert!(oversized_summary.len() < WEBSOCKET_BOOTSTRAP_REPLAY_TEXT_LIMIT_BYTES + 16);
     }
 
     #[test]
