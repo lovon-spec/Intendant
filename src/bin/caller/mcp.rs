@@ -422,6 +422,44 @@ impl McpAppState {
         }
     }
 
+    fn clear_session_usage_for_id(&mut self, session_id: &str) {
+        let mut keys = self.session_related_ids(session_id);
+        if keys.is_empty() {
+            keys.push(session_id.trim().to_string());
+        }
+        keys.retain(|key| !key.is_empty());
+        for key in &keys {
+            self.session_usage.remove(key);
+        }
+        if keys.iter().any(|key| key == &self.session_id) {
+            self.session_tokens = 0;
+            self.session_prompt_tokens = 0;
+            self.session_completion_tokens = 0;
+            self.session_cached_tokens = 0;
+            self.context_window = 0;
+            self.hard_context_window = None;
+            self.budget_pct = 0.0;
+        }
+    }
+
+    fn note_session_ended(&mut self, session_id: &str) {
+        self.note_session_phase(Some(session_id), None, Phase::Done, None);
+        self.clear_session_usage_for_id(session_id);
+        if self.session_id == session_id
+            || self
+                .session_related_ids(session_id)
+                .iter()
+                .any(|related| related == &self.session_id)
+        {
+            self.set_phase(Phase::Done);
+            self.active_session_source = None;
+            self.codex_managed_context = self.configured_codex_managed_context;
+        }
+        self.remove_pending_rewind_pressure_check_for_key(session_id);
+        self.remove_insufficient_rewind_notice_for_key(session_id);
+        self.remove_density_maintenance_satisfied_for_key(session_id);
+    }
+
     fn session_id_applies_to_current_session(&self, session_id: Option<&str>) -> bool {
         let Some(id) = session_id.map(str::trim).filter(|id| !id.is_empty()) else {
             return true;
@@ -4979,15 +5017,7 @@ pub fn spawn_event_listener(
                         ref session_id,
                         ref reason,
                     } => {
-                        s.note_session_phase(Some(session_id), None, Phase::Done, None);
-                        if s.session_id == session_id.as_str() {
-                            s.set_phase(Phase::Done);
-                            s.active_session_source = None;
-                            s.codex_managed_context = s.configured_codex_managed_context;
-                        }
-                        s.pending_rewind_pressure_checks.remove(session_id);
-                        s.insufficient_rewind_notices.remove(session_id);
-                        s.density_maintenance_satisfied.remove(session_id);
+                        s.note_session_ended(session_id);
                         s.push_log(
                             LogLevel::Info,
                             format!("Session ended: {} — {}", session_id, reason),
@@ -5379,15 +5409,7 @@ fn apply_observed_event_to_mcp_state(s: &mut McpAppState, event: &AppEvent) -> b
             true
         }
         AppEvent::SessionEnded { session_id, .. } => {
-            s.note_session_phase(Some(session_id), None, Phase::Done, None);
-            if s.session_id == session_id.as_str() {
-                s.set_phase(Phase::Done);
-                s.active_session_source = None;
-                s.codex_managed_context = s.configured_codex_managed_context;
-            }
-            s.pending_rewind_pressure_checks.remove(session_id);
-            s.insufficient_rewind_notices.remove(session_id);
-            s.density_maintenance_satisfied.remove(session_id);
+            s.note_session_ended(session_id);
             true
         }
         AppEvent::SessionDirChanged { path } => {
@@ -12995,6 +13017,90 @@ mod tests {
                 Some(&"waiting_follow_up".into())
             );
             assert_eq!(idle_status.pointer("/round"), Some(&14.into()));
+        });
+    }
+
+    #[test]
+    fn get_status_marks_ended_codex_session_done_without_stale_pressure() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let state = test_state();
+            {
+                let mut s = state.write().await;
+                s.session_id = "wrapper-session".to_string();
+                s.active_session_source = Some("codex".to_string());
+                s.codex_managed_context = true;
+                s.session_codex_managed_context
+                    .insert("wrapper-session".to_string(), true);
+                apply_observed_event_to_mcp_state(
+                    &mut s,
+                    &AppEvent::SessionIdentity {
+                        session_id: "wrapper-session".to_string(),
+                        source: "codex".to_string(),
+                        backend_session_id: "codex-thread".to_string(),
+                    },
+                );
+                apply_observed_event_to_mcp_state(
+                    &mut s,
+                    &AppEvent::StatusUpdate {
+                        turn: 10,
+                        phase: "running_agent".to_string(),
+                        autonomy: "medium".to_string(),
+                        session_id: "codex-thread".to_string(),
+                        task: "Codex follow-up round 10 in progress".to_string(),
+                    },
+                );
+                apply_observed_event_to_mcp_state(
+                    &mut s,
+                    &AppEvent::UsageSnapshot {
+                        session_id: Some("codex-thread".to_string()),
+                        main: frontend::ModelUsageSnapshot {
+                            provider: "openai".to_string(),
+                            model: "gpt-5.2-codex".to_string(),
+                            tokens_used: 258_400,
+                            context_window: 258_400,
+                            hard_context_window: Some(272_000),
+                            usage_pct: 100.0,
+                            prompt_tokens: 250_000,
+                            completion_tokens: 8_400,
+                            cached_tokens: 0,
+                        },
+                        presence: None,
+                    },
+                );
+                apply_observed_event_to_mcp_state(
+                    &mut s,
+                    &AppEvent::SessionEnded {
+                        session_id: "codex-thread".to_string(),
+                        reason: "Process stdout closed".to_string(),
+                    },
+                );
+            }
+
+            let server = IntendantServer::new(state.clone(), EventBus::new());
+            let status: serde_json::Value = serde_json::from_str(
+                &server
+                    .get_status_for_session(Some("wrapper-session"), Some(true))
+                    .await,
+            )
+            .unwrap();
+
+            assert_eq!(status.pointer("/phase"), Some(&"done".into()));
+            assert_eq!(status.pointer("/turn"), Some(&10.into()));
+            assert_eq!(status.pointer("/round"), Some(&10.into()));
+            assert_eq!(status.pointer("/session_tokens"), Some(&0.into()));
+            assert_eq!(status.pointer("/usage/main/tokens_used"), Some(&0.into()));
+            assert_eq!(
+                status.pointer("/context_pressure/status"),
+                Some(&"unknown".into())
+            );
+            assert_eq!(
+                status.pointer("/context_pressure/used_tokens"),
+                Some(&0.into())
+            );
         });
     }
 

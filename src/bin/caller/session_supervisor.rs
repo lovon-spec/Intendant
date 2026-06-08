@@ -2901,6 +2901,9 @@ impl SessionSupervisor {
                 self.update_session_phase(session_id.as_deref(), "done")
                     .await;
             }
+            AppEvent::SessionEnded { session_id, .. } => {
+                self.update_session_phase(Some(session_id), "done").await;
+            }
             AppEvent::StatusUpdate {
                 session_id, phase, ..
             } => {
@@ -4111,6 +4114,38 @@ mod tests {
                 .get("backend")
                 .map(|session| session.phase.as_str()),
             Some("thinking")
+        );
+    }
+
+    #[tokio::test]
+    async fn session_ended_marks_managed_session_done() {
+        let bus = EventBus::new();
+        let supervisor = test_supervisor(PathBuf::from("/tmp/project"), bus);
+        {
+            let mut state = supervisor.state.lock().await;
+            let mut session = managed_session("backend", "codex");
+            session.phase = "running".to_string();
+            state.sessions.insert("backend".to_string(), session);
+            state
+                .session_aliases
+                .insert("wrapper".to_string(), "backend".to_string());
+            state.active_session_id = Some("backend".to_string());
+        }
+
+        supervisor
+            .observe_lifecycle_event(&AppEvent::SessionEnded {
+                session_id: "wrapper".to_string(),
+                reason: "Process stdout closed".to_string(),
+            })
+            .await;
+
+        let state = supervisor.state.lock().await;
+        assert_eq!(
+            state
+                .sessions
+                .get("backend")
+                .map(|session| session.phase.as_str()),
+            Some("done")
         );
     }
 
