@@ -270,18 +270,20 @@ impl DisplayBackend for WaylandBackend {
 
         match event {
             InputEvent::KeyDown { ref code, .. } => {
-                if let Some(keycode) = super::keymap::dom_code_to_evdev(code) {
-                    rd.notify_keyboard_keycode(session, keycode as i32, KeyState::Pressed)
-                        .await
-                        .map_err(|e| CallerError::Display(format!("key inject: {e}")))?;
-                }
+                let keycode = super::keymap::dom_code_to_evdev(code).ok_or_else(|| {
+                    CallerError::Display(format!("unsupported Wayland key code: {code}"))
+                })?;
+                rd.notify_keyboard_keycode(session, keycode as i32, KeyState::Pressed)
+                    .await
+                    .map_err(|e| CallerError::Display(format!("key inject: {e}")))?;
             }
             InputEvent::KeyUp { ref code, .. } => {
-                if let Some(keycode) = super::keymap::dom_code_to_evdev(code) {
-                    rd.notify_keyboard_keycode(session, keycode as i32, KeyState::Released)
-                        .await
-                        .map_err(|e| CallerError::Display(format!("key inject: {e}")))?;
-                }
+                let keycode = super::keymap::dom_code_to_evdev(code).ok_or_else(|| {
+                    CallerError::Display(format!("unsupported Wayland key code: {code}"))
+                })?;
+                rd.notify_keyboard_keycode(session, keycode as i32, KeyState::Released)
+                    .await
+                    .map_err(|e| CallerError::Display(format!("key inject: {e}")))?;
             }
             InputEvent::MouseMove { x, y, .. } => {
                 rd.notify_pointer_motion_absolute(
@@ -358,6 +360,33 @@ impl DisplayBackend for WaylandBackend {
         Ok(())
     }
 
+    async fn inject_text(&self, text: &str) -> Result<(), CallerError> {
+        let guard = self.portal_session.lock().await;
+        let ps = guard.as_ref().ok_or_else(|| {
+            CallerError::Display("no active portal session for text injection".to_string())
+        })?;
+
+        let rd = &ps.remote_desktop;
+        let session = &ps.session;
+
+        for ch in text.chars() {
+            let keysym = char_to_x11_keysym(ch).ok_or_else(|| {
+                CallerError::Display(format!(
+                    "unsupported Wayland text character: U+{:04X}",
+                    ch as u32
+                ))
+            })?;
+            rd.notify_keyboard_keysym(session, keysym, KeyState::Pressed)
+                .await
+                .map_err(|e| CallerError::Display(format!("text inject: {e}")))?;
+            rd.notify_keyboard_keysym(session, keysym, KeyState::Released)
+                .await
+                .map_err(|e| CallerError::Display(format!("text inject: {e}")))?;
+        }
+
+        Ok(())
+    }
+
     fn resolution(&self) -> (u32, u32) {
         (
             self.shared_width.load(Ordering::SeqCst),
@@ -367,6 +396,25 @@ impl DisplayBackend for WaylandBackend {
 
     fn kind(&self) -> &'static str {
         "wayland"
+    }
+}
+
+fn char_to_x11_keysym(ch: char) -> Option<i32> {
+    match ch {
+        '\n' | '\r' => Some(0xff0d),
+        '\t' => Some(0xff09),
+        '\u{8}' => Some(0xff08),
+        '\u{1b}' => Some(0xff1b),
+        ' '..='~' => Some(ch as i32),
+        '\u{a0}'..='\u{ff}' => Some(ch as i32),
+        _ => {
+            let code = ch as u32;
+            if code <= 0x10ffff {
+                Some((0x01000000 | code) as i32)
+            } else {
+                None
+            }
+        }
     }
 }
 
@@ -757,12 +805,27 @@ fn target_pipewire_framerate(fps: u32) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::target_pipewire_framerate;
+    use super::{char_to_x11_keysym, target_pipewire_framerate};
 
     #[test]
     fn target_pipewire_framerate_clamps_to_supported_range() {
         assert_eq!(target_pipewire_framerate(0), 1);
         assert_eq!(target_pipewire_framerate(30), 30);
         assert_eq!(target_pipewire_framerate(120), 60);
+    }
+
+    #[test]
+    fn text_keysyms_cover_command_text() {
+        assert_eq!(char_to_x11_keysym('g'), Some(0x67));
+        assert_eq!(char_to_x11_keysym('C'), Some(0x43));
+        assert_eq!(char_to_x11_keysym('-'), Some(0x2d));
+        assert_eq!(char_to_x11_keysym('/'), Some(0x2f));
+        assert_eq!(char_to_x11_keysym(':'), Some(0x3a));
+        assert_eq!(char_to_x11_keysym('\n'), Some(0xff0d));
+    }
+
+    #[test]
+    fn text_keysyms_use_unicode_keysym_for_non_latin1() {
+        assert_eq!(char_to_x11_keysym('€'), Some(0x010020ac));
     }
 }

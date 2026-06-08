@@ -1124,104 +1124,33 @@ async fn execute_via_session(
                 needs_auto_screenshot = true;
             }
             CuAction::Type { text } => {
-                let mut success = true;
-                for ch in text.chars() {
-                    let code = char_to_dom_code(ch);
-                    let shift = ch.is_uppercase() || "!@#$%^&*()_+{}|:\"<>?~".contains(ch);
-                    if shift {
-                        let _ = session
-                            .inject_input(crate::display::InputEvent::KeyDown {
-                                code: "ShiftLeft".to_string(),
-                                key: "Shift".to_string(),
-                                shift: true,
-                                ctrl: false,
-                                alt: false,
-                                meta: false,
-                            })
-                            .await;
-                    }
-                    if session
-                        .inject_input(crate::display::InputEvent::KeyDown {
-                            code: code.to_string(),
-                            key: ch.to_string(),
-                            shift,
-                            ctrl: false,
-                            alt: false,
-                            meta: false,
-                        })
-                        .await
-                        .is_err()
-                    {
-                        success = false;
-                    }
-                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                    let _ = session
-                        .inject_input(crate::display::InputEvent::KeyUp {
-                            code: code.to_string(),
-                            key: ch.to_string(),
-                            shift,
-                            ctrl: false,
-                            alt: false,
-                            meta: false,
-                        })
-                        .await;
-                    if shift {
-                        let _ = session
-                            .inject_input(crate::display::InputEvent::KeyUp {
-                                code: "ShiftLeft".to_string(),
-                                key: "Shift".to_string(),
-                                shift: false,
-                                ctrl: false,
-                                alt: false,
-                                meta: false,
-                            })
-                            .await;
-                    }
-                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                }
+                let result = session.inject_text(text).await;
+                let success = result.is_ok();
                 results.push(CuActionResult {
                     success,
                     screenshot: None,
-                    error: if success {
-                        None
-                    } else {
-                        Some("Type injection failed".to_string())
-                    },
+                    error: result.err().map(|e| e.to_string()),
                 });
                 needs_auto_screenshot = true;
             }
             CuAction::Key { key } => {
-                let code = key_name_to_dom_code(key);
-                let down = session
-                    .inject_input(crate::display::InputEvent::KeyDown {
-                        code: code.to_string(),
-                        key: key.clone(),
-                        shift: false,
-                        ctrl: false,
-                        alt: false,
-                        meta: false,
-                    })
-                    .await;
-                tokio::time::sleep(std::time::Duration::from_millis(30)).await;
-                let up = session
-                    .inject_input(crate::display::InputEvent::KeyUp {
-                        code: code.to_string(),
-                        key: key.clone(),
-                        shift: false,
-                        ctrl: false,
-                        alt: false,
-                        meta: false,
-                    })
-                    .await;
-                let success = down.is_ok() && up.is_ok();
+                let events = key_action_events(key);
+                let mut success = events.is_ok();
+                let mut error = events.as_ref().err().cloned();
+                if let Ok(events) = events {
+                    for event in events {
+                        if let Err(e) = session.inject_input(event).await {
+                            success = false;
+                            error = Some(e.to_string());
+                            break;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                }
                 results.push(CuActionResult {
                     success,
                     screenshot: None,
-                    error: if success {
-                        None
-                    } else {
-                        Some("Key injection failed".to_string())
-                    },
+                    error,
                 });
                 needs_auto_screenshot = true;
             }
@@ -1448,23 +1377,49 @@ fn char_to_dom_code(ch: char) -> &'static str {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct KeyModifier {
+    code: &'static str,
+    key: &'static str,
+    shift: bool,
+    ctrl: bool,
+    alt: bool,
+    meta: bool,
+}
+
 /// Map a key name (from CU action) to a DOM `KeyboardEvent.code` value.
-fn key_name_to_dom_code(key: &str) -> &str {
-    match key.to_lowercase().as_str() {
+fn key_name_to_dom_code(key: &str) -> Option<&'static str> {
+    let trimmed = key.trim();
+    let mut chars = trimmed.chars();
+    if let (Some(ch), None) = (chars.next(), chars.next()) {
+        let code = char_to_dom_code(ch);
+        return (code != "Unidentified").then_some(code);
+    }
+
+    Some(match trimmed.to_lowercase().as_str() {
         "enter" | "return" => "Enter",
         "escape" | "esc" => "Escape",
         "backspace" => "Backspace",
         "tab" => "Tab",
-        "space" | " " => "Space",
+        "space" => "Space",
         "arrowup" | "up" => "ArrowUp",
         "arrowdown" | "down" => "ArrowDown",
         "arrowleft" | "left" => "ArrowLeft",
         "arrowright" | "right" => "ArrowRight",
-        "delete" => "Delete",
+        "delete" | "del" => "Delete",
+        "insert" | "ins" => "Insert",
         "home" => "Home",
         "end" => "End",
-        "pageup" => "PageUp",
-        "pagedown" => "PageDown",
+        "pageup" | "page_up" | "prior" => "PageUp",
+        "pagedown" | "page_down" | "next" => "PageDown",
+        "ctrl" | "control" | "control_l" | "controlleft" => "ControlLeft",
+        "control_r" | "controlright" => "ControlRight",
+        "alt" | "alt_l" | "altleft" | "option" => "AltLeft",
+        "alt_r" | "altright" => "AltRight",
+        "shift" | "shift_l" | "shiftleft" => "ShiftLeft",
+        "shift_r" | "shiftright" => "ShiftRight",
+        "meta" | "super" | "cmd" | "command" | "meta_l" | "metaleft" | "super_l" => "MetaLeft",
+        "meta_r" | "metaright" | "super_r" => "MetaRight",
         "f1" => "F1",
         "f2" => "F2",
         "f3" => "F3",
@@ -1477,8 +1432,143 @@ fn key_name_to_dom_code(key: &str) -> &str {
         "f10" => "F10",
         "f11" => "F11",
         "f12" => "F12",
-        _ => key, // pass through as-is
+        _ => return None,
+    })
+}
+
+fn modifier_for_key_name(key: &str) -> Option<KeyModifier> {
+    let code = key_name_to_dom_code(key)?;
+    Some(match code {
+        "ShiftLeft" | "ShiftRight" => KeyModifier {
+            code,
+            key: "Shift",
+            shift: true,
+            ctrl: false,
+            alt: false,
+            meta: false,
+        },
+        "ControlLeft" | "ControlRight" => KeyModifier {
+            code,
+            key: "Control",
+            shift: false,
+            ctrl: true,
+            alt: false,
+            meta: false,
+        },
+        "AltLeft" | "AltRight" => KeyModifier {
+            code,
+            key: "Alt",
+            shift: false,
+            ctrl: false,
+            alt: true,
+            meta: false,
+        },
+        "MetaLeft" | "MetaRight" => KeyModifier {
+            code,
+            key: "Meta",
+            shift: false,
+            ctrl: false,
+            alt: false,
+            meta: true,
+        },
+        _ => return None,
+    })
+}
+
+fn key_event(
+    down: bool,
+    code: &str,
+    key: &str,
+    shift: bool,
+    ctrl: bool,
+    alt: bool,
+    meta: bool,
+) -> crate::display::InputEvent {
+    if down {
+        crate::display::InputEvent::KeyDown {
+            code: code.to_string(),
+            key: key.to_string(),
+            shift,
+            ctrl,
+            alt,
+            meta,
+        }
+    } else {
+        crate::display::InputEvent::KeyUp {
+            code: code.to_string(),
+            key: key.to_string(),
+            shift,
+            ctrl,
+            alt,
+            meta,
+        }
     }
+}
+
+fn key_action_events(key: &str) -> Result<Vec<crate::display::InputEvent>, String> {
+    let parts: Vec<&str> = key
+        .split('+')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .collect();
+    if parts.is_empty() {
+        return Err("unsupported empty key action".to_string());
+    }
+
+    let (modifier_names, base_name) = parts.split_at(parts.len() - 1);
+    let modifiers: Vec<KeyModifier> = modifier_names
+        .iter()
+        .map(|name| {
+            modifier_for_key_name(name)
+                .ok_or_else(|| format!("unsupported key modifier in combo: {name}"))
+        })
+        .collect::<Result<_, _>>()?;
+
+    let base_name = base_name[0];
+    let base_code =
+        key_name_to_dom_code(base_name).ok_or_else(|| format!("unsupported key action: {key}"))?;
+    let base_key = if let Some(modifier) = modifier_for_key_name(base_name) {
+        modifier.key.to_string()
+    } else {
+        base_name.to_string()
+    };
+
+    let shift = modifiers.iter().any(|m| m.shift);
+    let ctrl = modifiers.iter().any(|m| m.ctrl);
+    let alt = modifiers.iter().any(|m| m.alt);
+    let meta = modifiers.iter().any(|m| m.meta);
+
+    let mut events = Vec::with_capacity(modifiers.len() * 2 + 2);
+    for modifier in &modifiers {
+        events.push(key_event(
+            true,
+            modifier.code,
+            modifier.key,
+            shift,
+            ctrl,
+            alt,
+            meta,
+        ));
+    }
+    events.push(key_event(
+        true, base_code, &base_key, shift, ctrl, alt, meta,
+    ));
+    events.push(key_event(
+        false, base_code, &base_key, shift, ctrl, alt, meta,
+    ));
+    for modifier in modifiers.iter().rev() {
+        events.push(key_event(
+            false,
+            modifier.code,
+            modifier.key,
+            shift,
+            ctrl,
+            alt,
+            meta,
+        ));
+    }
+
+    Ok(events)
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -1738,24 +1828,100 @@ mod tests {
 
     #[test]
     fn key_name_to_dom_code_known_keys() {
-        assert_eq!(key_name_to_dom_code("Enter"), "Enter");
-        assert_eq!(key_name_to_dom_code("ENTER"), "Enter");
-        assert_eq!(key_name_to_dom_code("return"), "Enter");
-        assert_eq!(key_name_to_dom_code("Escape"), "Escape");
-        assert_eq!(key_name_to_dom_code("esc"), "Escape");
-        assert_eq!(key_name_to_dom_code("Tab"), "Tab");
-        assert_eq!(key_name_to_dom_code("Backspace"), "Backspace");
-        assert_eq!(key_name_to_dom_code("ArrowUp"), "ArrowUp");
-        assert_eq!(key_name_to_dom_code("up"), "ArrowUp");
-        assert_eq!(key_name_to_dom_code("F1"), "F1");
-        assert_eq!(key_name_to_dom_code("f12"), "F12");
+        assert_eq!(key_name_to_dom_code("Enter"), Some("Enter"));
+        assert_eq!(key_name_to_dom_code("ENTER"), Some("Enter"));
+        assert_eq!(key_name_to_dom_code("return"), Some("Enter"));
+        assert_eq!(key_name_to_dom_code("Escape"), Some("Escape"));
+        assert_eq!(key_name_to_dom_code("esc"), Some("Escape"));
+        assert_eq!(key_name_to_dom_code("Tab"), Some("Tab"));
+        assert_eq!(key_name_to_dom_code("Backspace"), Some("Backspace"));
+        assert_eq!(key_name_to_dom_code("ArrowUp"), Some("ArrowUp"));
+        assert_eq!(key_name_to_dom_code("up"), Some("ArrowUp"));
+        assert_eq!(key_name_to_dom_code("F1"), Some("F1"));
+        assert_eq!(key_name_to_dom_code("f12"), Some("F12"));
     }
 
     #[test]
-    fn key_name_to_dom_code_passthrough() {
-        // Unknown keys pass through as-is
-        assert_eq!(key_name_to_dom_code("Meta"), "Meta");
-        assert_eq!(key_name_to_dom_code("ctrl+c"), "ctrl+c");
+    fn key_name_to_dom_code_single_letters_and_modifiers() {
+        assert_eq!(key_name_to_dom_code("q"), Some("KeyQ"));
+        assert_eq!(key_name_to_dom_code("C"), Some("KeyC"));
+        assert_eq!(key_name_to_dom_code("-"), Some("Minus"));
+        assert_eq!(key_name_to_dom_code("Meta"), Some("MetaLeft"));
+        assert_eq!(key_name_to_dom_code("CTRL"), Some("ControlLeft"));
+        assert_eq!(key_name_to_dom_code("ALT"), Some("AltLeft"));
+    }
+
+    #[test]
+    fn key_name_to_dom_code_rejects_unknown_keys() {
+        assert_eq!(key_name_to_dom_code("ctrl+c"), None);
+        assert_eq!(key_name_to_dom_code("BogusKey"), None);
+        assert_eq!(key_name_to_dom_code("\u{2603}"), None);
+    }
+
+    #[test]
+    fn key_action_events_single_letter() {
+        let events = key_action_events("q").unwrap();
+        assert_eq!(events.len(), 2);
+        match &events[0] {
+            crate::display::InputEvent::KeyDown { code, .. } => assert_eq!(code, "KeyQ"),
+            _ => panic!("expected keydown"),
+        }
+        match &events[1] {
+            crate::display::InputEvent::KeyUp { code, .. } => assert_eq!(code, "KeyQ"),
+            _ => panic!("expected keyup"),
+        }
+    }
+
+    #[test]
+    fn key_action_events_modifier_combo() {
+        let events = key_action_events("CTRL+C").unwrap();
+        assert_eq!(events.len(), 4);
+        match &events[0] {
+            crate::display::InputEvent::KeyDown { code, ctrl, .. } => {
+                assert_eq!(code, "ControlLeft");
+                assert!(*ctrl);
+            }
+            _ => panic!("expected control keydown"),
+        }
+        match &events[1] {
+            crate::display::InputEvent::KeyDown { code, ctrl, .. } => {
+                assert_eq!(code, "KeyC");
+                assert!(*ctrl);
+            }
+            _ => panic!("expected c keydown"),
+        }
+        match &events[3] {
+            crate::display::InputEvent::KeyUp { code, .. } => assert_eq!(code, "ControlLeft"),
+            _ => panic!("expected control keyup"),
+        }
+    }
+
+    #[test]
+    fn key_action_events_alt_function_combo() {
+        let events = key_action_events("ALT+F2").unwrap();
+        assert_eq!(events.len(), 4);
+        match &events[0] {
+            crate::display::InputEvent::KeyDown { code, alt, .. } => {
+                assert_eq!(code, "AltLeft");
+                assert!(*alt);
+            }
+            _ => panic!("expected alt keydown"),
+        }
+        match &events[1] {
+            crate::display::InputEvent::KeyDown { code, alt, .. } => {
+                assert_eq!(code, "F2");
+                assert!(*alt);
+            }
+            _ => panic!("expected f2 keydown"),
+        }
+    }
+
+    #[test]
+    fn key_action_events_rejects_unsupported_combo() {
+        let err = key_action_events("hyper+q").unwrap_err();
+        assert!(err.contains("unsupported key modifier"));
+        let err = key_action_events("ctrl+notakey").unwrap_err();
+        assert!(err.contains("unsupported key action"));
     }
 
     #[test]

@@ -8758,11 +8758,7 @@ impl IntendantServer {
         // Format results with action details (type, coordinates) for debugging.
         let mut summaries = Vec::new();
         for (i, (action, result)) in actions.iter().zip(results.iter()).enumerate() {
-            let status = if result.error.is_some() {
-                "failed"
-            } else {
-                "ok"
-            };
+            let status = cu_result_status(result);
             let action_desc = format_cu_action_brief(action);
             let detail = result.error.as_deref().unwrap_or("");
             if detail.is_empty() {
@@ -9313,6 +9309,14 @@ fn format_cu_action_brief(action: &crate::computer_use::CuAction) -> String {
     }
 }
 
+fn cu_result_status(result: &crate::computer_use::CuActionResult) -> &'static str {
+    if result.success && result.error.is_none() {
+        "ok"
+    } else {
+        "failed"
+    }
+}
+
 /// Draw red crosshairs on a screenshot at click/double_click coordinates.
 /// Returns annotated base64 PNG, or the original if annotation fails.
 fn annotate_screenshot_with_clicks(
@@ -9494,6 +9498,23 @@ mod tests {
             autonomy,
             log_dir,
         )))
+    }
+
+    #[test]
+    fn cu_result_status_respects_success_flag() {
+        let result = crate::computer_use::CuActionResult {
+            success: false,
+            screenshot: None,
+            error: None,
+        };
+        assert_eq!(cu_result_status(&result), "failed");
+
+        let result = crate::computer_use::CuActionResult {
+            success: true,
+            screenshot: None,
+            error: None,
+        };
+        assert_eq!(cu_result_status(&result), "ok");
     }
 
     fn spawn_codex_thread_action_result(

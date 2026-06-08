@@ -516,6 +516,15 @@ pub trait DisplayBackend: Send + Sync + 'static {
     /// Inject a browser input event into the display.
     async fn inject_input(&self, event: InputEvent) -> Result<(), CallerError>;
 
+    /// Inject literal text into the display.
+    async fn inject_text(&self, text: &str) -> Result<(), CallerError> {
+        let _ = text;
+        Err(CallerError::Display(format!(
+            "{} backend does not support exact text injection",
+            self.kind()
+        )))
+    }
+
     /// Current display resolution (width, height).
     fn resolution(&self) -> (u32, u32);
 
@@ -2704,6 +2713,11 @@ impl DisplaySession {
     /// Inject an input event into the display backend.
     pub async fn inject_input(&self, event: InputEvent) -> Result<(), CallerError> {
         self.backend.inject_input(event).await
+    }
+
+    /// Inject literal text into the display backend.
+    pub async fn inject_text(&self, text: &str) -> Result<(), CallerError> {
+        self.backend.inject_text(text).await
     }
 
     /// Current display resolution.
