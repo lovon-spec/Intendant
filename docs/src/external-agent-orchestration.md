@@ -168,7 +168,7 @@ features they lack.
   node scripts/validate-dashboard.cjs --port <web_port> \
     --station-probe rendered --station-probe dock-hidden
   node scripts/validate-dashboard.cjs --url http://127.0.0.1:<web_port>/app \
-    --require-current-static --require-station-state \
+    --require-current-static --require-station-state --require-ai-provider-session \
     --station-probe rendered --station-interaction-probe --json
   node scripts/validate-dashboard.cjs --launch-dashboard --port <throwaway_port> \
     --dashboard-arg --no-tls --headed \
@@ -190,11 +190,13 @@ features they lack.
   foreground/nohup dashboard launch. It does not default to port 8765; pass
   `--port`/`--url` or let it derive the port from `INTENDANT_MCP_URL`. Managed
   Station product validation against an already-running controller should add
-  `--require-current-static --require-station-state`: the first compares the
-  served embedded app/WASM/JS assets with this worktree's `static/` files so a
-  stale controller on the target port fails clearly, and the second fails if
-  Station sessions, events, managed context, and peers are all empty. Omit
-  `--require-current-static` only for generic connectivity checks against a
+  `--require-current-static --require-station-state --require-ai-provider-session`:
+  the first compares the served embedded app/WASM/JS assets with this worktree's
+  `static/` files so a stale controller on the target port fails clearly, the
+  second fails if Station sessions, events, managed context, and peers are all
+  empty, and the third fails if Station only exposes placeholder/no-provider
+  session state instead of a non-placeholder provider, model, and session id.
+  Omit `--require-current-static` only for generic connectivity checks against a
   controller intentionally built from another worktree, and use
   `--allow-empty-station-state` only for renderer smoke tests where an empty
   fixture is expected. Managed agents should keep validation bounded: one

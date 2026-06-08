@@ -98,6 +98,8 @@ Options:
   --dashboard-timeout MS     Temporary dashboard readiness timeout (default: ${DEFAULT_DASHBOARD_TIMEOUT_MS})
   --require-current-static   Fail unless served embedded dashboard static assets match this worktree
   --require-station-state    Fail if Station sessions/events/managed/peers are all empty
+  --require-ai-provider-session
+                             Fail unless Station exposes a real session with non-placeholder provider/model
   --allow-empty-station-state
                              Explicitly allow empty Station state with --require-station-state
   --check-static-scripts     Parse inline classic/module scripts in static/app.html without executing them
@@ -142,6 +144,7 @@ function parseArgs(argv, env = process.env) {
     selfTest: false,
     requireCurrentStatic: false,
     requireStationState: false,
+    requireAiProviderSession: false,
     allowEmptyStationState: false,
     checkStaticScripts: false,
     appHtmlPath: path.join('static', 'app.html'),
@@ -260,6 +263,8 @@ function parseArgs(argv, env = process.env) {
       opts.requireCurrentStatic = true;
     } else if (arg === '--require-station-state') {
       opts.requireStationState = true;
+    } else if (arg === '--require-ai-provider-session') {
+      opts.requireAiProviderSession = true;
     } else if (arg === '--allow-empty-station-state') {
       opts.allowEmptyStationState = true;
     } else if (arg === '--check-static-scripts') {
@@ -695,7 +700,10 @@ function formatStaticIdentityPass(result) {
 
 function formatStationStatePass(result) {
   const counts = result.counts || {};
-  return `  station state sessions=${counts.sessions || 0} events=${counts.events || 0} managed=${counts.managed || 0} peers=${counts.peers || 0}`;
+  const live = result.liveAgentSession && result.liveAgentSession.ok
+    ? ` liveSession=${quote(result.liveAgentSession.sessionId || '')} provider=${quote(result.liveAgentSession.provider || '')} model=${quote(result.liveAgentSession.model || '')}`
+    : '';
+  return `  station state sessions=${counts.sessions || 0} events=${counts.events || 0} managed=${counts.managed || 0} peers=${counts.peers || 0}${live}`;
 }
 
 function collectFailureLogs(lineCount, dashboard, harness) {
@@ -1348,7 +1356,7 @@ class BrowserHarness {
       for (const source of opts.functions) {
         await this.waitForFunction(source, opts.timeoutMs);
       }
-      if (opts.stationProbes.length > 0 || opts.stationInteractionProbe || opts.requireStationState) {
+      if (opts.stationProbes.length > 0 || opts.stationInteractionProbe || opts.requireStationState || opts.requireAiProviderSession) {
         await this.prepareStationSurface(opts.timeoutMs);
       }
       for (const probe of opts.stationProbes) {
@@ -1357,7 +1365,7 @@ class BrowserHarness {
       if (opts.stationInteractionProbe) {
         validation.stationInteraction = await this.runStationInteractionProbe(opts.timeoutMs);
       }
-      if (opts.requireStationState) {
+      if (opts.requireStationState || opts.requireAiProviderSession) {
         validation.stationState = await this.requireStationState(opts);
       }
       return validation;
@@ -1533,6 +1541,12 @@ class BrowserHarness {
     }
     if (!state.nonEmpty && !opts.allowEmptyStationState) {
       throw new Error(`station state check failed: Station sessions/events/managed/peers are all empty (last value: ${summarizeWaitValue(state)})`);
+    }
+    if (opts.requireAiProviderSession && !(state.liveAgentSession && state.liveAgentSession.ok)) {
+      const reason = state.liveAgentSession && state.liveAgentSession.reason
+        ? state.liveAgentSession.reason
+        : 'Station did not expose a real provider/model/session';
+      throw new Error(`ai provider session check failed: ${reason} (last value: ${summarizeWaitValue(state)})`);
     }
     return state;
   }
@@ -2797,6 +2811,113 @@ function stationStateSummarySource() {
       count += countArray(managed.recentBranches);
       return count;
     };
+    const asText = (value) => String(value ?? '').trim();
+    const placeholderPattern = /^(?:-|--|n\/a|na|null|undefined|unknown|none|no[-_\s]?provider|no[-_\s]?model|placeholder|dummy|default|auto|browser|current|global|managed-context|done-placeholder|claude-code-session)$/i;
+    const usableText = (value) => {
+      const text = asText(value);
+      return text && !placeholderPattern.test(text) ? text : '';
+    };
+    const sessionIdText = (value) => {
+      const text = usableText(value);
+      if (!text || /^(?:primary-agent|local|session|current-daemon-session)$/i.test(text)) return '';
+      return text;
+    };
+    const candidateFrom = (raw, fallback = {}) => {
+      const item = raw && typeof raw === 'object' ? raw : {};
+      const sessionId = sessionIdText(
+        item.session_id || item.sessionId || item.resume_id || item.resumeId ||
+        item.backend_session_id || item.backendSessionId || item.id || fallback.sessionId
+      );
+      const provider = usableText(item.provider || item.provider_name || item.providerName || fallback.provider);
+      const model = usableText(item.model || item.model_name || item.modelName || fallback.model);
+      return {
+        sessionId,
+        provider,
+        model,
+        source: usableText(item.source || item.backend_source || item.backendSource || item.source_label || item.sourceLabel || fallback.source),
+        status: asText(item.status || item.phase || fallback.status),
+        evidence: fallback.evidence || '',
+      };
+    };
+    const collectMapCandidates = (out, value, evidence) => {
+      if (!value || typeof value.forEach !== 'function') return;
+      value.forEach((item, key) => out.push(candidateFrom(item, { sessionId: key, evidence })));
+    };
+    const collectArrayCandidates = (out, value, evidence) => {
+      if (!Array.isArray(value)) return;
+      for (const item of value) out.push(candidateFrom(item, { evidence }));
+    };
+    const liveAgentSession = (snapshot) => {
+      const candidates = [];
+      try { collectMapCandidates(candidates, typeof sessionMetadataById !== 'undefined' ? sessionMetadataById : null, 'sessionMetadataById'); } catch (_) {}
+      try { collectMapCandidates(candidates, typeof sessionWindows !== 'undefined' ? sessionWindows : null, 'sessionWindows'); } catch (_) {}
+      try { collectArrayCandidates(candidates, typeof _cachedSessions !== 'undefined' ? _cachedSessions : null, '_cachedSessions'); } catch (_) {}
+      try {
+        const cache = typeof sessionsListCache !== 'undefined' ? sessionsListCache : null;
+        if (cache && typeof cache.forEach === 'function') {
+          cache.forEach((value) => collectArrayCandidates(candidates, value, 'sessionsListCache'));
+        }
+      } catch (_) {}
+      collectArrayCandidates(candidates, snapshot.sessions && snapshot.sessions.recent, 'snapshot.sessions.recent');
+      collectArrayCandidates(candidates, snapshot.sessions && snapshot.sessions.filteredSessions, 'snapshot.sessions.filteredSessions');
+      collectArrayCandidates(candidates, snapshot.sessions && snapshot.sessions.externalTargets, 'snapshot.sessions.externalTargets');
+
+      const agents = Array.isArray(snapshot.agents) ? snapshot.agents : [];
+      const agentWithModel = agents.find(agent => usableText(agent && agent.provider) && usableText(agent && agent.model));
+      const snapshotSession = (snapshot.sessions && (
+        (Array.isArray(snapshot.sessions.recent) && snapshot.sessions.recent[0]) ||
+        (Array.isArray(snapshot.sessions.externalTargets) && snapshot.sessions.externalTargets[0]) ||
+        null
+      )) || {};
+      if (agentWithModel) {
+        candidates.push(candidateFrom(snapshotSession, {
+          sessionId: snapshot.managed && snapshot.managed.sessionId || snapshotSession.id || snapshotSession.sessionId || snapshot.sessions && snapshot.sessions.latestSessionId || '',
+          provider: agentWithModel.provider,
+          model: agentWithModel.model,
+          source: snapshot.sessions && snapshot.sessions.latestSource || agentWithModel.role || '',
+          status: agentWithModel.status || agentWithModel.phase || '',
+          evidence: 'snapshot.agents+sessions',
+        }));
+      }
+      try {
+        const statusProvider = document.getElementById('sb-provider') && document.getElementById('sb-provider').textContent;
+        const statusModel = document.getElementById('sb-model') && document.getElementById('sb-model').textContent;
+        const currentId = typeof daemonSessionFullId !== 'undefined' && daemonSessionFullId
+          || typeof currentSessionFullId !== 'undefined' && currentSessionFullId
+          || typeof foregroundSessionFullId !== 'undefined' && foregroundSessionFullId
+          || '';
+        candidates.push(candidateFrom({}, {
+          sessionId: currentId,
+          provider: statusProvider,
+          model: statusModel,
+          source: 'status-bar',
+          status: typeof currentPhase !== 'undefined' ? currentPhase : '',
+          evidence: 'status-bar',
+        }));
+      } catch (_) {}
+
+      const winner = candidates.find(candidate => candidate.sessionId && candidate.provider && candidate.model);
+      if (winner) {
+        return {
+          ok: true,
+          sessionId: winner.sessionId,
+          provider: winner.provider,
+          model: winner.model,
+          source: winner.source,
+          status: winner.status,
+          evidence: winner.evidence,
+          candidates: candidates.length,
+        };
+      }
+      const withSession = candidates.filter(candidate => candidate.sessionId).length;
+      const withProvider = candidates.filter(candidate => candidate.provider).length;
+      const withModel = candidates.filter(candidate => candidate.model).length;
+      return {
+        ok: false,
+        reason: `found ${withSession} session id candidate(s), ${withProvider} provider candidate(s), ${withModel} model candidate(s), but no single non-placeholder provider/model/session`,
+        candidates: candidates.length,
+      };
+    };
     try {
       const snapshot = typeof buildStationSnapshot === 'function' ? buildStationSnapshot() : null;
       if (!snapshot || typeof snapshot !== 'object') {
@@ -2821,6 +2942,7 @@ function stationStateSummarySource() {
         counts,
         latestSession: snapshot.sessions && snapshot.sessions.latestTask || '',
         managedSessionId: snapshot.managed && snapshot.managed.sessionId || '',
+        liveAgentSession: liveAgentSession(snapshot),
       };
     } catch (error) {
       return {
@@ -2885,6 +3007,24 @@ function compactStationState(state) {
     },
     latestSession: truncateMiddle(state.latestSession || '', DIAGNOSTIC_TEXT_LIMIT),
     managedSessionId: truncateMiddle(state.managedSessionId || '', DIAGNOSTIC_TEXT_LIMIT),
+    liveAgentSession: compactLiveAgentSession(state.liveAgentSession),
+  };
+}
+
+function compactLiveAgentSession(session) {
+  if (!session || typeof session !== 'object') {
+    return session;
+  }
+  return {
+    ok: Boolean(session.ok),
+    sessionId: truncateMiddle(session.sessionId || '', DIAGNOSTIC_TEXT_LIMIT),
+    provider: truncateMiddle(session.provider || '', DIAGNOSTIC_TEXT_LIMIT),
+    model: truncateMiddle(session.model || '', DIAGNOSTIC_TEXT_LIMIT),
+    source: truncateMiddle(session.source || '', DIAGNOSTIC_TEXT_LIMIT),
+    status: truncateMiddle(session.status || '', DIAGNOSTIC_TEXT_LIMIT),
+    evidence: truncateMiddle(session.evidence || '', DIAGNOSTIC_TEXT_LIMIT),
+    reason: truncateMiddle(session.reason || '', DIAGNOSTIC_TEXT_LIMIT),
+    candidates: Number(session.candidates) || 0,
   };
 }
 
@@ -2946,6 +3086,9 @@ function validationFailureNextStep(result) {
   if (result.failureKind === 'station-state') {
     return 'target a populated managed Station controller, or rerun with --allow-empty-station-state only for renderer smoke tests';
   }
+  if (result.failureKind === 'ai-provider-session') {
+    return 'target a real managed Station session with populated provider/model metadata; do not count no-provider or placeholder sessions as product E2E success';
+  }
   if (result.failureKind === 'stale-static') {
     return 'rebuild and restart the dashboard controller from this worktree, then rerun with --require-current-static';
   }
@@ -2965,6 +3108,9 @@ function validationFailureKind(reason) {
   }
   if (/^station state check failed/.test(text)) {
     return 'station-state';
+  }
+  if (/^ai provider session check failed/.test(text)) {
+    return 'ai-provider-session';
   }
   if (/^stale dashboard static asset/.test(text)) {
     return 'stale-static';
@@ -3221,7 +3367,7 @@ function failureDiagnosticSelectors(opts) {
   for (const selector of diagnosticSelectorsFromWaitFunctions(opts.functions || [])) {
     addDiagnosticSelector(selectors, selector);
   }
-  if ((opts.stationProbes || []).length || opts.stationInteractionProbe || opts.requireStationState) {
+  if ((opts.stationProbes || []).length || opts.stationInteractionProbe || opts.requireStationState || opts.requireAiProviderSession) {
     for (const selector of ['#station-status', '#station-hud-canvas', '#station-dock', '#station-dock-nav [data-station-dock-nav="system:controls"]']) {
       addDiagnosticSelector(selectors, selector);
     }
@@ -3236,6 +3382,7 @@ function isStationFocusedCheck(opts) {
     ...(opts.stationProbes || []).map((probe) => `station:${probe}`),
     opts.stationInteractionProbe ? 'station:interaction' : '',
     opts.requireStationState ? 'station:state' : '',
+    opts.requireAiProviderSession ? 'station:ai-provider-session' : '',
   ].join('\n').toLowerCase();
   return haystack.includes('station-status')
     || haystack.includes('station-hud-canvas')
@@ -3427,6 +3574,7 @@ async function runSelfTest() {
       '--browser-arg=--ozone-platform=x11',
       '--require-current-static',
       '--require-station-state',
+      '--require-ai-provider-session',
       '--allow-empty-station-state',
     ],
     {},
@@ -3445,6 +3593,7 @@ async function runSelfTest() {
   assert.strictEqual(parsed.enableGpu, true);
   assert.strictEqual(parsed.requireCurrentStatic, true);
   assert.strictEqual(parsed.requireStationState, true);
+  assert.strictEqual(parsed.requireAiProviderSession, true);
   assert.strictEqual(parsed.allowEmptyStationState, true);
   assert.deepStrictEqual(parsed.browserArgs, ['--ozone-platform=x11']);
   assert.ok(browserArgs('/tmp/profile', parseArgs([], {})).includes('--disable-gpu'));
@@ -3779,6 +3928,7 @@ async function runSelfTest() {
   })();
   assert.strictEqual(stationStateSummary.ok, true);
   assert.strictEqual(stationStateSummary.nonEmpty, false);
+  assert.strictEqual(stationStateSummary.liveAgentSession.ok, false);
   assert.deepStrictEqual(JSON.parse(JSON.stringify(stationStateSummary.counts)), {
     sessions: 0,
     events: 0,
@@ -3803,21 +3953,83 @@ async function runSelfTest() {
     String,
   })();
   assert.strictEqual(populatedStationStateSummary.nonEmpty, true);
+  assert.strictEqual(populatedStationStateSummary.liveAgentSession.ok, false);
   assert.deepStrictEqual(JSON.parse(JSON.stringify(populatedStationStateSummary.counts)), {
     sessions: 4,
     events: 1,
     managed: 6,
     peers: 1,
   });
+  const placeholderProviderStationStateSummary = vm.runInNewContext(`(${stationStateSummarySource()})`, {
+    buildStationSnapshot: () => ({
+      hosts: [{ id: 'local' }],
+      agents: [{ id: 'primary-agent', provider: 'none', model: 'none', status: 'done' }],
+      events: [{ id: 'event-1' }],
+      activity: { retainedCount: 1, shownCount: 1 },
+      managed: { sessionId: 'done-placeholder', records: 1, anchors: 0 },
+      sessions: {
+        total: 1,
+        latestTask: 'done placeholder',
+        recent: [{ id: 'done-placeholder', status: 'done', source: 'codex' }],
+      },
+    }),
+    sessionMetadataById: new Map([
+      ['done-placeholder', { provider: 'no-provider', model: 'none', status: 'done' }],
+    ]),
+    daemons: [],
+    Map,
+    Set,
+    Array,
+    Object,
+    Number,
+    String,
+  })();
+  assert.strictEqual(placeholderProviderStationStateSummary.nonEmpty, true);
+  assert.strictEqual(placeholderProviderStationStateSummary.liveAgentSession.ok, false);
+  assert.ok(placeholderProviderStationStateSummary.liveAgentSession.reason.includes('no single non-placeholder'));
+  const liveProviderStationStateSummary = vm.runInNewContext(`(${stationStateSummarySource()})`, {
+    buildStationSnapshot: () => ({
+      hosts: [{ id: 'local' }],
+      agents: [{ id: 'primary-agent', provider: 'openai', model: 'gpt-5.2-codex', status: 'running' }],
+      events: [{ id: 'event-1' }],
+      activity: { retainedCount: 1, shownCount: 1 },
+      managed: { sessionId: 'sess-live', records: 1, anchors: 0 },
+      sessions: {
+        total: 1,
+        latestTask: 'real managed Station session',
+        latestSource: 'codex',
+        recent: [{ id: 'sess-live', status: 'running', source: 'codex' }],
+      },
+    }),
+    sessionMetadataById: new Map([
+      ['sess-live', { provider: 'openai', model: 'gpt-5.2-codex', status: 'running', source: 'codex' }],
+    ]),
+    daemons: [],
+    Map,
+    Set,
+    Array,
+    Object,
+    Number,
+    String,
+  })();
+  assert.strictEqual(liveProviderStationStateSummary.liveAgentSession.ok, true);
+  assert.strictEqual(liveProviderStationStateSummary.liveAgentSession.sessionId, 'sess-live');
+  assert.strictEqual(liveProviderStationStateSummary.liveAgentSession.provider, 'openai');
+  assert.strictEqual(liveProviderStationStateSummary.liveAgentSession.model, 'gpt-5.2-codex');
   assert.strictEqual(
     validationFailureKind('station state check failed: Station sessions/events/managed/peers are all empty'),
     'station-state',
+  );
+  assert.strictEqual(
+    validationFailureKind('ai provider session check failed: found 1 session id candidate(s), 0 provider candidate(s), 0 model candidate(s)'),
+    'ai-provider-session',
   );
   assert.strictEqual(
     validationFailureKind('stale dashboard static asset /app; served hash abc does not match static/app.html hash def'),
     'stale-static',
   );
   assert.ok(validationFailureNextStep({ failureKind: 'station-state', reason: '' }).includes('--allow-empty-station-state'));
+  assert.ok(validationFailureNextStep({ failureKind: 'ai-provider-session', reason: '' }).includes('provider/model'));
   assert.ok(validationFailureNextStep({ failureKind: 'stale-static', reason: '' }).includes('--require-current-static'));
   assert.strictEqual(
     normalizeAppHtmlForIdentity('<script src="/wasm-station/station_web.js?v=abc123"></script>'),
