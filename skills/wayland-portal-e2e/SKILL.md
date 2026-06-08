@@ -44,6 +44,67 @@ DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus
 XDG_SESSION_TYPE=wayland
 ```
 
+## Remote Headed Browser Validation
+
+For Station/dashboard browser validation on a remote GNOME Wayland host, do not
+assume a non-login SSH shell has the graphical environment or the Rustup
+toolchain on `PATH`. On `user@192.168.1.206`, non-login SSH has historically
+resolved `/usr/bin/cargo` / Rust 1.85 unless Rustup is prepended.
+
+The dashboard validation helper imports the active graphical session variables
+from `systemctl --user show-environment` for Linux `--headed` runs when
+`DISPLAY` / `WAYLAND_DISPLAY` are absent. Keep the Rust `PATH` fix explicit and
+use a throwaway port:
+
+```sh
+ssh user@192.168.1.206 '
+  set -euo pipefail
+  cd /home/user/projects/intendant-station-mainline-123e28c
+  export PATH="$HOME/.cargo/bin:$PATH"
+
+  # Rebuild explicitly instead if target/release/intendant is stale.
+  [ -x target/release/intendant ] || cargo build --release -p intendant
+
+  node scripts/validate-dashboard.cjs \
+    --launch-dashboard \
+    --port 8898 \
+    --dashboard-binary target/release/intendant \
+    --dashboard-arg --no-presence \
+    --headed \
+    --enable-gpu \
+    --station-probe dock-hidden
+'
+```
+
+For older helper versions, or when manually launching Chromium, import the
+graphical session variables before running the validation:
+
+```sh
+while IFS= read -r line; do
+  case "$line" in
+    DISPLAY=*|WAYLAND_DISPLAY=*|XDG_RUNTIME_DIR=*|XDG_SESSION_TYPE=*|\
+DBUS_SESSION_BUS_ADDRESS=*|XAUTHORITY=*|XDG_CURRENT_DESKTOP=*|DESKTOP_SESSION=*)
+      export "$line"
+      ;;
+  esac
+done < <(systemctl --user show-environment)
+```
+
+Check ports before launching and never reuse the protected local `8765` session
+or kill unrelated Intendant instances:
+
+```sh
+ss -ltnp | grep -E ':(8898|8899|8900)\b' || true
+pgrep -af intendant || true
+```
+
+If Chromium fails before CDP with `Missing X server or $DISPLAY`, the run is
+still missing the graphical session environment. If CDP starts and the helper
+returns a Station renderer failure such as `Station initializing` with a
+`0x0` canvas, the remote headed/GPU browser path is working and the remaining
+failure is a Station renderer/readiness condition, not an SSH/X11/ozone setup
+problem.
+
 ## Preferred Flow
 
 1. Enable GNOME Remote Desktop on the Wayland VM:
