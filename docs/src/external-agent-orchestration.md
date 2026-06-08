@@ -202,7 +202,13 @@ features they lack.
   Below the rewind-only threshold, status may be `watch` when density is getting
   high, but the MCP payload also reports `normal_tools_allowed=true` and
   `required_action=continue_or_rewind_optional`; that is an advisory density
-  signal, not an emergency recovery state.
+  signal, not an emergency recovery state. When Intendant sends a post-turn
+  density handoff, a model-selected exact rewind target must still be materially
+  useful: the chosen anchor/position must be expected to clear the recommended
+  density threshold, and Intendant rechecks backend-reported pressure after the
+  rollback before replaying any held follow-up. If the committed rewind remains
+  above the density threshold, the harness sends another maintenance handoff
+  instead of treating the shallow rewind as successful.
 
   Managed Codex relies on the minimal lineage patch separating Codex's thread id
   from the Responses `prompt_cache_key`. Same-thread restore keeps the active

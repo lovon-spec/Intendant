@@ -2208,6 +2208,7 @@ struct ExternalContextRewindRequest {
     artifacts: Vec<String>,
     next_steps: Vec<String>,
     auto_resume: bool,
+    require_density_improvement: bool,
 }
 
 #[derive(Debug, Default)]
@@ -2458,6 +2459,7 @@ fn external_context_rewind_request_from_action(
         artifacts: clean_context_rewind_list(params, "artifacts"),
         next_steps: clean_context_rewind_list(params, "next_steps"),
         auto_resume: is_model_rewind,
+        require_density_improvement: false,
     }))
 }
 
@@ -2566,6 +2568,29 @@ fn context_rewind_anchor_position_recovery_eligible(
     }))
 }
 
+fn managed_context_density_recommended_limit(rewind_only_limit: u64) -> u64 {
+    (rewind_only_limit as f64 * MANAGED_CONTEXT_DENSITY_THRESHOLD_PCT / 100.0).floor() as u64
+}
+
+fn context_rewind_anchor_has_density_headroom(used_tokens: u64, rewind_only_limit: u64) -> bool {
+    used_tokens < managed_context_density_recommended_limit(rewind_only_limit)
+}
+
+fn context_rewind_anchor_position_density_eligible(
+    anchor: &ContextRewindAnchorCatalogEntry,
+    position: external_agent::RollbackAnchorPosition,
+    latest_outcome: Option<ContextRewindBackendUsageAtLine>,
+) -> Option<bool> {
+    let (_, used_tokens, rewind_only_limit) =
+        context_rewind_anchor_restore_usage_for_headroom(anchor, position)?;
+    if !context_rewind_anchor_has_density_headroom(used_tokens, rewind_only_limit) {
+        return Some(false);
+    }
+    Some(latest_outcome.is_none_or(|outcome| {
+        context_rewind_anchor_has_density_headroom(outcome.used_tokens, outcome.rewind_only_limit)
+    }))
+}
+
 fn validate_context_rewind_anchor_restore_headroom(
     source_rollout_path: &Path,
     requested_item_id: &str,
@@ -2634,6 +2659,71 @@ fn validate_context_rewind_anchor_restore_headroom(
     ))
 }
 
+fn validate_context_rewind_anchor_density_improvement(
+    source_rollout_path: &Path,
+    requested_item_id: &str,
+    position: external_agent::RollbackAnchorPosition,
+) -> Result<(), String> {
+    let requested_item_id = requested_item_id.trim();
+    let Some(anchor) = find_context_rewind_anchor_entry(source_rollout_path, requested_item_id)
+        .map_err(|err| {
+            format!(
+                "failed to inspect rollout anchors in {}: {err}",
+                source_rollout_path.display()
+            )
+        })?
+    else {
+        return Ok(());
+    };
+
+    let Some((usage_kind, used_tokens, rewind_only_limit)) =
+        context_rewind_anchor_restore_usage_for_headroom(&anchor, position)
+    else {
+        return Err(format!(
+            "density handoff rewind anchor item_id `{requested_item_id}` cannot be validated for material density improvement at position `{}` because the rollout has no backend or prefix usage estimate for that position. Call list_rewind_anchors with include_pruning_estimates=true, choose an exact anchor whose density_eligible_positions includes the requested position, or reply with a concise no-rewind handoff and stop.",
+            position.as_str()
+        ));
+    };
+    let recommended_rewind_limit = managed_context_density_recommended_limit(rewind_only_limit);
+    if context_rewind_anchor_has_density_headroom(used_tokens, rewind_only_limit) {
+        if let Some(outcome) = latest_context_rewind_outcome_for_anchor(
+            source_rollout_path,
+            requested_item_id,
+            position,
+        )
+        .map_err(|err| {
+            format!(
+                "failed to inspect prior rewind outcomes in {}: {err}",
+                source_rollout_path.display()
+            )
+        })? {
+            if context_rewind_anchor_has_density_headroom(
+                outcome.used_tokens,
+                outcome.rewind_only_limit,
+            ) {
+                return Ok(());
+            }
+            return Err(format!(
+                "density handoff rewind anchor item_id `{requested_item_id}` is too shallow for position `{}`: a prior rewind to that exact item was followed by {} tokens, still at or above the recommended density threshold {} for the {} token context. Choose an earlier exact item_id/position from list_rewind_anchors whose density_eligible_positions includes the requested position, or reply with a concise no-rewind handoff and stop.",
+                position.as_str(),
+                outcome.used_tokens,
+                managed_context_density_recommended_limit(outcome.rewind_only_limit),
+                outcome.rewind_only_limit,
+            ));
+        }
+        return Ok(());
+    }
+
+    Err(format!(
+        "density handoff rewind anchor item_id `{requested_item_id}` is too shallow for position `{}`: restoring {} item would keep {} tokens, still at or above the recommended density threshold {} for the {} token context. Choose an earlier exact item_id/position from list_rewind_anchors whose density_eligible_positions includes the requested position, or reply with a concise no-rewind handoff and stop.",
+        position.as_str(),
+        usage_kind,
+        used_tokens,
+        recommended_rewind_limit,
+        rewind_only_limit
+    ))
+}
+
 fn context_rewind_thread_id_candidates(
     session_id: Option<&str>,
     alias_session_id: Option<&str>,
@@ -2689,6 +2779,13 @@ async fn validate_context_rewind_request_before_schedule(
                     &request.item_id,
                     request.position,
                 )?;
+                if request.require_density_improvement {
+                    validate_context_rewind_anchor_density_improvement(
+                        &source_rollout_path,
+                        &request.item_id,
+                        request.position,
+                    )?;
+                }
                 return Ok(());
             }
             Err(e) => metadata_errors.push(format!("{thread_id}: {e}")),
@@ -2975,6 +3072,8 @@ struct ContextRewindAnchorCatalogEntry {
     backend_usage_at_or_after_anchor: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     rewind_only_limit_at_or_after_anchor: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    recommended_rewind_limit_at_or_after_anchor: Option<u64>,
     #[serde(skip_serializing)]
     prefix_estimated_tokens_before_anchor: Option<u64>,
     #[serde(skip_serializing)]
@@ -2993,6 +3092,10 @@ struct ContextRewindAnchorCatalogEntry {
     recovery_eligible: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     recovery_eligible_positions: Option<Vec<&'static str>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    density_eligible: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    density_eligible_positions: Option<Vec<&'static str>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     managed_context_recovery_start_line: Option<usize>,
 }
@@ -3363,6 +3466,7 @@ fn scan_context_rewind_anchor_catalog(
                 summary: summary.clone(),
                 backend_usage_at_or_after_anchor: None,
                 rewind_only_limit_at_or_after_anchor: None,
+                recommended_rewind_limit_at_or_after_anchor: None,
                 prefix_estimated_tokens_before_anchor: Some(prefix_before_item),
                 prefix_estimated_tokens_after_anchor: Some(prefix_after_item),
                 approx_pruned_tokens_before: None,
@@ -3372,6 +3476,8 @@ fn scan_context_rewind_anchor_catalog(
                 latest_rewind_limit_after_anchor: None,
                 recovery_eligible: None,
                 recovery_eligible_positions: None,
+                density_eligible: None,
+                density_eligible_positions: None,
                 managed_context_recovery_start_line: None,
             });
         }
@@ -3406,7 +3512,12 @@ fn scan_context_rewind_anchor_catalog(
         };
         anchor.backend_usage_at_or_after_anchor = Some(usage.used_tokens);
         anchor.rewind_only_limit_at_or_after_anchor = Some(usage.rewind_only_limit);
+        anchor.recommended_rewind_limit_at_or_after_anchor = Some(
+            managed_context_density_recommended_limit(usage.rewind_only_limit),
+        );
         if in_managed_recovery_span.is_some() {
+            anchor.density_eligible = Some(false);
+            anchor.density_eligible_positions = None;
             continue;
         }
         let backend_has_headroom =
@@ -3443,6 +3554,28 @@ fn scan_context_rewind_anchor_catalog(
                 external_agent::RollbackAnchorPosition::Before,
             ))
             .copied();
+        let after_density_eligible = context_rewind_anchor_position_density_eligible(
+            anchor,
+            external_agent::RollbackAnchorPosition::After,
+            latest_rewind_after_outcome,
+        )
+        .unwrap_or(false);
+        let before_density_eligible = context_rewind_anchor_position_density_eligible(
+            anchor,
+            external_agent::RollbackAnchorPosition::Before,
+            latest_rewind_before_outcome,
+        )
+        .unwrap_or(false);
+        anchor.density_eligible = Some(after_density_eligible || before_density_eligible);
+        let mut density_eligible_positions = Vec::new();
+        if before_density_eligible {
+            density_eligible_positions.push("before");
+        }
+        if after_density_eligible {
+            density_eligible_positions.push("after");
+        }
+        anchor.density_eligible_positions =
+            (!density_eligible_positions.is_empty()).then_some(density_eligible_positions);
         let after_recovery_eligible = context_rewind_anchor_position_recovery_eligible(
             anchor,
             external_agent::RollbackAnchorPosition::After,
@@ -3965,6 +4098,13 @@ async fn apply_external_context_rewind(
         &resolved_anchor.item_id,
         request.position,
     )?;
+    if request.require_density_improvement {
+        validate_context_rewind_anchor_density_improvement(
+            &source_rollout_path,
+            &resolved_anchor.item_id,
+            request.position,
+        )?;
+    }
     let carried_forward_prior_facts = match context_rewind_pruned_prior_primer_facts(
         &source_rollout_path,
         &resolved_anchor.item_id,
@@ -4163,6 +4303,7 @@ async fn send_external_context_rewind_resume_turn(
         resume.codex_thread_action_dedupe,
         resume.side_sessions.as_deref_mut(),
         followup.managed_context_recovery_kickstart,
+        followup.managed_context_density_handoff,
     )
     .await)
 }
@@ -4594,8 +4735,7 @@ fn managed_context_density_pressure(
     if rewind_only_limit == 0 || used_tokens >= rewind_only_limit {
         return None;
     }
-    let recommended_rewind_limit =
-        (rewind_only_limit as f64 * MANAGED_CONTEXT_DENSITY_THRESHOLD_PCT / 100.0).floor() as u64;
+    let recommended_rewind_limit = managed_context_density_recommended_limit(rewind_only_limit);
     if used_tokens < recommended_rewind_limit {
         return None;
     }
@@ -4736,7 +4876,21 @@ fn managed_context_density_handoff_text(pressure: ManagedContextDensityPressure)
         .map(|hard| format!(" hard_limit={hard}"))
         .unwrap_or_default();
     format!(
-        "<managed_context_density_handoff>\nBackend-reported Codex context pressure is watch ({used}/{limit} tokens, recommended_density_threshold={recommended}{hard}). The previous implementation turn is complete, but the live transcript is above the recommended density threshold. Before handing control back, do a context-management handoff. If an exact managed-context rewind would materially improve density while preserving completed work, use list_rewind_anchors and inspect_rewind_anchor as needed, then call rewind_context with one exact returned item_id, the returned position_hint or a value in positions, and a dense carry-forward primer. If no rewind is worthwhile, do not continue implementation, exploration, or broad ordinary-tool work; reply with a concise handoff that crystallizes durable facts, changed files, verification results, user constraints, and remaining decisions, and state that you are leaving context unchanged. Normal tools are still allowed below rewind_only, but this maintenance turn should avoid ordinary tool use unless needed to inspect current status or anchors. Do not use auto anchors, N-turn rewinds, synthesized item ids, anchors from failed examples, or managed-context maintenance calls as rewind targets.\n</managed_context_density_handoff>",
+        "<managed_context_density_handoff>\nBackend-reported Codex context pressure is watch ({used}/{limit} tokens, recommended_density_threshold={recommended}{hard}). The previous implementation turn is complete, but the live transcript is above the recommended density threshold. Before handing control back, do a context-management handoff. If an exact managed-context rewind would materially improve density while preserving completed work, use list_rewind_anchors and inspect_rewind_anchor as needed, then call rewind_context with one exact returned item_id, the returned position_hint or a value in positions, and a dense carry-forward primer. For this density handoff, a rewind is useful only if the selected exact anchor/position is expected to reduce backend pressure below the recommended density threshold; anchor rows may expose density_eligible and density_eligible_positions to guide that choice. If no rewind is worthwhile, do not continue implementation, exploration, or broad ordinary-tool work; reply with a concise handoff that crystallizes durable facts, changed files, verification results, user constraints, and remaining decisions, and state that you are leaving context unchanged. Normal tools are still allowed below rewind_only, but this maintenance turn should avoid ordinary tool use unless needed to inspect current status or anchors. Do not use auto anchors, N-turn rewinds, synthesized item ids, anchors from failed examples, or managed-context maintenance calls as rewind targets.\n</managed_context_density_handoff>",
+        used = pressure.used_tokens,
+        limit = pressure.rewind_only_limit,
+        recommended = pressure.recommended_rewind_limit,
+        hard = hard,
+    )
+}
+
+fn managed_context_density_rewind_retry_text(pressure: ManagedContextDensityPressure) -> String {
+    let hard = pressure
+        .hard_context_window
+        .map(|hard| format!(" hard_limit={hard}"))
+        .unwrap_or_default();
+    format!(
+        "<managed_context_density_handoff>\nThe previous density-handoff rewind was applied, but backend-reported Codex context pressure is still watch ({used}/{limit} tokens, recommended_density_threshold={recommended}{hard}). That rewind is not enough to count as successful density maintenance, and Intendant will not replay ordinary follow-up work yet. Do not continue implementation, exploration, or broad ordinary-tool work. If another exact managed-context rewind can reduce backend pressure below the recommended density threshold while preserving completed work, use list_rewind_anchors and inspect_rewind_anchor as needed, then call rewind_context with one exact returned item_id and a dense carry-forward primer. Otherwise reply with a concise handoff that crystallizes durable facts, changed files, verification results, user constraints, and remaining decisions, and state that you are leaving context at the current rewind point. Do not use auto anchors, N-turn rewinds, synthesized item ids, anchors from failed examples, or managed-context maintenance calls as rewind targets.\n</managed_context_density_handoff>",
         used = pressure.used_tokens,
         limit = pressure.rewind_only_limit,
         recommended = pressure.recommended_rewind_limit,
@@ -6486,6 +6640,7 @@ async fn drain_external_child_turn(
         codex_thread_action_dedupe,
         None,
         false,
+        false,
     )
     .await
     {
@@ -6903,6 +7058,7 @@ async fn drain_external_agent_events(
     codex_thread_action_dedupe: &mut CodexThreadActionDedupe,
     mut side_sessions: Option<&mut ExternalSideSessionState<'_>>,
     managed_context_recovery_kickstart: bool,
+    managed_context_density_handoff: bool,
 ) -> DrainOutcome {
     use std::sync::atomic::Ordering;
 
@@ -7398,7 +7554,9 @@ async fn drain_external_agent_events(
                             )
                         {
                             match request {
-                                Ok(request) => {
+                                Ok(mut request) => {
+                                    request.require_density_improvement =
+                                        managed_context_density_handoff;
                                     if pending_context_rewind.is_some() {
                                         config.bus.send(AppEvent::CodexThreadActionResult {
                                             session_id: result_session_id.clone(),
@@ -8997,6 +9155,20 @@ fn managed_context_rewind_continuation(
         .map(managed_context_sanitize_queued_followup_replay)
         .or_else(|| managed_context_followup_replay_after_rewind(active_followup))
         .or(automatic_resume)
+}
+
+fn managed_context_density_retry_after_rewind(
+    active_followup: &FollowUpMessage,
+    post_rewind_snapshot: Option<&external_agent::AgentContextSnapshot>,
+) -> Option<FollowUpMessage> {
+    if !active_followup.managed_context_density_handoff {
+        return None;
+    }
+    let pressure = managed_context_density_pressure(post_rewind_snapshot?)?;
+    Some(
+        FollowUpMessage::text(managed_context_density_rewind_retry_text(pressure))
+            .managed_context_density_handoff(),
+    )
 }
 
 type FollowUpReceiver = tokio::sync::mpsc::Receiver<FollowUpMessage>;
@@ -10764,6 +10936,7 @@ mod tests {
             &mut dedupe,
             None,
             false,
+            false,
         )
         .await;
 
@@ -10878,12 +11051,53 @@ mod tests {
         assert!(text.contains("context pressure is watch"));
         assert!(text.contains("recommended_density_threshold=219640"));
         assert!(text.contains("one exact returned item_id"));
+        assert!(text.contains("density_eligible_positions"));
         assert!(text.contains("crystallizes durable facts"));
         assert!(text.contains("leaving context unchanged"));
         assert!(text.contains("Do not use auto anchors"));
         assert!(text.contains("N-turn rewinds"));
         assert!(!text.contains("call_"));
         assert!(!text.contains("rewind N"));
+    }
+
+    #[test]
+    fn managed_context_density_retry_after_rewind_blocks_normal_replay_when_still_watch() {
+        let active =
+            FollowUpMessage::text("density handoff".into()).managed_context_density_handoff();
+        let watch = external_agent::AgentContextSnapshot {
+            source: "codex".to_string(),
+            label: "Codex resolved request payload".to_string(),
+            request_id: Some("req-1".to_string()),
+            request_index: Some(1),
+            rollout_path: None,
+            format: "openai.responses.resolved_request.v1".to_string(),
+            token_count: Some(252_500),
+            token_count_kind: Some(external_agent::AgentContextTokenCountKind::BackendReported),
+            context_window: Some(258_400),
+            hard_context_window: Some(272_000),
+            item_count: Some(458),
+            raw: serde_json::json!({}),
+        };
+
+        let retry = managed_context_density_retry_after_rewind(&active, Some(&watch))
+            .expect("still-watch density should require another handoff");
+        assert!(retry.managed_context_density_handoff);
+        assert!(retry
+            .text
+            .contains("not enough to count as successful density maintenance"));
+        assert!(retry
+            .text
+            .contains("will not replay ordinary follow-up work yet"));
+        assert!(retry.text.contains("current rewind point"));
+
+        let below = external_agent::AgentContextSnapshot {
+            token_count: Some(219_000),
+            ..watch
+        };
+        assert!(managed_context_density_retry_after_rewind(&active, Some(&below)).is_none());
+
+        let normal = FollowUpMessage::text("ordinary follow-up".into());
+        assert!(managed_context_density_retry_after_rewind(&normal, Some(&below)).is_none());
     }
 
     #[test]
@@ -11440,6 +11654,7 @@ mod tests {
             artifacts: Vec::new(),
             next_steps: Vec::new(),
             auto_resume: true,
+            require_density_improvement: false,
         };
 
         let primer = request
@@ -11497,6 +11712,7 @@ mod tests {
             artifacts: Vec::new(),
             next_steps: Vec::new(),
             auto_resume: true,
+            require_density_improvement: false,
         };
 
         let carried = context_rewind_pruned_prior_primer_facts(
@@ -12102,6 +12318,138 @@ mod tests {
             pruned_after < pruned_before,
             "after-position pruning should show that keeping the branch-start call preserves more context: {branch_anchor}"
         );
+    }
+
+    #[test]
+    fn context_rewind_density_handoff_rejects_shallow_exact_anchor() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rollout.jsonl");
+        std::fs::write(
+            &path,
+            [
+                serde_json::json!({
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call",
+                        "name": "exec_command",
+                        "call_id": "call_good_density",
+                        "arguments": "{\"cmd\":\"cargo test -p intendant focused\"}"
+                    }
+                }),
+                serde_json::json!({
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "token_count",
+                        "info": {
+                            "last_token_usage": {
+                                "input_tokens": 40_000,
+                                "cached_input_tokens": 0,
+                                "output_tokens": 0,
+                                "total_tokens": 40_000
+                            },
+                            "model_context_window": 100_000
+                        }
+                    }
+                }),
+                serde_json::json!({
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call",
+                        "name": "exec_command",
+                        "call_id": "call_shallow_density",
+                        "arguments": "{\"cmd\":\"git rev-parse HEAD\"}"
+                    }
+                }),
+                serde_json::json!({
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "token_count",
+                        "info": {
+                            "last_token_usage": {
+                                "input_tokens": 87_000,
+                                "cached_input_tokens": 0,
+                                "output_tokens": 0,
+                                "total_tokens": 87_000
+                            },
+                            "model_context_window": 100_000
+                        }
+                    }
+                }),
+            ]
+            .into_iter()
+            .map(|value| value.to_string())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        )
+        .unwrap();
+
+        let raw = list_context_rewind_anchors_from_rollout(
+            &path,
+            &serde_json::json!({
+                "offset": 0,
+                "limit": 10,
+                "include_non_recovery": true,
+            }),
+        )
+        .expect("anchor catalog");
+        let catalog: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let anchors = catalog["anchors"].as_array().unwrap();
+        let good = anchors
+            .iter()
+            .find(|anchor| anchor["item_id"] == "call_good_density")
+            .expect("good density anchor");
+        assert_eq!(
+            good["recommended_rewind_limit_at_or_after_anchor"].as_u64(),
+            Some(85_000)
+        );
+        assert_eq!(good["density_eligible"].as_bool(), Some(true));
+        let good_positions = good["density_eligible_positions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|position| position.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(good_positions, vec!["before", "after"]);
+
+        let shallow = anchors
+            .iter()
+            .find(|anchor| anchor["item_id"] == "call_shallow_density")
+            .expect("shallow density anchor");
+        assert_eq!(shallow["recovery_eligible"].as_bool(), Some(true));
+        assert_eq!(shallow["density_eligible"].as_bool(), Some(true));
+        let shallow_positions = shallow["density_eligible_positions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|position| position.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(shallow_positions, vec!["before"]);
+
+        validate_context_rewind_anchor_restore_headroom(
+            &path,
+            "call_shallow_density",
+            external_agent::RollbackAnchorPosition::After,
+        )
+        .expect("shallow anchor still has ordinary recovery headroom");
+        let err = validate_context_rewind_anchor_density_improvement(
+            &path,
+            "call_shallow_density",
+            external_agent::RollbackAnchorPosition::After,
+        )
+        .expect_err("density handoff must reject barely useful after-position rewind");
+        assert!(err.contains("density handoff rewind anchor"), "got: {err}");
+        assert!(err.contains("too shallow"), "got: {err}");
+        assert!(
+            err.contains("recommended density threshold 85000"),
+            "got: {err}"
+        );
+
+        validate_context_rewind_anchor_density_improvement(
+            &path,
+            "call_good_density",
+            external_agent::RollbackAnchorPosition::After,
+        )
+        .expect("earlier exact anchor clears density threshold");
     }
 
     #[test]
@@ -19011,6 +19359,7 @@ async fn run_with_presence(
                 &mut codex_thread_action_dedupe,
                 Some(&mut side_session_state),
                 false,
+                false,
             )
             .await
             {
@@ -21081,6 +21430,7 @@ async fn run_external_agent_mode(
                         &mut codex_thread_action_dedupe,
                         Some(&mut side_session_state),
                         false,
+                        false,
                     )
                     .await
                     {
@@ -21345,6 +21695,7 @@ async fn run_external_agent_mode(
             &mut codex_thread_action_dedupe,
             Some(&mut side_session_state),
             managed_context_recovery_kickstart,
+            managed_context_density_handoff,
         )
         .await
         {
@@ -21595,6 +21946,36 @@ async fn run_external_agent_mode(
                 .await
                 {
                     Ok(automatic_resume) => {
+                        let post_rewind_snapshot = if managed_context_density_handoff {
+                            match refresh_external_context_usage_snapshot(&mut agent, &drain_config)
+                                .await
+                            {
+                                Ok(snapshot) => snapshot,
+                                Err(e) => {
+                                    slog(&session_log, |l| {
+                                        l.debug(&format!(
+                                            "Could not re-read Codex context pressure after density-handoff rewind: {}",
+                                            e
+                                        ))
+                                    });
+                                    None
+                                }
+                            }
+                        } else {
+                            None
+                        };
+                        if let Some(retry) = managed_context_density_retry_after_rewind(
+                            &active_followup_for_rewind_replay,
+                            post_rewind_snapshot.as_ref(),
+                        ) {
+                            slog(&session_log, |l| {
+                                l.warn(
+                                    "Managed-context density handoff rewind remained above the recommended threshold; sending another maintenance handoff instead of replaying follow-up",
+                                )
+                            });
+                            next_turn = Some(retry);
+                            continue 'outer;
+                        }
                         if let Some(continuation) = managed_context_rewind_continuation(
                             &mut pending_managed_context_replays,
                             &active_followup_for_rewind_replay,
