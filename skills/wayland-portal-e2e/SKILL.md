@@ -69,26 +69,36 @@ ssh user@192.168.1.206 '
     --launch-dashboard \
     --port 8898 \
     --dashboard-binary target/release/intendant \
+    --dashboard-arg --no-tls \
     --dashboard-arg --no-presence \
     --headed \
     --enable-gpu \
-    --station-probe dock-hidden
+    --station-probe dock-hidden \
+    --station-interaction-probe \
+    --screenshot /tmp/intendant-station-smoke.png \
+    --json
 '
 ```
 
 For the full managed Station headed/GPU acceptance check, use the same
-environment setup with the renderer probes:
+environment setup with renderer probes, a screenshot artifact, and the rendered
+hotspot interaction probe. Use the JSON artifact/latency fields rather than
+reusing the helper's temporary Chromium `DevToolsActivePort` path:
 
 ```sh
 node scripts/validate-dashboard.cjs \
   --launch-dashboard \
   --port 8897 \
   --dashboard-binary target/release/intendant \
+  --dashboard-arg --no-tls \
   --headed \
   --enable-gpu \
   --station-probe rendered \
   --station-probe webgpu \
   --station-probe dock-hidden \
+  --station-interaction-probe \
+  --screenshot /tmp/intendant-station-acceptance.png \
+  --json \
   --timeout 30000 \
   --dashboard-timeout 30000
 ```

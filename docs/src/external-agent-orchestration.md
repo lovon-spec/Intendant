@@ -168,15 +168,22 @@ features they lack.
   node scripts/validate-dashboard.cjs --port <web_port> \
     --station-probe rendered --station-probe dock-hidden
   node scripts/validate-dashboard.cjs --launch-dashboard --port <throwaway_port> \
+    --dashboard-arg --no-tls --headed \
+    --station-probe rendered --station-interaction-probe \
+    --screenshot /tmp/intendant-station.png --json
+  node scripts/validate-dashboard.cjs --launch-dashboard --port <throwaway_port> \
     --selector '<css>'
   ```
 
   The helper launches a fresh isolated headless Chromium, waits for CDP
-  readiness, supports selector/function waits plus named Station probes, falls back when Node has no
-  WebSocket module, and prints compact PASS/FAIL output with bounded log
-  excerpts on failure. With `--launch-dashboard`, it starts the built intendant
-  binary as `--web <port> --no-tui`, waits for HTTP readiness, and stops the
-  temporary process afterward; use that instead of a separate
+  readiness, supports selector/function waits plus named Station probes and
+  optional headed Station interaction/screenshot artifacts, falls back when Node
+  has no WebSocket module, and prints compact PASS/FAIL output with bounded log
+  excerpts on failure. Use `--station-interaction-probe --screenshot <png>
+  --json` for meaningful headed Station QA instead of scraping the helper's
+  temporary DevTools profile. With `--launch-dashboard`, it starts the built
+  intendant binary as `--web <port> --no-tui`, waits for HTTP readiness, and
+  stops the temporary process afterward; use that instead of a separate
   foreground/nohup dashboard launch. It does not default to port 8765; pass
   `--port`/`--url` or let it derive the port from `INTENDANT_MCP_URL`. Managed
   agents should keep validation bounded: one primary smoke, at most one

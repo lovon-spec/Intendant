@@ -76,6 +76,12 @@ Options:
   --sandbox                  Omit default --no-sandbox
   --log-lines N              Bounded browser/page log lines on failure (default: ${DEFAULT_LOG_LINES})
   --diagnostics              On failure, include compact generic DOM/page state
+  --screenshot PATH          Capture a PNG screenshot after validation/probes
+  --station-interaction-probe
+                             Click/activate rendered Station hotspots and report latency
+  --station-hotspot-probe    Alias for --station-interaction-probe
+  --keep-artifacts           Preserve the Chromium profile/temp artifact directory
+  --keep-browser             Leave Chromium running for manual follow-up; implies --keep-artifacts
   --launch-dashboard         Launch a temporary Intendant dashboard and stop it afterward
   --dashboard-binary PATH    Intendant binary for --launch-dashboard (default: $INTENDANT or a fresh target/{release,debug}/intendant)
   --dashboard-arg ARG        Extra arg appended to the launched dashboard command; repeatable
@@ -107,6 +113,10 @@ function parseArgs(argv, env = process.env) {
     cdpTimeoutMs: DEFAULT_CDP_TIMEOUT_MS,
     logLines: DEFAULT_LOG_LINES,
     diagnostics: false,
+    screenshotPath: undefined,
+    stationInteractionProbe: false,
+    keepArtifacts: false,
+    keepBrowser: false,
     launchDashboard: false,
     dashboardArgs: [],
     dashboardTimeoutMs: DEFAULT_DASHBOARD_TIMEOUT_MS,
@@ -204,6 +214,17 @@ function parseArgs(argv, env = process.env) {
       opts.logLines = parsePositiveInt(arg.slice('--log-lines='.length), '--log-lines');
     } else if (arg === '--diagnostics') {
       opts.diagnostics = true;
+    } else if (arg === '--screenshot') {
+      opts.screenshotPath = readValue();
+    } else if (arg.startsWith('--screenshot=')) {
+      opts.screenshotPath = arg.slice('--screenshot='.length);
+    } else if (arg === '--station-interaction-probe' || arg === '--station-hotspot-probe') {
+      opts.stationInteractionProbe = true;
+    } else if (arg === '--keep-artifacts') {
+      opts.keepArtifacts = true;
+    } else if (arg === '--keep-browser') {
+      opts.keepBrowser = true;
+      opts.keepArtifacts = true;
     } else if (arg === '--launch-dashboard') {
       opts.launchDashboard = true;
     } else if (arg === '--dashboard-binary') {
@@ -232,6 +253,9 @@ function parseArgs(argv, env = process.env) {
   }
 
   opts.url = resolveDashboardUrl(opts, env);
+  if (opts.screenshotPath) {
+    opts.screenshotPath = path.resolve(opts.screenshotPath);
+  }
   if (opts.launchDashboard) {
     validateDashboardLaunchOptions(opts);
   }
@@ -411,16 +435,26 @@ async function main() {
       dashboard = await TemporaryDashboard.launch(opts, launchEnv);
     }
     harness = await BrowserHarness.launch(opts, launchEnv);
-    await harness.validate(opts);
+    const validation = await harness.validate(opts);
+    const artifacts = {};
+    if (opts.screenshotPath) {
+      artifacts.screenshot = await harness.captureScreenshot(opts.screenshotPath);
+    }
+    if (opts.keepArtifacts || opts.keepBrowser) {
+      artifacts.browserUserDataDir = harness.userDataDir;
+    }
     const result = {
       status: 'pass',
       url: opts.url,
       ms: Date.now() - started,
       browser: harness.browserExecutable,
       websocket: harness.websocketKind,
+      artifacts,
       selectors: opts.selectors.length,
       functions: opts.functions.length,
       stationProbes: opts.stationProbes.length,
+      stationInteraction: validation.stationInteraction,
+      stationInteractions: validation.stationInteraction ? validation.stationInteraction.count : 0,
       staticScripts: staticScriptResult,
     };
     printResult(opts, result);
@@ -438,6 +472,7 @@ async function main() {
       failureKind: validationFailureKind(error.message || String(error)),
       browser: harness && harness.browserExecutable,
       websocket: harness && harness.websocketKind,
+      artifacts: failureArtifacts(opts, harness),
       logs: collectFailureLogs(opts.logLines, dashboard, harness),
       diagnostics,
       diagnosticsAuto: Boolean(diagnostics && !opts.diagnostics),
@@ -457,8 +492,21 @@ function staticScriptsOnly(opts) {
       && !opts.launchDashboard
       && opts.selectors.length === 0
       && opts.functions.length === 0
-      && opts.stationProbes.length === 0,
+      && opts.stationProbes.length === 0
+      && !opts.stationInteractionProbe
+      && !opts.screenshotPath
   );
+}
+
+function failureArtifacts(opts, harness) {
+  const artifacts = {};
+  if (opts.screenshotPath && fs.existsSync(opts.screenshotPath)) {
+    artifacts.screenshot = opts.screenshotPath;
+  }
+  if (harness && (opts.keepArtifacts || opts.keepBrowser)) {
+    artifacts.browserUserDataDir = harness.userDataDir;
+  }
+  return artifacts;
 }
 
 class TemporaryDashboard {
@@ -549,8 +597,16 @@ function printResult(opts, result) {
   }
   if (displayResult.status === 'pass') {
     console.log(
-      `PASS dashboard-validation url=${quote(displayResult.url)} selectors=${displayResult.selectors} functions=${displayResult.functions} stationProbes=${displayResult.stationProbes || 0} ms=${displayResult.ms} websocket=${displayResult.websocket || 'unknown'}`,
+      `PASS dashboard-validation url=${quote(displayResult.url)} selectors=${displayResult.selectors} functions=${displayResult.functions} stationProbes=${displayResult.stationProbes || 0} stationInteractions=${displayResult.stationInteractions || 0} ms=${displayResult.ms} websocket=${displayResult.websocket || 'unknown'}`,
     );
+    for (const line of formatArtifactLines(displayResult.artifacts)) {
+      console.log(`  ${line}`);
+    }
+    if (displayResult.stationInteraction) {
+      console.log(
+        `  station interaction count=${displayResult.stationInteraction.count || 0} warmupLatencyMs=${displayResult.stationInteraction.warmupLatencyMs || 0} subsequentLatencyMs=${displayResult.stationInteraction.subsequentLatencyMs || 0} names=${quote((displayResult.stationInteraction.names || []).join(','))}`,
+      );
+    }
     if (displayResult.staticScripts) {
       console.log(formatStaticScriptPass(displayResult.staticScripts));
     }
@@ -562,12 +618,29 @@ function printResult(opts, result) {
   for (const line of displayResult.logs || []) {
     console.error(`  ${line}`);
   }
+  for (const line of formatArtifactLines(displayResult.artifacts)) {
+    console.error(`  ${line}`);
+  }
   for (const line of formatDiagnostics(displayResult.diagnostics)) {
     console.error(`  ${line}`);
   }
   if (displayResult.next) {
     console.error(`  next=${quote(displayResult.next)}`);
   }
+}
+
+function formatArtifactLines(artifacts) {
+  if (!artifacts || typeof artifacts !== 'object') {
+    return [];
+  }
+  const lines = [];
+  if (artifacts.screenshot) {
+    lines.push(`artifact screenshot=${quote(artifacts.screenshot)}`);
+  }
+  if (artifacts.browserUserDataDir) {
+    lines.push(`artifact browserUserDataDir=${quote(artifacts.browserUserDataDir)}`);
+  }
+  return lines;
 }
 
 function printStaticScriptResult(opts, result) {
@@ -1077,7 +1150,10 @@ class BrowserHarness {
       }
     });
 
-    const harness = new BrowserHarness(executable, userDataDir, child, stderr);
+    const harness = new BrowserHarness(executable, userDataDir, child, stderr, {
+      keepArtifacts: opts.keepArtifacts,
+      keepBrowser: opts.keepBrowser,
+    });
     harness.activePort = await waitForDevToolsPort(userDataDir, child, stderr, opts.cdpTimeoutMs);
     const version = await httpJson(`http://127.0.0.1:${harness.activePort.port}/json/version`);
     const wsUrl = version.webSocketDebuggerUrl || `ws://127.0.0.1:${harness.activePort.port}${harness.activePort.path}`;
@@ -1088,11 +1164,13 @@ class BrowserHarness {
     return harness;
   }
 
-  constructor(browserExecutable, userDataDir, child, stderr) {
+  constructor(browserExecutable, userDataDir, child, stderr, lifecycle = {}) {
     this.browserExecutable = browserExecutable;
     this.userDataDir = userDataDir;
     this.child = child;
     this.stderr = stderr;
+    this.keepArtifacts = Boolean(lifecycle.keepArtifacts);
+    this.keepBrowser = Boolean(lifecycle.keepBrowser);
     this.pageLogs = new BoundedLog(LOG_BUFFER_LIMIT);
     this.websocketKind = 'unknown';
     this.closed = false;
@@ -1114,6 +1192,7 @@ class BrowserHarness {
 
   async validate(opts) {
     let loaded = false;
+    const validation = {};
     const onEvent = (message) => {
       if (message.sessionId === this.sessionId && message.method === 'Page.loadEventFired') {
         loaded = true;
@@ -1136,12 +1215,16 @@ class BrowserHarness {
       for (const source of opts.functions) {
         await this.waitForFunction(source, opts.timeoutMs);
       }
-      if (opts.stationProbes.length > 0) {
+      if (opts.stationProbes.length > 0 || opts.stationInteractionProbe) {
         await this.prepareStationSurface(opts.timeoutMs);
       }
       for (const probe of opts.stationProbes) {
         await this.waitForStationProbe(probe, opts.timeoutMs);
       }
+      if (opts.stationInteractionProbe) {
+        validation.stationInteraction = await this.runStationInteractionProbe(opts.timeoutMs);
+      }
+      return validation;
     } finally {
       this.cdp.off('event', onEvent);
     }
@@ -1242,6 +1325,71 @@ class BrowserHarness {
       : undefined;
   }
 
+  async captureScreenshot(filePath) {
+    const result = await this.cdp.send(
+      'Page.captureScreenshot',
+      {
+        format: 'png',
+        captureBeyondViewport: false,
+        fromSurface: true,
+      },
+      this.sessionId,
+    );
+    if (!result.data) {
+      throw new Error('screenshot capture returned no image data');
+    }
+    fs.mkdirSync(path.dirname(filePath), { recursive: true });
+    const tempPath = `${filePath}.tmp-${process.pid}`;
+    fs.writeFileSync(tempPath, Buffer.from(result.data, 'base64'));
+    fs.renameSync(tempPath, filePath);
+    return filePath;
+  }
+
+  async runStationInteractionProbe(timeoutMs) {
+    const targets = ['system:activity', 'system:controls', 'system:view'];
+    const interactions = [];
+    for (const target of targets) {
+      const point = await this.stationHotspotPoint(target);
+      if (!point.ok) {
+        throw new Error(`station interaction probe impossible: ${point.reason || `could not resolve ${target}`} (last value: ${summarizeWaitValue(point)})`);
+      }
+      const started = Date.now();
+      const activated = await this.activateStationHotspot(target);
+      if (!activated.ok) {
+        throw new Error(`station interaction probe ${target} did not pass (last value: ${summarizeWaitValue(activated)})`);
+      }
+      interactions.push({
+        name: target,
+        control: point.control || target,
+        input: activated.input || 'activation-event',
+        x: Math.round(point.x),
+        y: Math.round(point.y),
+        latencyMs: Date.now() - started,
+        state: activated.state,
+      });
+    }
+    const latencies = interactions.map((item) => item.latencyMs);
+    const subsequent = latencies.slice(1);
+    return {
+      status: 'pass',
+      count: interactions.length,
+      names: interactions.map((item) => item.name),
+      warmupLatencyMs: latencies[0] || 0,
+      subsequentLatencyMs: subsequent.length
+        ? Math.round(subsequent.reduce((sum, value) => sum + value, 0) / subsequent.length)
+        : 0,
+      interactions,
+    };
+  }
+
+  async stationHotspotPoint(target) {
+    return this.evaluate(`(${stationHotspotPointSource()})(${JSON.stringify(target)})`);
+  }
+
+  async activateStationHotspot(target) {
+    return this.evaluate(`(${stationHotspotActivateSource()})(${JSON.stringify(target)})`);
+  }
+
   recordPageEvent(message) {
     if (message.sessionId !== this.sessionId || !message.method) {
       return;
@@ -1286,16 +1434,20 @@ class BrowserHarness {
       return;
     }
     this.closed = true;
-    if (this.cdp) {
+    if (this.cdp && !this.keepBrowser) {
       await Promise.race([this.cdp.send('Browser.close'), delay(1000)]).catch(() => {});
       this.cdp.close();
+    } else if (this.cdp) {
+      this.cdp.close();
     }
-    if (this.child && !this.child.killed) {
+    if (!this.keepBrowser && this.child && !this.child.killed) {
       await waitForExit(this.child, 800).catch(() => {
         this.child.kill('SIGKILL');
       });
     }
-    fs.rmSync(this.userDataDir, { recursive: true, force: true });
+    if (!this.keepArtifacts) {
+      fs.rmSync(this.userDataDir, { recursive: true, force: true });
+    }
   }
 }
 
@@ -2298,6 +2450,182 @@ function stationProbeSource() {
   }.toString();
 }
 
+function stationHotspotPointSource() {
+  return function collectStationHotspotPoint(target) {
+    const fail = (reason, extra = {}) => ({
+      ok: false,
+      failureKind: 'interaction',
+      reason,
+      target,
+      ...extra,
+    });
+    const pane = document.getElementById('tab-station');
+    const hud = document.getElementById('station-hud-canvas');
+    if (!pane || !pane.classList.contains('active')) {
+      return fail('Station tab is not active');
+    }
+    if (!hud) {
+      return fail('Station HUD canvas is missing');
+    }
+    const rect = hud.getBoundingClientRect();
+    if (!rect || rect.width <= 0 || rect.height <= 0) {
+      return fail('Station HUD canvas has no measurable viewport area', {
+        rect: rect ? {
+          left: Math.round(rect.left),
+          top: Math.round(rect.top),
+          width: Math.round(rect.width),
+          height: Math.round(rect.height),
+        } : null,
+      });
+    }
+
+    let box = null;
+    try {
+      if (typeof stationHotspotBoxes === 'function') {
+        box = stationHotspotBoxes(rect.width || 1, rect.height || 1)
+          .find((candidate) => candidate && candidate.name === target);
+      }
+    } catch (error) {
+      return fail(`Station hotspot geometry failed: ${error && error.message ? error.message : error}`);
+    }
+    if (!box) {
+      const button = document.querySelector(`[data-station-hotspot="${String(target).replace(/"/g, '\\"')}"]`);
+      if (button) {
+        const buttonRect = button.getBoundingClientRect();
+        if (buttonRect.width > 0 && buttonRect.height > 0) {
+          box = {
+            name: target,
+            x: buttonRect.left - rect.left,
+            y: buttonRect.top - rect.top,
+            w: buttonRect.width,
+            h: buttonRect.height,
+          };
+        }
+      }
+    }
+    if (!box || box.w <= 0 || box.h <= 0) {
+      return fail(`Station hotspot ${target} is not measurable`);
+    }
+
+    const x = rect.left + box.x + box.w / 2;
+    const y = rect.top + box.y + box.h / 2;
+    const inViewport = x >= 0
+      && y >= 0
+      && x <= (window.innerWidth || document.documentElement.clientWidth || 0)
+      && y <= (window.innerHeight || document.documentElement.clientHeight || 0);
+    if (!inViewport) {
+      return fail(`Station hotspot ${target} is outside the viewport`, {
+        x: Math.round(x),
+        y: Math.round(y),
+        viewport: {
+          width: window.innerWidth || document.documentElement.clientWidth || 0,
+          height: window.innerHeight || document.documentElement.clientHeight || 0,
+        },
+      });
+    }
+    const hit = document.elementFromPoint(x, y);
+    const control = hit && hit.closest
+      ? (
+          hit.closest('[data-station-hotspot]')?.getAttribute('data-station-hotspot')
+          || hit.closest('#station-hud-canvas')?.id
+          || hit.id
+          || hit.tagName
+        )
+      : '';
+    return {
+      ok: true,
+      target,
+      input: 'mouse',
+      x,
+      y,
+      control,
+      rect: {
+        left: Math.round(rect.left),
+        top: Math.round(rect.top),
+        width: Math.round(rect.width),
+        height: Math.round(rect.height),
+      },
+      box: {
+        x: Math.round(box.x),
+        y: Math.round(box.y),
+        width: Math.round(box.w),
+        height: Math.round(box.h),
+      },
+    };
+  }.toString();
+}
+
+function stationHotspotActivateSource() {
+  return function activateStationHotspot(target) {
+    const stateFor = function collectStationInteractionStateInline(targetText) {
+      const kind = targetText.startsWith('system:') ? targetText.slice('system:'.length) : targetText;
+      const status = document.getElementById('station-status');
+      const dock = document.getElementById('station-dock');
+      const activeTab = document.getElementById('tab-station')?.classList.contains('active') ? 'station' : '';
+      const statusText = String(status?.textContent || '');
+      const dockKind = String(dock?.dataset?.kind || '');
+      const dockHidden = !dock || dock.classList.contains('hidden');
+      const statusMatches = kind
+        ? new RegExp(`\\b${kind.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i').test(statusText)
+        : false;
+      const renderedMatches = statusMatches && /\b(rendered|opening|station)\b/i.test(statusText);
+      const dockMatches = Boolean(kind && dockKind === kind && !dockHidden);
+      const ok = activeTab === 'station' && (dockMatches || renderedMatches);
+      return {
+        ok,
+        failureKind: ok ? '' : 'interaction',
+        target: targetText,
+        activeTab,
+        statusText,
+        dockKind,
+        dockHidden,
+        statusMatches,
+        dockMatches,
+        reason: ok ? 'passed' : `Station did not activate ${targetText}`,
+      };
+    };
+    const fail = (reason, extra = {}) => ({
+      ok: false,
+      failureKind: 'interaction',
+      reason,
+      target,
+      state: stateFor(String(target || '')),
+      ...extra,
+    });
+    const pane = document.getElementById('tab-station');
+    if (!pane || !pane.classList.contains('active')) {
+      return fail('Station tab is not active');
+    }
+    const selector = `[data-station-hotspot="${String(target).replace(/"/g, '\\"')}"]`;
+    const button = document.querySelector(selector);
+    if (!button) {
+      return fail(`Station hotspot ${target} is missing`, { selector });
+    }
+    if (button.disabled) {
+      return fail(`Station hotspot ${target} is disabled`, { selector });
+    }
+    button.focus();
+    const event = new MouseEvent('click', {
+      bubbles: true,
+      cancelable: true,
+      detail: 0,
+      view: window,
+    });
+    const accepted = button.dispatchEvent(event);
+    const state = stateFor(String(target || ''));
+    return {
+      ok: Boolean(state.ok),
+      target,
+      selector,
+      input: 'activation-event',
+      accepted,
+      defaultPrevented: event.defaultPrevented,
+      state,
+      reason: state.ok ? 'passed' : state.reason,
+    };
+  }.toString();
+}
+
 function stationConsoleWarnings(lines) {
   if (!Array.isArray(lines)) {
     return [];
@@ -2319,6 +2647,9 @@ function compactResultForOutput(opts, result) {
   if (Array.isArray(compact.logs)) {
     compact.logs = compact.logs.map((line) => truncateMiddle(line, RESULT_LOG_LIMIT));
   }
+  if (compact.stationInteraction) {
+    compact.stationInteraction = compactStationInteraction(compact.stationInteraction);
+  }
   if (compact.diagnostics) {
     compact.diagnostics = compactDiagnostics(compact.diagnostics, {
       suppressControls: isStationFocusedCheck(opts) && !opts.diagnostics,
@@ -2330,12 +2661,60 @@ function compactResultForOutput(opts, result) {
   return compact;
 }
 
+function compactStationInteraction(interaction) {
+  if (!interaction || typeof interaction !== 'object') {
+    return interaction;
+  }
+  const compact = {
+    status: interaction.status || '',
+    count: Number(interaction.count) || 0,
+    names: Array.isArray(interaction.names) ? interaction.names.slice(0, 8).map(String) : [],
+    warmupLatencyMs: Number(interaction.warmupLatencyMs) || 0,
+    subsequentLatencyMs: Number(interaction.subsequentLatencyMs) || 0,
+  };
+  if (Array.isArray(interaction.interactions)) {
+    compact.interactions = interaction.interactions.slice(0, 8).map((item) => ({
+      name: String(item.name || ''),
+      control: truncateMiddle(item.control || '', DIAGNOSTIC_TEXT_LIMIT),
+      input: String(item.input || ''),
+      x: Number(item.x) || 0,
+      y: Number(item.y) || 0,
+      latencyMs: Number(item.latencyMs) || 0,
+      state: compactStationInteractionState(item.state),
+    }));
+    if (interaction.interactions.length > compact.interactions.length) {
+      compact.interactionsOmitted = interaction.interactions.length - compact.interactions.length;
+    }
+  }
+  return compact;
+}
+
+function compactStationInteractionState(state) {
+  if (!state || typeof state !== 'object') {
+    return state;
+  }
+  return {
+    ok: Boolean(state.ok),
+    target: String(state.target || ''),
+    activeTab: String(state.activeTab || ''),
+    statusText: truncateMiddle(state.statusText || '', DIAGNOSTIC_TEXT_LIMIT),
+    dockKind: String(state.dockKind || ''),
+    dockHidden: Boolean(state.dockHidden),
+    statusMatches: Boolean(state.statusMatches),
+    dockMatches: Boolean(state.dockMatches),
+    reason: truncateMiddle(state.reason || '', DIAGNOSTIC_TEXT_LIMIT),
+  };
+}
+
 function validationFailureNextStep(result) {
   if (/headed Linux Chromium could not reach the graphical display|Missing X server or \$DISPLAY|ozone_platform_x11/i.test(result.reason || '')) {
     return 'fix the remote graphical session environment first: on SSH hosts, prepend ~/.cargo/bin to PATH and run from a live GNOME/RDP session or import DISPLAY/WAYLAND_DISPLAY, XDG_RUNTIME_DIR, DBUS_SESSION_BUS_ADDRESS, and XAUTHORITY from systemctl --user show-environment';
   }
   if (result.failureKind === 'renderer') {
     return 'treat as renderer validation failure; use the Station diagnostics here instead of repeating broad DOM/source dumps';
+  }
+  if (result.failureKind === 'interaction') {
+    return 'treat as headed interaction validation failure; use the reported hotspot state/latency facts instead of scraping DevToolsActivePort or switching to desktop portal screenshots';
   }
   if (result.failureKind === 'probe' || result.failureKind === 'assertion') {
     return 'treat as probe/assertion failure; adjust the targeted condition or report partial validation; avoid further broad selector/source dumps and do not retry the same brittle wait';
@@ -2348,6 +2727,12 @@ function validationFailureNextStep(result) {
 
 function validationFailureKind(reason) {
   const text = String(reason || '');
+  if (/^station interaction probe/.test(text) || /station interaction probe impossible/.test(text)) {
+    return 'interaction';
+  }
+  if (/^screenshot capture/.test(text)) {
+    return 'artifact';
+  }
   if (/^station probe .* did not pass/.test(text)) {
     return text.includes('"failureKind":"renderer"') ? 'renderer' : 'probe';
   }
@@ -2584,7 +2969,8 @@ function shouldCollectFailureDiagnostics(opts, error) {
 function isWaitFailureReason(reason) {
   return /^selector not found: /.test(String(reason || ''))
     || /^wait-for-function did not become truthy/.test(String(reason || ''))
-    || /^station probe .* did not pass/.test(String(reason || ''));
+    || /^station probe .* did not pass/.test(String(reason || ''))
+    || /^station interaction probe/.test(String(reason || ''));
 }
 
 function failureDiagnosticSelectors(opts) {
@@ -2595,7 +2981,7 @@ function failureDiagnosticSelectors(opts) {
   for (const selector of diagnosticSelectorsFromWaitFunctions(opts.functions || [])) {
     addDiagnosticSelector(selectors, selector);
   }
-  if ((opts.stationProbes || []).length) {
+  if ((opts.stationProbes || []).length || opts.stationInteractionProbe) {
     for (const selector of ['#station-status', '#station-hud-canvas', '#station-dock', '#station-dock-nav [data-station-dock-nav="system:controls"]']) {
       addDiagnosticSelector(selectors, selector);
     }
@@ -2608,6 +2994,7 @@ function isStationFocusedCheck(opts) {
     ...(opts.selectors || []),
     ...(opts.functions || []),
     ...(opts.stationProbes || []).map((probe) => `station:${probe}`),
+    opts.stationInteractionProbe ? 'station:interaction' : '',
   ].join('\n').toLowerCase();
   return haystack.includes('station-status')
     || haystack.includes('station-hud-canvas')
@@ -2791,6 +3178,10 @@ async function runSelfTest() {
       '--log-lines',
       '3',
       '--diagnostics',
+      '--screenshot',
+      '/tmp/station-shot.png',
+      '--station-hotspot-probe',
+      '--keep-browser',
       '--enable-gpu',
       '--browser-arg=--ozone-platform=x11',
     ],
@@ -2803,6 +3194,10 @@ async function runSelfTest() {
   assert.strictEqual(parsed.timeoutMs, 2500);
   assert.strictEqual(parsed.logLines, 3);
   assert.strictEqual(parsed.diagnostics, true);
+  assert.strictEqual(parsed.screenshotPath, path.resolve('/tmp/station-shot.png'));
+  assert.strictEqual(parsed.stationInteractionProbe, true);
+  assert.strictEqual(parsed.keepArtifacts, true);
+  assert.strictEqual(parsed.keepBrowser, true);
   assert.strictEqual(parsed.enableGpu, true);
   assert.deepStrictEqual(parsed.browserArgs, ['--ozone-platform=x11']);
   assert.ok(browserArgs('/tmp/profile', parseArgs([], {})).includes('--disable-gpu'));
@@ -2989,9 +3384,21 @@ async function runSelfTest() {
     validationFailureKind('station probe rendered did not pass (last value: {"failureKind":"renderer"})'),
     'renderer',
   );
+  assert.strictEqual(
+    validationFailureKind('station interaction probe system:view did not pass (last value: false)'),
+    'interaction',
+  );
+  assert.ok(
+    validationFailureNextStep({
+      failureKind: 'interaction',
+      reason: 'station interaction probe system:view did not pass',
+    }).includes('DevToolsActivePort'),
+  );
   assert.ok(pageDiagnosticsSource().includes('selectorMatches'));
   assert.ok(pageDiagnosticsSource().includes('dataset'));
   assert.ok(stationDiagnosticsSource().includes('station-hud-canvas'));
+  assert.ok(stationHotspotPointSource().includes('stationHotspotBoxes'));
+  assert.ok(stationHotspotActivateSource().includes('MouseEvent'));
   const fakeDock = {
     classList: { contains: (name) => name === 'hidden' },
     dataset: { kind: 'controls' },
@@ -3035,6 +3442,76 @@ async function runSelfTest() {
   });
   assert.strictEqual(unlitProbe.ok, false);
   assert.strictEqual(unlitProbe.failureKind, 'renderer');
+  const hotspotPoint = vm.runInNewContext(`(${stationHotspotPointSource()})`, {
+    window: { innerWidth: 1440, innerHeight: 1000 },
+    document: {
+      documentElement: { clientWidth: 1440, clientHeight: 1000 },
+      getElementById: (id) => {
+        if (id === 'tab-station') {
+          return { classList: { contains: (name) => name === 'active' } };
+        }
+        if (id === 'station-hud-canvas') {
+          return {
+            getBoundingClientRect: () => ({ left: 10, top: 20, width: 640, height: 480 }),
+            id,
+          };
+        }
+        return null;
+      },
+      querySelector: () => null,
+      elementFromPoint: () => ({ id: 'station-hud-canvas', closest: (selector) => (selector === '#station-hud-canvas' ? { id: 'station-hud-canvas' } : null) }),
+    },
+    stationHotspotBoxes: () => [{ name: 'system:view', x: 100, y: 120, w: 80, h: 40 }],
+    Math,
+  })('system:view');
+  assert.strictEqual(hotspotPoint.ok, true);
+  assert.strictEqual(Math.round(hotspotPoint.x), 150);
+  let dispatchedActivationDetail = null;
+  const fakeHotspotButton = {
+    disabled: false,
+    focus() {},
+    dispatchEvent(event) {
+      dispatchedActivationDetail = event.detail;
+      fakeActivateDocument.stationStatus.textContent = 'Opening view';
+      fakeActivateDocument.stationDock.dataset.kind = 'view';
+      fakeActivateDocument.stationDock.classList.hidden = false;
+      return false;
+    },
+  };
+  const fakeActivateDocument = {
+    stationStatus: { textContent: '' },
+    stationDock: {
+      dataset: { kind: '' },
+      classList: {
+        hidden: true,
+        contains(name) {
+          return name === 'hidden' && this.hidden;
+        },
+      },
+    },
+    getElementById: (id) => (id === 'tab-station' ? { classList: { contains: (name) => name === 'active' } } : null),
+    querySelector: (selector) => (selector === '[data-station-hotspot="system:view"]' ? fakeHotspotButton : null),
+  };
+  fakeActivateDocument.getElementById = (id) => {
+    if (id === 'tab-station') return { classList: { contains: (name) => name === 'active' } };
+    if (id === 'station-status') return fakeActivateDocument.stationStatus;
+    if (id === 'station-dock') return fakeActivateDocument.stationDock;
+    return null;
+  };
+  const hotspotActivation = vm.runInNewContext(`(${stationHotspotActivateSource()})`, {
+    document: fakeActivateDocument,
+    window: {},
+    MouseEvent: class FakeMouseEvent {
+      constructor(_type, init) {
+        this.detail = init.detail;
+        this.defaultPrevented = false;
+      }
+    },
+    RegExp,
+    String,
+  })('system:view');
+  assert.strictEqual(hotspotActivation.ok, true);
+  assert.strictEqual(dispatchedActivationDetail, 0);
   assert.deepStrictEqual(
     stationConsoleWarnings([
       '[console.log] Station ordinary log',
@@ -3080,6 +3557,15 @@ async function runSelfTest() {
       selectors: [],
       functions: [],
       stationProbes: ['rendered'],
+    }),
+    ['#station-status', '#station-hud-canvas', '#station-dock', '#station-dock-nav [data-station-dock-nav="system:controls"]'],
+  );
+  assert.deepStrictEqual(
+    failureDiagnosticSelectors({
+      selectors: [],
+      functions: [],
+      stationProbes: [],
+      stationInteractionProbe: true,
     }),
     ['#station-status', '#station-hud-canvas', '#station-dock', '#station-dock-nav [data-station-dock-nav="system:controls"]'],
   );
@@ -3141,6 +3627,44 @@ async function runSelfTest() {
   assert.strictEqual(compactedAutoDiagnosticFailure.diagnosticsAuto, true);
   assert.strictEqual(compactedAutoDiagnosticFailure.failureKind, 'assertion');
   assert.ok(compactedAutoDiagnosticFailure.next.includes('avoid further broad selector/source dumps'));
+  const compactedInteraction = compactResultForOutput(
+    {},
+    {
+      status: 'pass',
+      stationInteraction: {
+        status: 'pass',
+        count: 3,
+        names: ['system:activity', 'system:controls', 'system:view'],
+        warmupLatencyMs: 42,
+        subsequentLatencyMs: 17,
+        interactions: [{
+          name: 'system:view',
+          control: 'station-hud-canvas',
+          input: 'mouse',
+          x: 150,
+          y: 160,
+          latencyMs: 12,
+          state: {
+            ok: true,
+            target: 'system:view',
+            activeTab: 'station',
+            statusText: `Station view ${'detail '.repeat(200)}`,
+            dockKind: 'view',
+            dockHidden: false,
+            statusMatches: true,
+            dockMatches: true,
+            reason: 'passed',
+          },
+        }],
+      },
+    },
+  );
+  assert.strictEqual(compactedInteraction.stationInteraction.count, 3);
+  assert.ok(compactedInteraction.stationInteraction.interactions[0].state.statusText.includes('chars omitted'));
+  assert.deepStrictEqual(
+    formatArtifactLines({ screenshot: '/tmp/a.png', browserUserDataDir: '/tmp/profile' }),
+    ['artifact screenshot="/tmp/a.png"', 'artifact browserUserDataDir="/tmp/profile"'],
+  );
   const longStationStatus = `Station online ${'status-detail '.repeat(80)}ready`;
   const compactedStationFailure = compactResultForOutput(
     {
