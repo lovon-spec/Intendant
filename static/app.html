@@ -11431,6 +11431,7 @@ let stationPeerStatus = '';
 let stationPeerStatusKind = '';
 let stationPeerEligibleRows = [];
 let stationPeerRouteResult = null;
+const stationDisplayTelemetry = new Map();
 let stationLocalDisplays = [];
 let stationLocalDisplaysLoading = false;
 let stationLocalDisplayStatus = '';
@@ -12765,6 +12766,101 @@ async function stationCopyDisplayContinuityPayload() {
   stationRenderPeersDock();
 }
 
+function stationDisplayTelemetryKey(kind, hostId, displayId, sessionId = '') {
+  return [kind || 'display', hostId || selfPeerId || 'local', displayId ?? 0, sessionId || ''].join('|');
+}
+
+function stationDisplayTelemetryLabel(tel) {
+  if (!tel) return '';
+  return [tel.resolution, tel.fps ? `${Math.round(tel.fps)}fps` : '', tel.codec, tel.quality]
+    .filter(Boolean)
+    .join(' / ');
+}
+
+function stationDisplayTelemetryFor(key, videoEl, pc) {
+  const now = performance.now ? performance.now() : Date.now();
+  const cached = stationDisplayTelemetry.get(key) || {};
+  if (videoEl) {
+    const width = Number(videoEl.videoWidth) || cached.width || 0;
+    const height = Number(videoEl.videoHeight) || cached.height || 0;
+    cached.width = width;
+    cached.height = height;
+    cached.resolution = width && height ? `${width}x${height}` : cached.resolution || '';
+    if (typeof videoEl.getVideoPlaybackQuality === 'function') {
+      const quality = videoEl.getVideoPlaybackQuality();
+      const frames = Number(quality.totalVideoFrames) || 0;
+      const dropped = Number(quality.droppedVideoFrames) || 0;
+      if (cached.playbackFrames !== undefined && frames >= cached.playbackFrames && now > cached.playbackAt) {
+        const fps = ((frames - cached.playbackFrames) * 1000) / (now - cached.playbackAt);
+        if (Number.isFinite(fps) && fps >= 0 && fps < 240) cached.fps = fps;
+      }
+      cached.playbackFrames = frames;
+      cached.playbackAt = now;
+      if (frames > 0 && dropped > 0) {
+        cached.quality = `${Math.round((dropped / frames) * 100)}% dropped`;
+      } else if (frames > 0 && !cached.quality) {
+        cached.quality = 'steady';
+      }
+    }
+  }
+  if (pc && (!cached.lastStatsPollAt || now - cached.lastStatsPollAt > 1500)) {
+    cached.lastStatsPollAt = now;
+    stationDisplayTelemetry.set(key, cached);
+    stationRefreshDisplayTelemetry(key, pc).catch(err => {
+      const latest = stationDisplayTelemetry.get(key) || {};
+      latest.quality = `stats unavailable: ${err?.message || err}`;
+      stationDisplayTelemetry.set(key, latest);
+    });
+  } else {
+    stationDisplayTelemetry.set(key, cached);
+  }
+  return {
+    resolution: cached.resolution || '',
+    fps: Number(cached.fps) || 0,
+    codec: cached.codec || '',
+    quality: cached.quality || '',
+    label: stationDisplayTelemetryLabel(cached),
+  };
+}
+
+async function stationRefreshDisplayTelemetry(key, pc) {
+  if (!pc || typeof pc.getStats !== 'function') return;
+  const stats = await pc.getStats();
+  const cached = stationDisplayTelemetry.get(key) || {};
+  const codecs = new Map();
+  const inbound = [];
+  stats.forEach(report => {
+    if (report.type === 'codec') codecs.set(report.id, report);
+    if (report.type === 'inbound-rtp' && (report.kind === 'video' || report.mediaType === 'video')) {
+      inbound.push(report);
+    }
+  });
+  const report = inbound
+    .filter(item => !item.isRemote)
+    .sort((a, b) => (Number(b.framesDecoded) || 0) - (Number(a.framesDecoded) || 0))[0];
+  if (!report) return;
+  const frames = Number(report.framesDecoded ?? report.framesReceived) || 0;
+  const ts = Number(report.timestamp) || (performance.now ? performance.now() : Date.now());
+  if (cached.statsFrames !== undefined && frames >= cached.statsFrames && ts > cached.statsAt) {
+    const fps = ((frames - cached.statsFrames) * 1000) / (ts - cached.statsAt);
+    if (Number.isFinite(fps) && fps >= 0 && fps < 240) cached.fps = fps;
+  }
+  cached.statsFrames = frames;
+  cached.statsAt = ts;
+  const codec = codecs.get(report.codecId);
+  if (codec?.mimeType) {
+    cached.codec = String(codec.mimeType).replace(/^video\//i, '').toUpperCase();
+  }
+  const dropped = Number(report.framesDropped) || 0;
+  if (frames > 0 && dropped > 0) {
+    cached.quality = `${Math.round((dropped / frames) * 100)}% dropped`;
+  } else if (frames > 0 && !cached.quality) {
+    cached.quality = 'steady';
+  }
+  stationDisplayTelemetry.set(key, cached);
+  stationScheduleUpdate();
+}
+
 function stationDisplayRunwayPayload() {
   const controls = stationBuildControlsSummary();
   const selectedPeer = stationSelectedPeer();
@@ -12802,26 +12898,55 @@ function stationDisplayRunwayPayload() {
     });
   }
   for (const slot of displaySlots.values()) {
+    const telemetryKey = stationDisplayTelemetryKey('local', selfPeerId, slot.displayId);
+    const telemetry = stationDisplayTelemetryFor(telemetryKey, slot.videoEl, slot.pc);
     lanes.push({
       type: 'local_stream',
       id: `local:${slot.displayId}`,
       title: `${selfHostLabel || 'local'} :${slot.displayId}`,
       meta: `${slot.connected ? 'connected' : 'connecting'} / input ${slot.authorityState || 'unknown'}`,
-      detail: `${slot.width || 0}x${slot.height || 0} / ${slot.interactive ? 'interactive' : 'view only'}${slot.recording ? ' / recording' : ''}`,
+      detail: [
+        stationDisplayTelemetryLabel(telemetry) || `${slot.width || 0}x${slot.height || 0}`,
+        slot.interactive ? 'interactive' : 'view only',
+        slot.recording ? 'recording' : '',
+      ].filter(Boolean).join(' / '),
+      host_id: selfPeerId || 'local',
+      host_label: selfHostLabel || 'local',
       display_id: slot.displayId,
+      lane_label: `local:${slot.displayId}`,
+      resolution: telemetry.resolution,
+      fps: telemetry.fps,
+      codec: telemetry.codec,
+      quality: telemetry.quality,
+      telemetry_label: telemetry.label,
       input_authority: slot.authorityState || '',
       selected: userDisplayGranted && Number(grantedDisplayId) === Number(slot.displayId),
     });
   }
   for (const conn of peerDisplayConnections.values()) {
+    const telemetryKey = stationDisplayTelemetryKey('remote', conn.hostId, conn.displayId, conn.sessionId);
+    const container = stationPeerDisplayContainer(conn.hostId, false);
+    const video = container && container.querySelector('.peer-display-video');
+    const telemetry = stationDisplayTelemetryFor(telemetryKey, video, conn.pc);
     lanes.push({
       type: 'remote_stream',
       id: `remote:${conn.hostId}:${conn.displayId}:${conn.sessionId || ''}`,
       title: `${stationHostLabel(conn.hostId)} :${conn.displayId}`,
       meta: `${conn.displayStatusText || 'Connecting...'} / input ${conn.peerAuthorityState || 'unknown'}`,
-      detail: [conn.sessionId || '', conn.advertiseTcpViaUrl ? `via ${conn.advertiseTcpViaUrl}` : ''].filter(Boolean).join(' / '),
+      detail: [
+        stationDisplayTelemetryLabel(telemetry),
+        conn.sessionId || '',
+        conn.advertiseTcpViaUrl ? `via ${conn.advertiseTcpViaUrl}` : '',
+      ].filter(Boolean).join(' / '),
       host_id: conn.hostId || '',
+      host_label: stationHostLabel(conn.hostId),
       display_id: conn.displayId,
+      lane_label: `remote:${conn.hostId}:${conn.displayId}`,
+      resolution: telemetry.resolution,
+      fps: telemetry.fps,
+      codec: telemetry.codec,
+      quality: telemetry.quality,
+      telemetry_label: telemetry.label,
       session_id: conn.sessionId || '',
       input_authority: conn.peerAuthorityState || '',
       selected: String(conn.hostId || '') === String(selectedHostId || '') && Number(conn.displayId) === Number(selectedDisplayId),
@@ -12840,7 +12965,9 @@ function stationDisplayRunwayPayload() {
       meta: selectedPeer.connected ? 'ready to open' : 'peer offline',
       detail: stationPeerCapabilityLabels(selectedPeer).join(', ') || 'selected peer display target',
       host_id: selectedPeer.host_id,
+      host_label: stationPeerDisplayName(selectedPeer) || selectedPeer.host_id,
       display_id: selectedDisplayId,
+      lane_label: `target:${selectedPeer.host_id}:${selectedDisplayId}`,
       selected: true,
     });
   }

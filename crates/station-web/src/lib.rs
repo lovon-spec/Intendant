@@ -6780,8 +6780,12 @@ impl StationInner {
             self.panel_row(x, yy, "lanes", "no display/session lanes");
             return yy + 28.0;
         }
+        let mut monitor_idx = 0usize;
         for lane in runway.lanes.iter().take(4) {
-            yy = self.display_runway_lane_card(x, yy, panel_w, lane);
+            if display_lane_is_monitor(lane) {
+                monitor_idx += 1;
+            }
+            yy = self.display_runway_lane_card(x, yy, panel_w, lane, monitor_idx);
         }
         yy + 6.0
     }
@@ -6792,11 +6796,12 @@ impl StationInner {
         y: f32,
         panel_w: f32,
         lane: &StationDisplayRunwayLane,
+        lane_number: usize,
     ) -> f32 {
         let color = display_lane_color_css(&lane.kind);
         let actions = self.display_runway_lane_actions(lane);
         let multi_row_actions = actions.len() > 3;
-        let card_h = if multi_row_actions { 76.0 } else { 54.0 };
+        let card_h = if multi_row_actions { 104.0 } else { 82.0 };
         self.round_rect(
             x + 12.0,
             y - 9.0,
@@ -6811,8 +6816,12 @@ impl StationInner {
             color,
         );
         self.ctx.set_fill_style(&JsValue::from_str(color));
-        self.ctx
-            .fill_rect((x + 20.0) as f64, (y - 2.0) as f64, 3.0, 32.0);
+        self.ctx.fill_rect(
+            (x + 20.0) as f64,
+            (y - 2.0) as f64,
+            3.0,
+            card_h as f64 - 14.0,
+        );
         self.text(
             &truncate(&nonempty(&lane.title, &lane.kind), 28),
             x + 30.0,
@@ -6830,13 +6839,45 @@ impl StationInner {
             "normal",
         );
         self.text(
-            &truncate(&lane.detail, 38),
+            &truncate(&lane.detail, 32),
             x + 30.0,
             y + 35.0,
             8.0,
             C_SUBTEXT0_CSS,
             "normal",
         );
+        let ids = display_lane_identity(lane);
+        if !ids.is_empty() {
+            self.text(
+                &truncate(&ids, 36),
+                x + 30.0,
+                y + 50.0,
+                7.6,
+                C_OVERLAY1_CSS,
+                "normal",
+            );
+        }
+        let telemetry = display_lane_telemetry(lane);
+        if !telemetry.is_empty() {
+            self.text(
+                &truncate(&telemetry, 36),
+                x + 30.0,
+                y + 65.0,
+                7.6,
+                C_GREEN_CSS,
+                "normal",
+            );
+        }
+        if display_lane_is_monitor(lane) && lane_number > 0 && lane_number <= 3 {
+            self.text(
+                &format!("monitor {}/3", lane_number.min(3)),
+                x + panel_w - 78.0,
+                y + 3.0,
+                7.2,
+                C_PEACH_CSS,
+                "bold",
+            );
+        }
         if !lane.id.is_empty() {
             self.hit_zones.push(HitZone::new(
                 x + 12.0,
@@ -6858,7 +6899,14 @@ impl StationInner {
                 .sum::<f32>()
                 + row_actions.len().saturating_sub(1) as f32 * 6.0;
             let mut bx = x + panel_w - 20.0 - total_w;
-            let by = y + if row_idx == 0 { 25.0 } else { 47.0 };
+            let by = y + card_h
+                - if row_idx == 0 && !multi_row_actions {
+                    29.0
+                } else if row_idx == 0 {
+                    48.0
+                } else {
+                    26.0
+                };
             for action in row_actions {
                 let button_w = display_lane_button_width(&action.label);
                 self.pill_at(bx, by, button_w, 18.0, &action.label, action.color);
@@ -10746,6 +10794,13 @@ struct StationDisplayRunwayLane {
     display_id: i32,
     session_id: String,
     live_id: String,
+    host_label: String,
+    lane_label: String,
+    resolution: String,
+    fps: f32,
+    codec: String,
+    quality: String,
+    telemetry_label: String,
     input_authority: String,
     selected: bool,
     can_focus: bool,
@@ -11803,6 +11858,52 @@ fn display_lane_color_css(kind: &str) -> &'static str {
         "operator_target" => C_BLUE_CSS,
         _ => C_OVERLAY1_CSS,
     }
+}
+
+fn display_lane_is_monitor(lane: &StationDisplayRunwayLane) -> bool {
+    matches!(
+        lane.kind.as_str(),
+        "local_stream" | "remote_stream" | "peer_target" | "shared_view"
+    )
+}
+
+fn display_lane_identity(lane: &StationDisplayRunwayLane) -> String {
+    let mut parts = Vec::new();
+    let host = nonempty(&lane.host_label, &lane.host_id);
+    if !host.is_empty() {
+        parts.push(format!("peer {host}"));
+    }
+    if lane.kind != "operator_target" && lane.display_id >= 0 {
+        parts.push(format!("display :{}", lane.display_id));
+    }
+    let lane_label = nonempty(&lane.lane_label, &lane.id);
+    if !lane_label.is_empty() {
+        parts.push(format!("lane {lane_label}"));
+    }
+    if !lane.session_id.is_empty() {
+        parts.push(format!("session {}", short_id(&lane.session_id)));
+    }
+    parts.join(" / ")
+}
+
+fn display_lane_telemetry(lane: &StationDisplayRunwayLane) -> String {
+    if !lane.telemetry_label.is_empty() {
+        return lane.telemetry_label.clone();
+    }
+    let mut parts = Vec::new();
+    if !lane.resolution.is_empty() {
+        parts.push(lane.resolution.clone());
+    }
+    if lane.fps > 0.0 {
+        parts.push(format!("{:.0}fps", lane.fps));
+    }
+    if !lane.codec.is_empty() {
+        parts.push(lane.codec.clone());
+    }
+    if !lane.quality.is_empty() {
+        parts.push(lane.quality.clone());
+    }
+    parts.join(" / ")
 }
 
 fn external_turn_color_css(state: &str) -> &'static str {
