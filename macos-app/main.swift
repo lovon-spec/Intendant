@@ -6,8 +6,7 @@ import WebKit
 
 struct BackendLaunchPlan {
     let extraArgs: [String]
-    let autoTlsOnly: Bool
-    let autoTlsSelfSigned: Bool
+    let autoNoTls: Bool
     let autoMtls: Bool
     let usesTLS: Bool
     let usesMtls: Bool
@@ -47,24 +46,23 @@ func installedAccessMtlsAvailable(_ certDir: URL) -> Bool {
 
 func buildBackendLaunchPlan(extraArgs: [String]) -> BackendLaunchPlan {
     let certDir = defaultAccessCertDir()
-    let explicitTls = cliHasFlag(extraArgs, "--tls") ||
+    let explicitNoTls = cliHasFlag(extraArgs, "--no-tls")
+    let explicitTls = !explicitNoTls && (cliHasFlag(extraArgs, "--tls") ||
         cliHasFlag(extraArgs, "--mtls") ||
         cliHasFlag(extraArgs, "--tls-cert") ||
-        cliHasFlag(extraArgs, "--tls-key")
+        cliHasFlag(extraArgs, "--tls-key") ||
+        cliHasFlag(extraArgs, "--mtls-ca"))
     let usesExplicitTlsCertPair = cliHasFlag(extraArgs, "--tls-cert") ||
         cliHasFlag(extraArgs, "--tls-key")
     let disableAutoTls = ProcessInfo.processInfo.environment["INTENDANT_BUNDLE_DISABLE_TLS"] == "1"
-    let autoMtls = !explicitTls && !disableAutoTls && installedAccessMtlsAvailable(certDir)
-    let autoTlsOnly = !explicitTls && !disableAutoTls && !autoMtls &&
-        installedAccessTlsAvailable(certDir)
-    let autoTlsSelfSigned = !explicitTls && !disableAutoTls && !autoMtls && !autoTlsOnly
+    let autoNoTls = !explicitNoTls && !explicitTls && disableAutoTls
+    let autoMtls = !explicitNoTls && !explicitTls && !autoNoTls
     return BackendLaunchPlan(
         extraArgs: extraArgs,
-        autoTlsOnly: autoTlsOnly,
-        autoTlsSelfSigned: autoTlsSelfSigned,
+        autoNoTls: autoNoTls,
         autoMtls: autoMtls,
-        usesTLS: explicitTls || autoTlsOnly || autoMtls || autoTlsSelfSigned,
-        usesMtls: cliHasFlag(extraArgs, "--mtls") || autoMtls,
+        usesTLS: explicitTls || autoMtls,
+        usesMtls: cliHasFlag(extraArgs, "--mtls") || cliHasFlag(extraArgs, "--mtls-ca") || autoMtls,
         usesExplicitTlsCertPair: usesExplicitTlsCertPair,
         accessCertDir: certDir
     )
@@ -304,13 +302,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNavigationDe
                 delegateQueue: nil
             )
             if launchPlan.autoMtls {
-                NSLog("Access certs found in \(launchPlan.accessCertDir.path) — launching bundled backend with --mtls")
-            } else if launchPlan.autoTlsOnly {
-                NSLog(
-                    "Access server certs found in \(launchPlan.accessCertDir.path), but mTLS client identity or CA is incomplete — launching bundled backend with --tls"
-                )
-            } else if launchPlan.autoTlsSelfSigned {
-                NSLog("No complete access cert set found in \(launchPlan.accessCertDir.path) — launching bundled backend with --tls and an ephemeral self-signed certificate")
+                if installedAccessMtlsAvailable(launchPlan.accessCertDir) {
+                    NSLog("Access certs found in \(launchPlan.accessCertDir.path) — launching bundled backend with --mtls")
+                } else {
+                    NSLog("No complete access cert set found in \(launchPlan.accessCertDir.path) — launching bundled backend with --mtls so the daemon fails closed with setup guidance")
+                }
             } else {
                 NSLog("Bundled backend TLS enabled by launch arguments")
             }
@@ -483,10 +479,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNavigationDe
         var args = ["--web", String(port)]
         if launchPlan.autoMtls {
             args.append("--mtls")
-        } else if launchPlan.autoTlsOnly {
-            args.append("--tls")
-        } else if launchPlan.autoTlsSelfSigned {
-            args.append("--tls")
+        } else if launchPlan.autoNoTls {
+            args.append("--no-tls")
         }
         args.append(contentsOf: launchPlan.extraArgs)
         process.arguments = args

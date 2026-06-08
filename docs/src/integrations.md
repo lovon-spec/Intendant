@@ -374,8 +374,8 @@ endpoint table.
 ### Requirements
 
 - **Microphone access requires a secure context** — `localhost` (e.g.
-  `ssh -L 8765:localhost:8765 host`), HTTPS via `--tls`, or the macOS app's
-  `intendant://` scheme. See
+  `ssh -L 8765:localhost:8765 host`), default HTTPS/mTLS, `--tls` with a trusted
+  certificate, or the macOS app's `intendant://` scheme. See
   [Web Dashboard → Secure context](./web-dashboard.md#secure-context-and-lan-access).
 - **API key for voice** — Gemini or OpenAI, used browser-side only. Voice is
   optional.

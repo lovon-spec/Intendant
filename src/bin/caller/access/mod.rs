@@ -353,7 +353,7 @@ fn print_help() {
     println!("    intendant access <action> [flags]");
     println!();
     println!("ACTIONS:");
-    println!("    setup         Generate native TLS/mTLS access certs and start enrollment");
+    println!("    setup         Generate native dashboard mTLS certs and start enrollment");
     println!("    recert        Regenerate the server cert after access addresses change");
     println!("    remove        Remove the per-user access cert store");
     println!("    list          Show current setup state");
@@ -371,7 +371,7 @@ fn print_help() {
     println!("NOTES:");
     println!("    Loopback SANs are always included: localhost, 127.0.0.1, ::1.");
     println!("    Detected local interface IPs are included. Public interface IPs are");
-    println!("    allowed, but WAN exposure should use `intendant --mtls`, not only --tls.");
+    println!("    allowed, but WAN exposure should use default mTLS, not only --tls.");
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -400,9 +400,10 @@ async fn cmd_setup(args: AccessArgs) -> AccessResult<()> {
     println!();
     println!("  Native access certs: {}", cert_dir.display());
     println!("  Start or restart the dashboard with:");
-    println!("    intendant --tls");
-    println!("  Or require client certs with:");
-    println!("    intendant --mtls");
+    println!("    intendant");
+    println!("  That default requires enrolled browser/client certificates.");
+    println!("  Use `intendant --tls` only when you intentionally want TLS without");
+    println!("  client-certificate authentication.");
     println!();
     println!(
         "  Dashboard URL: https://{dashboard_host}:{}",
@@ -450,7 +451,7 @@ async fn cmd_recert(args: AccessArgs) -> AccessResult<()> {
     certs::recert(&cert_dir, &server_names, args.force)?;
 
     println!(":: done — native access server cert refreshed");
-    println!(":: restart any running `intendant --tls` / `--mtls` daemon to load it");
+    println!(":: restart any running `intendant` daemon to load it");
     println!(":: enrolled clients can keep using the same CA and client identity");
 
     Ok(())
@@ -544,7 +545,7 @@ fn print_public_ip_warnings(server_names: &certs::ServerNames) {
     for ip in &server_names.ips {
         if is_public_ip(ip) {
             println!("!! public interface address included in server cert: {ip}");
-            println!("!! WAN exposure should use `intendant --mtls`, not only `--tls`.");
+            println!("!! WAN exposure should use default mTLS, not only `--tls`.");
         }
     }
 }

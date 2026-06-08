@@ -9485,9 +9485,12 @@ struct CliFlags {
     /// --web [PORT]: Serve TUI via web (xterm.js + optional voice).
     web: bool,
     web_port: u16,
-    /// --tls: Serve the `--web` dashboard over HTTPS/WSS. Off by default
-    /// (plain HTTP). ORs with `[server.tls] enabled` in intendant.toml.
-    /// With no cert/key override, installed access certs are preferred when
+    /// --no-tls: Explicitly serve the web dashboard over plain HTTP. The
+    /// dashboard defaults to mTLS; this flag is the debug/programmatic escape
+    /// hatch for callers that knowingly want cleartext.
+    no_tls: bool,
+    /// --tls: Serve the `--web` dashboard over HTTPS/WSS without requiring
+    /// browser/client certificates. Installed access certs are preferred when
     /// present, otherwise a self-signed cert is minted at startup.
     tls: bool,
     /// --tls-cert <PATH>: PEM cert (chain) overriding default cert selection.
@@ -9495,8 +9498,8 @@ struct CliFlags {
     tls_cert: Option<String>,
     /// --tls-key <PATH>: PEM private key matching `--tls-cert`.
     tls_key: Option<String>,
-    /// --mtls: Require a browser/client certificate signed by the configured
-    /// client CA. Implies `--tls`.
+    /// --mtls: Explicitly require a browser/client certificate signed by the
+    /// configured client CA. This is also the default when web is enabled.
     mtls: bool,
     /// --mtls-ca <PATH>: PEM CA bundle used to verify client certs.
     /// Defaults to the installed access CA when present.
@@ -9543,11 +9546,16 @@ fn print_help() {
     println!("    --direct              Force single-agent mode (skip orchestrator/sub-agent delegation)");
     println!("    --no-presence         Disable the presence layer (direct agent interaction)");
     println!("    --web [PORT]          Web dashboard (default: on, port 8765; idle starts daemon/no TUI)");
-    println!("    --tls                 Serve the web dashboard over HTTPS/WSS (uses installed access certs when present)");
+    println!(
+        "    --no-tls              Serve the web dashboard over plain HTTP (explicit debug escape)"
+    );
+    println!(
+        "    --tls                 Serve HTTPS/WSS without requiring browser client certificates"
+    );
     println!("    --tls-cert <PATH>     PEM cert overriding default cert selection (with --tls-key; implies --tls)");
     println!("    --tls-key <PATH>      PEM private key matching --tls-cert");
     println!(
-        "    --mtls                Require client certificates signed by the Intendant access CA (implies --tls)"
+        "    --mtls                Require client certificates signed by the Intendant access CA (default)"
     );
     println!("    --mtls-ca <PATH>      PEM CA bundle for --mtls client certificate verification");
     println!("    --no-web              Disable web dashboard; use terminal TUI when interactive");
@@ -9697,18 +9705,19 @@ async fn bind_dual_stack_or_v4(port: u16) -> std::io::Result<tokio::net::TcpList
 
 /// Build the optional TLS acceptor for the `--web` dashboard.
 ///
-/// TLS is enabled when the CLI `--tls` / `--mtls` flag is set, or
-/// `[server.tls] enabled = true` / `[server.mtls] enabled = true` is in
-/// intendant.toml. When enabled, the cert source is resolved in priority order:
+/// The dashboard defaults to mTLS. `--tls` / `[server.tls] enabled = true`
+/// explicitly select TLS-only, and `--no-tls` is the cleartext debug escape.
+/// When TLS is enabled, the cert source is resolved in priority order:
 ///   1. Explicit PEM files — CLI `--tls-cert`/`--tls-key` first, else
 ///      `[server.tls] cert`/`key`. Both halves of a pair must be present.
 ///   2. Installed access certs (`server.crt` / `server.key`) from the platform's
 ///      `intendant access` cert directory.
-///   3. Otherwise a self-signed cert minted by `rcgen`, with the listener
-///      bind IP plus `localhost` (and optional `[server.tls] hostname`) in
-///      the SAN list.
+///   3. For TLS-only, otherwise a self-signed cert minted by `rcgen`, with the
+///      listener bind IP plus `localhost` (and optional `[server.tls] hostname`)
+///      in the SAN list. mTLS never silently falls back to self-signed because
+///      the browser also needs an enrolled client identity.
 ///
-/// Returns `Ok(None)` when TLS is off (the default), `Ok(Some(acceptor))`
+/// Returns `Ok(None)` only for `--no-tls`, `Ok(Some(acceptor))`
 /// when on and the cert built, or `Err` when enabled but misconfigured
 /// (mismatched cert/key pair, unreadable/invalid PEM, cert-gen failure) —
 /// surfaced loudly at startup rather than silently serving plain HTTP.
@@ -9718,11 +9727,10 @@ fn build_web_tls_acceptor(
     mtls_cfg: &project::ServerMutualTlsConfig,
     bind_addr: Option<std::net::SocketAddr>,
 ) -> Result<Option<tokio_rustls::TlsAcceptor>, CallerError> {
-    let mtls_enabled = flags.mtls || mtls_cfg.enabled;
-    let enabled = flags.tls || server_cfg.enabled || mtls_enabled;
-    if !enabled {
+    if flags.no_tls {
         return Ok(None);
     }
+    let mtls_enabled = web_mtls_enabled(flags, server_cfg, mtls_cfg);
 
     // Resolve an explicit cert/key pair: CLI overrides config. A
     // half-specified pair (only cert or only key) is a configuration
@@ -9743,6 +9751,11 @@ fn build_web_tls_acceptor(
         }
         (None, None) => match installed_access_tls_cert_source()? {
             Some(source) => source,
+            None if mtls_enabled => {
+                return Err(CallerError::Config(missing_default_mtls_cert_message(
+                    &installed_access_cert_dir(),
+                )));
+            }
             None => web_tls::TlsCertSource::SelfSigned {
                 bind_ip: bind_addr.map(|a| a.ip()),
                 hostname: server_cfg.hostname.clone(),
@@ -9791,6 +9804,35 @@ fn build_web_tls_acceptor(
     let acceptor = web_tls::build_acceptor_with_client_auth(&source, &client_auth)
         .map_err(|e| CallerError::Config(format!("TLS setup failed: {e}")))?;
     Ok(Some(acceptor))
+}
+
+fn web_mtls_enabled(
+    flags: &CliFlags,
+    server_cfg: &project::ServerTlsConfig,
+    mtls_cfg: &project::ServerMutualTlsConfig,
+) -> bool {
+    if flags.no_tls {
+        return false;
+    }
+    flags.mtls || mtls_cfg.enabled || web_default_mtls_enabled(flags, server_cfg)
+}
+
+fn web_default_mtls_enabled(flags: &CliFlags, server_cfg: &project::ServerTlsConfig) -> bool {
+    !flags.no_tls
+        && !flags.tls
+        && !server_cfg.enabled
+        && flags.tls_cert.is_none()
+        && flags.tls_key.is_none()
+}
+
+fn missing_default_mtls_cert_message(cert_dir: &Path) -> String {
+    format!(
+        "Dashboard mTLS is enabled by default, but no installed access server certificate was \
+         found in {cert_dir} (expected server.crt and server.key). Run `intendant access setup` \
+         to create/enroll dashboard access certificates, pass `--tls` for HTTPS without client \
+         certificate authentication, or pass `--no-tls` only for explicit local/debug plaintext.",
+        cert_dir = cert_dir.display()
+    )
 }
 
 fn installed_access_cert_dir() -> PathBuf {
@@ -9933,6 +9975,7 @@ fn parse_cli_flags() -> Result<CliFlags, CallerError> {
         no_presence: false,
         web: false,
         web_port: web_gateway::DEFAULT_PORT,
+        no_tls: false,
         tls: false,
         tls_cert: None,
         tls_key: None,
@@ -10058,6 +10101,10 @@ fn parse_cli_flags() -> Result<CliFlags, CallerError> {
                     i += 1;
                 }
             }
+            "--no-tls" => {
+                flags.no_tls = true;
+                i += 1;
+            }
             "--tls" => {
                 // Serve the dashboard over HTTPS/WSS. Installed access certs
                 // are preferred unless --tls-cert/--tls-key override them.
@@ -10167,8 +10214,26 @@ fn parse_cli_flags() -> Result<CliFlags, CallerError> {
     if !task_parts.is_empty() {
         flags.task = Some(task_parts.join(" "));
     }
+    validate_tls_cli_flags(&flags)?;
 
     Ok(flags)
+}
+
+fn validate_tls_cli_flags(flags: &CliFlags) -> Result<(), CallerError> {
+    if flags.no_tls
+        && (flags.tls
+            || flags.mtls
+            || flags.tls_cert.is_some()
+            || flags.tls_key.is_some()
+            || flags.mtls_ca.is_some())
+    {
+        return Err(CallerError::Config(
+            "`--no-tls` cannot be combined with `--tls`, `--mtls`, `--tls-cert`, \
+             `--tls-key`, or `--mtls-ca`."
+                .to_string(),
+        ));
+    }
+    Ok(())
 }
 
 fn should_start_idle_web_daemon(use_web: bool, flags: &CliFlags) -> bool {
@@ -15198,6 +15263,7 @@ Also: {"source": "bare"}"#;
             no_presence: false,
             web: false,
             web_port: web_gateway::DEFAULT_PORT,
+            no_tls: false,
             tls: false,
             tls_cert: None,
             tls_key: None,
@@ -15248,6 +15314,7 @@ Also: {"source": "bare"}"#;
             no_presence: false,
             web: false,
             web_port: web_gateway::DEFAULT_PORT,
+            no_tls: false,
             tls: false,
             tls_cert: None,
             tls_key: None,
@@ -15298,6 +15365,7 @@ Also: {"source": "bare"}"#;
             no_presence: false,
             web: true,
             web_port: web_gateway::DEFAULT_PORT,
+            no_tls: false,
             tls: false,
             tls_cert: None,
             tls_key: None,
@@ -15336,6 +15404,7 @@ Also: {"source": "bare"}"#;
             no_presence: false,
             web: true,
             web_port: 9000,
+            no_tls: false,
             tls: false,
             tls_cert: None,
             tls_key: None,
@@ -15352,6 +15421,56 @@ Also: {"source": "bare"}"#;
         };
         assert!(flags.web);
         assert_eq!(flags.web_port, 9000);
+    }
+
+    #[test]
+    fn web_tls_policy_defaults_to_mtls() {
+        let flags = cli_flags_for_tests();
+        let tls_cfg = project::ServerTlsConfig::default();
+        let mtls_cfg = project::ServerMutualTlsConfig::default();
+        assert!(web_default_mtls_enabled(&flags, &tls_cfg));
+        assert!(web_mtls_enabled(&flags, &tls_cfg, &mtls_cfg));
+    }
+
+    #[test]
+    fn web_tls_policy_tls_only_disables_default_mtls() {
+        let mut flags = cli_flags_for_tests();
+        flags.tls = true;
+        let tls_cfg = project::ServerTlsConfig::default();
+        let mtls_cfg = project::ServerMutualTlsConfig::default();
+        assert!(!web_default_mtls_enabled(&flags, &tls_cfg));
+        assert!(!web_mtls_enabled(&flags, &tls_cfg, &mtls_cfg));
+    }
+
+    #[test]
+    fn web_tls_policy_no_tls_is_plaintext_escape() {
+        let mut flags = cli_flags_for_tests();
+        flags.no_tls = true;
+        let tls_cfg = project::ServerTlsConfig::default();
+        let mtls_cfg = project::ServerMutualTlsConfig::default();
+        assert!(!web_default_mtls_enabled(&flags, &tls_cfg));
+        assert!(!web_mtls_enabled(&flags, &tls_cfg, &mtls_cfg));
+    }
+
+    #[test]
+    fn web_tls_policy_configured_tls_is_tls_only() {
+        let flags = cli_flags_for_tests();
+        let tls_cfg = project::ServerTlsConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let mtls_cfg = project::ServerMutualTlsConfig::default();
+        assert!(!web_default_mtls_enabled(&flags, &tls_cfg));
+        assert!(!web_mtls_enabled(&flags, &tls_cfg, &mtls_cfg));
+    }
+
+    #[test]
+    fn no_tls_rejects_tls_flags() {
+        let mut flags = cli_flags_for_tests();
+        flags.no_tls = true;
+        flags.tls = true;
+        let err = validate_tls_cli_flags(&flags).unwrap_err();
+        assert!(err.to_string().contains("--no-tls"), "err: {err}");
     }
 
     #[test]
@@ -24719,7 +24838,8 @@ async fn main() -> Result<(), CallerError> {
     let web_port_for_agent: Option<u16> = if use_web { Some(web_port) } else { None };
 
     // Build the dashboard's TLS acceptor once (cheap to clone into each
-    // gateway spawn site). Off unless `--tls` / `[server.tls] enabled`.
+    // gateway spawn site). Defaults to mTLS; `--no-tls` is the explicit
+    // plaintext escape.
     // A misconfiguration (bad cert/key, half-specified pair) fails startup
     // here rather than silently degrading to plain HTTP. The bind address
     // feeds the self-signed cert's SAN list.
@@ -24735,7 +24855,11 @@ async fn main() -> Result<(), CallerError> {
         None
     };
     if web_tls_acceptor.is_some() {
-        let mtls_enabled = flags.mtls || project.config.server.mtls.enabled;
+        let mtls_enabled = web_mtls_enabled(
+            &flags,
+            &project.config.server.tls,
+            &project.config.server.mtls,
+        );
         eprintln!(
             "[web_gateway] TLS enabled — dashboard is HTTPS/WSS-only on port {web_port} \
              (cleartext HTTP/WS connections are refused){}",

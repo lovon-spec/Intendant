@@ -221,7 +221,7 @@ The advertised TCP candidate's IP is derived from the browser's `Host:` header �
 whatever non-loopback IP the browser used to load the dashboard is what the
 server advertises:
 
-- **Via a routable IP** (e.g. `http://192.168.1.42:8765`) — ICE-TCP works
+- **Via a routable IP** (e.g. `https://192.168.1.42:8765`) — ICE-TCP works
   automatically.
 - **Via `http://localhost:8765`** — ICE-TCP does **not** work: Firefox and Chrome
   filter remote loopback candidates as an anti-rebinding mitigation. Bind the
@@ -234,11 +234,13 @@ VBoxManage modifyvm <vm> --natpf1 delete intendant
 VBoxManage modifyvm <vm> --natpf1 "intendant,tcp,0.0.0.0,8765,,8765"
 ```
 
-Then access the dashboard at `http://<host-LAN-IP>:8765`.
+Then access the dashboard at `https://<host-LAN-IP>:8765` after enrolling the
+browser/client certificate with `intendant access setup`. Use `--no-tls` only
+for explicit local/debug plaintext.
 
-That plain-HTTP LAN URL is sufficient for the display transport itself, but not
-for browser APIs that require a secure context. Use HTTPS/mTLS, native `--tls`
-with a trusted cert, or the macOS app wrapper when the same dashboard session
+Plain HTTP is sufficient for the display transport itself, but not for browser
+APIs that require a secure context. Use default HTTPS/mTLS, native `--tls` with
+a trusted cert, or the macOS app wrapper when the same dashboard session
 also needs Station WebGPU, microphone/camera, browser screen capture, or stricter
 clipboard APIs. See
 [Web Dashboard: Secure Browser Contexts](./web-dashboard.md#secure-browser-contexts).

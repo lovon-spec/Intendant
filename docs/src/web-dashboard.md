@@ -20,8 +20,9 @@ There is no opt-in: the gateway starts automatically unless you pass `--no-web`,
 ```
 
 The server binds port **8765** by default, auto-incrementing through 8785 if it
-is busy; the chosen port is printed at startup. Open `http://<host>:<port>/` in
-a browser.
+is busy; the chosen port is printed at startup. With the default mTLS transport,
+open `https://<host>:<port>/` in a browser after running
+`intendant access setup` and enrolling that browser/device.
 
 > **Correction vs. older docs:** `--web` is the default and no longer "implies
 > `--mcp`". Earlier docs described `--web` as opt-in and tied to MCP mode —
@@ -51,12 +52,11 @@ Practical rules:
   desktop browsers, but not by every embedding. In particular, the macOS
   `WKWebView` wrapper uses the custom `intendant://` scheme because
   `http://localhost` there does not expose media devices.
-- `http://<host-ip>` is not a secure context. Use native `--tls` with a trusted
-  certificate, `intendant access` cert enrollment plus native `--mtls`, the macOS
-  app wrapper, or another trusted HTTPS reverse proxy. The macOS app wrapper
-  starts its bundled backend with HTTPS by default; with full access certs it
-  upgrades to mTLS, otherwise it uses the daemon's self-signed TLS fallback
-  instead of serving plain HTTP.
+- `http://<host-ip>` is not a secure context. Use default native mTLS,
+  `--tls` with a trusted certificate, the macOS app wrapper, or another trusted
+  HTTPS reverse proxy. The macOS app wrapper starts its bundled backend with
+  mTLS by default and fails closed with setup guidance when access certs are
+  missing.
 - Clicking through a self-signed certificate warning is not a reliable substitute
   for installing/trusting the certificate; browsers may still withhold secure
   APIs.
@@ -311,26 +311,29 @@ and written to the session log. See
   a secure context in the browser, so `getUserMedia` is blocked there. Reach the
   dashboard over one of:
   - `http://localhost` (e.g. an SSH tunnel: `ssh -L 8765:localhost:8765 host`),
-  - HTTPS via `--tls` / `[server.tls]` (see below), or
+  - HTTPS/mTLS via the default dashboard transport, `--tls`, or `[server.tls]`
+    (see below), or
   - the macOS app bundle, which serves the page over a custom `intendant://`
     scheme specifically to restore the secure context (see
-    [Getting Started](./getting-started.md#macos-app-bundle)). When full access
-    certs are installed, the bundle also starts its daemon with native mTLS so
-    remote browsers get a safe context over `https://` and must present an
-    enrolled client identity.
+    [Getting Started](./getting-started.md#macos-app-bundle)). The bundle starts
+    its daemon with native mTLS by default so remote browsers get a safe context
+    over `https://` and must present an enrolled client identity.
 - **API key for voice:** Gemini or OpenAI, stored browser-side only.
 
 ### HTTPS / TLS
 
 ```bash
-./target/release/intendant --tls                 # installed access certs when present; else self-signed
-./target/release/intendant --mtls                # require client certificates
+./target/release/intendant                       # default: mTLS, requires access certs
+./target/release/intendant --tls                 # TLS-only; installed access certs when present, else self-signed
+./target/release/intendant --no-tls              # explicit plaintext/debug escape
 ./target/release/intendant --tls-cert c.pem --tls-key k.pem   # bring your own
 ```
 
-`--tls` (or `[server.tls] enabled = true`) makes the gateway serve HTTPS/WSS
-directly. With no explicit cert/key override, Intendant uses installed access
-server certs when present and falls back to an auto self-signed certificate.
+By default, the gateway serves HTTPS/WSS with browser client certificates
+required. `--tls` (or `[server.tls] enabled = true`) makes the gateway serve
+HTTPS/WSS without requiring client certificates. With no explicit cert/key
+override, TLS-only uses installed access server certs when present and falls back
+to an auto self-signed certificate.
 The gateway demuxes per connection: a first byte of `0x16` (a TLS ClientHello)
 is wrapped in the rustls acceptor, while raw WebRTC ICE-TCP/UDP media is left
 untouched. The TLS stack is pure Rust (`rustls` + `rcgen`) and works on every
@@ -338,8 +341,9 @@ platform including Windows — no nginx, no OpenSSL. See the
 `[server.tls]` keys under
 [Configuration → `[server]`](./configuration.md#server-daemon-and-federation).
 
-For mutual-TLS with client certificates (only enrolled devices can connect), use
-native `--mtls` / `[server.mtls]`; use `intendant access setup` to generate the
+For explicit mutual-TLS with client certificates (only enrolled devices can
+connect), use native `--mtls` / `[server.mtls]`; this is also the default when no
+transport flag is supplied. Use `intendant access setup` to generate the
 per-user access CA/server/client certs and run strict enrollment. See
 [Getting Started → Dashboard access over TLS](./getting-started.md#dashboard-access-over-tls) and
 [Peer Federation](./peer-federation.md). For the daemon posture and remote

@@ -309,7 +309,7 @@ browser-side check is UX only. The full protocol is in
 Two independent mechanisms expose the dashboard securely; they can be used
 together or separately.
 
-### Native HTTPS/WSS — `--tls`
+### Native HTTPS/WSS / mTLS
 
 `web_tls.rs` serves the `--web` dashboard over HTTPS/WSS directly, with no proxy,
 on **every platform including Windows**. It's pure-Rust (`rustls` + `rcgen`, both
@@ -319,14 +319,16 @@ ClientHello, wraps the socket in a `TlsAcceptor` before handing the decrypted
 stream to the existing HTTP/WebSocket handling.
 
 ```bash
-intendant --tls                                # installed access certs when present; else self-signed
-intendant --mtls                               # same, plus required client certs
+intendant                                      # default: mTLS with access certs
+intendant --tls                                # TLS-only; installed access certs when present, else self-signed
+intendant --no-tls                            # explicit plaintext/debug escape
 intendant --tls-cert chain.pem --tls-key key.pem   # explicit PEM (implies --tls)
 ```
 
 `--tls-cert` / `--tls-key` must be supplied together; supplying either implies
-`--tls`. `--mtls` implies `--tls` and verifies clients against the installed
-Intendant access CA unless `--mtls-ca` or `[server.mtls] ca` overrides it.
+`--tls`. With no transport flag, Intendant requires browser/client certificates
+against the installed access CA. `--mtls` makes that default explicit, and
+`--mtls-ca` or `[server.mtls] ca` overrides the client CA.
 
 Native HTTPS/WSS is also the direct way to make a remote dashboard origin a
 browser secure context when you need Station WebGPU, microphone/camera, browser
@@ -337,9 +339,10 @@ unlock these browser APIs. See
 
 ### Native access certs — `intendant access`
 
-`src/bin/caller/access/` creates the certificate material used by native
-`--tls` / `--mtls`: a per-user access CA, server certificate, client identity, and
-strict HTTPS enrollment server. Access clients (phones, tablets, other boxes) can
+`src/bin/caller/access/` creates the certificate material used by native default
+mTLS and TLS-only mode: a per-user access CA, server certificate, client
+identity, and strict HTTPS enrollment server. Access clients (phones, tablets,
+other boxes) can
 then reach the dashboard over HTTPS authenticated by a **client certificate**.
 Cert generation is pure-Rust (`rcgen` + RustCrypto `rsa` + `p12-keystore`); new
 cert material uses RSA-2048 with SHA-256 signatures so Apple
@@ -360,7 +363,7 @@ intendant access setup --name nicks-mac --port 8765
 
 The interactive `intendant access` setup/enrollment flow is currently validated on
 Unix hosts. Cert *generation* and native HTTPS/WSS are cross-platform, so a
-Windows daemon can still use `--tls` for native HTTPS and
+Windows daemon can still use native HTTPS/mTLS and
 `read_server_cert_fingerprint` to publish a pinned fingerprint. See
 [Windows Support](./windows-support.md).
 

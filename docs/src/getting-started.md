@@ -125,12 +125,11 @@ When the generated access cert set is readable in
 with native `--mtls`. The in-app `intendant://` bridge then speaks HTTPS/WSS to
 the local backend, pins the generated server certificate, and presents the
 generated `client.p12` for its own local bridge. Remote browsers use
-`https://<mac-ip>:<port>` and must have an enrolled client identity. If only the
-server certificate/key are readable, the wrapper falls back to TLS-only. If no
-complete access cert set is installed, the wrapper still starts the bundled
-daemon with native `--tls` and the daemon's self-signed fallback rather than
-serving plain HTTP. Explicit launch flags still win, so
-`open -a Intendant --args --tls` forces TLS-only.
+`https://<mac-ip>:<port>` and must have an enrolled client identity. If no
+complete access cert set is installed, the bundled daemon fails closed with setup
+guidance rather than serving plain HTTP. Explicit launch flags still win:
+`open -a Intendant --args --tls` forces TLS-only, and `--no-tls` is the explicit
+plaintext/debug escape.
 
 The same secure-context requirement applies to remote browsers using Station's
 WebGPU renderer, microphone/camera features, browser screen capture, and other
@@ -223,8 +222,14 @@ want the classic in-terminal TUI, run `intendant --no-web "task"`.
 ./target/release/intendant --web
 ./target/release/intendant --web 9000
 
-# Serve the dashboard over HTTPS/WSS (installed access certs when present)
+# Default dashboard: mTLS with installed access certs
+./target/release/intendant
+
+# TLS-only: HTTPS/WSS without requiring browser client certificates
 ./target/release/intendant --tls
+
+# Explicit plaintext/debug escape
+./target/release/intendant --no-tls
 
 # Classic terminal TUI (dashboard off)
 ./target/release/intendant --no-web "task"
@@ -238,9 +243,9 @@ want the classic in-terminal TUI, run `intendant --no-web "task"`.
 # macOS app bundle (after scripts/bundle-macos.sh)
 open -a Intendant
 
-# The bundle starts the backend with HTTPS by default. With full access certs
-# installed, the app auto-enables --mtls.
-# Forward --tls only when you intentionally want TLS without client cert auth.
+# The bundle starts the backend with mTLS by default.
+# Forward --tls only when you intentionally want TLS without client cert auth,
+# or --no-tls only for explicit plaintext/debug use.
 open -a Intendant --args --tls
 ```
 
@@ -268,10 +273,11 @@ value is missing.
 | `--no-presence` | — | Disable the presence layer (talk to the worker agent directly) |
 | `--web` | `[port]` | Start the web dashboard. **On by default**; optional numeric port (default 8765) |
 | `--no-web` | — | Disable the web dashboard; use the terminal TUI when interactive |
-| `--tls` | — | Serve the dashboard over HTTPS/WSS; uses installed access certs when present, otherwise falls back to an auto self-signed cert |
+| `--no-tls` | — | Serve the dashboard over plain HTTP. Explicit local/debug escape; do not use for remote dashboard access |
+| `--tls` | — | Serve HTTPS/WSS without requiring browser client certificates; uses installed access certs when present, otherwise falls back to an auto self-signed cert |
 | `--tls-cert` | `<path>` | PEM cert (chain) overriding the default cert selection; implies `--tls` (pair with `--tls-key`) |
 | `--tls-key` | `<path>` | PEM private key matching `--tls-cert`; implies `--tls` |
-| `--mtls` | — | Require browser/client certificates signed by the Intendant access CA; implies `--tls` |
+| `--mtls` | — | Require browser/client certificates signed by the Intendant access CA. This is the default dashboard transport |
 | `--mtls-ca` | `<path>` | PEM CA bundle for `--mtls` client certificate verification |
 | `--transcription` | — | Enable server-side speech transcription (overrides `[transcription] enabled`) |
 | `--record-display` | `<id>` | Record an existing X11 display, e.g. `50` for `:50` (repeatable) |
@@ -289,21 +295,25 @@ string; an unknown flag is an error.
 
 ## Dashboard access over TLS
 
-Two independent ways to reach the dashboard from other devices on your network:
+The dashboard defaults to native mTLS. Run `intendant access setup` first so the
+daemon has `server.crt`, `server.key`, and `ca.crt`, and so dashboard consumer
+devices can enroll a client identity.
 
-### 1. Built-in TLS (any platform, pure-Rust)
+### 1. Built-in mTLS / TLS (any platform, pure-Rust)
 
 ```bash
-./target/release/intendant --tls
+./target/release/intendant        # default: mTLS
+./target/release/intendant --tls  # TLS-only
 ```
 
-With `--tls` (or `[server.tls] enabled = true` in `intendant.toml`) the gateway
-serves HTTPS/WSS directly. With no explicit cert override it first uses the
-installed Intendant access server certificate (`server.crt` / `server.key`) when
-present, then falls back to minting a self-signed certificate at startup (SAN =
-bind IP + `localhost`, plus an optional configured hostname). The TLS stack is
-pure Rust (`rustls` + `rcgen`) — no OpenSSL, no nginx — and works on Windows
-too. See
+With no transport flag, the gateway serves HTTPS/WSS with client-certificate
+authentication required. `--tls` (or `[server.tls] enabled = true` in
+`intendant.toml`) serves HTTPS/WSS without requiring browser client
+certificates. With no explicit cert override, TLS-only first uses the installed
+Intendant access server certificate (`server.crt` / `server.key`) when present,
+then falls back to minting a self-signed certificate at startup (SAN = bind IP +
+`localhost`, plus an optional configured hostname). The TLS stack is pure Rust
+(`rustls` + `rcgen`) — no OpenSSL, no nginx — and works on Windows too. See
 [Configuration](./configuration.md) for `[server.tls]` and `--tls-cert` /
 `--tls-key`.
 
@@ -312,17 +322,18 @@ the current user's native cert store (`~/.intendant/access-certs` on Unix-like
 hosts). Run setup as the same user that launches the daemon; the native gateway
 reads `server.crt` / `server.key` directly from that store.
 
-For stricter remote dashboard access control, require client certificates:
+To be explicit about the default, pass `--mtls`:
 
 ```bash
 ./target/release/intendant --mtls
 ```
 
-`--mtls` implies `--tls` and verifies browser/client certificates against the
-installed Intendant access CA (`ca.crt`) unless `--mtls-ca` or `[server.mtls] ca`
-overrides it. This is native mTLS on the dashboard port; unlike plain `--tls`,
-clients without the installed client identity cannot complete the TLS
-handshake.
+`--mtls` verifies browser/client certificates against the installed Intendant
+access CA (`ca.crt`) unless `--mtls-ca` or `[server.mtls] ca` overrides it.
+Clients without the installed client identity cannot complete the TLS handshake.
+If access certs are missing, startup fails closed with setup guidance. Use
+`--no-tls` only when you intentionally want plain HTTP for local/programmatic
+debugging.
 
 ### 2. Native access cert enrollment (`intendant access setup`)
 
@@ -366,10 +377,11 @@ The enrollment page uses the browser's User-Agent only to prioritize the
 instructions and download buttons for that device. The authorization decision is
 always the strict terminal-paired session cookie.
 
-Use this HTTPS/mTLS path, native `--tls` with a trusted certificate, or the
-macOS app wrapper for dashboard features that require a secure browser context:
+Use this HTTPS/mTLS path, native `--tls` with a trusted certificate, or the macOS
+app wrapper for dashboard features that require a secure browser context:
 Station WebGPU, microphone/camera, browser screen capture, and stricter
-clipboard APIs. Plain `http://<host-ip>:8765` is enough for basic monitoring
+clipboard APIs. Plain `http://<host-ip>:8765` is available only when launched
+with `--no-tls` and is intended for local/programmatic debugging
 but not for those browser-gated features.
 
 The client certificate is exported as `client.p12`, a password-protected

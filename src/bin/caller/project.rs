@@ -524,9 +524,9 @@ pub struct ServerConfig {
     #[serde(default)]
     pub auth: ServerAuthConfig,
 
-    /// Native TLS for the `--web` dashboard. See [`ServerTlsConfig`].
-    /// Off by default — the gateway serves plain HTTP unless `tls = true`
-    /// here or `--tls` is passed on the CLI.
+    /// Native TLS-only mode for the `--web` dashboard. See
+    /// [`ServerTlsConfig`]. Off by default because the gateway defaults to
+    /// mTLS; enable this to serve HTTPS/WSS without client certificates.
     #[serde(default)]
     pub tls: ServerTlsConfig,
 
@@ -536,8 +536,10 @@ pub struct ServerConfig {
     pub mtls: ServerMutualTlsConfig,
 }
 
-/// Native HTTPS/WSS for the `--web` dashboard, lives under `[server.tls]`
-/// in intendant.toml.
+/// Native TLS-only HTTPS/WSS for the `--web` dashboard, lives under
+/// `[server.tls]` in intendant.toml. The dashboard defaults to mTLS; enabling
+/// this section intentionally disables browser client-certificate auth while
+/// keeping HTTPS/WSS.
 ///
 /// When enabled, the gateway's per-connection demux gains a TLS branch:
 /// an accepted connection whose first bytes are a TLS ClientHello
@@ -565,8 +567,8 @@ pub struct ServerConfig {
 /// ```
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ServerTlsConfig {
-    /// Master switch. `false` (default) keeps the current plain-HTTP
-    /// behavior. The CLI `--tls` flag ORs into this at runtime.
+    /// Master switch for TLS-only mode. `false` leaves the default mTLS
+    /// behavior in place. The CLI `--tls` flag ORs into this at runtime.
     #[serde(default)]
     pub enabled: bool,
 
@@ -588,7 +590,9 @@ pub struct ServerTlsConfig {
 }
 
 /// Native browser/client certificate verification for the `--web` dashboard,
-/// lives under `[server.mtls]` in intendant.toml.
+/// lives under `[server.mtls]` in intendant.toml. This is the default dashboard
+/// transport; the config section remains useful when an operator wants the
+/// intent written explicitly or wants to configure a custom CA.
 ///
 /// This is intentionally separate from [`ServerTlsConfig`]: TLS controls
 /// encryption and browser secure-context behavior, while mTLS controls client
@@ -605,9 +609,8 @@ pub struct ServerTlsConfig {
 /// ```
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ServerMutualTlsConfig {
-    /// Require clients to present a certificate signed by the configured
-    /// client CA. The CLI `--mtls` flag ORs into this at runtime and implies
-    /// TLS.
+    /// Explicitly require clients to present a certificate signed by the
+    /// configured client CA. The CLI `--mtls` flag ORs into this at runtime.
     #[serde(default)]
     pub enabled: bool,
 

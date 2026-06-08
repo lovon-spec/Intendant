@@ -314,39 +314,42 @@ deployments only ever touch `[server.tls]`.
 |-----|------|---------|-------------|
 | `advertise` | array | `[]` (auto-detect) | WebSocket URLs to advertise in this daemon's Agent Card, preference order. The CLI `--advertise-url` is additive over this |
 
-`[server.tls]` — native HTTPS/WSS for the dashboard (pure-Rust `rustls` +
-`rcgen`, all platforms; ORed with the `--tls` flag):
+`[server.tls]` — native TLS-only HTTPS/WSS for the dashboard (pure-Rust
+`rustls` + `rcgen`, all platforms; ORed with the `--tls` flag). The dashboard
+defaults to mTLS; enable this section when you intentionally want HTTPS/WSS
+without browser client-certificate authentication:
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `enabled` | bool | `false` | Serve the dashboard over HTTPS/WSS |
+| `enabled` | bool | `false` | Serve the dashboard over HTTPS/WSS without requiring browser client certificates |
 | `cert` | string | installed access certs, then auto self-signed | PEM cert (chain) overriding the default cert selection; pair with `key` |
 | `key` | string | — | PEM private key (PKCS#8, PKCS#1, or SEC1) matching `cert` |
 | `hostname` | string | — | Extra SAN hostname for the self-signed cert (in addition to bind IP + `localhost`) |
 
-When TLS is enabled and `cert`/`key` are omitted, Intendant first looks for the
-installed access server certificate in the per-user platform cert directory
-(`server.crt` / `server.key`, normally created by `intendant access setup`). If
-that pair is absent, it falls back to an ephemeral self-signed certificate.
+When TLS-only mode is enabled and `cert`/`key` are omitted, Intendant first looks
+for the installed access server certificate in the per-user platform cert
+directory (`server.crt` / `server.key`, normally created by `intendant access
+setup`). If that pair is absent, it falls back to an ephemeral self-signed
+certificate.
 
 `[server.mtls]` — native client-certificate authentication for the dashboard
-(ORed with the `--mtls` flag; implies native TLS):
+(ORed with the `--mtls` flag; this is the default dashboard transport):
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `enabled` | bool | `false` | Require browser/client certificates during the TLS handshake |
+| `enabled` | bool | `false` | Explicitly require browser/client certificates during the TLS handshake; default behavior already does this unless `--tls` / `[server.tls]` or `--no-tls` is used |
 | `ca` | string | installed access CA | PEM CA bundle used to verify client certificates |
 
-Use `[server.mtls]` only when the dashboard port itself should require a valid
-client identity. Plain `[server.tls]` is enough for browser secure-context APIs;
-`[server.mtls]` adds access control.
+Use `[server.tls]` only when the dashboard should be HTTPS/WSS without client
+certificate access control. Default mTLS and `[server.mtls]` require a valid
+client identity.
 
-Use `[server.tls]`, `--tls`, `intendant access`, the macOS app wrapper, or another
+Use default mTLS, `[server.tls]`, `--tls`, the macOS app wrapper, or another
 trusted HTTPS reverse proxy when a remote browser needs secure-context-gated
 features: Station WebGPU, microphone/camera, browser screen capture, or stricter
 clipboard APIs. Plain `http://<host-ip>` is not enough for those APIs. The macOS
-app wrapper auto-enables native mTLS when the full installed access cert set is
-readable, falling back to TLS-only when only the server pair is available; see
+app wrapper starts its bundled backend with native mTLS by default and fails
+closed with setup guidance when access certs are missing; see
 [Web Dashboard: Secure Browser Contexts](./web-dashboard.md#secure-browser-contexts).
 
 `[server.auth]` — inbound auth this daemon enforces on federation peers:

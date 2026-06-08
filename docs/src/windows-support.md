@@ -254,12 +254,12 @@ than a panic or silent no-op.
   bridge is wired up but has not yet been validated end-to-end on a Windows
   host. It also requires the manual VB-CABLE install (see
   [Audio](#audio-ffmpeg--vb-cable-wasapi-bridge)).
-- **`intendant access` enrollment is still Unix-validated.** Native HTTPS/WSS via
-  `--tls` and `--mtls` is pure Rust and cross-platform, but the interactive access
-  enrollment command has only been validated on Unix hosts so far. To expose the
-  dashboard to other devices from a Windows host, use native HTTPS/WSS with
-  explicit `--tls-cert` / `--tls-key`, run enrollment from a Unix peer, or front
-  the dashboard with your own reverse proxy. See
+- **`intendant access` enrollment is still Unix-validated.** Native HTTPS/WSS and
+  mTLS are pure Rust and cross-platform, but the interactive access enrollment
+  command has only been validated on Unix hosts so far. To expose the dashboard
+  to other devices from a Windows host, use native HTTPS/WSS with explicit
+  `--tls-cert` / `--tls-key` plus `--mtls-ca`, run enrollment from a Unix peer, or
+  front the dashboard with your own reverse proxy. See
   [Peer Federation](./peer-federation.md#dashboard-access-and-tls) for the full
   dashboard TLS/mTLS and federation auth story.
 - **No virtual-display equivalent.** There is no Windows analogue of Xvfb, so
