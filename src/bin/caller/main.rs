@@ -5149,6 +5149,16 @@ fn managed_context_preflight_density_gate_enabled(
     managed_context_rewind_only_gate_enabled && !managed_context_density_handoff_completed
 }
 
+fn managed_context_post_turn_density_handoff_enabled(
+    managed_context_recovery_kickstart: bool,
+    managed_context_density_handoff: bool,
+    managed_context_density_handoff_completed: bool,
+) -> bool {
+    !managed_context_recovery_kickstart
+        && !managed_context_density_handoff
+        && !managed_context_density_handoff_completed
+}
+
 fn managed_context_density_pressure_from_usage(
     usage: &external_agent::AgentUsageSnapshot,
 ) -> Option<ManagedContextDensityPressure> {
@@ -12530,6 +12540,14 @@ mod tests {
         assert!(!managed_context_preflight_density_gate_enabled(
             true,
             replay.managed_context_density_handoff_completed,
+        ));
+        assert!(!managed_context_post_turn_density_handoff_enabled(
+            false,
+            false,
+            replay.managed_context_density_handoff_completed,
+        ));
+        assert!(managed_context_post_turn_density_handoff_enabled(
+            false, false, false,
         ));
     }
 
@@ -24135,9 +24153,11 @@ async fn run_external_agent_mode(
                                     next_turn = Some(replay);
                                     continue 'outer;
                                 }
-                                if !managed_context_recovery_kickstart
-                                    && !managed_context_density_handoff
-                                {
+                                if managed_context_post_turn_density_handoff_enabled(
+                                    managed_context_recovery_kickstart,
+                                    managed_context_density_handoff,
+                                    managed_context_density_handoff_completed,
+                                ) {
                                     if let Some(pressure) =
                                         managed_context_density_pressure(&snapshot)
                                     {

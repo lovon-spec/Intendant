@@ -45,8 +45,6 @@ use crate::types::{LogLevel, Phase, Verbosity};
 use crate::FollowUpMessage;
 
 const CONTEXT_PRESSURE_REWIND_THRESHOLD_PCT: f64 = 85.0;
-const DENSITY_MAINTENANCE_SATISFIED_TOKEN_GROWTH_LIMIT: u64 = 8_000;
-
 // ---------------------------------------------------------------------------
 // Task launcher: allows MCP to start agent loops on demand
 // ---------------------------------------------------------------------------
@@ -173,6 +171,7 @@ struct DensityMaintenanceSatisfaction {
     used_tokens: u64,
     recommended_rewind_limit: u64,
     rewind_only_limit: u64,
+    round: usize,
 }
 
 /// Tracks a pending approval info (responder is in the shared ApprovalRegistry).
@@ -790,6 +789,10 @@ impl McpAppState {
                 let recommended_rewind_limit =
                     (context_window as f64 * CONTEXT_PRESSURE_REWIND_THRESHOLD_PCT / 100.0).floor()
                         as u64;
+                let round = self
+                    .session_status_for_id(&key)
+                    .map(|status| status.round)
+                    .unwrap_or(self.round);
                 self.insert_density_maintenance_satisfied_for_key(
                     &key,
                     DensityMaintenanceSatisfaction {
@@ -797,6 +800,7 @@ impl McpAppState {
                         used_tokens,
                         recommended_rewind_limit,
                         rewind_only_limit: context_window,
+                        round,
                     },
                 );
             } else {
@@ -823,17 +827,18 @@ impl McpAppState {
         rewind_only_limit: u64,
     ) -> Option<&DensityMaintenanceSatisfaction> {
         let key = self.rewind_session_key(session_id)?;
+        let round = self
+            .session_status_for_id(&key)
+            .map(|status| status.round)
+            .unwrap_or(self.round);
         self.rewind_related_keys(&key)
             .into_iter()
             .find_map(|related| self.density_maintenance_satisfied.get(&related))
             .filter(|satisfied| {
                 satisfied.rewind_only_limit == rewind_only_limit
                     && used_tokens < rewind_only_limit
-                    && used_tokens
-                        <= satisfied
-                            .used_tokens
-                            .saturating_add(DENSITY_MAINTENANCE_SATISFIED_TOKEN_GROWTH_LIMIT)
                     && recommended_rewind_limit == satisfied.recommended_rewind_limit
+                    && round == satisfied.round
             })
     }
 
@@ -1013,8 +1018,9 @@ impl McpAppState {
                     "used_tokens": satisfied.used_tokens,
                     "recommended_rewind_limit": satisfied.recommended_rewind_limit,
                     "rewind_only_limit": satisfied.rewind_only_limit,
-                    "token_growth_limit": DENSITY_MAINTENANCE_SATISFIED_TOKEN_GROWTH_LIMIT,
-                    "message": "A successful managed-context rewind already satisfied the current density handoff; forward progress is allowed while pressure remains below rewind-only and token growth stays bounded.",
+                    "round": satisfied.round,
+                    "valid_until": "round_complete_or_rewind_only",
+                    "message": "A successful managed-context rewind already satisfied the current density handoff; forward progress is allowed until the round completes while pressure remains below rewind-only.",
                 })
             }),
         })
@@ -4864,6 +4870,9 @@ pub fn spawn_event_listener(
                     } => {
                         s.round = round;
                         s.set_phase(Phase::WaitingFollowUp);
+                        if let Some(session_id) = session_id.as_deref() {
+                            s.remove_density_maintenance_satisfied_for_key(session_id);
+                        }
                         s.note_session_round(session_id.as_deref(), round);
                         s.note_session_phase(
                             session_id.as_deref(),
@@ -9740,16 +9749,24 @@ mod tests {
     }
 
     #[test]
-    fn managed_watch_context_pressure_allows_normal_tools_after_rewind() {
+    fn managed_watch_context_pressure_satisfied_after_rewind_across_alias_and_compact_cu_growth() {
         let mut s = McpAppState::new(
             "none".to_string(),
             "none".to_string(),
             autonomy::shared_autonomy(AutonomyState::default()),
             std::path::PathBuf::from("/tmp/test_session"),
         );
-        s.session_id = "codex-thread".to_string();
+        s.session_id = "wrapper-session".to_string();
         s.active_session_source = Some("codex".to_string());
         s.codex_managed_context = true;
+        s.session_aliases
+            .entry("wrapper-session".to_string())
+            .or_default()
+            .insert("codex-thread".to_string());
+        s.session_aliases
+            .entry("codex-thread".to_string())
+            .or_default()
+            .insert("wrapper-session".to_string());
         s.insufficient_rewind_notices.insert(
             "codex-thread".to_string(),
             InsufficientRewindNotice {
@@ -9788,28 +9805,165 @@ mod tests {
             },
         );
 
-        let pressure = s.context_pressure_snapshot();
+        let pressure = s.context_pressure_snapshot_for(Some("wrapper-session"), Some(true));
         assert_eq!(pressure["status"], "watch");
         assert_eq!(pressure["rewind_only"], false);
-        assert_eq!(pressure["density_maintenance_recommended"], true);
+        assert_eq!(pressure["density_maintenance_recommended"], false);
         assert_eq!(pressure["normal_tools_allowed"], true);
-        assert_eq!(pressure["broad_followup_allowed"], false);
+        assert_eq!(pressure["broad_followup_allowed"], true);
         assert_eq!(pressure["narrow_inflight_validation_allowed"], true);
+        assert_eq!(pressure["required_action"], "continue_after_density_rewind");
+        assert_eq!(
+            pressure["last_rewind_insufficient"],
+            serde_json::Value::Null
+        );
+        assert_eq!(
+            pressure["density_maintenance_satisfied"]["record_id"],
+            "rewind-watch"
+        );
+        assert_eq!(
+            pressure["density_maintenance_satisfied"]["valid_until"],
+            "round_complete_or_rewind_only"
+        );
+        let message = pressure["message"].as_str().unwrap_or_default();
+        assert!(message.contains("successful managed-context rewind already satisfied"));
+        assert!(!message.contains("recovery"));
+        assert!(!message.contains("Use rewind_context before ordinary"));
+        assert!(s.rewind_only_gate_message("execute_cu_actions").is_none());
+
+        apply_observed_event_to_mcp_state(
+            &mut s,
+            &AppEvent::CodexThreadActionResult {
+                session_id: Some("codex-thread".to_string()),
+                action: "execute_cu_actions".to_string(),
+                success: true,
+                message: "ok (781 bytes)".to_string(),
+            },
+        );
+        apply_observed_event_to_mcp_state(
+            &mut s,
+            &AppEvent::UsageSnapshot {
+                session_id: Some("codex-thread".to_string()),
+                main: frontend::ModelUsageSnapshot {
+                    provider: "openai".to_string(),
+                    model: "gpt-5.2-codex".to_string(),
+                    tokens_used: 221_166,
+                    context_window: 258_400,
+                    hard_context_window: Some(272_000),
+                    usage_pct: 85.6,
+                    prompt_tokens: 220_781,
+                    completion_tokens: 385,
+                    cached_tokens: 0,
+                },
+                presence: None,
+            },
+        );
+
+        let pressure = s.context_pressure_snapshot_for(Some("wrapper-session"), Some(true));
+        assert_eq!(pressure["status"], "watch");
+        assert_eq!(pressure["density_maintenance_recommended"], false);
+        assert_eq!(pressure["broad_followup_allowed"], true);
+        assert_eq!(pressure["required_action"], "continue_after_density_rewind");
+        assert_eq!(
+            pressure["density_maintenance_satisfied"]["record_id"],
+            "rewind-watch"
+        );
+
+        apply_observed_event_to_mcp_state(
+            &mut s,
+            &AppEvent::UsageSnapshot {
+                session_id: Some("codex-thread".to_string()),
+                main: frontend::ModelUsageSnapshot {
+                    provider: "openai".to_string(),
+                    model: "gpt-5.2-codex".to_string(),
+                    tokens_used: 258_400,
+                    context_window: 258_400,
+                    hard_context_window: Some(272_000),
+                    usage_pct: 100.0,
+                    prompt_tokens: 258_000,
+                    completion_tokens: 400,
+                    cached_tokens: 0,
+                },
+                presence: None,
+            },
+        );
+        let pressure = s.context_pressure_snapshot_for(Some("wrapper-session"), Some(true));
+        assert_eq!(pressure["status"], "high");
+        assert_eq!(pressure["rewind_only"], true);
+        assert_eq!(pressure["normal_tools_allowed"], false);
+        assert_eq!(pressure["required_action"], "rewind_context");
+        assert_eq!(
+            pressure["density_maintenance_satisfied"],
+            serde_json::Value::Null
+        );
+    }
+
+    #[test]
+    fn managed_watch_context_pressure_requires_density_again_after_round_complete() {
+        let mut s = McpAppState::new(
+            "none".to_string(),
+            "none".to_string(),
+            autonomy::shared_autonomy(AutonomyState::default()),
+            std::path::PathBuf::from("/tmp/test_session"),
+        );
+        s.session_id = "codex-thread".to_string();
+        s.active_session_source = Some("codex".to_string());
+        s.codex_managed_context = true;
+
+        apply_observed_event_to_mcp_state(
+            &mut s,
+            &AppEvent::CodexThreadActionResult {
+                session_id: Some("codex-thread".to_string()),
+                action: "rewind_context".to_string(),
+                success: true,
+                message: "Rewound Codex thread and saved record rewind-watch.".to_string(),
+            },
+        );
+        apply_observed_event_to_mcp_state(
+            &mut s,
+            &AppEvent::UsageSnapshot {
+                session_id: Some("codex-thread".to_string()),
+                main: frontend::ModelUsageSnapshot {
+                    provider: "openai".to_string(),
+                    model: "gpt-5.2-codex".to_string(),
+                    tokens_used: 220_385,
+                    context_window: 258_400,
+                    hard_context_window: Some(272_000),
+                    usage_pct: 85.3,
+                    prompt_tokens: 220_000,
+                    completion_tokens: 385,
+                    cached_tokens: 0,
+                },
+                presence: None,
+            },
+        );
+        assert_eq!(
+            s.context_pressure_snapshot()["required_action"],
+            "continue_after_density_rewind"
+        );
+
+        apply_observed_event_to_mcp_state(
+            &mut s,
+            &AppEvent::RoundComplete {
+                session_id: Some("codex-thread".to_string()),
+                round: 3,
+                turns_in_round: 2,
+                native_message_count: None,
+            },
+        );
+
+        let pressure = s.context_pressure_snapshot();
+        assert_eq!(pressure["status"], "watch");
+        assert_eq!(pressure["density_maintenance_recommended"], true);
+        assert_eq!(pressure["broad_followup_allowed"], false);
         assert_eq!(
             pressure["required_action"],
             "density_handoff_before_broad_work"
         );
         assert_eq!(
-            pressure["last_rewind_insufficient"],
+            pressure["density_maintenance_satisfied"],
             serde_json::Value::Null
         );
-        let message = pressure["message"].as_str().unwrap_or_default();
-        assert!(message.contains("Normal tools remain allowed"));
-        assert!(message.contains("one narrow in-flight validation or build"));
-        assert!(message.contains("concise no-rewind density handoff"));
-        assert!(!message.contains("recovery"));
-        assert!(!message.contains("Use rewind_context before ordinary"));
-        assert!(s.rewind_only_gate_message("execute_cu_actions").is_none());
     }
 
     #[test]
