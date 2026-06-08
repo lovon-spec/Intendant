@@ -21241,6 +21241,22 @@ function stationBuildControlsSummary() {
     && sharedViewState.action === 'input_request'
     && sharedViewState.displayId !== null
     && displaySlots.has(sharedViewState.displayId);
+  const externalTurn = stationBuildExternalTurnSummary({
+    backend,
+    command,
+    sessionId,
+    sessionSelection,
+    sessionSource,
+    sessionCommand,
+    sessionLivePhase,
+    sessionActive,
+    sessionDetached,
+    sessionCanFocus,
+    sessionCanAttach,
+    sessionCanStop,
+    sessionCanConfig,
+    sessionCanInterrupt,
+  });
   return {
     backend: backend || 'none',
     command,
@@ -21291,6 +21307,11 @@ function stationBuildControlsSummary() {
     sessionGoalTokens: sessionGoal?.tokensUsed !== null && sessionGoal?.tokensUsed !== undefined
       ? String(sessionGoal.tokensUsed)
       : '',
+    externalTurnState: externalTurn.state,
+    externalTurnBackend: externalTurn.backend,
+    externalTurnLabel: externalTurn.label,
+    externalTurnDetail: externalTurn.detail,
+    externalTurnSessionId: externalTurn.sessionId,
     promptMode,
     directMode: !!document.getElementById('direct-mode-toggle')?.checked,
     draftChars,
@@ -21313,6 +21334,63 @@ function stationBuildControlsSummary() {
     sharedViewAction: sharedViewState.action || '',
     sharedViewNote,
     sharedViewCanTakeInput,
+  };
+}
+
+function stationBuildExternalTurnSummary(input = {}) {
+  const backend = normalizeAgentId(input.backend || '');
+  const source = normalizeAgentId(input.sessionSource || '');
+  const configured = backend && backend !== 'internal' && backend !== 'none' ? backend : '';
+  const external = source && source !== 'intendant' ? source : configured;
+  if (!external) {
+    return {
+      state: 'internal',
+      backend: 'internal',
+      label: 'Internal agent',
+      detail: 'Intendant daemon loop',
+      sessionId: String(input.sessionId || ''),
+    };
+  }
+
+  const phase = normalizeSessionPhase(input.sessionLivePhase || '');
+  const command = String(input.sessionCommand || input.command || '').trim();
+  const sessionId = String(input.sessionId || '').trim();
+  const sourceLabel = prettyAgentName(external) || external;
+  let state = 'stopped';
+  if (!command && !sessionId) {
+    state = 'misconfigured';
+  } else if (!sessionId) {
+    state = 'queued';
+  } else if (input.sessionDetached) {
+    state = 'stopped';
+  } else if (phase.startsWith('waiting')) {
+    state = 'waiting';
+  } else if (phase === 'thinking') {
+    state = 'thinking';
+  } else if (phase === 'running' || phase === 'orchestrating' || input.sessionActive) {
+    state = 'running tools';
+  } else if (phase === 'interrupted' || phase === 'done') {
+    state = 'stopped';
+  }
+
+  const capabilities = [
+    input.sessionCanInterrupt ? 'interrupt' : '',
+    input.sessionCanAttach ? 'attach' : '',
+    input.sessionCanFocus ? 'focus' : '',
+    input.sessionCanConfig ? 'config' : '',
+  ].filter(Boolean).join(' / ');
+  const detail = [
+    input.sessionSelection || '',
+    phase || (input.sessionDetached ? 'detached' : ''),
+    capabilities,
+    command && command !== 'internal' ? command : '',
+  ].filter(Boolean).join(' / ');
+  return {
+    state,
+    backend: external,
+    label: sourceLabel,
+    detail: detail || (sessionId ? 'external session selected' : 'external backend selected'),
+    sessionId,
   };
 }
 

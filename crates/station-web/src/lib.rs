@@ -1841,6 +1841,9 @@ impl StationInner {
             self.snapshot.managed.used_tokens,
             self.snapshot.managed.effective_window,
         );
+        let external_turn =
+            controls.external_turn_state != "internal" && !controls.external_turn_state.is_empty();
+        let external_color = external_turn_color_css(&controls.external_turn_state);
         let metrics = [
             (
                 "Draft",
@@ -1857,10 +1860,27 @@ impl StationInner {
                 C_BLUE_CSS,
             ),
             (
-                "Session",
-                session_state.to_string(),
-                nonempty(&controls.session_goal_status, &controls.session_live_phase),
-                if controls.session_active {
+                if external_turn { "External" } else { "Session" },
+                if external_turn {
+                    nonempty(&controls.external_turn_state, session_state)
+                } else {
+                    session_state.to_string()
+                },
+                if external_turn {
+                    truncate(
+                        &format!(
+                            "{} / {}",
+                            nonempty(&controls.external_turn_label, "external"),
+                            nonempty(&controls.external_turn_detail, "controller")
+                        ),
+                        42,
+                    )
+                } else {
+                    nonempty(&controls.session_goal_status, &controls.session_live_phase)
+                },
+                if external_turn {
+                    external_color
+                } else if controls.session_active {
                     C_TEAL_CSS
                 } else {
                     C_OVERLAY1_CSS
@@ -6139,6 +6159,7 @@ impl StationInner {
             );
             yy += 22.0;
         }
+        yy = self.draw_external_turn_monitor(x, panel_w, yy, &controls);
         self.panel_row(
             x,
             yy,
@@ -6320,6 +6341,115 @@ impl StationInner {
             &maintenance_actions,
             &codex_target,
         );
+    }
+
+    fn draw_external_turn_monitor(
+        &mut self,
+        x: f32,
+        panel_w: f32,
+        y: f32,
+        controls: &StationControlsSummary,
+    ) -> f32 {
+        if controls.external_turn_state.is_empty() || controls.external_turn_state == "internal" {
+            return y;
+        }
+        let mut yy = y + 8.0;
+        let color = external_turn_color_css(&controls.external_turn_state);
+        self.section_title_color(x, yy, "External turn", color);
+        yy += 22.0;
+        self.round_rect(
+            x + 12.0,
+            yy - 14.0,
+            panel_w - 24.0,
+            74.0,
+            4.0,
+            "rgba(17,17,27,0.78)",
+            color,
+        );
+        self.ctx.set_fill_style(&JsValue::from_str(color));
+        self.ctx
+            .fill_rect((x + 20.0) as f64, (yy - 6.0) as f64, 3.0, 48.0);
+        self.text(
+            &truncate(&nonempty(&controls.external_turn_label, "external"), 24),
+            x + 30.0,
+            yy,
+            10.0,
+            color,
+            "bold",
+        );
+        self.text(
+            &truncate(&controls.external_turn_state, 18),
+            x + panel_w - 116.0,
+            yy,
+            10.0,
+            color,
+            "bold",
+        );
+        yy += 18.0;
+        self.text(
+            &truncate(&controls.external_turn_detail, 48),
+            x + 30.0,
+            yy,
+            9.0,
+            C_SUBTEXT0_CSS,
+            "normal",
+        );
+        yy += 18.0;
+        self.text(
+            &truncate(
+                &format!(
+                    "{} / {}",
+                    nonempty(&controls.external_turn_session_id, "no session"),
+                    nonempty(&controls.session_live_phase, "controller")
+                ),
+                48,
+            ),
+            x + 30.0,
+            yy,
+            8.5,
+            C_OVERLAY1_CSS,
+            "normal",
+        );
+        yy += 31.0;
+
+        let session_id = nonempty(&controls.external_turn_session_id, &controls.session_id);
+        let mut actions = Vec::new();
+        if controls.session_can_focus {
+            actions.push((
+                "focus".to_string(),
+                "focus".to_string(),
+                56.0,
+                C_TEAL_CSS.to_string(),
+            ));
+        }
+        if controls.session_can_attach {
+            actions.push((
+                "attach".to_string(),
+                "attach".to_string(),
+                68.0,
+                C_PEACH_CSS.to_string(),
+            ));
+        }
+        if controls.session_can_interrupt || controls.session_can_stop {
+            actions.push((
+                "stop".to_string(),
+                "stop".to_string(),
+                54.0,
+                C_RED_CSS.to_string(),
+            ));
+        }
+        if controls.session_can_config {
+            actions.push((
+                "config".to_string(),
+                "config".to_string(),
+                64.0,
+                C_MAUVE_CSS.to_string(),
+            ));
+        }
+        if !actions.is_empty() && !session_id.is_empty() {
+            yy = self.draw_session_action_pills(x, panel_w, yy - 14.0, &actions, &session_id);
+        }
+        yy + 8.0
     }
 
     fn draw_view_info(&mut self, x: f32, y: f32, _panel_w: f32) {
@@ -8278,6 +8408,11 @@ struct StationControlsSummary {
     session_goal_status: String,
     session_goal_objective: String,
     session_goal_tokens: String,
+    external_turn_state: String,
+    external_turn_backend: String,
+    external_turn_label: String,
+    external_turn_detail: String,
+    external_turn_session_id: String,
     prompt_mode: String,
     direct_mode: bool,
     draft_chars: u32,
@@ -8344,6 +8479,11 @@ impl Default for StationControlsSummary {
             session_goal_status: String::new(),
             session_goal_objective: String::new(),
             session_goal_tokens: String::new(),
+            external_turn_state: String::new(),
+            external_turn_backend: String::new(),
+            external_turn_label: String::new(),
+            external_turn_detail: String::new(),
+            external_turn_session_id: String::new(),
             prompt_mode: String::new(),
             direct_mode: false,
             draft_chars: 0,
@@ -9137,6 +9277,7 @@ const C_SUBTEXT0_CSS: &str = "#a6adc8";
 const C_OVERLAY0_CSS: &str = "#6c7086";
 const C_OVERLAY1_CSS: &str = "#7f849c";
 const C_BLUE_CSS: &str = "#89b4fa";
+const C_LAVENDER_CSS: &str = "#b4befe";
 const C_TEAL_CSS: &str = "#94e2d5";
 const C_GREEN_CSS: &str = "#a6e3a1";
 const C_YELLOW_CSS: &str = "#f9e2af";
@@ -9236,6 +9377,18 @@ fn display_lane_color_css(kind: &str) -> &'static str {
         "shared_view" => C_GREEN_CSS,
         "operator_target" => C_BLUE_CSS,
         _ => C_OVERLAY1_CSS,
+    }
+}
+
+fn external_turn_color_css(state: &str) -> &'static str {
+    match state {
+        "thinking" => C_LAVENDER_CSS,
+        "running tools" => C_TEAL_CSS,
+        "waiting" => C_YELLOW_CSS,
+        "queued" => C_BLUE_CSS,
+        "misconfigured" => C_RED_CSS,
+        "stopped" => C_OVERLAY1_CSS,
+        _ => C_MAUVE_CSS,
     }
 }
 
