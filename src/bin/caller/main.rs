@@ -9599,6 +9599,8 @@ type FollowUpReceiver = tokio::sync::mpsc::Receiver<FollowUpMessage>;
 /// CLI flags parsed from command-line arguments.
 struct CliFlags {
     task: Option<String>,
+    /// --task-file <PATH>: Read the initial task from a file instead of argv.
+    task_file: Option<String>,
     provider: Option<String>,
     model: Option<String>,
     verbose: bool,
@@ -9672,6 +9674,7 @@ fn print_help() {
     println!("OPTIONS:");
     println!("    --provider <NAME>     API provider (openai, anthropic, or gemini)");
     println!("    --model <NAME>        Model name to use");
+    println!("    --task-file <PATH>    Read initial task from file instead of argv");
     println!("    --autonomy <LEVEL>    Autonomy level: low, medium, high, full");
     println!("    --log-file <DIR>      Override session log directory (default: ~/.intendant/logs/<uuid>/)");
     println!("    --continue, -c        Resume the most recent session for this project");
@@ -10098,6 +10101,7 @@ fn parse_cli_flags() -> Result<CliFlags, CallerError> {
     let args: Vec<String> = env::args().skip(1).collect();
     let mut flags = CliFlags {
         task: None,
+        task_file: None,
         provider: None,
         model: None,
         verbose: false,
@@ -10154,6 +10158,16 @@ fn parse_cli_flags() -> Result<CliFlags, CallerError> {
                     i += 2;
                 } else {
                     return Err(CallerError::Config("Missing value for --model".to_string()));
+                }
+            }
+            "--task-file" => {
+                if i + 1 < args.len() {
+                    flags.task_file = Some(args[i + 1].clone());
+                    i += 2;
+                } else {
+                    return Err(CallerError::Config(
+                        "Missing value for --task-file".to_string(),
+                    ));
                 }
             }
             "--verbose" | "-v" => {
@@ -10353,6 +10367,11 @@ fn parse_cli_flags() -> Result<CliFlags, CallerError> {
     if !task_parts.is_empty() {
         flags.task = Some(task_parts.join(" "));
     }
+    if flags.task.is_some() && flags.task_file.is_some() {
+        return Err(CallerError::Config(
+            "`--task-file` cannot be combined with a positional task".to_string(),
+        ));
+    }
     validate_tls_cli_flags(&flags)?;
 
     Ok(flags)
@@ -10378,6 +10397,7 @@ fn validate_tls_cli_flags(flags: &CliFlags) -> Result<(), CallerError> {
 fn should_start_idle_web_daemon(use_web: bool, flags: &CliFlags) -> bool {
     use_web
         && !flags.mcp
+        && flags.task_file.is_none()
         && flags
             .task
             .as_ref()
@@ -15609,6 +15629,7 @@ Also: {"source": "bare"}"#;
     fn cli_flags_for_tests() -> CliFlags {
         CliFlags {
             task: None,
+            task_file: None,
             provider: None,
             model: None,
             verbose: false,
@@ -15652,6 +15673,55 @@ Also: {"source": "bare"}"#;
 
         flags.task = Some("do the thing".to_string());
         assert!(!should_start_idle_web_daemon(true, &flags));
+
+        flags.task = None;
+        flags.task_file = Some("/tmp/intendant-task.txt".to_string());
+        assert!(!should_start_idle_web_daemon(true, &flags));
+    }
+
+    #[test]
+    fn task_file_is_trimmed_for_initial_task() {
+        let dir = tempfile::tempdir().unwrap();
+        let task_path = dir.path().join("task.txt");
+        std::fs::write(&task_path, "long managed prompt\n").unwrap();
+
+        let mut flags = cli_flags_for_tests();
+        flags.task_file = Some(task_path.to_string_lossy().into_owned());
+
+        let task = get_task_from_flags_or_env(&flags).unwrap();
+        assert_eq!(task, "long managed prompt");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn black_frame_detector_rejects_all_zero_rgb() {
+        let frame = display::Frame {
+            data: vec![0; 4 * 4 * 4],
+            format: display::FrameFormat::Bgra,
+            width: 4,
+            height: 4,
+            stride: 16,
+            timestamp: std::time::Instant::now(),
+        };
+
+        assert!(!frame_has_visible_rgb(&frame));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn black_frame_detector_accepts_visible_rgb() {
+        let mut data = vec![0; 4 * 4 * 4];
+        data[10] = 64;
+        let frame = display::Frame {
+            data,
+            format: display::FrameFormat::Bgra,
+            width: 4,
+            height: 4,
+            stride: 16,
+            timestamp: std::time::Instant::now(),
+        };
+
+        assert!(frame_has_visible_rgb(&frame));
     }
 
     #[test]
@@ -15660,6 +15730,7 @@ Also: {"source": "bare"}"#;
         // but we can test the struct defaults
         let flags = CliFlags {
             task: None,
+            task_file: None,
             provider: None,
             model: None,
             verbose: false,
@@ -15711,6 +15782,7 @@ Also: {"source": "bare"}"#;
     fn cli_web_flag() {
         let flags = CliFlags {
             task: None,
+            task_file: None,
             provider: None,
             model: None,
             verbose: false,
@@ -15750,6 +15822,7 @@ Also: {"source": "bare"}"#;
     fn cli_web_with_port() {
         let flags = CliFlags {
             task: None,
+            task_file: None,
             provider: None,
             model: None,
             verbose: false,
@@ -18979,6 +19052,11 @@ async fn run_round_loop(
 fn get_task_from_flags_or_env(flags: &CliFlags) -> Result<String, CallerError> {
     if let Some(ref task) = flags.task {
         return Ok(task.clone());
+    }
+    if let Some(ref path) = flags.task_file {
+        return std::fs::read_to_string(path)
+            .map(|s| s.trim_end_matches(|c| c == '\r' || c == '\n').to_string())
+            .map_err(|e| CallerError::Config(format!("Failed to read --task-file {path}: {e}")));
     }
     if let Ok(task) = env::var("INTENDANT_TASK") {
         return Ok(task);
@@ -24162,7 +24240,11 @@ async fn activate_user_display(
     // Detect Wayland even when WAYLAND_DISPLAY isn't in our env (e.g. started
     // from a tty/ssh session while a graphical session is active).
     #[cfg(target_os = "linux")]
-    if std::env::var("WAYLAND_DISPLAY").is_ok() || detect_wayland_socket().is_some() {
+    let wayland_session_detected =
+        std::env::var("WAYLAND_DISPLAY").is_ok() || detect_wayland_socket().is_some();
+
+    #[cfg(target_os = "linux")]
+    if wayland_session_detected {
         if let Some(socket) = detect_wayland_socket() {
             if std::env::var("WAYLAND_DISPLAY").is_err() {
                 eprintln!(
@@ -24275,6 +24357,20 @@ async fn activate_user_display(
                 {
                     eprintln!("[user_display] X11 display session failed: {}", e);
                 } else {
+                    if wayland_session_detected && x11_fallback_session_is_all_black(&session).await
+                    {
+                        session.stop().await;
+                        reject_user_display_activation(
+                            bus,
+                            display_id,
+                            "Wayland portal was not approved and X11 fallback captured an \
+                             all-black rootless Xwayland frame. Approve the screen-sharing \
+                             portal for the user session, or target a virtual Xvfb display \
+                             for headed harness work."
+                                .to_string(),
+                        );
+                        return;
+                    }
                     let (width, height) = session.resolution();
                     let session = Arc::new(session);
                     session.spawn_metrics_logger(Some(bus.clone()));
@@ -24377,6 +24473,49 @@ async fn activate_user_display(
     {
         reject_user_display_activation(bus, display_id, "no supported display backend detected");
     }
+}
+
+#[cfg(target_os = "linux")]
+async fn x11_fallback_session_is_all_black(session: &display::DisplaySession) -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        if let Some(frame) = session.latest_frame().await {
+            return !frame_has_visible_rgb(&frame);
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn frame_has_visible_rgb(frame: &display::Frame) -> bool {
+    if frame.width == 0 || frame.height == 0 || frame.stride == 0 {
+        return false;
+    }
+    let row_bytes = frame.width as usize * 4;
+    let stride = frame.stride as usize;
+    if stride < row_bytes || frame.data.len() < stride.saturating_mul(frame.height as usize) {
+        return false;
+    }
+
+    let total_pixels = frame.width as usize * frame.height as usize;
+    let step = (total_pixels / 4096).max(1);
+    let mut pixel_index = 0usize;
+    for y in 0..frame.height as usize {
+        let row = y * stride;
+        for x in 0..frame.width as usize {
+            if pixel_index % step == 0 {
+                let px = row + x * 4;
+                if frame.data[px] > 3 || frame.data[px + 1] > 3 || frame.data[px + 2] > 3 {
+                    return true;
+                }
+            }
+            pixel_index += 1;
+        }
+    }
+    false
 }
 
 /// Auto-register the Windows desktop as an active display at web-daemon

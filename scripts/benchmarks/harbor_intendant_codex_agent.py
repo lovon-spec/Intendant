@@ -179,13 +179,15 @@ class IntendantCodex(Codex):
 
         await self.exec_as_agent(environment, command=setup_command, env=env)
 
-        escaped_instruction = shlex.quote(instruction)
         output_path = (EnvironmentPaths.agent_dir / self._OUTPUT_FILENAME).as_posix()
+        task_path = (EnvironmentPaths.agent_dir / "intendant-task.txt").as_posix()
+        escaped_instruction = shlex.quote(instruction)
         try:
             await self.exec_as_agent(
                 environment,
                 command=(
                     "set -euo pipefail\n"
+                    f"printf '%s' {escaped_instruction} > {shlex.quote(task_path)}\n"
                     f": > {shlex.quote(output_path)}\n"
                     "/usr/local/bin/intendant "
                     f"--web {self._web_port} "
@@ -193,7 +195,7 @@ class IntendantCodex(Codex):
                     "--no-presence "
                     "--agent codex "
                     f"--log-file {shlex.quote(intendant_log_dir)} "
-                    f"{escaped_instruction} "
+                    f"--task-file {shlex.quote(task_path)} "
                     f"> {shlex.quote(output_path)} 2>&1 </dev/null &\n"
                     "intendant_pid=$!\n"
                     f"tail -n +1 -F {shlex.quote(output_path)} &\n"
