@@ -11993,6 +11993,7 @@ mod tests {
         let mut diff_tracker = ExternalDiffDeltaTracker::default();
         let mut pending_runtime_steers = std::collections::VecDeque::new();
         let mut handled_steer_ids = std::collections::HashSet::new();
+        let mut cancelled_follow_ups = HashSet::new();
         let mut dedupe = CodexThreadActionDedupe::default();
 
         let outcome = drain_external_agent_events(
@@ -12004,6 +12005,7 @@ mod tests {
             &mut diff_tracker,
             &mut pending_runtime_steers,
             &mut handled_steer_ids,
+            &mut cancelled_follow_ups,
             &mut dedupe,
             None,
             false,
