@@ -222,19 +222,20 @@ features they lack.
   threshold; listing anchors is for an immediate recovery, density handoff, or
   targeted cleanup rewind that is expected to materially improve the live
   transcript. Model-driven rewinds must first call `list_rewind_anchors`; by
-  default it returns one
-  compact whole-catalog result with exact `item_id` values and short semantic
-  rows for all matching valid anchors instead of a paged crawl. When a compact
-  row is ambiguous, `inspect_rewind_anchor` returns a small before/after window
-  for the candidate. `rewind_context` still validates the exact `item_id`
-  against the current rollout before mutating the Codex thread.
+  default it returns a bounded compact page with exact `item_id` values, short
+  semantic rows, `filtered_total`, and `next_offset`. Use `offset`/`limit` to
+  page through the catalog, `query` for semantic or exact-id filters, and
+  `reverse=true` for newest-first order. When a compact row is ambiguous,
+  `inspect_rewind_anchor` returns a small before/after window for the candidate.
+  `rewind_context` still validates the exact `item_id` against the current
+  rollout before mutating the Codex thread.
   When backend-reported pressure is at or above the rewind-only threshold,
   `list_rewind_anchors` defaults to recovery candidates: anchors whose nearest
   following backend token report is below that threshold with enough normal-tool
   resume headroom. The default recovery catalog narrows `positions` to accepted
   `rewind_context` values. `include_pruning_estimates=true` adds approximate
-  discard sizes to compact rows, while `detail=true` or explicit `offset`/`limit`
-  requests diagnostic detailed pages. Passing `include_non_recovery=true` is an
+  discard sizes to compact rows, while `detail=true` requests diagnostic
+  detailed pages. Passing `include_non_recovery=true` is an
   audit escape hatch, not the normal recovery path. Anchors inside the active
   managed-context recovery span, starting at the recovery kickstart prompt, are
   not valid recovery targets because they would preserve recovery instructions

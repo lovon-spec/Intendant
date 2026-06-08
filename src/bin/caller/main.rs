@@ -3318,6 +3318,8 @@ struct ContextRewindAnchorCompactCatalog {
     offset: usize,
     limit: usize,
     next_offset: Option<usize>,
+    output_cap_bytes: usize,
+    output_truncated: bool,
     query: Option<String>,
     include_management_tools: bool,
     include_non_recovery: bool,
@@ -3351,6 +3353,9 @@ const CONTEXT_REWIND_ANCHOR_LIST_MAX_LIMIT: usize = 10;
 const CONTEXT_REWIND_ANCHOR_INSPECT_DEFAULT_RADIUS: usize = 2;
 const CONTEXT_REWIND_ANCHOR_INSPECT_MAX_RADIUS: usize = 5;
 const CONTEXT_REWIND_ANCHOR_COMPACT_SUMMARY_LIMIT: usize = 96;
+const CONTEXT_REWIND_ANCHOR_COMPACT_TEXT_LIST_LIMIT: usize = 4;
+const CONTEXT_REWIND_ANCHOR_COMPACT_TEXT_ITEM_LIMIT: usize = 48;
+const CONTEXT_REWIND_ANCHOR_COMPACT_OUTPUT_MAX_BYTES: usize = 6_000;
 const CONTEXT_REWIND_ANCHOR_SUMMARY_LIMIT: usize = 120;
 const CONTEXT_REWIND_ANCHOR_MERGED_SUMMARY_LIMIT: usize = 160;
 const CONTEXT_REWIND_RECOVERY_MIN_RESUME_HEADROOM_TOKENS: u64 = 8_000;
@@ -3461,26 +3466,31 @@ fn list_context_rewind_anchors_from_rollout(
     }
     let filtered_total = anchors.len();
     if compact_catalog {
+        let page = anchors
+            .iter()
+            .skip(offset)
+            .take(limit)
+            .map(|anchor| context_rewind_anchor_compact_entry(anchor, include_pruning_estimates))
+            .collect::<Vec<_>>();
+        let next_offset = (offset.saturating_add(page.len()) < filtered_total)
+            .then_some(offset.saturating_add(page.len()));
         let compact = ContextRewindAnchorCompactCatalog {
-            catalog_format: "compact_all",
+            catalog_format: "compact_page",
             total,
             filtered_total,
-            offset: 0,
-            limit: filtered_total,
-            next_offset: None,
+            offset,
+            limit,
+            next_offset,
+            output_cap_bytes: CONTEXT_REWIND_ANCHOR_COMPACT_OUTPUT_MAX_BYTES,
+            output_truncated: false,
             query,
             include_management_tools,
             include_non_recovery,
             recovery_candidates_only,
             pruning_estimates_included: include_pruning_estimates,
-            anchors: anchors
-                .iter()
-                .map(|anchor| {
-                    context_rewind_anchor_compact_entry(anchor, include_pruning_estimates)
-                })
-                .collect(),
+            anchors: page,
         };
-        return serde_json::to_string(&compact).map_err(|err| err.to_string());
+        return serialize_context_rewind_anchor_compact_catalog(compact, filtered_total);
     }
     let mut page = anchors
         .into_iter()
@@ -3533,9 +3543,26 @@ fn context_rewind_anchor_use_compact_catalog(
     {
         return true;
     }
-    !params.get("offset").is_some()
-        && !params.get("start_index").is_some()
-        && !params.get("limit").is_some()
+    true
+}
+
+fn serialize_context_rewind_anchor_compact_catalog(
+    mut compact: ContextRewindAnchorCompactCatalog,
+    filtered_total: usize,
+) -> Result<String, String> {
+    loop {
+        let serialized = serde_json::to_string(&compact).map_err(|err| err.to_string())?;
+        if serialized.len() <= CONTEXT_REWIND_ANCHOR_COMPACT_OUTPUT_MAX_BYTES
+            || compact.anchors.len() <= 1
+        {
+            return Ok(serialized);
+        }
+        compact.anchors.pop();
+        compact.output_truncated = true;
+        compact.next_offset = (compact.offset.saturating_add(compact.anchors.len())
+            < filtered_total)
+            .then_some(compact.offset.saturating_add(compact.anchors.len()));
+    }
 }
 
 fn context_rewind_anchor_compact_entry(
@@ -3555,8 +3582,8 @@ fn context_rewind_anchor_compact_entry(
         item_type,
         positions: anchor.positions.clone(),
         position_hint: anchor.position_hint,
-        names: anchor.names.clone(),
-        roles: anchor.roles.clone(),
+        names: context_rewind_anchor_compact_strings(&anchor.names),
+        roles: context_rewind_anchor_compact_strings(&anchor.roles),
         summary,
         density_eligible_positions: anchor.density_eligible_positions.clone(),
         approx_pruned_tokens_before: include_pruning_estimates
@@ -3566,6 +3593,14 @@ fn context_rewind_anchor_compact_entry(
             .then_some(anchor.approx_pruned_tokens_after)
             .flatten(),
     }
+}
+
+fn context_rewind_anchor_compact_strings(values: &[String]) -> Vec<String> {
+    values
+        .iter()
+        .take(CONTEXT_REWIND_ANCHOR_COMPACT_TEXT_LIST_LIMIT)
+        .map(|value| truncate_string_copy(value, CONTEXT_REWIND_ANCHOR_COMPACT_TEXT_ITEM_LIMIT))
+        .collect()
 }
 
 fn inspect_context_rewind_anchor_from_rollout(
@@ -5187,7 +5222,7 @@ fn managed_context_recovery_kickstart_text(
         ""
     };
     format!(
-        "<managed_context_recovery>\nBackend-reported Codex context pressure is {status} ({used}/{limit} tokens{hard}), leaving too little room for a normal tool/result cycle. Do not continue normally. The Intendant MCP tools list_rewind_anchors and inspect_rewind_anchor are callable in this turn; any earlier transcript claim that either is unavailable is stale and incorrect. First call list_rewind_anchors without a query to inspect the compact valid non-management recovery catalog. The normal catalog hides anchors known to remain at/above the rewind-only limit or without enough normal-tool resume headroom; include_non_recovery=true is diagnostic-only and rows with recovery_eligible=false must not be passed to rewind_context. If a compact catalog row is ambiguous, call inspect_rewind_anchor for the candidate item_id before mutating the thread. Then call rewind_context with one exact returned item_id, the returned position_hint or a value in positions, and a dense carry-forward primer. A successful rewind only validates lineage; normal tools remain unavailable until backend-reported pressure has enough normal-tool headroom below the rewind-only limit. Do not synthesize anchor ids from prior failed tool calls. Do not use auto anchors or N-turn rewinds.{held}\n</managed_context_recovery>",
+        "<managed_context_recovery>\nBackend-reported Codex context pressure is {status} ({used}/{limit} tokens{hard}), leaving too little room for a normal tool/result cycle. Do not continue normally. The Intendant MCP tools list_rewind_anchors and inspect_rewind_anchor are callable in this turn; any earlier transcript claim that either is unavailable is stale and incorrect. First call list_rewind_anchors without a query to inspect the first bounded compact page of valid non-management recovery anchors; use next_offset/offset, limit, query, or reverse to inspect other catalog ranges without dumping the whole catalog. The normal catalog hides anchors known to remain at/above the rewind-only limit or without enough normal-tool resume headroom; include_non_recovery=true is diagnostic-only and rows with recovery_eligible=false must not be passed to rewind_context. If a compact catalog row is ambiguous, call inspect_rewind_anchor for the candidate item_id before mutating the thread. Then call rewind_context with one exact returned item_id, the returned position_hint or a value in positions, and a dense carry-forward primer. A successful rewind only validates lineage; normal tools remain unavailable until backend-reported pressure has enough normal-tool headroom below the rewind-only limit. Do not synthesize anchor ids from prior failed tool calls. Do not use auto anchors or N-turn rewinds.{held}\n</managed_context_recovery>",
         status = pressure.status,
         used = pressure.used_tokens,
         limit = pressure.rewind_only_limit,
@@ -5257,7 +5292,7 @@ fn managed_context_backend_recovery_kickstart_text(
         .map(|hint| format!(" Codex recovery hint: {hint}"))
         .unwrap_or_default();
     format!(
-        "<managed_context_recovery>\nCodex reported backend recovery required before completing the turn: {message}.{hint} Do not continue normally. The Intendant MCP tools list_rewind_anchors and inspect_rewind_anchor are callable in this turn; any earlier transcript claim that either is unavailable is stale and incorrect. First call list_rewind_anchors without a query to inspect the compact valid non-management recovery catalog. The normal catalog hides anchors known to remain at/above the rewind-only limit or without enough normal-tool resume headroom; include_non_recovery=true is diagnostic-only and rows with recovery_eligible=false must not be passed to rewind_context. If a compact catalog row is ambiguous, call inspect_rewind_anchor for the candidate item_id before mutating the thread. Then call rewind_context with one exact returned item_id, the returned position_hint or a value in positions, and a dense carry-forward primer. A successful rewind only validates lineage; normal tools remain unavailable until backend-reported pressure has enough normal-tool headroom below the rewind-only limit. Do not synthesize anchor ids from prior failed tool calls. Do not use auto anchors or N-turn rewinds.\n</managed_context_recovery>"
+        "<managed_context_recovery>\nCodex reported backend recovery required before completing the turn: {message}.{hint} Do not continue normally. The Intendant MCP tools list_rewind_anchors and inspect_rewind_anchor are callable in this turn; any earlier transcript claim that either is unavailable is stale and incorrect. First call list_rewind_anchors without a query to inspect the first bounded compact page of valid non-management recovery anchors; use next_offset/offset, limit, query, or reverse to inspect other catalog ranges without dumping the whole catalog. The normal catalog hides anchors known to remain at/above the rewind-only limit or without enough normal-tool resume headroom; include_non_recovery=true is diagnostic-only and rows with recovery_eligible=false must not be passed to rewind_context. If a compact catalog row is ambiguous, call inspect_rewind_anchor for the candidate item_id before mutating the thread. Then call rewind_context with one exact returned item_id, the returned position_hint or a value in positions, and a dense carry-forward primer. A successful rewind only validates lineage; normal tools remain unavailable until backend-reported pressure has enough normal-tool headroom below the rewind-only limit. Do not synthesize anchor ids from prior failed tool calls. Do not use auto anchors or N-turn rewinds.\n</managed_context_recovery>"
     )
 }
 
@@ -13312,6 +13347,8 @@ mod tests {
         let missing = resolve_context_rewind_anchor(&path, "rewind_context-call_7")
             .expect_err("synthetic anchors are not accepted");
         assert!(missing.contains("call list_rewind_anchors"));
+        assert!(!missing.contains("call_latest_rewind"));
+        assert!(!missing.contains("call_prior_rewind"));
     }
 
     #[test]
@@ -14032,6 +14069,7 @@ mod tests {
             &serde_json::json!({
                 "offset": 0,
                 "limit": 10,
+                "detail": true,
                 "recovery_candidates_only": true,
             }),
         )
@@ -14284,6 +14322,7 @@ mod tests {
                 "query": "cargo build --release --bin intendant",
                 "offset": 0,
                 "limit": 10,
+                "detail": true,
                 "recovery_candidates_only": true,
             }),
         )
@@ -14615,10 +14654,10 @@ mod tests {
     }
 
     #[test]
-    fn context_rewind_anchor_catalog_default_is_compact_whole_catalog() {
+    fn context_rewind_anchor_catalog_default_is_bounded_compact_page() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("rollout.jsonl");
-        let lines = (0..6)
+        let lines = (0..224)
             .map(|idx| {
                 serde_json::json!({
                     "type": "response_item",
@@ -14638,17 +14677,35 @@ mod tests {
         let raw = list_context_rewind_anchors_from_rollout(&path, &serde_json::json!({}))
             .expect("anchor catalog");
         let catalog: serde_json::Value = serde_json::from_str(&raw).unwrap();
-        assert_eq!(catalog["catalog_format"].as_str(), Some("compact_all"));
-        assert_eq!(catalog["limit"].as_u64(), Some(6));
-        assert!(catalog["next_offset"].is_null());
-        assert_eq!(catalog["anchors"].as_array().unwrap().len(), 6);
+        assert_eq!(catalog["catalog_format"].as_str(), Some("compact_page"));
+        assert_eq!(
+            catalog["limit"].as_u64(),
+            Some(CONTEXT_REWIND_ANCHOR_LIST_DEFAULT_LIMIT as u64)
+        );
+        assert_eq!(
+            catalog["next_offset"].as_u64(),
+            Some(CONTEXT_REWIND_ANCHOR_LIST_DEFAULT_LIMIT as u64)
+        );
+        assert_eq!(catalog["filtered_total"].as_u64(), Some(224));
+        assert_eq!(
+            catalog["output_cap_bytes"].as_u64(),
+            Some(CONTEXT_REWIND_ANCHOR_COMPACT_OUTPUT_MAX_BYTES as u64)
+        );
+        assert_eq!(
+            catalog["anchors"].as_array().unwrap().len(),
+            CONTEXT_REWIND_ANCHOR_LIST_DEFAULT_LIMIT
+        );
         assert!(catalog.get("selection_note").is_none());
         assert!(catalog.get("usage").is_none());
-        assert!(raw.len() < 2_000, "catalog too large: {} bytes", raw.len());
+        assert!(
+            raw.len() <= CONTEXT_REWIND_ANCHOR_COMPACT_OUTPUT_MAX_BYTES,
+            "catalog too large: {} bytes",
+            raw.len()
+        );
     }
 
     #[test]
-    fn context_rewind_anchor_compact_default_covers_all_without_detail_bloat() {
+    fn context_rewind_anchor_compact_pages_discover_all_without_detail_bloat() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("rollout.jsonl");
         let long_output = "large diagnostic output ".repeat(80);
@@ -14688,31 +14745,45 @@ mod tests {
             "compact catalog should not expose repeated raw output blobs"
         );
         let catalog: serde_json::Value = serde_json::from_str(&raw).unwrap();
-        assert_eq!(catalog["catalog_format"].as_str(), Some("compact_all"));
+        assert_eq!(catalog["catalog_format"].as_str(), Some("compact_page"));
         assert_eq!(catalog["filtered_total"].as_u64(), Some(12));
-        assert_eq!(catalog["limit"].as_u64(), Some(12));
-        assert!(catalog["next_offset"].is_null());
         let anchors = catalog["anchors"].as_array().unwrap();
-        assert_eq!(anchors.len(), 12);
-        let ids = anchors
-            .iter()
-            .filter_map(|anchor| anchor["item_id"].as_str())
-            .map(str::to_string)
-            .collect::<Vec<_>>();
+        assert_eq!(anchors.len(), CONTEXT_REWIND_ANCHOR_LIST_DEFAULT_LIMIT);
+
+        let mut ids = Vec::new();
+        let mut offset = 0usize;
+        loop {
+            let raw = list_context_rewind_anchors_from_rollout(
+                &path,
+                &serde_json::json!({ "offset": offset, "limit": 5 }),
+            )
+            .expect("anchor catalog page");
+            assert!(
+                raw.len() <= CONTEXT_REWIND_ANCHOR_COMPACT_OUTPUT_MAX_BYTES,
+                "catalog page too large: {} bytes",
+                raw.len()
+            );
+            let catalog: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            assert_eq!(catalog["catalog_format"].as_str(), Some("compact_page"));
+            for anchor in catalog["anchors"].as_array().unwrap() {
+                assert!(anchor.get("first_line").is_none(), "got {anchor}");
+                assert!(
+                    anchor.get("backend_usage_at_or_after_anchor").is_none(),
+                    "got {anchor}"
+                );
+                let summary = anchor["summary"].as_str().unwrap_or_default();
+                assert!(summary.len() <= CONTEXT_REWIND_ANCHOR_COMPACT_SUMMARY_LIMIT + 3);
+                ids.push(anchor["item_id"].as_str().unwrap().to_string());
+            }
+            let Some(next_offset) = catalog["next_offset"].as_u64() else {
+                break;
+            };
+            offset = usize::try_from(next_offset).unwrap();
+        }
         assert_eq!(
             ids,
             (0..12).map(|idx| format!("call_{idx}")).collect::<Vec<_>>()
         );
-        for anchor in anchors {
-            assert!(anchor.get("first_line").is_none(), "got {anchor}");
-            assert!(
-                anchor.get("backend_usage_at_or_after_anchor").is_none(),
-                "got {anchor}"
-            );
-            let summary = anchor["summary"].as_str().unwrap_or_default();
-            assert!(summary.len() <= CONTEXT_REWIND_ANCHOR_COMPACT_SUMMARY_LIMIT + 3);
-        }
-        assert!(raw.len() < 4_000, "catalog too large: {} bytes", raw.len());
     }
 
     #[test]
