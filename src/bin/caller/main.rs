@@ -2855,7 +2855,7 @@ fn validate_context_rewind_anchor_density_improvement(
         context_rewind_anchor_restore_usage_for_headroom(&anchor, position)
     else {
         return Err(format!(
-            "density handoff rewind anchor item_id `{requested_item_id}` cannot be validated for material density improvement at position `{}` because the rollout has no backend or prefix usage estimate for that position. Call list_rewind_anchors with include_pruning_estimates=true, choose an exact anchor whose density_eligible_positions includes the requested position, or reply with a concise no-rewind handoff and stop.",
+            "density handoff rewind anchor item_id `{requested_item_id}` cannot be validated for material density improvement at position `{}` because the rollout has no backend or prefix usage estimate for that position. Call list_rewind_anchors with density_candidates_only=true and include_pruning_estimates=true, choose an exact returned anchor/position, or reply with a concise no-rewind handoff and stop.",
             position.as_str()
         ));
     };
@@ -2879,7 +2879,7 @@ fn validate_context_rewind_anchor_density_improvement(
                 return Ok(());
             }
             return Err(format!(
-                "density handoff rewind anchor item_id `{requested_item_id}` is too shallow for position `{}`: a prior rewind to that exact item was followed by {} tokens, still at or above the recommended density threshold {} for the {} token context. Choose an exact item_id/position from list_rewind_anchors whose density_eligible_positions includes the requested position, or reply with a concise no-rewind handoff and stop.",
+                "density handoff rewind anchor item_id `{requested_item_id}` is too shallow for position `{}`: a prior rewind to that exact item was followed by {} tokens, still at or above the recommended density threshold {} for the {} token context. Choose an exact item_id/position from list_rewind_anchors with density_candidates_only=true, or reply with a concise no-rewind handoff and stop.",
                 position.as_str(),
                 outcome.used_tokens,
                 managed_context_density_recommended_limit(outcome.rewind_only_limit),
@@ -2890,7 +2890,7 @@ fn validate_context_rewind_anchor_density_improvement(
     }
 
     Err(format!(
-        "density handoff rewind anchor item_id `{requested_item_id}` is too shallow for position `{}`: restoring {} item would keep {} tokens, still at or above the recommended density threshold {} for the {} token context. Choose an exact item_id/position from list_rewind_anchors whose density_eligible_positions includes the requested position, or reply with a concise no-rewind handoff and stop.",
+        "density handoff rewind anchor item_id `{requested_item_id}` is too shallow for position `{}`: restoring {} item would keep {} tokens, still at or above the recommended density threshold {} for the {} token context. Choose an exact item_id/position from list_rewind_anchors with density_candidates_only=true, or reply with a concise no-rewind handoff and stop.",
         position.as_str(),
         usage_kind,
         used_tokens,
@@ -3306,6 +3306,7 @@ struct ContextRewindAnchorCatalog {
     include_management_tools: bool,
     include_non_recovery: bool,
     recovery_candidates_only: bool,
+    density_candidates_only: bool,
     pruning_estimates_included: bool,
     anchors: Vec<ContextRewindAnchorCatalogEntry>,
 }
@@ -3324,6 +3325,7 @@ struct ContextRewindAnchorCompactCatalog {
     include_management_tools: bool,
     include_non_recovery: bool,
     recovery_candidates_only: bool,
+    density_candidates_only: bool,
     pruning_estimates_included: bool,
     anchors: Vec<ContextRewindAnchorCompactEntry>,
 }
@@ -3414,6 +3416,13 @@ fn list_context_rewind_anchors_from_rollout(
         .and_then(|value| value.as_bool())
         .unwrap_or(false);
     let recovery_candidates_only = !include_non_recovery;
+    let density_candidates_only = params
+        .get("density_candidates_only")
+        .or_else(|| params.get("densityCandidatesOnly"))
+        .or_else(|| params.get("density_mode"))
+        .or_else(|| params.get("densityMode"))
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
     let reverse = params
         .get("reverse")
         .and_then(|value| value.as_bool())
@@ -3457,6 +3466,26 @@ fn list_context_rewind_anchors_from_rollout(
             }
         }
     }
+    if density_candidates_only {
+        anchors.retain(|anchor| {
+            anchor
+                .density_eligible_positions
+                .as_ref()
+                .is_some_and(|positions| !positions.is_empty())
+        });
+        for anchor in &mut anchors {
+            if let Some(positions) = anchor
+                .density_eligible_positions
+                .as_ref()
+                .filter(|positions| !positions.is_empty())
+            {
+                anchor.positions = positions.clone();
+                if !anchor.positions.contains(&anchor.position_hint) {
+                    anchor.position_hint = anchor.positions[0];
+                }
+            }
+        }
+    }
     if reverse {
         anchors.reverse();
     }
@@ -3487,6 +3516,7 @@ fn list_context_rewind_anchors_from_rollout(
             include_management_tools,
             include_non_recovery,
             recovery_candidates_only,
+            density_candidates_only,
             pruning_estimates_included: include_pruning_estimates,
             anchors: page,
         };
@@ -3515,6 +3545,7 @@ fn list_context_rewind_anchors_from_rollout(
         include_management_tools,
         include_non_recovery,
         recovery_candidates_only,
+        density_candidates_only,
         pruning_estimates_included: include_pruning_estimates,
         anchors: page,
     };
@@ -5242,7 +5273,7 @@ fn managed_context_density_handoff_text(pressure: ManagedContextDensityPressure)
         .map(|hard| format!(" hard_limit={hard}"))
         .unwrap_or_default();
     format!(
-        "<managed_context_density_handoff>\nBackend-reported Codex context pressure is watch ({used}/{limit} tokens, recommended_density_threshold={recommended}{hard}). The previous implementation turn is complete, but the live transcript is above the recommended density threshold. Before handing control back, do a context-management handoff. If an exact managed-context rewind would materially improve density while preserving completed work, use list_rewind_anchors and inspect_rewind_anchor as needed, then call rewind_context with one exact returned item_id, the returned position_hint or a value in positions, and a dense carry-forward primer. For this density handoff, a rewind is useful only if the selected exact anchor/position is expected to reduce backend pressure below the recommended density threshold; anchor rows may expose density_eligible and density_eligible_positions to guide that choice. If no rewind is worthwhile, do not continue implementation, exploration, or broad ordinary-tool work; reply with a concise handoff that crystallizes durable facts, changed files, verification results, user constraints, and remaining decisions, and state that you are leaving context unchanged. Normal tools are still allowed below rewind_only, but this maintenance turn should avoid ordinary tool use unless needed to inspect current status or anchors. Do not use auto anchors, N-turn rewinds, synthesized item ids, anchors from failed examples, or managed-context maintenance calls as rewind targets.\n</managed_context_density_handoff>",
+        "<managed_context_density_handoff>\nBackend-reported Codex context pressure is watch ({used}/{limit} tokens, recommended_density_threshold={recommended}{hard}). The previous implementation turn is complete, but the live transcript is above the recommended density threshold. Before handing control back, do a context-management handoff. If an exact managed-context rewind would materially improve density while preserving completed work, call list_rewind_anchors with density_candidates_only=true and include_pruning_estimates=true, use inspect_rewind_anchor as needed, then call rewind_context with one exact returned item_id, the returned position_hint or a value in positions, and a dense carry-forward primer. In density-candidate mode, list_rewind_anchors hides anchors without a density-valid position and narrows positions to values expected to reduce backend pressure below the recommended density threshold. If no rewind is worthwhile, do not continue implementation, exploration, or broad ordinary-tool work; reply with a concise handoff that crystallizes durable facts, changed files, verification results, user constraints, and remaining decisions, and state that you are leaving context unchanged. Normal tools are still allowed below rewind_only, but this maintenance turn should avoid ordinary tool use unless needed to inspect current status or anchors. Do not use auto anchors, N-turn rewinds, synthesized item ids, anchors from failed examples, or managed-context maintenance calls as rewind targets.\n</managed_context_density_handoff>",
         used = pressure.used_tokens,
         limit = pressure.rewind_only_limit,
         recommended = pressure.recommended_rewind_limit,
@@ -5264,7 +5295,7 @@ fn managed_context_density_active_steer_text(
         "Allow the currently in-flight narrow validation/build/tool to finish and preserve its durable result, but do not start another broad build, QA, exploration, or implementation loop before density maintenance."
     };
     format!(
-        "<managed_context_density_steer>\nBackend-reported Codex context pressure is watch ({used}/{limit} tokens, recommended_density_threshold={recommended}{hard}). {in_flight} Normal tools are still allowed below rewind_only, but before broad follow-up work do exact-anchor density maintenance if a current catalog anchor can materially reduce pressure below the recommended density threshold, or give a concise no-rewind density handoff that crystallizes durable facts, changed files, validation results, constraints, and remaining decisions. Use list_rewind_anchors and inspect_rewind_anchor only as needed; if rewinding, call rewind_context with one exact returned item_id, a valid returned position, and a dense carry-forward primer. Do not use auto anchors, N-turn rewinds, synthesized item ids, anchors from failed examples, or managed-context maintenance calls as rewind targets.\n</managed_context_density_steer>",
+        "<managed_context_density_steer>\nBackend-reported Codex context pressure is watch ({used}/{limit} tokens, recommended_density_threshold={recommended}{hard}). {in_flight} Normal tools are still allowed below rewind_only, but before broad follow-up work do exact-anchor density maintenance if a current catalog anchor can materially reduce pressure below the recommended density threshold, or give a concise no-rewind density handoff that crystallizes durable facts, changed files, validation results, constraints, and remaining decisions. Use list_rewind_anchors with density_candidates_only=true and include_pruning_estimates=true, and inspect_rewind_anchor only as needed; if rewinding, call rewind_context with one exact returned item_id, a valid returned position, and a dense carry-forward primer. Do not use auto anchors, N-turn rewinds, synthesized item ids, anchors from failed examples, or managed-context maintenance calls as rewind targets.\n</managed_context_density_steer>",
         used = pressure.used_tokens,
         limit = pressure.rewind_only_limit,
         recommended = pressure.recommended_rewind_limit,
@@ -5279,7 +5310,7 @@ fn managed_context_density_rewind_retry_text(pressure: ManagedContextDensityPres
         .map(|hard| format!(" hard_limit={hard}"))
         .unwrap_or_default();
     format!(
-        "<managed_context_density_handoff>\nThe previous density-handoff rewind was applied, but backend-reported Codex context pressure is still watch ({used}/{limit} tokens, recommended_density_threshold={recommended}{hard}). That rewind is not enough to count as successful density maintenance, and Intendant will not replay ordinary follow-up work yet. Do not continue implementation, exploration, or broad ordinary-tool work. If another exact managed-context rewind can reduce backend pressure below the recommended density threshold while preserving completed work, use list_rewind_anchors and inspect_rewind_anchor as needed, then call rewind_context with one exact returned item_id and a dense carry-forward primer. Otherwise reply with a concise handoff that crystallizes durable facts, changed files, verification results, user constraints, and remaining decisions, and state that you are leaving context at the current rewind point. Do not use auto anchors, N-turn rewinds, synthesized item ids, anchors from failed examples, or managed-context maintenance calls as rewind targets.\n</managed_context_density_handoff>",
+        "<managed_context_density_handoff>\nThe previous density-handoff rewind was applied, but backend-reported Codex context pressure is still watch ({used}/{limit} tokens, recommended_density_threshold={recommended}{hard}). That rewind is not enough to count as successful density maintenance, and Intendant will not replay ordinary follow-up work yet. Do not continue implementation, exploration, or broad ordinary-tool work. If another exact managed-context rewind can reduce backend pressure below the recommended density threshold while preserving completed work, use list_rewind_anchors with density_candidates_only=true and include_pruning_estimates=true, and inspect_rewind_anchor as needed, then call rewind_context with one exact returned item_id and a dense carry-forward primer. Otherwise reply with a concise handoff that crystallizes durable facts, changed files, verification results, user constraints, and remaining decisions, and state that you are leaving context at the current rewind point. Do not use auto anchors, N-turn rewinds, synthesized item ids, anchors from failed examples, or managed-context maintenance calls as rewind targets.\n</managed_context_density_handoff>",
         used = pressure.used_tokens,
         limit = pressure.rewind_only_limit,
         recommended = pressure.recommended_rewind_limit,
@@ -12357,8 +12388,9 @@ mod tests {
 
         assert!(text.contains("context pressure is watch"));
         assert!(text.contains("recommended_density_threshold=219640"));
+        assert!(text.contains("density_candidates_only=true"));
         assert!(text.contains("one exact returned item_id"));
-        assert!(text.contains("density_eligible_positions"));
+        assert!(text.contains("narrows positions"));
         assert!(text.contains("crystallizes durable facts"));
         assert!(text.contains("leaving context unchanged"));
         assert!(text.contains("Do not use auto anchors"));
@@ -13888,6 +13920,41 @@ mod tests {
                         }
                     }
                 }),
+                serde_json::json!({
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{
+                            "type": "output_text",
+                            "text": "density filler ".repeat(40_000)
+                        }]
+                    }
+                }),
+                serde_json::json!({
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call",
+                        "name": "exec_command",
+                        "call_id": "call_too_shallow_density",
+                        "arguments": "{\"cmd\":\"git status --short\"}"
+                    }
+                }),
+                serde_json::json!({
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "token_count",
+                        "info": {
+                            "last_token_usage": {
+                                "input_tokens": 87_000,
+                                "cached_input_tokens": 0,
+                                "output_tokens": 0,
+                                "total_tokens": 87_000
+                            },
+                            "model_context_window": 100_000
+                        }
+                    }
+                }),
             ]
             .into_iter()
             .map(|value| value.to_string())
@@ -13937,6 +14004,64 @@ mod tests {
             .filter_map(|position| position.as_str())
             .collect::<Vec<_>>();
         assert_eq!(shallow_positions, vec!["before"]);
+        let all_shallow_positions = shallow["positions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|position| position.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(all_shallow_positions, vec!["before", "after"]);
+
+        let too_shallow = anchors
+            .iter()
+            .find(|anchor| anchor["item_id"] == "call_too_shallow_density")
+            .expect("fully shallow density anchor");
+        assert_eq!(too_shallow["density_eligible"].as_bool(), Some(false));
+        assert!(too_shallow["density_eligible_positions"].is_null());
+
+        let raw = list_context_rewind_anchors_from_rollout(
+            &path,
+            &serde_json::json!({
+                "density_candidates_only": true,
+                "include_pruning_estimates": true,
+            }),
+        )
+        .expect("density-filtered catalog");
+        let density_catalog: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(
+            density_catalog["density_candidates_only"].as_bool(),
+            Some(true)
+        );
+        let density_anchors = density_catalog["anchors"].as_array().unwrap();
+        let density_ids = density_anchors
+            .iter()
+            .filter_map(|anchor| anchor["item_id"].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            density_ids,
+            vec!["call_good_density", "call_shallow_density"]
+        );
+        let shallow_density_row = density_anchors
+            .iter()
+            .find(|anchor| anchor["item_id"] == "call_shallow_density")
+            .expect("shallow row should remain for before-position density rewind");
+        let shallow_density_positions = shallow_density_row["positions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|position| position.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(shallow_density_positions, vec!["before"]);
+        assert_eq!(
+            shallow_density_row["position_hint"].as_str(),
+            Some("before")
+        );
+        assert!(
+            density_anchors
+                .iter()
+                .all(|anchor| anchor["item_id"] != "call_too_shallow_density"),
+            "fully shallow anchors should not be offered in density mode: {density_catalog}"
+        );
 
         validate_context_rewind_anchor_restore_headroom(
             &path,

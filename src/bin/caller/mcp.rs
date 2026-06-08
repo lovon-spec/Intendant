@@ -1181,7 +1181,7 @@ fn append_manual_http_tool_definitions(
         "list_rewind_anchors",
         manual_http_tool_definition!(
             "list_rewind_anchors",
-            "Discover exact Codex rewind anchors only after you have already decided a managed-context rewind may be needed because recovery/density handoff guidance asked for it, context pressure is rewind-only or watch, or a recent completed tool result was genuinely noisy/unexpectedly large. Do not call during ordinary startup/status/search turns merely because managed_context=managed is enabled, or after bounded low-output searches while context_pressure.status is ok. By default returns the first bounded compact page of matching valid non-management anchors, with exact item_id values, accepted positions, item type/name/role, short semantic summaries, filtered_total, and next_offset; it does not select or recommend one anchor. Use offset/limit to inspect additional pages, query for a semantic or exact-id filter, reverse when newest-first order is useful, detail=true for diagnostic detailed pages, and inspect_rewind_anchor for one anchor's before/after context. For density compaction, include_pruning_estimates=true adds approximate discard sizes to compact rows. The default catalog hides managed-context maintenance calls such as list_rewind_anchors, inspect_rewind_anchor, rewind_context, and rewind_backout so recovery does not target its own tool calls; pass include_management_tools=true only when intentionally targeting those internals. Normal model-facing results hide anchors known to remain at/above the rewind-only limit or without enough resume headroom, and narrow positions to values accepted by rewind_context; recovery_candidates_only=false alone is ignored. Pass include_non_recovery=true only for diagnostics/audit, and never pass a recovery_eligible=false audit row to rewind_context. Use inspect_rewind_anchor on a candidate when the compact summary is ambiguous, then copy the chosen item_id and position_hint, or a value in positions, into rewind_context.",
+            "Discover exact Codex rewind anchors only after you have already decided a managed-context rewind may be needed because recovery/density handoff guidance asked for it, context pressure is rewind-only or watch, or a recent completed tool result was genuinely noisy/unexpectedly large. Do not call during ordinary startup/status/search turns merely because managed_context=managed is enabled, or after bounded low-output searches while context_pressure.status is ok. By default returns the first bounded compact page of matching valid non-management anchors, with exact item_id values, accepted positions, item type/name/role, short semantic summaries, filtered_total, and next_offset; it does not select or recommend one anchor. Use offset/limit to inspect additional pages, query for a semantic or exact-id filter, reverse when newest-first order is useful, detail=true for diagnostic detailed pages, and inspect_rewind_anchor for one anchor's before/after context. For density compaction, pass density_candidates_only=true with include_pruning_estimates=true to hide anchors with no density-valid position and narrow positions to values accepted by rewind_context density validation. The default catalog hides managed-context maintenance calls such as list_rewind_anchors, inspect_rewind_anchor, rewind_context, and rewind_backout so recovery does not target its own tool calls; pass include_management_tools=true only when intentionally targeting those internals. Normal model-facing results hide anchors known to remain at/above the rewind-only limit or without enough resume headroom, and narrow positions to values accepted by rewind_context; recovery_candidates_only=false alone is ignored. Pass include_non_recovery=true only for diagnostics/audit, and never pass a recovery_eligible=false audit row to rewind_context. Use inspect_rewind_anchor on a candidate when the compact summary is ambiguous, then copy the chosen item_id and position_hint, or a value in positions, into rewind_context.",
             ListRewindAnchorsParams
         ),
     );
@@ -5612,6 +5612,10 @@ pub struct ListRewindAnchorsParams {
     /// query and reverse listings.
     #[serde(default, alias = "includePruningEstimates")]
     pub include_pruning_estimates: bool,
+    /// Density handoff mode. Hides anchors with no density-valid position and
+    /// narrows positions to values accepted by rewind_context density validation.
+    #[serde(default, alias = "densityCandidatesOnly", alias = "densityMode")]
+    pub density_candidates_only: bool,
     /// Return detailed paged rows instead of the default bounded compact rows.
     #[serde(default)]
     pub detail: bool,
@@ -7544,7 +7548,7 @@ impl IntendantServer {
     }
 
     #[tool(
-        description = "Discover exact Codex rewind anchors only after you have already decided a managed-context rewind may be needed because recovery/density handoff guidance asked for it, context pressure is rewind-only or watch, or a recent completed tool result was genuinely noisy/unexpectedly large. Do not call during ordinary startup/status/search turns merely because managed_context=managed is enabled, or after bounded low-output searches while context_pressure.status is ok. By default returns the first bounded compact page of matching valid non-management anchors, with exact item_id values, accepted positions, item type/name/role, short semantic summaries, filtered_total, and next_offset; it does not select or recommend one anchor. Use offset/limit to inspect additional pages, query for a semantic or exact-id filter, reverse when newest-first order is useful, detail=true for diagnostic detailed pages, and inspect_rewind_anchor for one anchor's before/after context. For density compaction, include_pruning_estimates=true adds approximate discard sizes to compact rows. The default catalog hides managed-context maintenance calls such as list_rewind_anchors, inspect_rewind_anchor, rewind_context, and rewind_backout so recovery does not target its own tool calls; pass include_management_tools=true only when intentionally targeting those internals. Normal model-facing results hide anchors known to remain at/above the rewind-only limit or without enough resume headroom, and narrow positions to values accepted by rewind_context; recovery_candidates_only=false alone is ignored. Pass include_non_recovery=true only for diagnostics/audit, and never pass a recovery_eligible=false audit row to rewind_context. Use inspect_rewind_anchor on a candidate when the compact summary is ambiguous, then copy the chosen item_id and position_hint, or a value in positions, into rewind_context."
+        description = "Discover exact Codex rewind anchors only after you have already decided a managed-context rewind may be needed because recovery/density handoff guidance asked for it, context pressure is rewind-only or watch, or a recent completed tool result was genuinely noisy/unexpectedly large. Do not call during ordinary startup/status/search turns merely because managed_context=managed is enabled, or after bounded low-output searches while context_pressure.status is ok. By default returns the first bounded compact page of matching valid non-management anchors, with exact item_id values, accepted positions, item type/name/role, short semantic summaries, filtered_total, and next_offset; it does not select or recommend one anchor. Use offset/limit to inspect additional pages, query for a semantic or exact-id filter, reverse when newest-first order is useful, detail=true for diagnostic detailed pages, and inspect_rewind_anchor for one anchor's before/after context. For density compaction, pass density_candidates_only=true with include_pruning_estimates=true to hide anchors with no density-valid position and narrow positions to values accepted by rewind_context density validation. The default catalog hides managed-context maintenance calls such as list_rewind_anchors, inspect_rewind_anchor, rewind_context, and rewind_backout so recovery does not target its own tool calls; pass include_management_tools=true only when intentionally targeting those internals. Normal model-facing results hide anchors known to remain at/above the rewind-only limit or without enough resume headroom, and narrow positions to values accepted by rewind_context; recovery_candidates_only=false alone is ignored. Pass include_non_recovery=true only for diagnostics/audit, and never pass a recovery_eligible=false audit row to rewind_context. Use inspect_rewind_anchor on a candidate when the compact summary is ambiguous, then copy the chosen item_id and position_hint, or a value in positions, into rewind_context."
     )]
     async fn list_rewind_anchors(
         &self,
@@ -7563,6 +7567,7 @@ impl IntendantServer {
             "include_management_tools": params.include_management_tools,
             "recovery_candidates_only": recovery_candidates_only,
             "include_non_recovery": params.include_non_recovery,
+            "density_candidates_only": params.density_candidates_only,
             "compact_catalog": !params.detail && params.offset.is_none() && params.limit.is_none() && !params.include_non_recovery,
         });
         if let Some(limit) = params.limit {
@@ -11178,6 +11183,7 @@ mod tests {
                             assert_eq!(params["include_pruning_estimates"], true);
                             assert_eq!(params["recovery_candidates_only"], true);
                             assert_eq!(params["include_non_recovery"], false);
+                            assert_eq!(params["density_candidates_only"], true);
                             responder_bus.send(AppEvent::CodexThreadActionResult {
                                 session_id,
                                 action: op,
@@ -11201,6 +11207,7 @@ mod tests {
                         "query": "tool",
                         "reverse": true,
                         "include_pruning_estimates": true,
+                        "density_candidates_only": true,
                         "recovery_candidates_only": false
                     }),
                     Some("backend-session-1"),
