@@ -232,6 +232,11 @@ Routes coding tasks to an external CLI agent instead of the native loop (see
 | `writable_roots` | array | `[]` | Extra writable roots, each passed as `--add-dir` (absolute, or resolved against project root) |
 | `managed_context` | string | `vanilla` | `vanilla` for upstream/original-fork Codex; `managed` enables proactive Intendant context densification, rewind/backout tools, disables Codex auto-compaction, and requires the patched Codex app-server protocol with lineage prompt-cache-key support |
 
+Intendant-supervised Codex `app-server` launches suppress inherited user-global
+Codex MCP/plugin/app servers by default and inject Intendant's MCP endpoint plus
+the explicit toggles above. Set `INTENDANT_CODEX_INHERIT_MCP_SERVERS=1` only for
+a launch that should inherit the user's configured Codex MCP servers and plugins.
+
 `[agent.claude_code]`:
 
 | Key | Type | Default | Description |

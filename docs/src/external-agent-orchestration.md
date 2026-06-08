@@ -139,6 +139,13 @@ features they lack.
   `sandbox_workspace_write.network_access=true` (only in `workspace-write`), and
   `sandbox_workspace_write.writable_roots=[…]`.
 
+  Intendant-supervised Codex app-server launches also pass config overrides that
+  suppress inherited user-global Codex MCP servers and plugin/app connectors by
+  default. This keeps startup to Intendant MCP plus explicitly requested Codex
+  toggles instead of loading arbitrary global Google/Gmail/Linear/Slack/etc.
+  servers. Set `INTENDANT_CODEX_INHERIT_MCP_SERVERS=1` for a launch that should
+  deliberately inherit the user's Codex MCP/plugin configuration.
+
   Codex uses `tool_profile=core` by default to avoid MCP tool-schema bloat. The
   core profile keeps a small bootstrap surface (`get_status`, shared-view tools,
   and managed-context tools when enabled). Broad or rare Intendant operations
