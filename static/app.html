@@ -21267,6 +21267,7 @@ function stationBuildControlsSummary() {
       ? 'session window'
       : (fallbackTargetId ? 'latest external' : 'daemon'));
   const sessionMeta = sessionId ? sessionConfigMetadata(sessionId) : {};
+  const sessionForStatus = sessionId ? stationFindSessionById(sessionId) : null;
   const rawSessionSource = sessionId ? sessionConfigSource(sessionMeta) : '';
   const sessionSource = rawSessionSource || (sessionId ? 'intendant' : '');
   const rawSessionCommand = sessionId ? sessionConfigCommand(sessionMeta) : '';
@@ -21318,6 +21319,13 @@ function stationBuildControlsSummary() {
       || sessionSource === 'codex'
     : backend === 'codex';
   const sessionLivePhase = externalLive?.phase || '';
+  const sessionStatus = normalizeSessionPhase(
+    sessionLivePhase ||
+    sessionMeta.phase ||
+    sessionMeta.status ||
+    sessionForStatus?.status ||
+    ''
+  ) || (sessionDetached ? 'detached' : (sessionActive ? 'active' : (sessionId ? 'idle' : 'none')));
   const sessionServiceTier = sessionSource === 'codex'
     ? normalizeCodexServiceTier(
       sessionCapabilities.codexServiceTier ||
@@ -21356,6 +21364,7 @@ function stationBuildControlsSummary() {
     sessionId,
     sessionSelection,
     sessionSource,
+    sessionStatus,
     sessionCommand,
     sessionLivePhase,
     sessionActive,

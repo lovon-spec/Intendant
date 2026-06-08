@@ -1607,7 +1607,7 @@ impl StationInner {
         let max_w = if compact { w - 28.0 } else { 980.0 };
         let lane_w = (w - left_clear - 14.0).min(max_w).max(300.0);
         let dense = compact || lane_w < 760.0;
-        let lane_h = if dense { 104.0 } else { 78.0 };
+        let lane_h = if dense { 124.0 } else { 104.0 };
         let x = if compact {
             14.0
         } else {
@@ -1670,6 +1670,7 @@ impl StationInner {
                 C_SUBTEXT0_CSS,
                 "normal",
             );
+            self.command_lane_status_strip(x + 12.0, y + 65.0, lane_w - 24.0, &controls, true);
         } else {
             self.status_chip(x + 112.0, y + 8.0, 230.0, &status_a, C_TEAL_CSS);
             self.status_chip(
@@ -1701,6 +1702,7 @@ impl StationInner {
                 ),
                 C_PEACH_CSS,
             );
+            self.command_lane_status_strip(x + 12.0, y + 36.0, lane_w - 24.0, &controls, false);
         }
 
         let mut actions = vec![
@@ -1765,7 +1767,7 @@ impl StationInner {
         ]);
 
         let mut ax = x + 12.0;
-        let mut ay = y + if dense { 64.0 } else { 45.0 };
+        let mut ay = y + if dense { 90.0 } else { 72.0 };
         let max_x = x + lane_w - 12.0;
         let max_rows = if dense { 2 } else { 1 };
         let mut row = 0;
@@ -1782,6 +1784,79 @@ impl StationInner {
             self.hit_zones
                 .push(HitZone::new(ax, ay, action.width, 21.0, action.hit));
             ax += action.width + 8.0;
+        }
+    }
+
+    fn command_lane_status_strip(
+        &self,
+        x: f32,
+        y: f32,
+        width: f32,
+        controls: &StationControlsSummary,
+        compact: bool,
+    ) {
+        let state = nonempty(&controls.session_status, {
+            if controls.session_detached {
+                "detached"
+            } else if controls.session_active {
+                "active"
+            } else if controls.session_id.is_empty() {
+                "none"
+            } else {
+                "idle"
+            }
+        });
+        let state_color = if state == "active" || state == "running" || state == "thinking" {
+            C_TEAL_CSS
+        } else if state == "detached" || state.starts_with("waiting") {
+            C_YELLOW_CSS
+        } else if state == "stopped" || state == "interrupted" {
+            C_RED_CSS
+        } else {
+            C_OVERLAY1_CSS
+        };
+        self.round_rect(
+            x,
+            y - 12.0,
+            width,
+            if compact { 20.0 } else { 22.0 },
+            4.0,
+            "rgba(24,24,37,0.72)",
+            "rgba(69,71,90,0.78)",
+        );
+        self.text(
+            &truncate(
+                &format!(
+                    "{} / {} / {}",
+                    nonempty(&controls.session_label, &controls.session_selection),
+                    nonempty(&controls.session_source, "source"),
+                    state
+                ),
+                if compact { 43 } else { 54 },
+            ),
+            x + 8.0,
+            y + 2.0,
+            8.5,
+            state_color,
+            "bold",
+        );
+        if !compact {
+            self.text(
+                &truncate(
+                    &format!(
+                        "{} · live {} · actions {}",
+                        nonempty(&controls.session_command, &controls.command),
+                        short_id(&controls.session_live_id),
+                        short_id(&controls.session_action_id)
+                    ),
+                    50,
+                ),
+                x + width * 0.52,
+                y + 2.0,
+                8.0,
+                C_SUBTEXT0_CSS,
+                "normal",
+            );
         }
     }
 
@@ -9405,6 +9480,7 @@ struct StationControlsSummary {
     session_label: String,
     session_selection: String,
     session_source: String,
+    session_status: String,
     session_command: String,
     session_backend_id: String,
     session_intendant_id: String,
@@ -9486,6 +9562,7 @@ impl Default for StationControlsSummary {
             session_label: String::new(),
             session_selection: String::new(),
             session_source: String::new(),
+            session_status: String::new(),
             session_command: String::new(),
             session_backend_id: String::new(),
             session_intendant_id: String::new(),
