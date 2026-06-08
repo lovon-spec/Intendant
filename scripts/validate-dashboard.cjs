@@ -2622,26 +2622,26 @@ async function runSelfTest() {
       '--station-probe',
       'rendered-surface',
       '--station-probe=dock-hidden',
+      '--station-probe',
+      'webgpu',
       '--timeout=2500',
       '--log-lines',
       '3',
       '--diagnostics',
       '--enable-gpu',
       '--browser-arg=--ozone-platform=x11',
-      '--browser-arg',
-      '--enable-unsafe-webgpu',
     ],
     {},
   );
   assert.strictEqual(parsed.url, 'http://127.0.0.1:1234/app');
   assert.deepStrictEqual(parsed.selectors, ['#root']);
   assert.deepStrictEqual(parsed.functions, ['() => true']);
-  assert.deepStrictEqual(parsed.stationProbes, ['rendered', 'dock-hidden']);
+  assert.deepStrictEqual(parsed.stationProbes, ['rendered', 'dock-hidden', 'webgpu']);
   assert.strictEqual(parsed.timeoutMs, 2500);
   assert.strictEqual(parsed.logLines, 3);
   assert.strictEqual(parsed.diagnostics, true);
   assert.strictEqual(parsed.enableGpu, true);
-  assert.deepStrictEqual(parsed.browserArgs, ['--ozone-platform=x11', '--enable-unsafe-webgpu']);
+  assert.deepStrictEqual(parsed.browserArgs, ['--ozone-platform=x11']);
   assert.ok(browserArgs('/tmp/profile', parseArgs([], {})).includes('--disable-gpu'));
   const gpuBrowserArgs = browserArgs('/tmp/profile', parsed);
   assert.ok(!gpuBrowserArgs.includes('--disable-gpu'));
