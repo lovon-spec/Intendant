@@ -2459,6 +2459,19 @@ fn context_rewind_active_tool_defer_message(
     ))
 }
 
+fn context_rewind_blocking_active_tool_count(
+    active_tool_count: usize,
+    action_origin: Option<&str>,
+) -> usize {
+    if action_origin == Some("mcp") {
+        // The rewind_context MCP call is itself an active tool until this
+        // handler returns; do not let it block its own scheduling.
+        active_tool_count.saturating_sub(1)
+    } else {
+        active_tool_count
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ResolvedContextRewindAnchor {
     item_id: String,
@@ -7884,6 +7897,7 @@ async fn drain_external_agent_events(
                         session_id,
                         action,
                         params,
+                        origin,
                     }) if event_targets_session_or_alias(
                         &session_id,
                         &local_session_id,
@@ -7950,7 +7964,10 @@ async fn drain_external_agent_events(
                                         if let Some(message) =
                                             context_rewind_active_tool_defer_message(
                                                 &request,
-                                                active_tool_ids.len(),
+                                                context_rewind_blocking_active_tool_count(
+                                                    active_tool_ids.len(),
+                                                    origin.as_deref(),
+                                                ),
                                                 normal_tools_allowed,
                                             )
                                         {
@@ -13019,6 +13036,32 @@ mod tests {
         assert!(message.contains("normal tools are currently allowed"));
         assert!(message.contains("did not stop the active turn or schedule the rewind"));
         assert!(message.contains("retry rewind_context"));
+    }
+
+    #[test]
+    fn context_rewind_ignores_current_mcp_tool_for_active_defer() {
+        assert_eq!(context_rewind_blocking_active_tool_count(1, Some("mcp")), 0);
+        assert_eq!(context_rewind_blocking_active_tool_count(2, Some("mcp")), 1);
+        assert_eq!(context_rewind_blocking_active_tool_count(1, None), 1);
+    }
+
+    #[test]
+    fn context_rewind_mcp_self_tool_does_not_defer() {
+        let params = serde_json::json!({
+            "anchor": {"item_id": "call-123", "position": "after"},
+            "reason": "cleanup stale build warning noise",
+            "primer": "Keep the durable build result once it completes."
+        });
+        let request = external_context_rewind_request_from_action(
+            "rewind_context",
+            &params,
+            Some("s".into()),
+        )
+        .expect("rewind action")
+        .expect("valid request");
+        let blocking = context_rewind_blocking_active_tool_count(1, Some("mcp"));
+
+        assert!(context_rewind_active_tool_defer_message(&request, blocking, true).is_none());
     }
 
     #[test]
@@ -20015,6 +20058,7 @@ async fn run_with_presence(
                     session_id,
                     action,
                     params,
+                    ..
                 }) if event_targets_external_session_or_side(
                     &session_id,
                     &local_session_id,
@@ -22574,6 +22618,7 @@ async fn run_external_agent_mode(
                                 session_id,
                                 action,
                                 params,
+                                ..
                             }) if event_targets_external_session_or_side(
                                 &session_id,
                                 &live_session_id,

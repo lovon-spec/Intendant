@@ -333,6 +333,7 @@ async fn handle_control_msg(msg: &ControlMsg, state: &ControlPlaneState) {
             session_id,
             op,
             params,
+            origin,
         } => {
             if session_id
                 .as_deref()
@@ -356,6 +357,7 @@ async fn handle_control_msg(msg: &ControlMsg, state: &ControlPlaneState) {
                 session_id: session_id.clone(),
                 action: op.clone(),
                 params: params.clone(),
+                origin: origin.clone(),
             });
         }
         ControlMsg::SetCodexWritableRoots { roots } => {
@@ -1415,6 +1417,7 @@ mod tests {
             session_id: Some("sess-action".to_string()),
             op: "compact".to_string(),
             params: serde_json::json!({"extra": "data"}),
+            origin: None,
         }));
 
         // Drain up to a handful of events looking for the broadcast.
@@ -1426,11 +1429,13 @@ mod tests {
                     session_id,
                     action,
                     params,
+                    origin,
                 })) => {
                     assert!(!request_id.is_empty());
                     assert_eq!(session_id.as_deref(), Some("sess-action"));
                     assert_eq!(action, "compact");
                     assert_eq!(params["extra"], "data");
+                    assert_eq!(origin, None);
                     found = true;
                     break;
                 }
@@ -1468,6 +1473,7 @@ mod tests {
             session_id: None,
             op: "goal-clear".to_string(),
             params: serde_json::json!({}),
+            origin: None,
         }));
 
         let mut found_result = false;

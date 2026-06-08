@@ -1707,6 +1707,7 @@ impl SessionSupervisor {
                                         session_id: Some(managed_id),
                                         op: command.op,
                                         params: command.params,
+                                        origin: None,
                                     },
                                 ));
                             } else {
@@ -2300,6 +2301,7 @@ impl SessionSupervisor {
                                 session_id: Some(managed_id),
                                 op: command.op,
                                 params: command.params,
+                                origin: None,
                             },
                         ));
                         if !steer_id.trim().is_empty() {
@@ -2502,6 +2504,7 @@ impl SessionSupervisor {
                         session_id: Some(managed_id.clone()),
                         op: "rename".to_string(),
                         params: serde_json::json!({ "name": name }),
+                        origin: None,
                     },
                 ));
                 return;

@@ -652,6 +652,7 @@ pub enum AppEvent {
         session_id: Option<String>,
         action: String,
         params: serde_json::Value,
+        origin: Option<String>,
     },
 
     /// Emitted by the daemon-side action watcher after a CodexThreadAction
@@ -1101,6 +1102,8 @@ pub enum ControlMsg {
         op: String,
         #[serde(default)]
         params: serde_json::Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        origin: Option<String>,
     },
     /// Rename a session through Intendant's generic session-name abstraction.
     /// Backends with native rename support may map this to their own protocol;

@@ -6148,6 +6148,7 @@ impl IntendantServer {
                 session_id: session_id.clone(),
                 op: op.clone(),
                 params,
+                origin: Some("mcp".to_string()),
             }));
 
         match tokio::time::timeout(std::time::Duration::from_secs(20), async {
@@ -10154,6 +10155,7 @@ mod tests {
                             session_id,
                             op,
                             params,
+                            ..
                         })) if op == "rewind_context" => {
                             let event = (session_id.clone(), op.clone(), params);
                             responder_bus.send(AppEvent::CodexThreadActionResult {
@@ -10867,6 +10869,7 @@ mod tests {
                             session_id,
                             op,
                             params,
+                            ..
                         })) if op == "list_rewind_anchors" => {
                             assert_eq!(session_id.as_deref(), Some("backend-session-1"));
                             assert_eq!(params["offset"], 25);
@@ -10939,6 +10942,7 @@ mod tests {
                             session_id,
                             op,
                             params,
+                            ..
                         })) if op == "list_rewind_anchors" => {
                             assert_eq!(session_id.as_deref(), Some("backend-session-1"));
                             assert_eq!(params["offset"], 0);
@@ -11002,6 +11006,7 @@ mod tests {
                             session_id,
                             op,
                             params,
+                            ..
                         })) if op == "inspect_rewind_anchor" => {
                             assert_eq!(session_id.as_deref(), Some("backend-session-1"));
                             assert_eq!(params["anchor"]["item_id"], "call-1");
