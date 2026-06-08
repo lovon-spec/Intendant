@@ -3076,9 +3076,11 @@ impl StationInner {
     }
 
     fn attention_items(&self) -> Vec<AttentionItem> {
-        let mut items = Vec::new();
+        const ATTENTION_VISIBLE_CAP: usize = 6;
+        let mut primary_items = Vec::new();
+        let mut critical_items = Vec::new();
         let rendered_keys = self.rendered_attention_keys();
-        items.extend(self.rendered_attention_items());
+        primary_items.extend(self.rendered_attention_items());
         let controls = &self.snapshot.controls;
         if let Some(agent) = self
             .snapshot
@@ -3087,7 +3089,7 @@ impl StationInner {
             .find(|agent| agent.needs_approval)
         {
             push_synth_attention(
-                &mut items,
+                &mut primary_items,
                 &rendered_keys,
                 "approval",
                 AttentionItem {
@@ -3106,7 +3108,7 @@ impl StationInner {
         }
         if controls.shared_view_can_take_input {
             push_synth_attention(
-                &mut items,
+                &mut primary_items,
                 &rendered_keys,
                 "shared",
                 AttentionItem {
@@ -3120,7 +3122,7 @@ impl StationInner {
             );
         } else if controls.shared_view_visible {
             push_synth_attention(
-                &mut items,
+                &mut primary_items,
                 &rendered_keys,
                 "shared",
                 AttentionItem {
@@ -3133,7 +3135,7 @@ impl StationInner {
         }
         if controls.session_can_interrupt {
             push_synth_attention(
-                &mut items,
+                &mut primary_items,
                 &rendered_keys,
                 "active",
                 AttentionItem {
@@ -3148,7 +3150,7 @@ impl StationInner {
             );
         } else if controls.session_active {
             push_synth_attention(
-                &mut items,
+                &mut primary_items,
                 &rendered_keys,
                 "active",
                 AttentionItem {
@@ -3164,7 +3166,7 @@ impl StationInner {
         }
         if controls.pending_attachments > 0 {
             push_synth_attention(
-                &mut items,
+                &mut primary_items,
                 &rendered_keys,
                 "attachments",
                 AttentionItem {
@@ -3176,7 +3178,7 @@ impl StationInner {
             );
         }
         if self.snapshot.managed.rewind_only {
-            items.push(AttentionItem {
+            critical_items.push(AttentionItem {
                 title: "rewind only".to_string(),
                 detail: format_token_ratio(
                     self.snapshot.managed.used_tokens,
@@ -3190,7 +3192,7 @@ impl StationInner {
             self.snapshot.managed.effective_window,
         ) >= 0.78
         {
-            items.push(AttentionItem {
+            critical_items.push(AttentionItem {
                 title: "context pressure".to_string(),
                 detail: format_token_ratio(
                     self.snapshot.managed.used_tokens,
@@ -3201,7 +3203,7 @@ impl StationInner {
             });
         }
         if self.snapshot.changes.count > 0 {
-            items.push(AttentionItem {
+            critical_items.push(AttentionItem {
                 title: "working tree".to_string(),
                 detail: format!(
                     "{} files +{} -{}",
@@ -3218,7 +3220,7 @@ impl StationInner {
             self.snapshot.context.effective_window,
         );
         if self.snapshot.context.available && context_pct >= 0.78 {
-            items.push(AttentionItem {
+            critical_items.push(AttentionItem {
                 title: "context window".to_string(),
                 detail: format!(
                     "{} / {}",
@@ -3229,8 +3231,11 @@ impl StationInner {
                 hit: HitAction::Select("system:context".to_string()),
             });
         }
-        items.truncate(6);
-        items
+        merge_attention_with_reserved_critical(
+            primary_items,
+            critical_items,
+            ATTENTION_VISIBLE_CAP,
+        )
     }
 
     fn rendered_attention_items(&self) -> Vec<AttentionItem> {
@@ -9497,6 +9502,22 @@ fn push_synth_attention(
     if !rendered_keys.contains(key) {
         items.push(item);
     }
+}
+
+fn merge_attention_with_reserved_critical(
+    mut primary_items: Vec<AttentionItem>,
+    mut critical_items: Vec<AttentionItem>,
+    cap: usize,
+) -> Vec<AttentionItem> {
+    if critical_items.is_empty() {
+        primary_items.truncate(cap);
+        return primary_items;
+    }
+    let primary_keep = cap.saturating_sub(critical_items.len()).min(primary_items.len());
+    primary_items.truncate(primary_keep);
+    primary_items.append(&mut critical_items);
+    primary_items.truncate(cap);
+    primary_items
 }
 
 fn activity_event_is_managed(event: &StationEvent) -> bool {
