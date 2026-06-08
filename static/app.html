@@ -12689,6 +12689,234 @@ function stationFocusSharedViewDisplayFromDock() {
   renderSharedViewFocus(slot, sharedViewState.region, sharedViewState.note);
 }
 
+function stationBrowserWorkspaceStatusPayload() {
+  const rows = Array.from(browserWorkspaces.values())
+    .filter(w => (w.status || '') !== 'closed')
+    .sort((a, b) => String(b.updated_at || '').localeCompare(String(a.updated_at || '')));
+  const latest = rows[0] || null;
+  return {
+    count: rows.length,
+    latest_id: latest?.id || '',
+    latest_label: latest ? (latest.label || latest.id || '') : '',
+    latest_status: latest?.status || '',
+    latest_provider: latest?.provider || '',
+    latest_url: latest?.url || '',
+    latest_updated: latest?.updated_at || '',
+    lease: latest?.lease ? (latest.lease.holder_id || 'leased') : '',
+    validation_state: latest ? (latest.status || 'unknown') : 'idle',
+    validation_detail: latest
+      ? [latest.provider || 'browser', latest.lease ? 'leased' : 'unleased', latest.browser_executable_source || '']
+        .filter(Boolean)
+        .join(' / ')
+      : 'no workspace',
+  };
+}
+
+function stationLatestOperationalActivityPayload() {
+  const needles = ['display', 'shared_view', 'shared view', 'browser', 'computer use', 'cu_', 'take_screenshot', 'execute_cu'];
+  const events = stationActivityEvents().slice().reverse();
+  const ev = events.find(item => {
+    const text = [
+      item?.source || '',
+      item?.msg || item?.message || '',
+      item?.detail || '',
+      item?.tool || '',
+      item?.event || '',
+    ].join(' ').toLowerCase();
+    return needles.some(needle => text.includes(needle));
+  });
+  if (!ev) return { label: '', detail: '' };
+  return {
+    label: compactSessionText([ev.level || '', ev.source || 'activity'].filter(Boolean).join(' / ')),
+    detail: compactSessionText(ev.msg || ev.message || ev.detail || ev.id || ''),
+  };
+}
+
+function stationDisplayControlTargetPayload() {
+  const selectedPeer = stationSelectedPeer();
+  const selectedHostId = selectedPeer?.host_id || stationPeerDraft.selectedHostId || stationSelectedPeerHost || '';
+  const selectedDisplayId = selectedHostId
+    ? stationPeerDisplayIdForHost(selectedHostId)
+    : stationPeerDisplayId();
+  const now = performance.now ? performance.now() : Date.now();
+  const freshnessLabel = (stamp) => {
+    const at = Number(stamp) || 0;
+    if (!at) return '';
+    const age = Math.max(0, now - at);
+    if (age < 2000) return 'fresh';
+    if (age < 30000) return `${Math.round(age / 1000)}s old`;
+    return 'stale';
+  };
+  const selectedIsLocal = !selectedHostId || selectedHostId === selfPeerId || selectedHostId === 'local';
+  const localSlot = selectedIsLocal && Number.isFinite(Number(selectedDisplayId))
+    ? displaySlots.get(Number(selectedDisplayId))
+    : null;
+  if (localSlot) {
+    const key = stationDisplayTelemetryKey('local', selfPeerId, localSlot.displayId);
+    const telemetry = stationDisplayTelemetryFor(key, localSlot.videoEl, localSlot.pc);
+    const cached = stationDisplayTelemetry.get(key) || {};
+    return {
+      kind: 'local_stream',
+      label: `${selfHostLabel || 'local'} :${localSlot.displayId}`,
+      target: `local:${localSlot.displayId}`,
+      host_id: selfPeerId || 'local',
+      display_id: localSlot.displayId,
+      lane_id: `local:${localSlot.displayId}`,
+      status: localSlot.connected ? 'connected' : 'connecting',
+      authority: localSlot.authorityState || 'unknown',
+      capture: localSlot.streaming
+        ? (localSlot.frameIdEl?.textContent || `${localSlot._streamFrameCounter || 0} frames`)
+        : (localSlot.videoEl?.videoWidth ? 'preview ready' : 'no frame'),
+      freshness: freshnessLabel(cached.playbackAt || cached.statsAt),
+      telemetry: telemetry.label || '',
+      can_open: true,
+      can_focus: true,
+      can_take_input: (localSlot.authorityState || '') !== 'you',
+      can_release_input: (localSlot.authorityState || '') === 'you',
+      can_attach_frame: !!localSlot.videoEl?.videoWidth,
+      can_capture: !!localSlot.videoEl?.videoWidth,
+    };
+  }
+  const remoteConn = stationPeerDisplayConnection(selectedHostId, selectedDisplayId);
+  if (remoteConn) {
+    const key = stationDisplayTelemetryKey('remote', remoteConn.hostId, remoteConn.displayId, remoteConn.sessionId);
+    const container = stationPeerDisplayContainer(remoteConn.hostId, false);
+    const video = container && container.querySelector('.peer-display-video');
+    const telemetry = stationDisplayTelemetryFor(key, video, remoteConn.pc);
+    const cached = stationDisplayTelemetry.get(key) || {};
+    return {
+      kind: 'remote_stream',
+      label: `${stationHostLabel(remoteConn.hostId)} :${remoteConn.displayId}`,
+      target: `remote:${remoteConn.hostId}:${remoteConn.displayId}`,
+      host_id: remoteConn.hostId || '',
+      display_id: remoteConn.displayId,
+      lane_id: `remote:${remoteConn.hostId}:${remoteConn.displayId}:${remoteConn.sessionId || ''}`,
+      status: remoteConn.displayStatusText || 'connecting',
+      authority: remoteConn.peerAuthorityState || 'unknown',
+      capture: telemetry.label || 'stream telemetry pending',
+      freshness: freshnessLabel(cached.playbackAt || cached.statsAt),
+      telemetry: telemetry.label || '',
+      can_open: true,
+      can_focus: true,
+      can_take_input: (remoteConn.peerAuthorityState || '') !== 'you',
+      can_release_input: (remoteConn.peerAuthorityState || '') === 'you',
+      can_attach_frame: false,
+      can_capture: false,
+    };
+  }
+  if (selectedPeer && peerCanShareDisplay(selectedPeer)) {
+    return {
+      kind: 'peer_target',
+      label: `${stationPeerDisplayName(selectedPeer) || selectedPeer.host_id} :${selectedDisplayId}`,
+      target: `target:${selectedPeer.host_id}:${selectedDisplayId}`,
+      host_id: selectedPeer.host_id || '',
+      display_id: selectedDisplayId,
+      lane_id: `target:${selectedPeer.host_id}:${selectedDisplayId}`,
+      status: selectedPeer.connected ? 'ready' : 'offline',
+      authority: 'unknown',
+      capture: 'not open',
+      freshness: '',
+      telemetry: '',
+      can_open: true,
+      can_focus: false,
+      can_take_input: false,
+      can_release_input: false,
+      can_attach_frame: false,
+      can_capture: false,
+    };
+  }
+  const fallbackSlot = displaySlots.values().next().value;
+  if (fallbackSlot) {
+    const key = stationDisplayTelemetryKey('local', selfPeerId, fallbackSlot.displayId);
+    const telemetry = stationDisplayTelemetryFor(key, fallbackSlot.videoEl, fallbackSlot.pc);
+    const cached = stationDisplayTelemetry.get(key) || {};
+    return {
+      kind: 'local_stream',
+      label: `${selfHostLabel || 'local'} :${fallbackSlot.displayId}`,
+      target: `local:${fallbackSlot.displayId}`,
+      host_id: selfPeerId || 'local',
+      display_id: fallbackSlot.displayId,
+      lane_id: `local:${fallbackSlot.displayId}`,
+      status: fallbackSlot.connected ? 'connected' : 'connecting',
+      authority: fallbackSlot.authorityState || 'unknown',
+      capture: fallbackSlot.streaming
+        ? (fallbackSlot.frameIdEl?.textContent || `${fallbackSlot._streamFrameCounter || 0} frames`)
+        : (fallbackSlot.videoEl?.videoWidth ? 'preview ready' : 'no frame'),
+      freshness: freshnessLabel(cached.playbackAt || cached.statsAt),
+      telemetry: telemetry.label || '',
+      can_open: true,
+      can_focus: true,
+      can_take_input: (fallbackSlot.authorityState || '') !== 'you',
+      can_release_input: (fallbackSlot.authorityState || '') === 'you',
+      can_attach_frame: !!fallbackSlot.videoEl?.videoWidth,
+      can_capture: !!fallbackSlot.videoEl?.videoWidth,
+    };
+  }
+  return {
+    kind: 'none',
+    label: '',
+    target: '',
+    host_id: '',
+    display_id: null,
+    lane_id: '',
+    status: 'idle',
+    authority: 'unknown',
+    capture: 'no stream',
+    freshness: '',
+    telemetry: '',
+    can_open: false,
+    can_focus: false,
+    can_take_input: false,
+    can_release_input: false,
+    can_attach_frame: false,
+    can_capture: false,
+  };
+}
+
+function stationOperateSelectedDisplayTarget(op) {
+  const target = stationDisplayControlTargetPayload();
+  if (!target || !target.kind || target.kind === 'none') return;
+  if (op === 'copy') {
+    copyTextToClipboard(JSON.stringify(target, null, 2))
+      .then(() => stationSetPeerStatus('Selected display target copied', 'ok'))
+      .catch(err => stationSetPeerStatus(`Display target copy failed: ${err?.message || err}`, 'error'))
+      .finally(stationScheduleUpdate);
+    return;
+  }
+  if (target.kind === 'peer_target') {
+    if (op === 'open' || op === 'focus') {
+      stationSetPeerTarget(target.host_id, target.display_id);
+      stationOpenDisplay(target.host_id, target.display_id);
+    }
+    return;
+  }
+  if (target.kind === 'remote_stream') {
+    const conn = stationPeerDisplayConnection(target.host_id, target.display_id);
+    if (op === 'open' || op === 'focus') {
+      stationSetPeerTarget(target.host_id, target.display_id);
+      stationOpenDisplay(target.host_id, target.display_id);
+    } else if (op === 'input') {
+      if ((conn?.peerAuthorityState || '') === 'you') conn?.releaseControl?.();
+      else conn?.takeControl?.();
+    }
+    stationScheduleUpdate();
+    return;
+  }
+  if (target.kind === 'local_stream') {
+    const slot = stationLocalDisplaySlot(target.display_id);
+    if (op === 'open' || op === 'focus') {
+      stationForceRouteTo('displays', '');
+      slot?.el?.scrollIntoView?.({ block: 'center', inline: 'center', behavior: 'smooth' });
+    } else if (op === 'input') {
+      if ((slot?.authorityState || '') === 'you') slot?.releaseBtn?.click();
+      else slot?.takeBtn?.click();
+    } else if (op === 'capture') {
+      slot?.attachBtn?.click();
+    }
+    stationScheduleUpdate();
+  }
+}
+
 function stationRenderSharedViewSection(parent) {
   const state = stationSharedViewStatusPayload();
   const section = stationDockSection(parent, 'Shared view');
@@ -20777,6 +21005,26 @@ function stationHandleControlsAction(action) {
     stationScheduleUpdate();
     return;
   }
+  if (op === 'display-target-open') {
+    stationOperateSelectedDisplayTarget('open');
+    return;
+  }
+  if (op === 'display-target-focus') {
+    stationOperateSelectedDisplayTarget('focus');
+    return;
+  }
+  if (op === 'display-target-input') {
+    stationOperateSelectedDisplayTarget('input');
+    return;
+  }
+  if (op === 'display-target-capture') {
+    stationOperateSelectedDisplayTarget('capture');
+    return;
+  }
+  if (op === 'display-target-copy') {
+    stationOperateSelectedDisplayTarget('copy');
+    return;
+  }
   if (op === 'shared-view-focus') {
     stationFocusSharedViewDisplayFromDock();
     return;
@@ -21855,6 +22103,15 @@ function stationBuildControlsSummary() {
     && sharedViewState.action === 'input_request'
     && sharedViewState.displayId !== null
     && displaySlots.has(sharedViewState.displayId);
+  const browserWorkspaceStatus = stationBrowserWorkspaceStatusPayload();
+  const displayTarget = stationDisplayControlTargetPayload();
+  const latestOperationalActivity = stationLatestOperationalActivityPayload();
+  const cuValidationState = debugStatus || (displayTarget.kind !== 'none' ? 'display target ready' : 'idle');
+  const cuValidationDetail = [
+    stationComputerUseValue('set-cu-provider', '') || 'auto',
+    stationComputerUseValue('set-cu-backend', 'auto') || 'auto',
+    displayTarget.authority ? `input ${displayTarget.authority}` : '',
+  ].filter(Boolean).join(' / ');
   const externalTurn = stationBuildExternalTurnSummary({
     backend,
     command,
@@ -21947,11 +22204,17 @@ function stationBuildControlsSummary() {
     videoActive: !!videoActive,
     activeBrowser: !!isActiveBrowser,
     browserWorkspaces: activeBrowserWorkspaces,
+    browserWorkspaceStatus: browserWorkspaceStatus.validation_state,
+    browserWorkspaceDetail: browserWorkspaceStatus.validation_detail,
+    browserWorkspaceLatest: browserWorkspaceStatus.latest_label || browserWorkspaceStatus.latest_id || '',
+    browserWorkspaceLease: browserWorkspaceStatus.lease || '',
     recordings: recordingStreams.size,
     activeRecording: activeRecordingStream || '',
     cuProvider: stationComputerUseValue('set-cu-provider', '') || 'auto',
     cuModel: stationComputerUseValue('set-cu-model', '') || 'default',
     cuBackend: stationComputerUseValue('set-cu-backend', 'auto') || 'auto',
+    cuValidationState,
+    cuValidationDetail,
     debugScreen: /^active$/i.test(debugStatus),
     debugRecording: !!debugRecordBtn && /stop/i.test(debugRecordBtn.textContent || ''),
     pendingAttachments: pendingAttachmentCount,
@@ -21960,6 +22223,25 @@ function stationBuildControlsSummary() {
     sharedViewAction: sharedViewState.action || '',
     sharedViewNote,
     sharedViewCanTakeInput,
+    selectedDisplayKind: displayTarget.kind || '',
+    selectedDisplayLabel: displayTarget.label || '',
+    selectedDisplayTarget: displayTarget.target || '',
+    selectedDisplayHostId: displayTarget.host_id || '',
+    selectedDisplayId: displayTarget.display_id,
+    selectedDisplayLaneId: displayTarget.lane_id || '',
+    selectedDisplayStatus: displayTarget.status || '',
+    selectedDisplayAuthority: displayTarget.authority || '',
+    selectedDisplayCapture: displayTarget.capture || '',
+    selectedDisplayFreshness: displayTarget.freshness || '',
+    selectedDisplayTelemetry: displayTarget.telemetry || '',
+    selectedDisplayCanOpen: !!displayTarget.can_open,
+    selectedDisplayCanFocus: !!displayTarget.can_focus,
+    selectedDisplayCanTakeInput: !!displayTarget.can_take_input,
+    selectedDisplayCanReleaseInput: !!displayTarget.can_release_input,
+    selectedDisplayCanAttachFrame: !!displayTarget.can_attach_frame,
+    selectedDisplayCanCapture: !!displayTarget.can_capture,
+    latestOperationalActivity: latestOperationalActivity.detail || '',
+    latestOperationalActivityLabel: latestOperationalActivity.label || '',
   };
 }
 
