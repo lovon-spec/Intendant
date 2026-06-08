@@ -15492,6 +15492,21 @@ function stationSessionRowForDock(session, indexedIds = new Set()) {
   const source = normalizeAgentId(configSource || stationSessionSource(session) || session?.source || '') || 'intendant';
   const project = sessionProjectDirectory(session);
   const rowId = String(id || '').trim();
+  const backendId = String(configMeta.backendSessionId || configMeta.backend_session_id || '').trim();
+  const intendantId = String(configMeta.intendantSessionId || configMeta.intendant_session_id || '').trim();
+  const live = stationExternalLiveThreadDescriptor(session || rowId);
+  const command = sessionConfigCommand(configMeta);
+  const managedMode = source === 'codex' ? sessionConfigManagedMode(configMeta) : '';
+  const archiveMode = source === 'codex' ? sessionConfigArchiveMode(configMeta) : '';
+  const sandboxMode = source === 'codex' ? sessionLaunchSandboxMode(configMeta) : '';
+  const approvalPolicy = source === 'codex' ? sessionLaunchApprovalPolicy(configMeta) : '';
+  const launchPersistent = source !== 'intendant' && !!(
+    command ||
+    sessionLaunchManagedMode(configMeta) ||
+    sessionLaunchArchiveMode(configMeta) ||
+    sandboxMode ||
+    approvalPolicy
+  );
   const goal = normalizeSessionGoal(configMeta.goal || configMeta.session_goal || configMeta.sessionGoal || null);
   const threadActionSessionId = stationCodexThreadActionSessionId(session) || rowId;
   return {
@@ -15508,6 +15523,19 @@ function stationSessionRowForDock(session, indexedIds = new Set()) {
     source,
     status,
     project,
+    backendId,
+    intendantId,
+    liveId: live?.liveId || '',
+    actionId: live?.actionId || '',
+    attachId: live?.attachId || '',
+    stopId: live?.stopId || '',
+    externalStatus: live?.target ? 'target' : (live?.detached ? 'detached' : (live?.phase || status)),
+    externalDetached: !!live?.detached,
+    livePhase: live?.phase || status || '',
+    command: source === 'intendant' ? 'internal' : (command || 'global default'),
+    managedContext: managedMode,
+    contextArchive: archiveMode,
+    launchPersistent,
     isCodex: source === 'codex' || stationSessionLooksCodex(rowId),
     threadActionSessionId,
     goalStatus: goal?.status || '',
@@ -15523,6 +15551,9 @@ function stationSessionRowForDock(session, indexedIds = new Set()) {
     canRename: !!rowId,
     canAttach: !!rowId && canAttachSessionWindow(rowId),
     canStop: !!rowId && sessionWindowStopAvailability(rowId).ok,
+    canRestart: !!rowId && !!configSource && configSource !== 'intendant',
+    canOpenLog: !!rowId,
+    canFork: !!rowId && (source === 'codex' || stationSessionLooksCodex(threadActionSessionId || rowId)),
   };
 }
 
@@ -20164,6 +20195,16 @@ function stationHandleSessionAction(action) {
     resumeSession(session);
     return;
   }
+  if (op === 'open-log') {
+    stationRenderSessionsDock(stationSessionId(session) || sessionId);
+    stationLoadSessionLogForDock(session);
+    return;
+  }
+  if (op === 'fork') {
+    const threadId = stationCodexThreadActionSessionId(session, live) || sessionId;
+    if (threadId) stationHandleThreadAction({ op: 'fork', session_id: threadId });
+    return;
+  }
   if (op === 'attach') {
     attachSessionWindowAction(live?.attachId || sessionId);
     return;
@@ -21370,10 +21411,20 @@ function stationBuildSessionsSummary() {
       externalDetached: !!row.detached,
       isCodex: !!row.isCodex,
       threadActionSessionId: row.actionId || row.id || '',
+      backendId: row.id || '',
+      intendantId: row.sid && row.sid !== row.id ? row.sid : '',
+      livePhase: row.status || '',
+      command: sessionConfigCommand(sessionConfigMetadata(row.id)) || 'global default',
+      managedContext: row.source === 'codex' ? sessionConfigManagedMode(sessionConfigMetadata(row.id)) : '',
+      contextArchive: row.source === 'codex' ? sessionConfigArchiveMode(sessionConfigMetadata(row.id)) : '',
+      launchPersistent: true,
       canResume: !!row.canResume,
       canConfig: !!row.canConfig,
       canAttach: !!row.attachId,
       canStop: !!row.stopId,
+      canRestart: !!row.canConfig,
+      canOpenLog: true,
+      canFork: !!row.isCodex,
     }));
   } catch (err) {
     console.warn('Station external target snapshot failed:', err);
@@ -21392,6 +21443,19 @@ function stationBuildSessionsSummary() {
     indexStatus: sessionsLoaded
       ? 'loaded'
       : (stationSessionsIndexLoading ? 'indexing' : (stationSessionsIndexError ? 'error' : 'cold')),
+    searchQuery: stationSessionDockFilter || sessionSearchQuery?.() || '',
+    sourceFilter: stationSessionDockSourceFilter || '',
+    statusFilter: stationSessionDockStatusFilter || '',
+    projectFilter: stationSessionDockProjectFilter || '',
+    filtered: stationSessionRowsForDock().filter(row =>
+      stationSessionDockRowMatchesFilters(
+        row,
+        stationSessionDockFilter.trim(),
+        stationSessionDockSourceFilter,
+        stationSessionDockStatusFilter,
+        stationSessionDockProjectFilter
+      )
+    ).length,
     externalTargets,
     recent,
     ...worktrees,
@@ -21445,6 +21509,13 @@ function stationBuildControlsSummary() {
   const sessionConfigDraft = sessionConfigEditing ? stationSessionConfigDraftFor(sessionConfigEditing) : null;
   const sessionConfigPending = !!(sessionConfigSavePending?.station && sessionConfigEditing?.sessionId && sessionConfigSavePending.sessionId === sessionConfigEditing.sessionId);
   const sessionConfigResultActive = !!(sessionConfigEditing?.sessionId && stationSessionConfigResult.sessionId === sessionConfigEditing.sessionId);
+  const sessionLaunchPersistent = !!(sessionConfigEditing?.sessionId && (
+    rawSessionCommand ||
+    sessionLaunchManagedMode(sessionMeta) ||
+    sessionLaunchArchiveMode(sessionMeta) ||
+    sessionLaunchSandboxMode(sessionMeta) ||
+    sessionLaunchApprovalPolicy(sessionMeta)
+  ));
   const sessionLiveId = externalLive?.liveId || '';
   const sessionActionId = externalLive?.actionId || '';
   const sessionAttachId = externalLive?.attachId || '';
@@ -21578,6 +21649,7 @@ function stationBuildControlsSummary() {
     sessionConfigResultKind: sessionConfigResultActive ? (stationSessionConfigResult.kind || '') : '',
     sessionConfigHasDraft: sessionConfigHadDraft,
     sessionConfigPending,
+    sessionLaunchPersistent,
     sessionCanConfig,
     sessionCanFocus,
     sessionCanAttach,

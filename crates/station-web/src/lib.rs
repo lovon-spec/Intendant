@@ -5830,6 +5830,40 @@ impl StationInner {
         self.panel_row(
             x,
             yy,
+            "visible",
+            &format!(
+                "{} filtered · {}",
+                sessions.filtered,
+                if sessions.search_query.is_empty() {
+                    "no search".to_string()
+                } else {
+                    format!("search {}", truncate(&sessions.search_query, 22))
+                }
+            ),
+        );
+        yy += 22.0;
+        self.panel_row(
+            x,
+            yy,
+            "filters",
+            &truncate(
+                &format!(
+                    "src {} · status {} · project {}",
+                    nonempty(&sessions.source_filter, "all"),
+                    nonempty(&sessions.status_filter, "all"),
+                    if sessions.project_filter.is_empty() {
+                        "all".to_string()
+                    } else {
+                        truncate(&sessions.project_filter, 18)
+                    }
+                ),
+                44,
+            ),
+        );
+        yy += 22.0;
+        self.panel_row(
+            x,
+            yy,
             "worktrees",
             &format!(
                 "{} · {} cleanup",
@@ -5947,6 +5981,142 @@ impl StationInner {
             },
         ));
         yy += 28.0;
+        let controls = self.snapshot.controls.clone();
+        if !controls.session_id.is_empty() {
+            self.section_title_color(x, yy, "Selected backend", C_PEACH_CSS);
+            yy += 22.0;
+            self.panel_row(
+                x,
+                yy,
+                "active id",
+                &truncate(
+                    &nonempty(
+                        &controls.session_live_id,
+                        &nonempty(&controls.session_id, "--"),
+                    ),
+                    42,
+                ),
+            );
+            yy += 22.0;
+            if !controls.session_backend_id.is_empty() || !controls.session_intendant_id.is_empty()
+            {
+                self.panel_row(
+                    x,
+                    yy,
+                    "backend",
+                    &truncate(
+                        &format!(
+                            "{} · wrapper {}",
+                            nonempty(&controls.session_backend_id, "--"),
+                            short_id(&controls.session_intendant_id)
+                        ),
+                        42,
+                    ),
+                );
+                yy += 22.0;
+            }
+            self.panel_row(
+                x,
+                yy,
+                "phase",
+                &nonempty(
+                    &controls.session_live_phase,
+                    &nonempty(&controls.session_status, "--"),
+                ),
+            );
+            yy += 22.0;
+            self.panel_row(
+                x,
+                yy,
+                "binary",
+                &truncate(&nonempty(&controls.session_command, "--"), 42),
+            );
+            yy += 22.0;
+            self.panel_row(
+                x,
+                yy,
+                "mode",
+                &truncate(
+                    &format!(
+                        "managed {} · archive {}",
+                        nonempty(&controls.session_managed_context, "--"),
+                        nonempty(&controls.session_context_archive, "--")
+                    ),
+                    42,
+                ),
+            );
+            yy += 22.0;
+            if controls.session_can_config {
+                self.panel_row_color(
+                    x,
+                    yy,
+                    "launch",
+                    if controls.session_config_pending {
+                        "saving launch config"
+                    } else if controls.session_config_has_draft {
+                        "draft edits pending"
+                    } else if controls.session_launch_persistent {
+                        "saved per-session config"
+                    } else {
+                        "inherits backend defaults"
+                    },
+                    if controls.session_config_pending || controls.session_config_has_draft {
+                        C_YELLOW_CSS
+                    } else if controls.session_launch_persistent {
+                        C_GREEN_CSS
+                    } else {
+                        C_TEXT_CSS
+                    },
+                );
+                yy += 22.0;
+            }
+            let mut target_actions = Vec::new();
+            if controls.session_can_attach {
+                target_actions.push((
+                    "attach".to_string(),
+                    "attach".to_string(),
+                    58.0,
+                    C_TEAL_CSS.to_string(),
+                ));
+            }
+            if !controls.session_id.is_empty() {
+                target_actions.push((
+                    "resume".to_string(),
+                    "resume".to_string(),
+                    62.0,
+                    C_TEAL_CSS.to_string(),
+                ));
+                target_actions.push((
+                    "open-log".to_string(),
+                    "open log".to_string(),
+                    78.0,
+                    C_BLUE_CSS.to_string(),
+                ));
+            }
+            if controls.session_can_config {
+                target_actions.push((
+                    "restart".to_string(),
+                    "restart saved".to_string(),
+                    112.0,
+                    C_PEACH_CSS.to_string(),
+                ));
+            }
+            if controls.session_is_codex {
+                target_actions.push((
+                    "fork".to_string(),
+                    "fork".to_string(),
+                    48.0,
+                    C_MAUVE_CSS.to_string(),
+                ));
+            }
+            yy = self.draw_session_action_pills(
+                x,
+                panel_w,
+                yy - 14.0,
+                &target_actions,
+                &controls.session_id,
+            );
+        }
         if !sessions.external_targets.is_empty() {
             self.section_title_color(x, yy, "External control", C_PEACH_CSS);
             yy += 18.0;
@@ -6985,8 +7155,10 @@ impl StationInner {
                             "saving "
                         } else if controls.session_config_has_draft {
                             "draft "
+                        } else if controls.session_launch_persistent {
+                            "persisted "
                         } else {
-                            "saved "
+                            "inherited "
                         },
                         nonempty(&controls.session_config_managed, "vanilla"),
                         nonempty(&controls.session_config_archive, "summary")
@@ -7045,6 +7217,20 @@ impl StationInner {
                     "restart saved".to_string(),
                     112.0,
                     C_RED_CSS.to_string(),
+                ));
+            }
+            config_actions.push((
+                "open-log".to_string(),
+                "open log".to_string(),
+                78.0,
+                C_BLUE_CSS.to_string(),
+            ));
+            if controls.session_is_codex {
+                config_actions.push((
+                    "fork".to_string(),
+                    "fork".to_string(),
+                    48.0,
+                    C_MAUVE_CSS.to_string(),
                 ));
             }
             yy = self.draw_session_action_pills(
@@ -8044,9 +8230,19 @@ impl StationInner {
         for row in rows.iter().take(max_rows) {
             let external_runway = Self::external_runway_label(row);
             let has_goal = !row.goal_status.is_empty() || !row.goal_objective.is_empty();
+            let has_launch_context = !row.backend_id.is_empty()
+                || !row.live_phase.is_empty()
+                || !row.command.is_empty()
+                || !row.managed_context.is_empty()
+                || !row.context_archive.is_empty()
+                || row.launch_persistent;
             let show_thread_controls = row.is_codex || has_goal;
             let show_external_runway = !show_thread_controls && !external_runway.is_empty();
-            let card_h = if show_thread_controls {
+            let card_h = if has_launch_context && show_thread_controls {
+                92.0
+            } else if has_launch_context {
+                82.0
+            } else if show_thread_controls {
                 68.0
             } else if show_external_runway {
                 62.0
@@ -8103,6 +8299,51 @@ impl StationInner {
                 C_SUBTEXT0_CSS,
                 "normal",
             );
+            if has_launch_context {
+                let active_id = nonempty(&row.live_id, &row.id);
+                let backend_id = nonempty(&row.backend_id, &row.action_id);
+                self.text(
+                    &truncate(
+                        &format!(
+                            "active {} · backend {} · phase {}",
+                            short_id(&active_id),
+                            short_id(&backend_id),
+                            nonempty(&row.live_phase, "--")
+                        ),
+                        44,
+                    ),
+                    x + 20.0,
+                    yy + 35.0,
+                    8.3,
+                    C_PEACH_CSS,
+                    "normal",
+                );
+                self.text(
+                    &truncate(
+                        &format!(
+                            "{} · managed {} · archive {} · {}",
+                            nonempty(&row.command, "binary --"),
+                            nonempty(&row.managed_context, "--"),
+                            nonempty(&row.context_archive, "--"),
+                            if row.launch_persistent {
+                                "saved launch"
+                            } else {
+                                "inherits launch"
+                            }
+                        ),
+                        48,
+                    ),
+                    x + 20.0,
+                    yy + 50.0,
+                    8.3,
+                    if row.launch_persistent {
+                        C_GREEN_CSS
+                    } else {
+                        C_SUBTEXT0_CSS
+                    },
+                    "normal",
+                );
+            }
             if show_thread_controls {
                 let goal_status = nonempty(&row.goal_status, "goal");
                 let goal_detail = if row.goal_objective.is_empty() {
@@ -8126,7 +8367,7 @@ impl StationInner {
                 self.text(
                     &truncate(&format!("{goal_detail}{goal_tokens}"), 28),
                     x + 20.0,
-                    yy + 35.0,
+                    yy + if has_launch_context { 66.0 } else { 35.0 },
                     8.5,
                     if !external_runway.is_empty() && row.goal_status.is_empty() {
                         C_TEAL_CSS
@@ -8158,10 +8399,11 @@ impl StationInner {
                         + (goal_buttons.len().saturating_sub(1) as f32 * 6.0);
                     let mut bx = x + panel_w - total_w - 28.0;
                     for (op, label, width, color) in goal_buttons {
-                        self.pill_at(bx, yy + 39.0, width, 18.0, label, color);
+                        let by = yy + if has_launch_context { 70.0 } else { 39.0 };
+                        self.pill_at(bx, by, width, 18.0, label, color);
                         self.hit_zones.push(HitZone::new(
                             bx,
-                            yy + 39.0,
+                            by,
                             width,
                             18.0,
                             HitAction::ThreadAction {
@@ -8190,8 +8432,17 @@ impl StationInner {
             if row.can_resume && !row.id.is_empty() {
                 buttons.push(("resume", "resume", 58.0, C_TEAL_CSS));
             }
+            if row.can_restart && !row.id.is_empty() {
+                buttons.push(("restart", "restart", 62.0, C_PEACH_CSS));
+            }
             if row.can_config && !row.id.is_empty() {
                 buttons.push(("config", "config", 58.0, C_MAUVE_CSS));
+            }
+            if row.can_fork && !row.id.is_empty() {
+                buttons.push(("fork", "fork", 42.0, C_MAUVE_CSS));
+            }
+            if row.can_open_log && !row.id.is_empty() {
+                buttons.push(("open-log", "log", 38.0, C_BLUE_CSS));
             }
             if row.can_stop && !row.id.is_empty() {
                 buttons.push(("stop", "stop", 46.0, C_RED_CSS));
@@ -8199,7 +8450,7 @@ impl StationInner {
             if row.can_rename && !row.id.is_empty() && buttons.len() < 3 {
                 buttons.push(("rename", "rename", 58.0, C_BLUE_CSS));
             }
-            let visible_buttons = buttons.into_iter().take(3).collect::<Vec<_>>();
+            let visible_buttons = buttons.into_iter().take(4).collect::<Vec<_>>();
             if !visible_buttons.is_empty() {
                 let total_w: f32 = visible_buttons
                     .iter()
@@ -8208,10 +8459,16 @@ impl StationInner {
                     + (visible_buttons.len().saturating_sub(1) as f32 * 6.0);
                 let mut bx = x + panel_w - total_w - 28.0;
                 for (action, label, width, color) in visible_buttons {
-                    self.pill_at(bx, yy + 15.0, width, 19.0, label, color);
+                    let by = yy
+                        + if has_launch_context && !show_thread_controls {
+                            61.0
+                        } else {
+                            15.0
+                        };
+                    self.pill_at(bx, by, width, 19.0, label, color);
                     self.hit_zones.push(HitZone::new(
                         bx,
-                        yy + 15.0,
+                        by,
                         width,
                         19.0,
                         HitAction::SessionAction {
@@ -9853,6 +10110,11 @@ struct StationSessionsSummary {
     latest_source: String,
     latest_updated: String,
     index_status: String,
+    search_query: String,
+    source_filter: String,
+    status_filter: String,
+    project_filter: String,
+    filtered: u32,
     external_targets: Vec<StationDetailRow>,
     recent: Vec<StationDetailRow>,
     recent_worktrees: Vec<StationDetailRow>,
@@ -9877,6 +10139,11 @@ impl Default for StationSessionsSummary {
             latest_source: String::new(),
             latest_updated: String::new(),
             index_status: String::new(),
+            search_query: String::new(),
+            source_filter: String::new(),
+            status_filter: String::new(),
+            project_filter: String::new(),
+            filtered: 0,
             external_targets: Vec::new(),
             recent: Vec::new(),
             recent_worktrees: Vec::new(),
@@ -9923,6 +10190,7 @@ struct StationControlsSummary {
     session_config_result_kind: String,
     session_config_has_draft: bool,
     session_config_pending: bool,
+    session_launch_persistent: bool,
     session_can_config: bool,
     session_can_focus: bool,
     session_can_attach: bool,
@@ -10005,6 +10273,7 @@ impl Default for StationControlsSummary {
             session_config_result_kind: String::new(),
             session_config_has_draft: false,
             session_config_pending: false,
+            session_launch_persistent: false,
             session_can_config: false,
             session_can_focus: false,
             session_can_attach: false,
@@ -10138,10 +10407,17 @@ struct StationDetailRow {
     detail: String,
     tone: String,
     external_status: String,
+    backend_id: String,
+    intendant_id: String,
     live_id: String,
     action_id: String,
     attach_id: String,
     stop_id: String,
+    live_phase: String,
+    command: String,
+    managed_context: String,
+    context_archive: String,
+    launch_persistent: bool,
     external_detached: bool,
     is_codex: bool,
     thread_action_session_id: String,
@@ -10154,6 +10430,9 @@ struct StationDetailRow {
     can_rename: bool,
     can_attach: bool,
     can_stop: bool,
+    can_restart: bool,
+    can_open_log: bool,
+    can_fork: bool,
 }
 
 impl Default for StationDetailRow {
@@ -10167,10 +10446,17 @@ impl Default for StationDetailRow {
             detail: String::new(),
             tone: String::new(),
             external_status: String::new(),
+            backend_id: String::new(),
+            intendant_id: String::new(),
             live_id: String::new(),
             action_id: String::new(),
             attach_id: String::new(),
             stop_id: String::new(),
+            live_phase: String::new(),
+            command: String::new(),
+            managed_context: String::new(),
+            context_archive: String::new(),
+            launch_persistent: false,
             external_detached: false,
             is_codex: false,
             thread_action_session_id: String::new(),
@@ -10183,6 +10469,9 @@ impl Default for StationDetailRow {
             can_rename: false,
             can_attach: false,
             can_stop: false,
+            can_restart: false,
+            can_open_log: false,
+            can_fork: false,
         }
     }
 }
