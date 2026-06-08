@@ -785,7 +785,10 @@ impl McpAppState {
                 "hard_limit": null,
                 "rewind_only": false,
                 "density_pressure": false,
+                "density_maintenance_recommended": false,
                 "normal_tools_allowed": true,
+                "broad_followup_allowed": true,
+                "narrow_inflight_validation_allowed": true,
                 "required_action": "continue",
                 "message": "Backend-reported context pressure is unavailable. Normal tools are allowed unless a later status reports rewind_only=true; continue ordinary work while pressure is unknown.",
                 "managed_context": Self::managed_context_mode(managed_context),
@@ -811,9 +814,14 @@ impl McpAppState {
         };
         let rewind_only = managed_context && (status == "high" || status == "critical");
         let density_pressure = used_tokens >= recommended_rewind_limit;
+        let density_maintenance_recommended = managed_context && density_pressure && !rewind_only;
         let normal_tools_allowed = !rewind_only;
+        let broad_followup_allowed = normal_tools_allowed && !density_maintenance_recommended;
+        let narrow_inflight_validation_allowed = normal_tools_allowed;
         let required_action = if rewind_only {
             "rewind_context"
+        } else if density_maintenance_recommended {
+            "density_handoff_before_broad_work"
         } else if density_pressure {
             "continue_or_rewind_optional"
         } else {
@@ -822,7 +830,11 @@ impl McpAppState {
         let message = if rewind_only {
             "Managed context is in rewind-only mode. Use rewind_context before ordinary model-facing tools."
         } else if density_pressure {
-            "Context is above the recommended density threshold but below the rewind-only limit. Normal tools are allowed; at handoff or before broad follow-up work, exact-anchor density maintenance is optional only if it materially improves density."
+            if managed_context {
+                "Managed context is above the recommended density threshold but below the rewind-only limit. Normal tools remain allowed for status/anchor inspection and one narrow in-flight validation or build to finish, but before broad follow-up work perform exact-anchor density maintenance when it materially improves density, or produce a concise no-rewind density handoff."
+            } else {
+                "Context is above the recommended density threshold but below the rewind-only limit. Normal tools are allowed; at handoff or before broad follow-up work, exact-anchor density maintenance is optional only if it materially improves density."
+            }
         } else {
             "Context is below the recommended density threshold. Normal tools are allowed; no rewind preparation is needed unless a recent tool result was genuinely noisy or unexpectedly large."
         };
@@ -841,7 +853,10 @@ impl McpAppState {
             "hard_limit": hard_context_window,
             "rewind_only": rewind_only,
             "density_pressure": density_pressure,
+            "density_maintenance_recommended": density_maintenance_recommended,
             "normal_tools_allowed": normal_tools_allowed,
+            "broad_followup_allowed": broad_followup_allowed,
+            "narrow_inflight_validation_allowed": narrow_inflight_validation_allowed,
             "required_action": required_action,
             "message": message,
             "managed_context": Self::managed_context_mode(managed_context),
@@ -9288,7 +9303,10 @@ mod tests {
             assert_eq!(pressure["rewind_only_limit"], 100_000);
             assert_eq!(pressure["rewind_only"], false);
             assert_eq!(pressure["density_pressure"], true);
+            assert_eq!(pressure["density_maintenance_recommended"], false);
             assert_eq!(pressure["normal_tools_allowed"], true);
+            assert_eq!(pressure["broad_followup_allowed"], true);
+            assert_eq!(pressure["narrow_inflight_validation_allowed"], true);
             assert_eq!(pressure["required_action"], "continue_or_rewind_optional");
             assert_eq!(pressure["managed_context"], "vanilla");
         });
@@ -9346,14 +9364,22 @@ mod tests {
         let pressure = s.context_pressure_snapshot();
         assert_eq!(pressure["status"], "watch");
         assert_eq!(pressure["rewind_only"], false);
+        assert_eq!(pressure["density_maintenance_recommended"], true);
         assert_eq!(pressure["normal_tools_allowed"], true);
-        assert_eq!(pressure["required_action"], "continue_or_rewind_optional");
+        assert_eq!(pressure["broad_followup_allowed"], false);
+        assert_eq!(pressure["narrow_inflight_validation_allowed"], true);
+        assert_eq!(
+            pressure["required_action"],
+            "density_handoff_before_broad_work"
+        );
         assert_eq!(
             pressure["last_rewind_insufficient"],
             serde_json::Value::Null
         );
         let message = pressure["message"].as_str().unwrap_or_default();
-        assert!(message.contains("Normal tools are allowed"));
+        assert!(message.contains("Normal tools remain allowed"));
+        assert!(message.contains("one narrow in-flight validation or build"));
+        assert!(message.contains("concise no-rewind density handoff"));
         assert!(!message.contains("recovery"));
         assert!(!message.contains("Use rewind_context before ordinary"));
         assert!(s.rewind_only_gate_message("execute_cu_actions").is_none());
@@ -11649,7 +11675,11 @@ mod tests {
             );
             assert_eq!(
                 value.pointer("/context_pressure/required_action"),
-                Some(&"continue_or_rewind_optional".into())
+                Some(&"density_handoff_before_broad_work".into())
+            );
+            assert_eq!(
+                value.pointer("/context_pressure/broad_followup_allowed"),
+                Some(&false.into())
             );
             assert_eq!(
                 value.pointer("/context_pressure/managed_context"),
