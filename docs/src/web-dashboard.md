@@ -52,8 +52,8 @@ Practical rules:
   `WKWebView` wrapper uses the custom `intendant://` scheme because
   `http://localhost` there does not expose media devices.
 - `http://<LAN-IP>` is not a secure context. Use native `--tls` with a trusted
-  certificate, the `intendant lan` mTLS proxy/enrollment flow, the macOS app
-  wrapper, or another trusted HTTPS reverse proxy.
+  certificate, `intendant lan` cert enrollment plus native `--mtls`, the macOS
+  app wrapper, or another trusted HTTPS reverse proxy.
 - Clicking through a self-signed certificate warning is not a reliable substitute
   for installing/trusting the certificate; browsers may still withhold secure
   APIs.
