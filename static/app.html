@@ -10180,6 +10180,7 @@ body.display-fullscreen-open {
     <div class="session-config-row" id="session-config-sandbox-row">
       <label for="session-config-sandbox">Sandbox</label>
       <select id="session-config-sandbox">
+        <option value="">inherit Control default</option>
         <option value="workspace-write">workspace-write</option>
         <option value="danger-full-access">danger-full-access</option>
         <option value="read-only">read-only</option>
@@ -10188,6 +10189,7 @@ body.display-fullscreen-open {
     <div class="session-config-row" id="session-config-approval-row">
       <label for="session-config-approval-policy">Approval</label>
       <select id="session-config-approval-policy">
+        <option value="">inherit Control default</option>
         <option value="on-request">on-request</option>
         <option value="never">never</option>
         <option value="untrusted">untrusted</option>
@@ -15743,11 +15745,21 @@ function stationRenderLaunchReadinessSection(parent, opts = {}) {
 }
 
 function stationApplyCodexLaunchDefaultsToDraft() {
-  stationLaunchDraft.managed = newSessionCodexManagedContext || controlCodexConfig.managed_context || 'vanilla';
-  stationLaunchDraft.sandbox = newSessionCodexSandbox || controlCodexConfig.sandbox || 'workspace-write';
-  stationLaunchDraft.approval = newSessionCodexApprovalPolicy || controlCodexConfig.approval_policy || 'on-request';
-  stationLaunchDraft.archive = newSessionCodexContextArchive || controlCodexConfig.context_archive || 'summary';
-  stationLaunchDraft.fast = codexServiceTierIsFast(newSessionCodexDefaultServiceTier || controlCodexConfig.service_tier || '');
+  stationLaunchDraft.managed = newSessionCodexLaunchDefaultsLoaded
+    ? (newSessionCodexManagedContext || controlCodexConfig.managed_context || 'vanilla')
+    : '';
+  stationLaunchDraft.sandbox = newSessionCodexLaunchDefaultsLoaded
+    ? (newSessionCodexSandbox || controlCodexConfig.sandbox || 'workspace-write')
+    : '';
+  stationLaunchDraft.approval = newSessionCodexLaunchDefaultsLoaded
+    ? (newSessionCodexApprovalPolicy || controlCodexConfig.approval_policy || 'on-request')
+    : '';
+  stationLaunchDraft.archive = newSessionCodexLaunchDefaultsLoaded
+    ? (newSessionCodexContextArchive || controlCodexConfig.context_archive || 'summary')
+    : '';
+  stationLaunchDraft.fast = newSessionCodexLaunchDefaultsLoaded
+    ? codexServiceTierIsFast(newSessionCodexDefaultServiceTier || controlCodexConfig.service_tier || '')
+    : false;
 }
 
 function stationSetLaunchDraftAgent(agent, opts = {}) {
@@ -15848,14 +15860,38 @@ async function stationStartSessionFromDock() {
     if (command) msg.agent_command = command;
   }
   if (stationEffectiveLaunchAgent() === 'codex') {
-    msg.codex_sandbox = normalizeCodexSandbox(stationLaunchDraft.sandbox || newSessionCodexSandbox || controlCodexConfig.sandbox);
-    msg.codex_approval_policy = normalizeCodexApprovalPolicy(stationLaunchDraft.approval || newSessionCodexApprovalPolicy || controlCodexConfig.approval_policy);
-    msg.codex_managed_context = stationLaunchDraft.managed === 'managed' ? 'managed' : 'vanilla';
-    msg.codex_context_archive = normalizeContextArchiveMode(stationLaunchDraft.archive || newSessionCodexContextArchive);
-    if (stationLaunchDraft.fast) {
-      msg.codex_service_tier = 'priority';
-    } else if (codexServiceTierIsFast(newSessionCodexDefaultServiceTier)) {
-      msg.codex_service_tier = 'standard';
+    const hasCodexLaunchConfig = newSessionCodexLaunchDefaultsLoaded ||
+      !!stationLaunchDraft.sandbox ||
+      !!stationLaunchDraft.approval ||
+      !!stationLaunchDraft.managed ||
+      !!stationLaunchDraft.archive ||
+      !!stationLaunchDraft.fast;
+    if (hasCodexLaunchConfig) {
+      const sandbox = normalizeCodexSandboxOptional(
+        stationLaunchDraft.sandbox ||
+          (newSessionCodexLaunchDefaultsLoaded ? (newSessionCodexSandbox || controlCodexConfig.sandbox) : '')
+      );
+      const approval = normalizeCodexApprovalPolicyOptional(
+        stationLaunchDraft.approval ||
+          (newSessionCodexLaunchDefaultsLoaded ? (newSessionCodexApprovalPolicy || controlCodexConfig.approval_policy) : '')
+      );
+      const managed = stationLaunchDraft.managed === 'managed' || stationLaunchDraft.managed === 'vanilla'
+        ? stationLaunchDraft.managed
+        : (newSessionCodexLaunchDefaultsLoaded
+          ? (newSessionCodexManagedContext === 'managed' ? 'managed' : 'vanilla')
+          : '');
+      const archive = normalizeContextArchiveModeOptional(
+        stationLaunchDraft.archive || (newSessionCodexLaunchDefaultsLoaded ? newSessionCodexContextArchive : '')
+      );
+      if (sandbox) msg.codex_sandbox = sandbox;
+      if (approval) msg.codex_approval_policy = approval;
+      if (managed) msg.codex_managed_context = managed;
+      if (archive) msg.codex_context_archive = archive;
+      if (stationLaunchDraft.fast) {
+        msg.codex_service_tier = 'priority';
+      } else if (codexServiceTierIsFast(newSessionCodexDefaultServiceTier)) {
+        msg.codex_service_tier = 'standard';
+      }
     }
   }
   if (stationLaunchDraft.direct) msg.direct = true;
@@ -16740,14 +16776,14 @@ function stationSessionConfigEditingFor(sessionOrId) {
 }
 
 function stationSessionConfigDraftFor(editing) {
-  if (!editing?.sessionId) return { command: '', managed: 'vanilla', sandbox: 'workspace-write', approval: 'on-request', archive: 'summary' };
+  if (!editing?.sessionId) return { command: '', managed: 'vanilla', sandbox: '', approval: '', archive: 'summary' };
   const existing = stationSessionConfigDrafts.get(editing.sessionId);
   if (existing) return existing;
   const draft = {
     command: sessionConfigCommand(editing.meta),
     managed: editing.source === 'codex' ? sessionConfigManagedMode(editing.meta) : 'vanilla',
-    sandbox: editing.source === 'codex' ? sessionConfigSandboxMode(editing.meta) : 'workspace-write',
-    approval: editing.source === 'codex' ? sessionConfigApprovalPolicy(editing.meta) : 'on-request',
+    sandbox: editing.source === 'codex' ? sessionConfigExplicitSandboxMode(editing.meta) : '',
+    approval: editing.source === 'codex' ? sessionConfigExplicitApprovalPolicy(editing.meta) : '',
     archive: editing.source === 'codex' ? sessionConfigArchiveMode(editing.meta) : 'summary',
   };
   stationSessionConfigDrafts.set(editing.sessionId, draft);
@@ -16762,8 +16798,8 @@ function stationRememberSessionConfigDraft(sessionId) {
     ...prior,
     command: document.getElementById('station-session-config-command')?.value || '',
     managed: document.getElementById('station-session-config-managed')?.value || prior.managed || 'vanilla',
-    sandbox: document.getElementById('station-session-config-sandbox')?.value || prior.sandbox || 'workspace-write',
-    approval: document.getElementById('station-session-config-approval')?.value || prior.approval || 'on-request',
+    sandbox: document.getElementById('station-session-config-sandbox')?.value ?? prior.sandbox ?? '',
+    approval: document.getElementById('station-session-config-approval')?.value ?? prior.approval ?? '',
     archive: document.getElementById('station-session-config-archive')?.value || prior.archive || 'summary',
   });
 }
@@ -16779,8 +16815,8 @@ function stationSetSessionConfigResult(sessionId, text, kind = '') {
 function stationSessionConfigPayload(editing, draft) {
   const command = String(draft.command || '').trim();
   const mode = draft.managed === 'managed' ? 'managed' : 'vanilla';
-  const sandboxMode = normalizeCodexSandbox(draft.sandbox || controlCodexConfig.sandbox);
-  const approvalPolicy = normalizeCodexApprovalPolicy(draft.approval || controlCodexConfig.approval_policy);
+  const sandboxMode = normalizeOptionalCodexSandbox(draft.sandbox || '');
+  const approvalPolicy = normalizeOptionalCodexApprovalPolicy(draft.approval || '');
   const archiveMode = normalizeContextArchiveMode(draft.archive || controlCodexConfig.context_archive);
   return {
     payload: {
@@ -16791,8 +16827,8 @@ function stationSessionConfigPayload(editing, draft) {
       ...(editing.intendantSessionId ? { intendant_session_id: editing.intendantSessionId } : {}),
       agent_command: command,
       ...(editing.source === 'codex' ? {
-        codex_sandbox: sandboxMode,
-        codex_approval_policy: approvalPolicy,
+        codex_sandbox: sandboxMode || 'inherit',
+        codex_approval_policy: approvalPolicy || 'inherit',
         codex_managed_context: mode,
         codex_context_archive: archiveMode,
       } : {}),
@@ -16891,13 +16927,15 @@ function stationRenderSessionConfigSection(parent, sessionOrId) {
       ['managed', 'managed'],
     ], { id: 'station-session-config-managed' });
     managed.addEventListener('change', () => stationRememberSessionConfigDraft(editing.sessionId));
-    const sandbox = stationDockSelect(section, 'Sandbox', normalizeCodexSandbox(draft.sandbox), [
+    const sandbox = stationDockSelect(section, 'Sandbox', draft.sandbox || '', [
+      ['', `inherit (${controlCodexConfig.sandbox || 'workspace-write'})`],
       ['workspace-write', 'workspace-write'],
       ['danger-full-access', 'danger-full-access'],
       ['read-only', 'read-only'],
     ], { id: 'station-session-config-sandbox' });
     sandbox.addEventListener('change', () => stationRememberSessionConfigDraft(editing.sessionId));
-    const approval = stationDockSelect(section, 'Approval', normalizeCodexApprovalPolicy(draft.approval), [
+    const approval = stationDockSelect(section, 'Approval', draft.approval || '', [
+      ['', `inherit (${controlCodexConfig.approval_policy || 'on-request'})`],
       ['on-request', 'on-request'],
       ['never', 'never'],
       ['untrusted', 'untrusted'],
@@ -24023,11 +24061,12 @@ let newSessionAgentCommands = {
 };
 let newSessionCodexManagedContext = 'vanilla';
 let newSessionCodexContextArchive = 'summary';
-let newSessionCodexSandbox = 'workspace-write';
-let newSessionCodexApprovalPolicy = 'on-request';
+let newSessionCodexSandbox = '';
+let newSessionCodexApprovalPolicy = '';
 let newSessionCodexDefaultServiceTier = '';
 let newSessionCodexFastMode = false;
 let newSessionCodexFastModeTouched = false;
+let newSessionCodexLaunchDefaultsLoaded = false;
 let newSessionSpawnPending = false;
 let newSessionSpawnTask = '';
 let newSessionSpawnName = '';
@@ -24068,6 +24107,7 @@ async function refreshControlPane() {
     newSessionCodexSandbox = controlCodexConfig.sandbox || 'workspace-write';
     newSessionCodexApprovalPolicy = controlCodexConfig.approval_policy || 'on-request';
     newSessionCodexDefaultServiceTier = controlCodexConfig.service_tier || '';
+    newSessionCodexLaunchDefaultsLoaded = true;
     if (!newSessionCodexFastModeTouched) {
       newSessionCodexFastMode = codexServiceTierIsFast(newSessionCodexDefaultServiceTier);
     }
@@ -28868,10 +28908,35 @@ function sessionConfigManagedMode(meta = {}) {
   return mode === 'managed' ? 'managed' : 'vanilla';
 }
 
-function sessionConfigSandboxMode(meta = {}) {
-  return normalizeCodexSandbox(
+function normalizeOptionalCodexSandbox(mode) {
+  const v = String(mode || '').trim();
+  return ['workspace-write', 'danger-full-access', 'read-only'].includes(v) ? v : '';
+}
+
+function normalizeOptionalCodexApprovalPolicy(policy) {
+  const v = String(policy || '').trim();
+  return ['on-request', 'never', 'untrusted', 'on-failure'].includes(v) ? v : '';
+}
+
+function sessionConfigExplicitSandboxMode(meta = {}) {
+  return normalizeOptionalCodexSandbox(
     meta.codexSandbox ||
     meta.codex_sandbox ||
+    ''
+  );
+}
+
+function sessionConfigExplicitApprovalPolicy(meta = {}) {
+  return normalizeOptionalCodexApprovalPolicy(
+    meta.codexApprovalPolicy ||
+    meta.codex_approval_policy ||
+    ''
+  );
+}
+
+function sessionConfigSandboxMode(meta = {}) {
+  return normalizeCodexSandbox(
+    sessionConfigExplicitSandboxMode(meta) ||
     meta.capabilities?.codexSandbox ||
     meta.capabilities?.codex_sandbox ||
     controlCodexConfig.sandbox ||
@@ -28881,8 +28946,7 @@ function sessionConfigSandboxMode(meta = {}) {
 
 function sessionConfigApprovalPolicy(meta = {}) {
   return normalizeCodexApprovalPolicy(
-    meta.codexApprovalPolicy ||
-    meta.codex_approval_policy ||
+    sessionConfigExplicitApprovalPolicy(meta) ||
     meta.capabilities?.codexApprovalPolicy ||
     meta.capabilities?.codex_approval_policy ||
     controlCodexConfig.approval_policy ||
@@ -28898,6 +28962,43 @@ function sessionConfigArchiveMode(meta = {}) {
     meta.capabilities?.codex_context_archive ||
     ''
   ).trim() || controlCodexConfig.context_archive || 'summary');
+}
+
+function sessionLaunchManagedMode(meta = {}) {
+  const mode = String(
+    meta.codexManagedContext ||
+    meta.codex_managed_context ||
+    meta.capabilities?.codexManagedContext ||
+    meta.capabilities?.codex_managed_context ||
+    ''
+  ).trim();
+  return mode === 'managed' || mode === 'vanilla' ? mode : '';
+}
+
+function sessionLaunchSandboxMode(meta = {}) {
+  return normalizeCodexSandboxOptional(
+    meta.codexSandbox ||
+    meta.codex_sandbox ||
+    ''
+  );
+}
+
+function sessionLaunchApprovalPolicy(meta = {}) {
+  return normalizeCodexApprovalPolicyOptional(
+    meta.codexApprovalPolicy ||
+    meta.codex_approval_policy ||
+    ''
+  );
+}
+
+function sessionLaunchArchiveMode(meta = {}) {
+  return normalizeContextArchiveModeOptional(
+    meta.codexContextArchive ||
+    meta.codex_context_archive ||
+    meta.capabilities?.codexContextArchive ||
+    meta.capabilities?.codex_context_archive ||
+    ''
+  );
 }
 
 function sessionConfigMetadata(sessionOrId) {
@@ -28930,10 +29031,14 @@ function sessionLaunchOverridesForSession(sessionOrId) {
   const command = sessionConfigCommand(meta);
   if (command) overrides.agent_command = command;
   if (source === 'codex') {
-    overrides.codex_sandbox = sessionConfigSandboxMode(meta);
-    overrides.codex_approval_policy = sessionConfigApprovalPolicy(meta);
-    overrides.codex_managed_context = sessionConfigManagedMode(meta);
-    overrides.codex_context_archive = sessionConfigArchiveMode(meta);
+    const sandbox = sessionLaunchSandboxMode(meta);
+    const approvalPolicy = sessionLaunchApprovalPolicy(meta);
+    const managedMode = sessionLaunchManagedMode(meta);
+    const archiveMode = sessionLaunchArchiveMode(meta);
+    if (sandbox) overrides.codex_sandbox = sandbox;
+    if (approvalPolicy) overrides.codex_approval_policy = approvalPolicy;
+    if (managedMode) overrides.codex_managed_context = managedMode;
+    if (archiveMode) overrides.codex_context_archive = archiveMode;
   }
   return overrides;
 }
@@ -28984,9 +29089,9 @@ function openSessionConfigModal(sessionOrId) {
   if (managedRow) managedRow.style.display = source === 'codex' ? '' : 'none';
   if (managedSel) managedSel.value = sessionConfigManagedMode(meta);
   if (sandboxRow) sandboxRow.style.display = source === 'codex' ? '' : 'none';
-  if (sandboxSel) sandboxSel.value = sessionConfigSandboxMode(meta);
+  if (sandboxSel) sandboxSel.value = sessionConfigExplicitSandboxMode(meta);
   if (approvalRow) approvalRow.style.display = source === 'codex' ? '' : 'none';
-  if (approvalSel) approvalSel.value = sessionConfigApprovalPolicy(meta);
+  if (approvalSel) approvalSel.value = sessionConfigExplicitApprovalPolicy(meta);
   if (archiveRow) archiveRow.style.display = source === 'codex' ? '' : 'none';
   if (archiveSel) archiveSel.value = sessionConfigArchiveMode(meta);
   const status = document.getElementById('session-config-status');
@@ -29114,8 +29219,8 @@ function applySessionConfigLocal(meta, command, sandboxMode, approvalPolicy, mod
       ...(meta.intendantSessionId ? { intendantSessionId: meta.intendantSessionId } : {}),
       ...(command ? { agentCommand: command } : {}),
       ...(meta.source === 'codex' ? {
-        codexSandbox: normalizeCodexSandbox(sandboxMode),
-        codexApprovalPolicy: normalizeCodexApprovalPolicy(approvalPolicy),
+        codexSandbox: sandboxMode ? normalizeCodexSandbox(sandboxMode) : '',
+        codexApprovalPolicy: approvalPolicy ? normalizeCodexApprovalPolicy(approvalPolicy) : '',
         codexManagedContext: mode,
         codexContextArchive: archiveMode,
       } : {}),
@@ -29140,8 +29245,16 @@ function applySessionConfigLocal(meta, command, sandboxMode, approvalPolicy, mod
       delete session.codex_command;
     }
     if (meta.source === 'codex') {
-      session.codex_sandbox = normalizeCodexSandbox(sandboxMode);
-      session.codex_approval_policy = normalizeCodexApprovalPolicy(approvalPolicy);
+      if (sandboxMode) {
+        session.codex_sandbox = normalizeCodexSandbox(sandboxMode);
+      } else {
+        delete session.codex_sandbox;
+      }
+      if (approvalPolicy) {
+        session.codex_approval_policy = normalizeCodexApprovalPolicy(approvalPolicy);
+      } else {
+        delete session.codex_approval_policy;
+      }
       session.codex_managed_context = mode;
       session.codex_context_archive = archiveMode;
     }
@@ -29152,11 +29265,11 @@ function applySessionConfigLocal(meta, command, sandboxMode, approvalPolicy, mod
 function saveSessionConfigModal(options = {}) {
   if (!sessionConfigEditing || !app) return;
   const command = document.getElementById('session-config-command')?.value.trim() || '';
-  const sandboxMode = normalizeCodexSandbox(
-    document.getElementById('session-config-sandbox')?.value || controlCodexConfig.sandbox
+  const sandboxMode = normalizeOptionalCodexSandbox(
+    document.getElementById('session-config-sandbox')?.value || ''
   );
-  const approvalPolicy = normalizeCodexApprovalPolicy(
-    document.getElementById('session-config-approval-policy')?.value || controlCodexConfig.approval_policy
+  const approvalPolicy = normalizeOptionalCodexApprovalPolicy(
+    document.getElementById('session-config-approval-policy')?.value || ''
   );
   const mode = document.getElementById('session-config-managed-context')?.value === 'managed'
     ? 'managed'
@@ -29172,8 +29285,8 @@ function saveSessionConfigModal(options = {}) {
     ...(sessionConfigEditing.intendantSessionId ? { intendant_session_id: sessionConfigEditing.intendantSessionId } : {}),
     agent_command: command,
     ...(sessionConfigEditing.source === 'codex' ? {
-      codex_sandbox: sandboxMode,
-      codex_approval_policy: approvalPolicy,
+      codex_sandbox: sandboxMode || 'inherit',
+      codex_approval_policy: approvalPolicy || 'inherit',
       codex_managed_context: mode,
       codex_context_archive: archiveMode,
     } : {}),
@@ -45859,14 +45972,29 @@ function normalizeContextArchiveMode(mode) {
   return ['summary', 'exact', 'off'].includes(mode) ? mode : 'summary';
 }
 
+function normalizeContextArchiveModeOptional(mode) {
+  const v = String(mode || '').trim();
+  return ['summary', 'exact', 'off'].includes(v) ? v : '';
+}
+
 function normalizeCodexSandbox(mode) {
   const v = String(mode || '').trim();
   return ['workspace-write', 'danger-full-access', 'read-only'].includes(v) ? v : 'workspace-write';
 }
 
+function normalizeCodexSandboxOptional(mode) {
+  const v = String(mode || '').trim();
+  return ['workspace-write', 'danger-full-access', 'read-only'].includes(v) ? v : '';
+}
+
 function normalizeCodexApprovalPolicy(policy) {
   const v = String(policy || '').trim();
   return ['on-request', 'never', 'untrusted', 'on-failure'].includes(v) ? v : 'on-request';
+}
+
+function normalizeCodexApprovalPolicyOptional(policy) {
+  const v = String(policy || '').trim();
+  return ['on-request', 'never', 'untrusted', 'on-failure'].includes(v) ? v : '';
 }
 
 function normalizeCodexServiceTier(tier) {
@@ -45899,6 +46027,7 @@ function setNewSessionAgentDefaults(settings) {
   newSessionCodexSandbox = normalizeCodexSandbox(settings.codex_sandbox || 'workspace-write');
   newSessionCodexApprovalPolicy = normalizeCodexApprovalPolicy(settings.codex_approval_policy || 'on-request');
   newSessionCodexDefaultServiceTier = normalizeCodexServiceTier(settings.codex_service_tier || '');
+  newSessionCodexLaunchDefaultsLoaded = true;
   if (!newSessionCodexFastModeTouched) {
     newSessionCodexFastMode = codexServiceTierIsFast(newSessionCodexDefaultServiceTier);
   }
@@ -46228,25 +46357,27 @@ async function startNewSession() {
     if (agentCommand) msg.agent_command = agentCommand;
   }
   if (effectiveNewSessionAgentId() === 'codex') {
-    msg.codex_sandbox = normalizeCodexSandbox(
-      document.getElementById('new-session-codex-sandbox')?.value || newSessionCodexSandbox
-    );
-    msg.codex_approval_policy = normalizeCodexApprovalPolicy(
-      document.getElementById('new-session-codex-approval-policy')?.value || newSessionCodexApprovalPolicy
-    );
-    const mode = document.getElementById('new-session-codex-managed-context')?.value === 'managed'
-      ? 'managed'
-      : 'vanilla';
-    msg.codex_managed_context = mode;
-    const archiveMode = normalizeContextArchiveMode(
-      document.getElementById('new-session-codex-context-archive')?.value || newSessionCodexContextArchive
-    );
-    msg.codex_context_archive = archiveMode;
-    const fastChecked = !!document.getElementById('new-session-codex-fast')?.checked;
-    if (fastChecked) {
-      msg.codex_service_tier = 'priority';
-    } else if (codexServiceTierIsFast(newSessionCodexDefaultServiceTier)) {
-      msg.codex_service_tier = 'standard';
+    if (newSessionCodexLaunchDefaultsLoaded) {
+      msg.codex_sandbox = normalizeCodexSandbox(
+        document.getElementById('new-session-codex-sandbox')?.value || newSessionCodexSandbox
+      );
+      msg.codex_approval_policy = normalizeCodexApprovalPolicy(
+        document.getElementById('new-session-codex-approval-policy')?.value || newSessionCodexApprovalPolicy
+      );
+      const mode = document.getElementById('new-session-codex-managed-context')?.value === 'managed'
+        ? 'managed'
+        : 'vanilla';
+      msg.codex_managed_context = mode;
+      const archiveMode = normalizeContextArchiveMode(
+        document.getElementById('new-session-codex-context-archive')?.value || newSessionCodexContextArchive
+      );
+      msg.codex_context_archive = archiveMode;
+      const fastChecked = !!document.getElementById('new-session-codex-fast')?.checked;
+      if (fastChecked) {
+        msg.codex_service_tier = 'priority';
+      } else if (codexServiceTierIsFast(newSessionCodexDefaultServiceTier)) {
+        msg.codex_service_tier = 'standard';
+      }
     }
   }
   if (direct) msg.direct = true;

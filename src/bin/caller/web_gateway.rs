@@ -8475,14 +8475,6 @@ fn intendant_session_list_row_from_dir(dir: &Path, session_id: &str) -> Option<s
                             .as_ref()
                             .and_then(|caps| caps.get("codex_command"))
                             .and_then(|v| v.as_str());
-                        let sandbox = capabilities
-                            .as_ref()
-                            .and_then(|caps| caps.get("codex_sandbox"))
-                            .and_then(|v| v.as_str());
-                        let approval_policy = capabilities
-                            .as_ref()
-                            .and_then(|caps| caps.get("codex_approval_policy"))
-                            .and_then(|v| v.as_str());
                         let mode = capabilities
                             .as_ref()
                             .and_then(|caps| caps.get("codex_managed_context"))
@@ -8498,8 +8490,8 @@ fn intendant_session_list_row_from_dir(dir: &Path, session_id: &str) -> Option<s
                         session_agent_config = Some(crate::session_config::from_wire(
                             source,
                             command,
-                            sandbox,
-                            approval_policy,
+                            None,
+                            None,
                             mode,
                             archive,
                             service_tier,
@@ -20640,6 +20632,7 @@ mod tests {
 
     #[test]
     fn list_sessions_joins_external_context_from_debug_thread_log() {
+        let _codex_home = EnvVarGuard::unset("CODEX_HOME");
         let home = tempfile::tempdir().unwrap();
         let repo = home.path().join("repo");
         let command_cwd = repo.join(".worktrees").join("feature");

@@ -104,11 +104,19 @@ pub fn normalize_codex_home(home: Option<&str>) -> Option<String> {
 }
 
 pub fn normalize_codex_sandbox(mode: Option<&str>) -> Option<String> {
-    mode.map(crate::project::normalize_sandbox_mode)
+    let trimmed = mode.map(str::trim).filter(|value| !value.is_empty())?;
+    if matches!(trimmed, "inherit" | "default" | "global") {
+        return None;
+    }
+    Some(crate::project::normalize_sandbox_mode(trimmed))
 }
 
 pub fn normalize_codex_approval_policy(policy: Option<&str>) -> Option<String> {
-    policy.map(crate::project::normalize_approval_policy)
+    let trimmed = policy.map(str::trim).filter(|value| !value.is_empty())?;
+    if matches!(trimmed, "inherit" | "default" | "global") {
+        return None;
+    }
+    Some(crate::project::normalize_approval_policy(trimmed))
 }
 
 pub fn effective_codex_home() -> Option<String> {
@@ -323,6 +331,25 @@ pub fn write_external_overlay(
     session_id: &str,
     config: &SessionAgentConfig,
 ) -> Result<(), String> {
+    write_external_overlay_inner(home, source, session_id, config, true)
+}
+
+pub fn replace_external_overlay(
+    home: &Path,
+    source: &str,
+    session_id: &str,
+    config: &SessionAgentConfig,
+) -> Result<(), String> {
+    write_external_overlay_inner(home, source, session_id, config, false)
+}
+
+fn write_external_overlay_inner(
+    home: &Path,
+    source: &str,
+    session_id: &str,
+    config: &SessionAgentConfig,
+    merge_existing: bool,
+) -> Result<(), String> {
     let source = crate::session_names::normalize_source(source);
     let session_id = session_id.trim();
     if source == "intendant" || session_id.is_empty() || config.is_empty() {
@@ -368,11 +395,13 @@ pub fn write_external_overlay(
         }
         let source_entries = source_value.as_object_mut().expect("source is object");
         let mut merged = normalize_session_agent_config(config.clone(), Some(&source));
-        if let Some(existing) = source_entries
-            .get(session_id)
-            .and_then(|value| serde_json::from_value::<SessionAgentConfig>(value.clone()).ok())
-        {
-            merged.merge_missing_from(normalize_session_agent_config(existing, Some(&source)));
+        if merge_existing {
+            if let Some(existing) = source_entries
+                .get(session_id)
+                .and_then(|value| serde_json::from_value::<SessionAgentConfig>(value.clone()).ok())
+            {
+                merged.merge_missing_from(normalize_session_agent_config(existing, Some(&source)));
+            }
         }
         source_entries.insert(
             session_id.to_string(),
@@ -759,6 +788,38 @@ mod tests {
         assert_eq!(loaded.codex_approval_policy.as_deref(), Some("never"));
         assert_eq!(loaded.codex_managed_context.as_deref(), Some("managed"));
         assert_eq!(loaded.codex_context_archive.as_deref(), Some("summary"));
+    }
+
+    #[test]
+    fn replace_overlay_can_clear_launch_sandbox_override() {
+        let home = tempfile::tempdir().unwrap();
+        let full = from_wire(
+            Some("codex"),
+            Some("/tmp/codex"),
+            Some("danger-full-access"),
+            Some("never"),
+            Some("vanilla"),
+            Some("summary"),
+            None,
+        );
+        write_external_overlay(home.path(), "codex", "thread-1", &full).unwrap();
+
+        let inherit = from_wire(
+            Some("codex"),
+            Some("/tmp/codex"),
+            Some("inherit"),
+            Some("inherit"),
+            Some("managed"),
+            Some("summary"),
+            None,
+        );
+        replace_external_overlay(home.path(), "codex", "thread-1", &inherit).unwrap();
+
+        let loaded = lookup_external_overlay(home.path(), "codex", "thread-1").unwrap();
+        assert_eq!(loaded.agent_command.as_deref(), Some("/tmp/codex"));
+        assert_eq!(loaded.codex_sandbox, None);
+        assert_eq!(loaded.codex_approval_policy, None);
+        assert_eq!(loaded.codex_managed_context.as_deref(), Some("managed"));
     }
 
     #[test]
