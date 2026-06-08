@@ -202,6 +202,18 @@ impl Dispatcher {
                 self.warn_drop(bus, "FollowUp", &text);
             }
 
+            ControlMsg::CancelFollowUp {
+                session_id,
+                id,
+                reason,
+            } => {
+                bus.send(AppEvent::FollowUpCancelRequested {
+                    session_id,
+                    id,
+                    reason: reason.unwrap_or_else(|| "cleared by user".to_string()),
+                });
+            }
+
             ControlMsg::Interrupt {
                 session_id,
                 expected_turn: _,
@@ -306,7 +318,8 @@ fn control_target_session_id(msg: &ControlMsg) -> Option<&str> {
         | ControlMsg::Steer { session_id, .. }
         | ControlMsg::CancelSteer { session_id, .. }
         | ControlMsg::StartTask { session_id, .. }
-        | ControlMsg::FollowUp { session_id, .. } => session_id.as_deref(),
+        | ControlMsg::FollowUp { session_id, .. }
+        | ControlMsg::CancelFollowUp { session_id, .. } => session_id.as_deref(),
         ControlMsg::ConfigureSessionAgent { session_id, .. } => Some(session_id.as_str()),
         ControlMsg::StopSession { session_id } => Some(session_id.as_str()),
         ControlMsg::ResumeSession { .. } | ControlMsg::RestartSession { .. } => None,

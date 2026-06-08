@@ -692,6 +692,13 @@ impl SessionSupervisor {
             } => {
                 self.route_cancel_steer(session_id, id, reason).await;
             }
+            event::ControlMsg::CancelFollowUp {
+                session_id,
+                id,
+                reason,
+            } => {
+                self.route_cancel_follow_up(session_id, id, reason).await;
+            }
             event::ControlMsg::Approve { session_id, id } => {
                 self.resolve_approval(session_id, id, event::ApprovalResponse::Approve, "approve")
                     .await;
@@ -2391,6 +2398,37 @@ impl SessionSupervisor {
         });
     }
 
+    async fn route_cancel_follow_up(
+        &self,
+        session_id: Option<String>,
+        id: Option<String>,
+        reason: Option<String>,
+    ) {
+        let requested_id = session_id.clone();
+        let event_session_id =
+            if let Some(target_id) = self.resolve_target_session_id(session_id).await {
+                let state = self.state.lock().await;
+                let managed_id = state.resolve_session_id(&target_id).unwrap_or(target_id);
+                requested_id.or(Some(managed_id))
+            } else {
+                requested_id
+            };
+        let reason = reason.unwrap_or_else(|| "cleared by user".to_string());
+        self.config.bus.send(AppEvent::FollowUpCancelRequested {
+            session_id: event_session_id.clone(),
+            id: id.clone(),
+            reason: reason.clone(),
+        });
+        emit_follow_up_status(
+            &self.config.bus,
+            event_session_id,
+            &id,
+            None,
+            "cancelled",
+            Some(&reason),
+        );
+    }
+
     async fn resolve_approval(
         &self,
         session_id: Option<String>,
@@ -3575,7 +3613,8 @@ fn control_target_session_id(msg: &event::ControlMsg) -> Option<&str> {
         | event::ControlMsg::CancelSteer { session_id, .. }
         | event::ControlMsg::StartTask { session_id, .. }
         | event::ControlMsg::EditUserMessage { session_id, .. }
-        | event::ControlMsg::FollowUp { session_id, .. } => session_id.as_deref(),
+        | event::ControlMsg::FollowUp { session_id, .. }
+        | event::ControlMsg::CancelFollowUp { session_id, .. } => session_id.as_deref(),
         event::ControlMsg::RenameSession { session_id, .. } => Some(session_id.as_str()),
         event::ControlMsg::ConfigureSessionAgent { session_id, .. } => Some(session_id.as_str()),
         event::ControlMsg::StopSession { session_id } => Some(session_id.as_str()),

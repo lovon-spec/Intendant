@@ -275,6 +275,7 @@ impl AppEventUpcaster {
             | AppEvent::ContextSnapshot { .. }
             | AppEvent::CodexThreadActionRequested { .. }
             | AppEvent::ExternalFollowUpRequested { .. }
+            | AppEvent::FollowUpCancelRequested { .. }
             | AppEvent::GeminiThreadActionRequested { .. }
             | AppEvent::SessionStopRequested { .. }
             | AppEvent::SessionIdentity { .. }

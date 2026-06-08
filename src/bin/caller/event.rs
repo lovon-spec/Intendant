@@ -283,6 +283,13 @@ pub enum AppEvent {
         status: String,
         reason: Option<String>,
     },
+    /// User/admin requested that a queued ordinary follow-up be cleared before
+    /// the target session consumes it for the next turn.
+    FollowUpCancelRequested {
+        session_id: Option<String>,
+        id: Option<String>,
+        reason: String,
+    },
     /// Internal request to send a follow-up to a backend-native child thread
     /// without waiting for the parent session's next turn. The active external
     /// agent drain consumes this directly; browsers only see FollowUpStatus.
@@ -1414,6 +1421,16 @@ pub enum ControlMsg {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         follow_up_id: Option<String>,
     },
+    /// Clear one queued ordinary follow-up by correlation id. This cannot
+    /// unsend text already delivered to a backend runtime.
+    CancelFollowUp {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
     /// Replace a previous user message by rewinding the target session to the
     /// selected user turn and submitting replacement text.
     ///
@@ -1857,6 +1874,7 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
             status: status.clone(),
             reason: reason.clone(),
         }),
+        AppEvent::FollowUpCancelRequested { .. } => None,
         AppEvent::SessionStarted { session_id, task } => Some(OutboundEvent::SessionStarted {
             session_id: session_id.clone(),
             task: task.clone(),
@@ -3819,6 +3837,22 @@ mod tests {
                 assert_eq!(follow_up_id.as_deref(), Some("follow-1"));
             }
             _ => panic!("expected FollowUp"),
+        }
+
+        let cancel_json =
+            r#"{"action":"cancel_follow_up","session_id":"sess-123","id":"follow-1"}"#;
+        let cancel: ControlMsg = serde_json::from_str(cancel_json).unwrap();
+        match cancel {
+            ControlMsg::CancelFollowUp {
+                session_id,
+                id,
+                reason,
+            } => {
+                assert_eq!(session_id.as_deref(), Some("sess-123"));
+                assert_eq!(id.as_deref(), Some("follow-1"));
+                assert_eq!(reason, None);
+            }
+            _ => panic!("expected CancelFollowUp"),
         }
     }
 

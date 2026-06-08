@@ -28134,13 +28134,20 @@ function shouldApplyStatusPhaseForSession(sessionId) {
     && targetSid === resolvePromptTargetSessionId();
 }
 
-function focusSessionWindowFromLifecycle(sessionId) {
+function focusSessionWindowFromLifecycle(sessionId, options = {}) {
   const sid = String(sessionId || '').trim();
   if (!sid) return;
-  if (!processingLogReplay || !foregroundSessionFullId) {
+  const currentTarget = String(
+    options.currentTarget === undefined ? resolvePromptTargetSessionId() : options.currentTarget
+  ).trim();
+  const force = !!options.force;
+  const shouldFocus = force || !currentTarget || currentTarget === sid;
+  if (shouldFocus && (!processingLogReplay || !foregroundSessionFullId || force)) {
     focusSessionWindow(sid);
+    return true;
   } else {
     updateTaskTargetChip();
+    return false;
   }
 }
 
@@ -46026,10 +46033,10 @@ function onSessionStarted(sessionId, task) {
   stationCurrentApproval = null;
   stationScheduleUpdate();
   const shouldFocusActivity = newSessionSpawnPending;
+  const currentTarget = resolvePromptTargetSessionId();
   finishNewSessionSpawnNotice(sid, task);
   const alias = externalBackendAliasForSession(sid);
   const visibleSessionId = alias?.backendSessionId || sid;
-  currentSessionFullId = visibleSessionId || '';
   if (visibleSessionId) {
     setSessionWindowDetached(visibleSessionId, false);
     ensureSessionWindow(visibleSessionId, {
@@ -46038,7 +46045,10 @@ function onSessionStarted(sessionId, task) {
       ended: false,
       ...(alias?.source ? { source: alias.source, backendSource: alias.source } : {}),
     });
-    focusSessionWindowFromLifecycle(visibleSessionId);
+    focusSessionWindowFromLifecycle(visibleSessionId, {
+      force: shouldFocusActivity,
+      currentTarget,
+    });
   } else {
     updateTaskTargetChip();
   }
@@ -46060,7 +46070,7 @@ function onSessionStarted(sessionId, task) {
 }
 
 function onSessionAttached(sessionId, source) {
-  currentSessionFullId = sessionId || '';
+  const currentTarget = resolvePromptTargetSessionId();
   if (sessionId) {
     setSessionWindowDetached(sessionId, false);
     const existingPhase = normalizeSessionPhase(sessionWindows.get(sessionId)?.phase || '');
@@ -46068,7 +46078,7 @@ function onSessionAttached(sessionId, source) {
       ? existingPhase
       : 'idle';
     ensureSessionWindow(sessionId, { source: source || 'session', phase, ended: false });
-    focusSessionWindowFromLifecycle(sessionId);
+    focusSessionWindowFromLifecycle(sessionId, { currentTarget });
     flushPendingDetachedCodexThreadActions(sessionId);
   } else {
     updateTaskTargetChip();
@@ -46620,6 +46630,11 @@ function cancelSteerRow(id) {
     const msg = { action: 'cancel_steer', id: key, reason: 'cleared by user' };
     if (sessionId) msg.session_id = sessionId;
     app.send_server_action(msg);
+  } else if (app) {
+    const msg = { action: 'cancel_follow_up', id: key, reason: 'cleared by user' };
+    if (sessionId) msg.session_id = sessionId;
+    app.send_server_action(msg);
+    forgetPendingFollowUp(key);
   } else {
     forgetPendingFollowUp(key);
   }
@@ -46659,7 +46674,9 @@ function onSteerStatusUpdate(id, text, status, reason, options = {}) {
   const cancelBtn = el.querySelector('.steer-cancel');
   if (cancelBtn) {
     const terminal = ['delivered', 'cancelled', 'failed'].includes(status);
-    cancelBtn.style.display = key.startsWith('steer-') && !terminal ? '' : 'none';
+    cancelBtn.style.display = !terminal ? '' : 'none';
+    cancelBtn.title = key.startsWith('steer-') ? 'Clear queued steer' : 'Clear queued follow-up';
+    cancelBtn.setAttribute('aria-label', cancelBtn.title);
   }
   if (text) entry.text = text;
   textNode.textContent = entry.text || text || '';

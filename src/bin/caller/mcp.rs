@@ -4056,6 +4056,25 @@ async fn handle_control_command_mcp(
             );
             Some(RESOURCE_STATUS_URI)
         }
+        ControlMsg::CancelFollowUp {
+            session_id,
+            id,
+            reason,
+        } => {
+            bus.send(AppEvent::FollowUpCancelRequested {
+                session_id,
+                id,
+                reason: reason.unwrap_or_else(|| "cleared by user".to_string()),
+            });
+            emit_control_result(
+                control_tx,
+                "cancel_follow_up",
+                true,
+                "Follow-up cancellation requested".to_string(),
+                None,
+            );
+            Some(RESOURCE_STATUS_URI)
+        }
         ControlMsg::WebRtcSignal { .. } => {
             // Federation-driven WebRTC signaling — handled by the
             // web gateway's per-peer WS dispatcher, not the MCP
@@ -4191,6 +4210,7 @@ pub fn spawn_event_listener(
                     | AppEvent::AutonomyChanged { .. }
                     | AppEvent::CodexThreadActionRequested { .. }
                     | AppEvent::ExternalFollowUpRequested { .. }
+                    | AppEvent::FollowUpCancelRequested { .. }
                     | AppEvent::SessionStopRequested { .. }
                     | AppEvent::SessionRelationship { .. }
                     | AppEvent::SessionGoal { .. }

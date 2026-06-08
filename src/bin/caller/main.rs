@@ -196,6 +196,23 @@ fn event_targets_external_session_or_side(
     }
 }
 
+fn event_targets_external_session_or_optional_side(
+    target: &Option<String>,
+    session_id: &Option<String>,
+    alias_session_id: &Option<String>,
+    side_threads: Option<&HashMap<String, String>>,
+) -> bool {
+    match side_threads {
+        Some(side_threads) => event_targets_external_session_or_side(
+            target,
+            session_id,
+            alias_session_id,
+            side_threads,
+        ),
+        None => event_targets_session_or_alias(target, session_id, alias_session_id),
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ExternalSteerTargetKind {
     Primary,
@@ -4509,6 +4526,7 @@ struct ExternalContextRewindResume<'a, 'b> {
     diff_tracker: &'a mut ExternalDiffDeltaTracker,
     pending_runtime_steers: &'a mut std::collections::VecDeque<PendingRuntimeSteer>,
     handled_steer_ids: &'a mut std::collections::HashSet<String>,
+    cancelled_follow_ups: &'a mut HashSet<String>,
     codex_thread_action_dedupe: &'a mut CodexThreadActionDedupe,
     side_sessions: Option<&'a mut ExternalSideSessionState<'b>>,
 }
@@ -4534,6 +4552,7 @@ async fn send_external_context_rewind_resume_turn(
         resume.diff_tracker,
         resume.pending_runtime_steers,
         resume.handled_steer_ids,
+        resume.cancelled_follow_ups,
         resume.codex_thread_action_dedupe,
         resume.side_sessions.as_deref_mut(),
         followup.managed_context_recovery_kickstart,
@@ -6887,6 +6906,7 @@ async fn drain_external_child_turn(
     diff_tracker: &mut ExternalDiffDeltaTracker,
     pending_runtime_steers: &mut std::collections::VecDeque<PendingRuntimeSteer>,
     handled_steer_ids: &mut std::collections::HashSet<String>,
+    cancelled_follow_ups: &mut HashSet<String>,
     codex_thread_action_dedupe: &mut CodexThreadActionDedupe,
     child_thread_id: String,
     conversation_kind: &str,
@@ -6926,6 +6946,7 @@ async fn drain_external_child_turn(
         diff_tracker,
         pending_runtime_steers,
         handled_steer_ids,
+        cancelled_follow_ups,
         codex_thread_action_dedupe,
         None,
         false,
@@ -7344,6 +7365,7 @@ async fn drain_external_agent_events(
     diff_tracker: &mut ExternalDiffDeltaTracker,
     pending_runtime_steers: &mut std::collections::VecDeque<PendingRuntimeSteer>,
     handled_steer_ids: &mut std::collections::HashSet<String>,
+    cancelled_follow_ups: &mut HashSet<String>,
     codex_thread_action_dedupe: &mut CodexThreadActionDedupe,
     mut side_sessions: Option<&mut ExternalSideSessionState<'_>>,
     managed_context_recovery_kickstart: bool,
@@ -7514,6 +7536,28 @@ async fn drain_external_agent_events(
                                 });
                             }
                         }
+                        continue;
+                    }
+                    Ok(AppEvent::FollowUpCancelRequested {
+                        session_id,
+                        id,
+                        reason,
+                    }) if event_targets_external_session_or_optional_side(
+                        &session_id,
+                        &local_session_id,
+                        &alias_session_id,
+                        side_sessions
+                            .as_ref()
+                            .map(|state| &*state.open_side_threads),
+                    ) => {
+                        let status_session = session_id.as_deref().or(local_session_id.as_deref());
+                        record_cancelled_follow_up_id(
+                            cancelled_follow_ups,
+                            config.bus,
+                            status_session,
+                            id,
+                            &reason,
+                        );
                         continue;
                     }
                     Ok(AppEvent::SteerCancelRequested {
@@ -9096,6 +9140,35 @@ fn emit_follow_up_status(
         status: status.to_string(),
         reason: reason.map(str::to_string),
     });
+}
+
+fn normalized_follow_up_id(id: &Option<String>) -> Option<String> {
+    id.as_deref()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+}
+
+fn record_cancelled_follow_up_id(
+    cancelled_follow_ups: &mut HashSet<String>,
+    bus: &EventBus,
+    session_id: Option<&str>,
+    id: Option<String>,
+    reason: &str,
+) {
+    let Some(id) = normalized_follow_up_id(&id) else {
+        return;
+    };
+    cancelled_follow_ups.insert(id.clone());
+    emit_follow_up_status(bus, session_id, &Some(id), None, "cancelled", Some(reason));
+}
+
+fn follow_up_message_was_cancelled(
+    cancelled_follow_ups: &mut HashSet<String>,
+    message: &FollowUpMessage,
+) -> bool {
+    normalized_follow_up_id(&message.follow_up_id)
+        .is_some_and(|id| cancelled_follow_ups.remove(&id))
 }
 
 async fn emit_external_turn_status(
@@ -11618,6 +11691,7 @@ mod tests {
         let mut diff_tracker = ExternalDiffDeltaTracker::default();
         let mut pending_runtime_steers = std::collections::VecDeque::new();
         let mut handled_steer_ids = std::collections::HashSet::new();
+        let mut cancelled_follow_ups = HashSet::new();
         let mut dedupe = CodexThreadActionDedupe::default();
 
         let outcome = drain_external_agent_events(
@@ -11629,6 +11703,7 @@ mod tests {
             &mut diff_tracker,
             &mut pending_runtime_steers,
             &mut handled_steer_ids,
+            &mut cancelled_follow_ups,
             &mut dedupe,
             None,
             false,
@@ -11860,6 +11935,7 @@ mod tests {
         let mut diff_tracker = ExternalDiffDeltaTracker::default();
         let mut pending_runtime_steers = std::collections::VecDeque::new();
         let mut handled_steer_ids = std::collections::HashSet::new();
+        let mut cancelled_follow_ups = HashSet::new();
         let mut dedupe = CodexThreadActionDedupe::default();
 
         bus.send(AppEvent::SessionStopRequested {
@@ -11876,6 +11952,7 @@ mod tests {
             &mut diff_tracker,
             &mut pending_runtime_steers,
             &mut handled_steer_ids,
+            &mut cancelled_follow_ups,
             &mut dedupe,
             None,
             false,
@@ -12036,6 +12113,21 @@ mod tests {
             FollowUpMessage::text("held follow-up".into()).after_managed_context_density_handoff();
         assert!(replay.managed_context_density_handoff_completed);
         assert!(!replay.managed_context_density_handoff);
+    }
+
+    #[test]
+    fn cancelled_follow_up_ids_skip_matching_message_once() {
+        let mut cancelled = HashSet::from(["follow-1".to_string()]);
+        let matching =
+            FollowUpMessage::text("wrong target".into()).with_follow_up_id(Some("follow-1".into()));
+        let other = FollowUpMessage::text("legit follow-up".into())
+            .with_follow_up_id(Some("follow-2".into()));
+        let anonymous = FollowUpMessage::text("no id".into());
+
+        assert!(follow_up_message_was_cancelled(&mut cancelled, &matching));
+        assert!(!follow_up_message_was_cancelled(&mut cancelled, &matching));
+        assert!(!follow_up_message_was_cancelled(&mut cancelled, &other));
+        assert!(!follow_up_message_was_cancelled(&mut cancelled, &anonymous));
     }
 
     #[test]
@@ -18871,6 +18963,8 @@ async fn run_round_loop(
     let mut cumulative_stats = LoopStats::default();
     let mut xvfb_guard: Option<vision::XvfbGuard> = None;
     let local_session_id = session_log_id(&session_log);
+    let mut follow_up_cancel_rx = bus.subscribe();
+    let mut cancelled_follow_ups: HashSet<String> = HashSet::new();
 
     loop {
         let (stats, exit_reason) = run_agent_loop(
@@ -18917,51 +19011,104 @@ async fn run_round_loop(
                     native_message_count,
                 });
 
-                // Wait for follow-up message
-                match follow_up_rx.recv().await {
-                    Some(message) => {
-                        round += 1;
-                        let followup_text =
-                            message.attachments.text_with_file_prelude(&message.text);
-                        let followup_images = message.attachments.conversation_images();
-                        slog(&session_log, |l| {
-                            l.info(&format!(
-                                "Round {} follow-up: {}{}",
-                                round,
-                                &message.text,
-                                if message.attachments.is_empty() {
-                                    String::new()
-                                } else {
-                                    format!(" ({} attachment(s))", message.attachments.len())
-                                }
-                            ))
-                        });
-                        if followup_images.is_empty() {
-                            conversation.add_user(followup_text);
-                        } else {
-                            conversation.add_user_with_images(followup_text, followup_images);
-                        }
-                        if let Some(id) = message.steer_id {
-                            bus.send(AppEvent::SteerDelivered {
-                                session_id: local_session_id.clone(),
+                // Wait for follow-up message, while accepting queued
+                // cancellation requests before the next turn consumes them.
+                let Some(message) = (loop {
+                    while let Ok(AppEvent::FollowUpCancelRequested {
+                        session_id,
+                        id,
+                        reason,
+                    }) = follow_up_cancel_rx.try_recv()
+                    {
+                        if event_targets_session(&session_id, &local_session_id) {
+                            record_cancelled_follow_up_id(
+                                &mut cancelled_follow_ups,
+                                bus,
+                                local_session_id.as_deref(),
                                 id,
-                                mid_turn: false,
-                            });
+                                &reason,
+                            );
                         }
-                        emit_follow_up_status(
-                            bus,
-                            local_session_id.as_deref(),
-                            &message.follow_up_id,
-                            Some(&message.text),
-                            "delivered",
-                            None,
-                        );
                     }
-                    None => {
-                        // Channel closed — user quit or sender dropped
-                        break;
+                    tokio::select! {
+                        biased;
+                        bus_event = follow_up_cancel_rx.recv() => {
+                            match bus_event {
+                                Ok(AppEvent::FollowUpCancelRequested { session_id, id, reason })
+                                    if event_targets_session(&session_id, &local_session_id) =>
+                                {
+                                    record_cancelled_follow_up_id(
+                                        &mut cancelled_follow_ups,
+                                        bus,
+                                        local_session_id.as_deref(),
+                                        id,
+                                        &reason,
+                                    );
+                                }
+                                Ok(_) => {}
+                                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                                Err(tokio::sync::broadcast::error::RecvError::Closed) => {}
+                            }
+                        }
+                        maybe_message = follow_up_rx.recv() => {
+                            match maybe_message {
+                                Some(message) => {
+                                    if follow_up_message_was_cancelled(
+                                        &mut cancelled_follow_ups,
+                                        &message,
+                                    ) {
+                                        slog(&session_log, |l| {
+                                            l.info("Skipped cancelled queued follow-up")
+                                        });
+                                        continue;
+                                    }
+                                    break Some(message);
+                                }
+                                None => {
+                                    // Channel closed — user quit or sender dropped
+                                    break None;
+                                }
+                            }
+                        }
                     }
+                }) else {
+                    break;
+                };
+                round += 1;
+                let followup_text = message.attachments.text_with_file_prelude(&message.text);
+                let followup_images = message.attachments.conversation_images();
+                slog(&session_log, |l| {
+                    l.info(&format!(
+                        "Round {} follow-up: {}{}",
+                        round,
+                        &message.text,
+                        if message.attachments.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" ({} attachment(s))", message.attachments.len())
+                        }
+                    ))
+                });
+                if followup_images.is_empty() {
+                    conversation.add_user(followup_text);
+                } else {
+                    conversation.add_user_with_images(followup_text, followup_images);
                 }
+                if let Some(id) = message.steer_id {
+                    bus.send(AppEvent::SteerDelivered {
+                        session_id: local_session_id.clone(),
+                        id,
+                        mid_turn: false,
+                    });
+                }
+                emit_follow_up_status(
+                    bus,
+                    local_session_id.as_deref(),
+                    &message.follow_up_id,
+                    Some(&message.text),
+                    "delivered",
+                    None,
+                );
             }
             LoopExitReason::BudgetExhausted
             | LoopExitReason::SafetyCapReached
@@ -19411,6 +19558,7 @@ async fn run_with_presence(
         std::collections::VecDeque::new();
     let mut persistent_handled_steer_ids: std::collections::HashSet<String> =
         std::collections::HashSet::new();
+    let mut persistent_cancelled_follow_ups: HashSet<String> = HashSet::new();
     let mut persistent_open_side_threads: HashMap<String, String> = HashMap::new();
     let mut persistent_side_rounds: HashMap<String, usize> = HashMap::new();
     let mut persistent_side_turn_revisions: HashMap<String, UserTurnRevisionState> = HashMap::new();
@@ -19519,6 +19667,26 @@ async fn run_with_presence(
                     turn_bus_rx = bus.subscribe();
                     continue;
                 }
+                Ok(AppEvent::FollowUpCancelRequested {
+                    session_id,
+                    id,
+                    reason,
+                }) if event_targets_external_session_or_side(
+                    &session_id,
+                    &local_session_id,
+                    &persistent_thread.as_ref().map(|thread| thread.thread_id.clone()),
+                    &persistent_open_side_threads,
+                ) => {
+                    let status_session = session_id.as_deref().or(local_session_id.as_deref());
+                    record_cancelled_follow_up_id(
+                        &mut persistent_cancelled_follow_ups,
+                        &bus,
+                        status_session,
+                        id,
+                        &reason,
+                    );
+                    continue;
+                }
                 // Any other bus event: skip, keep selecting. Lagged /
                 // Closed also fall through — task_rx close is the
                 // authoritative "we're done" signal.
@@ -19612,6 +19780,7 @@ async fn run_with_presence(
                                     diff_tracker: &mut persistent_diff_tracker,
                                     pending_runtime_steers: &mut persistent_pending_runtime_steers,
                                     handled_steer_ids: &mut persistent_handled_steer_ids,
+                                    cancelled_follow_ups: &mut persistent_cancelled_follow_ups,
                                     codex_thread_action_dedupe: &mut codex_thread_action_dedupe,
                                     side_sessions: Some(&mut side_session_state),
                                 };
@@ -20083,6 +20252,7 @@ async fn run_with_presence(
                                 &mut persistent_diff_tracker,
                                 &mut persistent_pending_runtime_steers,
                                 &mut persistent_handled_steer_ids,
+                                &mut persistent_cancelled_follow_ups,
                                 &mut codex_thread_action_dedupe,
                                 child_thread_id,
                                 "side",
@@ -20621,6 +20791,7 @@ async fn run_with_presence(
                 &mut persistent_diff_tracker,
                 &mut persistent_pending_runtime_steers,
                 &mut persistent_handled_steer_ids,
+                &mut persistent_cancelled_follow_ups,
                 &mut codex_thread_action_dedupe,
                 Some(&mut side_session_state),
                 false,
@@ -20689,6 +20860,7 @@ async fn run_with_presence(
                                 diff_tracker: &mut persistent_diff_tracker,
                                 pending_runtime_steers: &mut persistent_pending_runtime_steers,
                                 handled_steer_ids: &mut persistent_handled_steer_ids,
+                                cancelled_follow_ups: &mut persistent_cancelled_follow_ups,
                                 codex_thread_action_dedupe: &mut codex_thread_action_dedupe,
                                 side_sessions: Some(&mut resume_side_state),
                             };
@@ -21714,6 +21886,7 @@ async fn run_external_agent_mode(
     let mut pending_runtime_steers: std::collections::VecDeque<PendingRuntimeSteer> =
         std::collections::VecDeque::new();
     let mut handled_steer_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut cancelled_follow_ups: HashSet<String> = HashSet::new();
     let mut open_side_threads: HashMap<String, String> = HashMap::new();
     let mut side_rounds: HashMap<String, usize> = HashMap::new();
     let mut side_turn_revisions: HashMap<String, UserTurnRevisionState> = HashMap::new();
@@ -21771,6 +21944,15 @@ async fn run_external_agent_mode(
                     maybe_followup = follow_up_rx.recv() => {
                         match maybe_followup {
                             Some(followup) => {
+                                if follow_up_message_was_cancelled(
+                                    &mut cancelled_follow_ups,
+                                    &followup,
+                                ) {
+                                    slog(&session_log, |l| {
+                                        l.info("Skipped cancelled queued follow-up")
+                                    });
+                                    continue;
+                                }
                                 if let Some(id) = followup.steer_id.as_deref() {
                                     if steer_id_has_been_handled(&handled_steer_ids, id) {
                                         slog(&session_log, |l| {
@@ -21917,6 +22099,27 @@ async fn run_external_agent_mode(
                                 }
                                 continue;
                             }
+                            Ok(AppEvent::FollowUpCancelRequested {
+                                session_id,
+                                id,
+                                reason,
+                            }) if event_targets_external_session_or_side(
+                                &session_id,
+                                &live_session_id,
+                                &drain_config.alias_session_id,
+                                &open_side_threads,
+                            ) => {
+                                let status_session =
+                                    session_id.as_deref().or(live_session_id.as_deref());
+                                record_cancelled_follow_up_id(
+                                    &mut cancelled_follow_ups,
+                                    &bus,
+                                    status_session,
+                                    id,
+                                    &reason,
+                                );
+                                continue;
+                            }
                             Ok(AppEvent::SteerRequested {
                                 session_id,
                                 text,
@@ -21966,12 +22169,22 @@ async fn run_external_agent_mode(
                                 &drain_config.alias_session_id,
                                 &open_side_threads,
                             ) => {
-                                break FollowUpMessage::with_attachments(
+                                let followup = FollowUpMessage::with_attachments(
                                     text,
                                     UserAttachments::from_items(attachments),
                                 )
                                 .for_target(Some(session_id))
                                 .with_follow_up_id(follow_up_id);
+                                if follow_up_message_was_cancelled(
+                                    &mut cancelled_follow_ups,
+                                    &followup,
+                                ) {
+                                    slog(&session_log, |l| {
+                                        l.info("Skipped cancelled queued follow-up")
+                                    });
+                                    continue;
+                                }
+                                break followup;
                             }
                             Ok(AppEvent::CodexThreadActionRequested {
                                 request_id,
@@ -22111,6 +22324,7 @@ async fn run_external_agent_mode(
                                         &mut diff_tracker,
                                         &mut pending_runtime_steers,
                                         &mut handled_steer_ids,
+                                        &mut cancelled_follow_ups,
                                         &mut codex_thread_action_dedupe,
                                         child_thread_id,
                                         "side",
@@ -22149,6 +22363,12 @@ async fn run_external_agent_mode(
                 }
             },
         };
+        if follow_up_message_was_cancelled(&mut cancelled_follow_ups, &followup) {
+            slog(&session_log, |l| {
+                l.info("Skipped cancelled queued follow-up")
+            });
+            continue;
+        }
         let active_followup_for_rewind_replay = followup.clone();
         let turn_text = followup.text;
         let attachments = followup.attachments;
@@ -22299,6 +22519,7 @@ async fn run_external_agent_mode(
                 &mut diff_tracker,
                 &mut pending_runtime_steers,
                 &mut handled_steer_ids,
+                &mut cancelled_follow_ups,
                 &mut codex_thread_action_dedupe,
                 side_thread_id,
                 "side",
@@ -22415,6 +22636,7 @@ async fn run_external_agent_mode(
                 &mut diff_tracker,
                 &mut pending_runtime_steers,
                 &mut handled_steer_ids,
+                &mut cancelled_follow_ups,
                 &mut codex_thread_action_dedupe,
                 subagent_thread_id,
                 "subagent",
@@ -22758,6 +22980,7 @@ async fn run_external_agent_mode(
                         &mut diff_tracker,
                         &mut pending_runtime_steers,
                         &mut handled_steer_ids,
+                        &mut cancelled_follow_ups,
                         &mut codex_thread_action_dedupe,
                         Some(&mut side_session_state),
                         false,
@@ -23025,6 +23248,7 @@ async fn run_external_agent_mode(
             &mut diff_tracker,
             &mut pending_runtime_steers,
             &mut handled_steer_ids,
+            &mut cancelled_follow_ups,
             &mut codex_thread_action_dedupe,
             Some(&mut side_session_state),
             managed_context_recovery_kickstart,

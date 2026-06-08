@@ -1779,6 +1779,10 @@ impl App {
                 // Dispatcher re-emits as AppEvent::SteerCancelRequested; TUI
                 // reacts to the resulting cancellation event.
             }
+            ControlMsg::CancelFollowUp { .. } => {
+                // Dispatcher re-emits as AppEvent::FollowUpCancelRequested; TUI
+                // reacts to the resulting follow-up status.
+            }
             ControlMsg::WebRtcSignal { .. } => {
                 // Federation-driven WebRTC signaling — handled by the
                 // web gateway's WS handler, not the TUI control command
@@ -2786,6 +2790,7 @@ impl App {
                 );
             }
             AppEvent::SteerCancelRequested { .. } => {}
+            AppEvent::FollowUpCancelRequested { .. } => {}
             AppEvent::SteerCancelled {
                 ref id, ref reason, ..
             } => {

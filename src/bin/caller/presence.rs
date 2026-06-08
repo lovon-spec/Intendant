@@ -1071,7 +1071,8 @@ pub fn filter_event(event: &AppEvent, last_phase: &mut String) -> Option<Presenc
         | AppEvent::SteerQueued { .. }
         | AppEvent::SteerDelivered { .. }
         | AppEvent::SteerCancelRequested { .. }
-        | AppEvent::SteerCancelled { .. } => None,
+        | AppEvent::SteerCancelled { .. }
+        | AppEvent::FollowUpCancelRequested { .. } => None,
     }
 }
 
