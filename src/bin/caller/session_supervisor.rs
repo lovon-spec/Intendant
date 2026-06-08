@@ -2558,6 +2558,10 @@ impl SessionSupervisor {
             self.loop_error(message);
             return;
         };
+        let clear_codex_sandbox = matches!(backend, external_agent::AgentBackend::Codex)
+            && session_config_clear_value(codex_sandbox.as_deref());
+        let clear_codex_approval_policy = matches!(backend, external_agent::AgentBackend::Codex)
+            && session_config_clear_value(codex_approval_policy.as_deref());
         let mut config = crate::session_config::from_wire(
             Some(backend.as_short_str()),
             agent_command.as_deref(),
@@ -2591,6 +2595,12 @@ impl SessionSupervisor {
                     config.merge_missing_from(existing);
                 }
             }
+        }
+        if clear_codex_sandbox {
+            config.codex_sandbox = None;
+        }
+        if clear_codex_approval_policy {
+            config.codex_approval_policy = None;
         }
         if config.is_empty() {
             let message = "Session config failed: no launch settings supplied".to_string();
@@ -2655,7 +2665,7 @@ impl SessionSupervisor {
                 continue;
             }
             wrote_external = true;
-            if let Err(e) = crate::session_config::write_external_overlay(
+            if let Err(e) = crate::session_config::replace_external_overlay(
                 &home,
                 backend.as_short_str(),
                 external_id,
@@ -3221,12 +3231,19 @@ fn normalize_session_codex_managed_context(mode: Option<&str>) -> Option<String>
     mode.map(crate::project::normalize_codex_managed_context)
 }
 
+fn session_config_clear_value(value: Option<&str>) -> bool {
+    value
+        .map(str::trim)
+        .map(|value| value.is_empty() || matches!(value, "inherit" | "default" | "global"))
+        .unwrap_or(false)
+}
+
 fn normalize_session_codex_sandbox(mode: Option<&str>) -> Option<String> {
-    mode.map(crate::project::normalize_sandbox_mode)
+    crate::session_config::normalize_codex_sandbox(mode)
 }
 
 fn normalize_session_codex_approval_policy(policy: Option<&str>) -> Option<String> {
-    policy.map(crate::project::normalize_approval_policy)
+    crate::session_config::normalize_codex_approval_policy(policy)
 }
 
 fn normalize_session_codex_context_archive(mode: Option<&str>) -> Option<String> {
