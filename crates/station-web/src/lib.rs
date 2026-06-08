@@ -4733,6 +4733,7 @@ impl StationInner {
             "normal",
         );
         yy += 38.0;
+        yy = self.draw_managed_action_cockpit(x, yy, panel_w, &managed);
         yy = self.draw_managed_activity_signal(x, yy, panel_w, &managed);
         self.section_title_color(x, yy, "Recent rewinds", C_MAUVE_CSS);
         yy += 18.0;
@@ -4766,6 +4767,131 @@ impl StationInner {
             "No claimable fission branches",
             3,
         );
+    }
+
+    fn draw_managed_action_cockpit(
+        &mut self,
+        x: f32,
+        y: f32,
+        panel_w: f32,
+        managed: &StationManagedSummary,
+    ) -> f32 {
+        let action = &managed.action_state;
+        let card_h = 108.0;
+        self.round_rect(
+            x + 12.0,
+            y - 10.0,
+            panel_w - 24.0,
+            card_h,
+            4.0,
+            "rgba(17,17,27,0.78)",
+            "rgba(203,166,247,0.56)",
+        );
+        self.text(
+            "Managed action cockpit",
+            x + 20.0,
+            y + 2.0,
+            9.0,
+            C_MAUVE_CSS,
+            "bold",
+        );
+        self.text(
+            &truncate(&nonempty(&action.readiness, "ready"), 38),
+            x + 20.0,
+            y + 18.0,
+            8.5,
+            if action.can_rewind || action.can_backout || action.can_inspect {
+                C_GREEN_CSS
+            } else {
+                C_YELLOW_CSS
+            },
+            "normal",
+        );
+        self.text(
+            &format!("anchor {}", truncate(&nonempty(&action.anchor, "--"), 22)),
+            x + 20.0,
+            y + 34.0,
+            8.0,
+            C_SUBTEXT0_CSS,
+            "normal",
+        );
+        self.text(
+            &format!("record {}", truncate(&nonempty(&action.record, "--"), 22)),
+            x + 20.0,
+            y + 49.0,
+            8.0,
+            C_SUBTEXT0_CSS,
+            "normal",
+        );
+        self.text(
+            &truncate(&nonempty(&action.result, "No action result yet"), 37),
+            x + 20.0,
+            y + 65.0,
+            8.0,
+            C_OVERLAY1_CSS,
+            "normal",
+        );
+
+        let mut buttons: Vec<(&str, f32, &str, HitAction, bool)> = Vec::new();
+        buttons.push((
+            "inspect",
+            58.0,
+            C_PEACH_CSS,
+            HitAction::ManagedAction {
+                action: "anchor-inspect".to_string(),
+                id: action.anchor.clone(),
+                session_id: managed.session_id.clone(),
+            },
+            action.can_inspect,
+        ));
+        buttons.push((
+            "rewind",
+            58.0,
+            C_MAUVE_CSS,
+            HitAction::ManagedAction {
+                action: "dispatch-rewind".to_string(),
+                id: action.anchor.clone(),
+                session_id: managed.session_id.clone(),
+            },
+            action.can_rewind,
+        ));
+        buttons.push((
+            if action.backout_mode.is_empty() {
+                "backout"
+            } else {
+                "run"
+            },
+            58.0,
+            C_TEAL_CSS,
+            HitAction::ManagedAction {
+                action: "run-backout".to_string(),
+                id: action.record.clone(),
+                session_id: managed.session_id.clone(),
+            },
+            action.can_backout,
+        ));
+        buttons.push((
+            "refresh",
+            58.0,
+            C_BLUE_CSS,
+            HitAction::ManagedAction {
+                action: "refresh".to_string(),
+                id: String::new(),
+                session_id: managed.session_id.clone(),
+            },
+            true,
+        ));
+        let mut bx = x + panel_w - 12.0 - 58.0;
+        for (label, button_w, color, hit, enabled) in buttons.into_iter().rev() {
+            let draw_color = if enabled { color } else { C_OVERLAY1_CSS };
+            self.pill_at(bx, y + 76.0, button_w, 19.0, label, draw_color);
+            if enabled {
+                self.hit_zones
+                    .push(HitZone::new(bx, y + 76.0, button_w, 19.0, hit));
+            }
+            bx -= button_w + 6.0;
+        }
+        y + card_h + 4.0
     }
 
     fn draw_managed_activity_signal(
@@ -7983,6 +8109,7 @@ struct StationManagedSummary {
     fission_groups: u32,
     branches: u32,
     error: String,
+    action_state: StationManagedActionState,
     activity_signal: StationDetailRow,
     recent_records: Vec<StationDetailRow>,
     recent_anchors: Vec<StationDetailRow>,
@@ -8005,12 +8132,26 @@ impl Default for StationManagedSummary {
             fission_groups: 0,
             branches: 0,
             error: String::new(),
+            action_state: StationManagedActionState::default(),
             activity_signal: StationDetailRow::default(),
             recent_records: Vec::new(),
             recent_anchors: Vec::new(),
             recent_branches: Vec::new(),
         }
     }
+}
+
+#[derive(Clone, Deserialize, Default)]
+#[serde(default, rename_all = "camelCase")]
+struct StationManagedActionState {
+    anchor: String,
+    record: String,
+    backout_mode: String,
+    readiness: String,
+    result: String,
+    can_inspect: bool,
+    can_rewind: bool,
+    can_backout: bool,
 }
 
 #[derive(Clone, Deserialize)]

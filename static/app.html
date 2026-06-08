@@ -20147,6 +20147,22 @@ function stationHandleManagedAction(action) {
       });
     return;
   }
+  if (op === 'dispatch-rewind') {
+    Promise.resolve(id ? stationApplyManagedAction('anchor', id, sessionId) : undefined)
+      .then(() => stationSubmitManagedRewindFromDock())
+      .finally(() => {
+        stationRenderedSelectPanel('system:managed', 'Managed rewind dispatched from rendered Station');
+      });
+    return;
+  }
+  if (op === 'run-backout') {
+    Promise.resolve(id ? stationApplyManagedAction('record', id, sessionId) : undefined)
+      .then(() => stationSubmitManagedBackoutFromDock())
+      .finally(() => {
+        stationRenderedSelectPanel('system:managed', 'Managed backout requested from rendered Station');
+      });
+    return;
+  }
   if (op === 'use-target') {
     managedContextEl?.('managed-context-use-target')?.click();
     if (stationRenderedSelectPanel('system:managed', 'Managed context target updated')) return;
@@ -20740,7 +20756,7 @@ function stationBuildManagedSummary(contextSummary) {
   const mode = sessionId
     ? managedContextEffectiveMode(sessionId, meta)
     : (controlCodexConfig.managed_context || 'vanilla');
-  return {
+  const summary = {
     sessionId: sessionId || '',
     live,
     mode,
@@ -20764,6 +20780,18 @@ function stationBuildManagedSummary(contextSummary) {
     recentBranches: ledgers.recentBranches,
     activitySignal: stationManagedActivitySignal || {},
   };
+  const ready = stationManagedReadiness(summary);
+  summary.actionState = {
+    anchor: ready.anchor || '',
+    record: ready.record || '',
+    backoutMode: stationManagedDraftValue('backoutMode', 'managed-context-backout-mode', 'inspect') || 'inspect',
+    readiness: ready.base || ready.rewindTitle || ready.backoutTitle || 'ready',
+    result: stationManagedResultText(),
+    canInspect: !!ready.canInspect,
+    canRewind: !!ready.canRewind,
+    canBackout: !!ready.canBackout,
+  };
+  return summary;
 }
 
 function stationChangesKindLabel(kind) {
