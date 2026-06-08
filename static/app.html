@@ -28015,6 +28015,17 @@ function sessionWindowTargetForLogSession(sessionId) {
   return alias?.backendSessionId || sid;
 }
 
+function sessionWindowRestoreIsInFlightFor(sessionId) {
+  const sid = String(sessionId || '').trim();
+  if (!sid) return false;
+  if (sessionWindowRestoreInFlight.has(sid)) return true;
+  for (const inflightSid of sessionWindowRestoreInFlight) {
+    const targetSid = sessionWindowTargetForLogSession(inflightSid);
+    if (targetSid && targetSid === sid) return true;
+  }
+  return false;
+}
+
 function statusSessionWindowTarget(sessionId) {
   return sessionWindowTargetForLogSession(sessionId);
 }
@@ -29135,18 +29146,36 @@ async function hydrateRestoredSessionWindow(win, record) {
   if (!sid || !source || !win || ensureSessionWindowHistory(win).length > 0) return;
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 10000);
-  const url = `/api/session/${encodeURIComponent(sid)}?source=${encodeURIComponent(source)}&limit=${SESSION_WINDOW_RESTORE_LOG_LIMIT}`;
   try {
-    const resp = await fetch(url, { signal: controller.signal, cache: 'no-store' });
-    const data = await resp.json();
-    if (!resp.ok || data.error) throw new Error(data.error || resp.statusText || 'session detail fetch failed');
+    let lastError = null;
+    let data = null;
+    const sources = source === 'intendant' ? [source] : [source, 'intendant'];
+    for (const candidateSource of sources) {
+      const url = `/api/session/${encodeURIComponent(sid)}?source=${encodeURIComponent(candidateSource)}&limit=${SESSION_WINDOW_RESTORE_LOG_LIMIT}`;
+      const resp = await fetch(url, { signal: controller.signal, cache: 'no-store' });
+      let candidate = {};
+      try {
+        candidate = await resp.json();
+      } catch {
+        candidate = {};
+      }
+      if (resp.ok && !candidate.error) {
+        data = candidate;
+        break;
+      }
+      lastError = new Error(candidate.error || resp.statusText || 'session detail fetch failed');
+      if (resp.status !== 404) break;
+    }
+    if (!data) throw lastError || new Error('session detail fetch failed');
     const entries = Array.isArray(data.entries) ? data.entries : [];
     applySessionIdentitiesFromReplayEntries(entries);
     applyExternalIdentitiesFromLogEntries(entries);
     applySessionGoalsFromReplayEntries(entries);
-    const rendered = renderRestoredSessionWindowEntries(win, entries, sid);
+    const targetSid = sessionWindowTargetForLogSession(sid) || sid;
+    const targetWin = sessionWindows.get(targetSid) || (win.el?.isConnected ? win : null);
+    const rendered = renderRestoredSessionWindowEntries(targetWin, entries, targetSid);
     if (rendered > 0) {
-      updateSessionWindow(sid, { phase: 'idle', ended: false });
+      updateSessionWindow(targetSid, { phase: 'idle', ended: false });
       stationScheduleUpdate();
     }
   } catch (err) {
@@ -29156,10 +29185,53 @@ async function hydrateRestoredSessionWindow(win, record) {
   }
 }
 
+function sessionWindowHydrationRecord(sessionId) {
+  const sid = String(sessionId || '').trim();
+  if (!sid) return null;
+  const win = sessionWindows.get(sid) || null;
+  const meta = sessionMetadataById.get(sid) || {};
+  let source = normalizeAgentId(
+    meta.backendSource ||
+    meta.backend_source ||
+    meta.source ||
+    meta.sourceLabel ||
+    win?.source ||
+    ''
+  );
+  const backendSessionId = String(meta.backendSessionId || meta.backend_session_id || '').trim();
+  if (backendSessionId && backendSessionId !== sid) source = 'intendant';
+  if (!source) return null;
+  return { sessionId: sid, source, meta };
+}
+
+async function hydrateSessionWindowIfEmpty(sessionId) {
+  const sid = String(sessionId || '').trim();
+  const win = sid ? sessionWindows.get(sid) : null;
+  if (!sid || !win || ensureSessionWindowHistory(win).length > 0) return;
+  if (sessionWindowRestoreIsInFlightFor(sid)) return;
+  sessionWindowRestoreInFlight.add(sid);
+  try {
+    let record = sessionWindowHydrationRecord(sid);
+    if (!record) {
+      const resp = await fetch(`/api/sessions?ids=${encodeURIComponent(sid)}`, { cache: 'no-store' });
+      if (resp.ok) {
+        const sessions = await resp.json();
+        cacheSessionWindowMetadata(sessions);
+      }
+      record = sessionWindowHydrationRecord(sid);
+    }
+    if (record) await hydrateRestoredSessionWindow(win, record);
+  } catch (err) {
+    console.warn('Failed to hydrate session window', sid, err);
+  } finally {
+    sessionWindowRestoreInFlight.delete(sid);
+  }
+}
+
 async function restorePersistedSessionWindow(record) {
   const sid = String(record?.sessionId || '').trim();
   const source = normalizeAgentId(record?.source || '');
-  if (!sid || !source || sessionWindowRestoreInFlight.has(sid)) return;
+  if (!sid || !source || sessionWindowRestoreIsInFlightFor(sid)) return;
   const existing = sessionWindows.get(sid);
   if (existing && ensureSessionWindowHistory(existing).length > 0) return;
   sessionWindowRestoreInFlight.add(sid);
@@ -32276,6 +32348,7 @@ function focusSessionWindow(sessionId) {
   renderForegroundSessionUsage();
   renderContextPane();
   if (win.phase) setPhase(win.phase);
+  hydrateSessionWindowIfEmpty(sid);
 }
 
 window.focusForegroundSessionWindow = function() {
