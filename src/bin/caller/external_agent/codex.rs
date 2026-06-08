@@ -5396,6 +5396,24 @@ fn translate_notification_with_state(
     translate_notification_with_scope(method, params, event_tx, state, None, None);
 }
 
+fn codex_item_event_id<'a>(
+    params: &'a serde_json::Value,
+    item: &'a serde_json::Value,
+) -> Option<&'a str> {
+    [
+        item.get("id"),
+        item.get("call_id"),
+        item.get("callId"),
+        params.get("itemId"),
+        params.get("call_id"),
+        params.get("callId"),
+    ]
+    .into_iter()
+    .flatten()
+    .filter_map(|value| value.as_str().map(str::trim))
+    .find(|value| !value.is_empty())
+}
+
 fn translate_notification_with_scope(
     method: &str,
     params: &serde_json::Value,
@@ -5428,15 +5446,10 @@ fn translate_notification_with_scope(
         }
 
         "item/started" => {
-            let item_type = params
-                .pointer("/item/type")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let item_id = params
-                .pointer("/item/id")
-                .or_else(|| params.get("itemId"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
+            let item = params.get("item").unwrap_or(params);
+            let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
+            let item_id = codex_item_event_id(params, item)
+                .unwrap_or_default()
                 .to_string();
 
             match item_type {
@@ -5570,10 +5583,8 @@ fn translate_notification_with_scope(
 
         "item/completed" => {
             let item = params.get("item").unwrap_or(params);
-            let item_id = item
-                .get("id")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
+            let item_id = codex_item_event_id(params, item)
+                .unwrap_or_default()
                 .to_string();
             let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
@@ -8802,6 +8813,50 @@ error: build failed
         match event {
             AgentEvent::ToolCompleted { item_id, status } => {
                 assert_eq!(item_id, "item-1");
+                assert_eq!(status, ToolCompletionStatus::Success);
+            }
+            other => panic!("expected ToolCompleted, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn translate_function_call_output_completion_uses_call_id() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let params = serde_json::json!({
+            "item": {
+                "type": "function_call_output",
+                "call_id": "call_CP7ok6SOm9fbU9zYp8Ok1IL3",
+                "output": "Chunk ID: d1ff8c\nWall time: 30.0011 seconds\nProcess running with session ID 1404\n"
+            }
+        });
+
+        translate_notification("item/completed", &params, &tx);
+
+        match rx.try_recv().unwrap() {
+            AgentEvent::ToolCompleted { item_id, status } => {
+                assert_eq!(item_id, "call_CP7ok6SOm9fbU9zYp8Ok1IL3");
+                assert_eq!(status, ToolCompletionStatus::Success);
+            }
+            other => panic!("expected ToolCompleted, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn translate_function_call_output_completion_uses_top_level_call_id() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let params = serde_json::json!({
+            "callId": "call_IXwDrmqUWzOZ8mBwjyG3rJqd",
+            "item": {
+                "type": "function_call_output",
+                "output": "Chunk ID: c36672\nWall time: 17.4574 seconds\nProcess exited with code 0\n"
+            }
+        });
+
+        translate_notification("item/completed", &params, &tx);
+
+        match rx.try_recv().unwrap() {
+            AgentEvent::ToolCompleted { item_id, status } => {
+                assert_eq!(item_id, "call_IXwDrmqUWzOZ8mBwjyG3rJqd");
                 assert_eq!(status, ToolCompletionStatus::Success);
             }
             other => panic!("expected ToolCompleted, got {:?}", other),
