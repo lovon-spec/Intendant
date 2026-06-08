@@ -14,9 +14,10 @@
 //! cert are preserved and only the server cert is regenerated when the
 //! LAN IP has changed.
 //!
-//! Pure-Rust: cert generation uses `rcgen` (ECDSA P-256 keys via the
-//! `ring` backend — no OpenSSL/aws-lc-sys C toolchain) and the PKCS#12
-//! bundle is built with `p12-keystore` (RustCrypto PBES2/AES).
+//! Pure-Rust: RSA keys are generated with RustCrypto `rsa`, certs are
+//! signed with `rcgen` via the `ring` backend (no OpenSSL/aws-lc-sys C
+//! toolchain), and the PKCS#12 bundle is built with `p12-keystore`
+//! (RustCrypto PBES2/AES).
 
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
@@ -24,8 +25,9 @@ use std::path::{Path, PathBuf};
 use p12_keystore::{Certificate as P12Certificate, KeyStore, KeyStoreEntry, PrivateKeyChain};
 use rcgen::{
     BasicConstraints, Certificate, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa,
-    Issuer, KeyPair, KeyUsagePurpose, SanType,
+    Issuer, KeyPair, KeyUsagePurpose, SanType, PKCS_RSA_SHA256,
 };
+use rsa::pkcs8::{EncodePrivateKey, LineEnding};
 use time::{Duration, OffsetDateTime};
 
 use super::{state, LanError, LanResult};
@@ -220,9 +222,20 @@ fn ca_params_for(label: &str) -> LanResult<CertificateParams> {
 
 fn generate_ca(label: &str) -> LanResult<(Certificate, KeyPair)> {
     let params = ca_params_for(label)?;
-    let key = KeyPair::generate()?;
+    let key = generate_rsa_key_pair()?;
     let cert = params.self_signed(&key)?;
     Ok((cert, key))
+}
+
+fn generate_rsa_key_pair() -> LanResult<KeyPair> {
+    let mut rng = rand::rngs::OsRng;
+    let rsa_key = rsa::RsaPrivateKey::new(&mut rng, 2048)
+        .map_err(|e| LanError(format!("generate RSA key: {e}")))?;
+    let pkcs8_pem = rsa_key
+        .to_pkcs8_pem(LineEnding::LF)
+        .map_err(|e| LanError(format!("encode RSA key: {e}")))?;
+    KeyPair::from_pem_and_sign_algo(pkcs8_pem.as_str(), &PKCS_RSA_SHA256)
+        .map_err(|e| LanError(format!("load RSA key: {e}")))
 }
 
 /// Reconstruct a signing [`Issuer`] from a CA cert in PEM form plus its
@@ -256,7 +269,7 @@ fn generate_server_cert(
     // iOS requires server cert validity ≤825 days.
     params.not_after = now + Duration::days(825);
 
-    let key = KeyPair::generate()?;
+    let key = generate_rsa_key_pair()?;
     let cert = params.signed_by(&key, ca_issuer)?;
     Ok((cert, key))
 }
@@ -280,7 +293,7 @@ fn generate_client_cert(
     params.not_before = now - Duration::hours(1);
     params.not_after = now + Duration::days(3650);
 
-    let key = KeyPair::generate()?;
+    let key = generate_rsa_key_pair()?;
     let cert = params.signed_by(&key, ca_issuer)?;
     Ok((cert, key))
 }
@@ -393,6 +406,25 @@ mod tests {
             assert!(p.exists(), "missing: {}", p.display());
         }
         assert!(!state.p12_password.is_empty());
+    }
+
+    #[test]
+    fn ensure_certs_produces_rsa_certificate_payloads() {
+        use x509_parser::oid_registry::OID_PKCS1_RSAENCRYPTION;
+        use x509_parser::prelude::*;
+
+        let tmp = TempDir::new().unwrap();
+        ensure_certs(tmp.path(), "192.168.1.100", "rsa-test", false).unwrap();
+
+        for name in [CA_CRT, SERVER_CRT, CLIENT_CRT] {
+            let der = read_cert_der(&tmp.path().join(name)).unwrap();
+            let (_, cert) = X509Certificate::from_der(&der).unwrap();
+            assert_eq!(
+                cert.public_key().algorithm.algorithm,
+                OID_PKCS1_RSAENCRYPTION,
+                "{name} must use an RSA public key for broad Apple profile compatibility"
+            );
+        }
     }
 
     #[test]

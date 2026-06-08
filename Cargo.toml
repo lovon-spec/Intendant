@@ -88,20 +88,21 @@ notify = { version = "8", default-features = false, features = ["macos_fsevent"]
 similar = "2"
 sha2 = "0.10"
 # `intendant lan` mTLS certificate generation — pure-Rust, replacing the
-# former OpenSSL dependency. `rcgen` builds the CA + server (SAN=IP, ≤825d) +
-# client certs on the `ring` backend (ECDSA P-256 keys, no aws-lc-sys C
-# toolchain); `x509-parser` (enabled in rcgen and used directly) reads the
-# server cert CN back for IP-drift detection and reconstructs the CA issuer
-# on `recert`. `p12-keystore` writes the client bundle as a MODERN PKCS#12
-# (PBES2 / PBKDF2-HMAC-SHA256 / AES-256-CBC + SHA-256 MAC) that Apple's
-# `SecPKCS12Import` (Keychain Access on macOS 15+, iOS 18 profile install)
-# accepts. All four are pure-Rust and cross-platform, so they live here
-# rather than under a platform gate. `pem` decodes stored PEM certs to DER
-# for the SHA-256 fingerprint (`pin-self-cert`) path.
+# former OpenSSL dependency. `rsa` generates RSA-2048 keys; `rcgen` builds
+# the CA + server (SAN=IP, ≤825d) + client certs on the `ring` backend using
+# RSA/SHA-256 signatures; `x509-parser` (enabled in rcgen and used directly)
+# reads the server cert CN back for IP-drift detection and reconstructs the
+# CA issuer on `recert`. `p12-keystore` writes the client bundle as a MODERN
+# PKCS#12 (PBES2 / PBKDF2-HMAC-SHA256 / AES-256-CBC + SHA-256 MAC) that
+# Apple's `SecPKCS12Import` (Keychain Access on macOS 15+, iOS 18 profile
+# install) accepts. All five are pure-Rust and cross-platform, so they live
+# here rather than under a platform gate. `pem` decodes stored PEM certs to
+# DER for the SHA-256 fingerprint (`pin-self-cert`) path.
 rcgen = { version = "0.14", default-features = false, features = ["pem", "ring", "x509-parser"] }
 x509-parser = "0.18"
 p12-keystore = "0.2.1"
 pem = "3"
+rsa = "0.9.8"
 rand = "0.8"
 # `rcgen`'s `not_before` / `not_after` cert-validity fields are `time`'s
 # `OffsetDateTime`; we set them via `OffsetDateTime::now_utc()` + `Duration`.

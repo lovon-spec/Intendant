@@ -132,8 +132,11 @@ fn print_chrome_mac(lan_ip: &str, port: u16) {
     println!();
     println!("    Step 2 — Install Apple profile:");
     println!("      Download intendant.mobileconfig from the unlocked pairing page.");
-    println!("      System Settings → Privacy & Security → Profiles → Install");
+    println!("      System Settings → General → Device Management → Install");
+    println!("      If the pane is hidden, search System Settings for Profiles.");
     println!("      If needed, set the Intendant CA to Always Trust in Keychain Access.");
+    println!("      If macOS says the certificate could not be verified, use the");
+    println!("      manual fallback below or regenerate old LAN certs with --force.");
     println!();
     println!("    Manual fallback — install CA certificate:");
     println!("      Download ca.crt from the unlocked pairing page.");

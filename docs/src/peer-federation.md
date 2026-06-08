@@ -339,8 +339,10 @@ unlock these browser APIs. See
 setup` stands up an **mTLS nginx reverse proxy** in front of `intendant --web` so
 LAN clients (phones, tablets, other boxes) reach the dashboard over HTTPS
 authenticated by a **client certificate**. Cert generation is pure-Rust (`rcgen` +
-`p12-keystore`); the proxy/service plumbing (nginx config, apt/brew installs,
-systemd/launchd) is Unix-specific. Subcommands:
+RustCrypto `rsa` + `p12-keystore`); new cert material uses RSA-2048 with SHA-256
+signatures so Apple configuration-profile certificate payloads match Apple's
+documented compatibility path. The proxy/service plumbing (nginx config,
+apt/brew installs, systemd/launchd) is Unix-specific. Subcommands:
 
 | Command | Action |
 |---|---|

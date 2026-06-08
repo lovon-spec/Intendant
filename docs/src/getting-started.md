@@ -331,12 +331,20 @@ PKCS#12 bundle for installation on iOS / Android / desktop browsers. The
 password is shown only on the unlocked enrollment page. The Apple
 `intendant.mobileconfig` profile embeds that same client identity, the LAN CA,
 and the PKCS#12 password, so it is served only after strict pairing succeeds.
+On macOS, install downloaded profiles from **System Settings → General → Device
+Management**; if that pane is hidden, search System Settings for "Profiles".
+If macOS reports that the profile certificate could not be verified, install
+`ca.crt` and `client.p12` manually from the same unlocked page, or regenerate
+older LAN cert material with `intendant lan setup --force` so the Apple profile
+uses RSA certificate payloads.
 
 #### Apple device requirement for `client.p12`
 
 `client.p12` is packaged with modern PKCS#12 encryption — PBES2 (PBKDF2-HMAC-
 SHA256 + AES-256-CBC) with a SHA-256 MAC, the algorithm set Apple's current
-importer (`SecPKCS12Import`) accepts.
+importer (`SecPKCS12Import`) accepts. New LAN cert material uses RSA-2048
+certificates with SHA-256 signatures, matching Apple's documented certificate
+configuration-profile payload compatibility.
 
 > **Supported environment:** importing `client.p12` on an Apple device requires
 > **macOS 15 (Sequoia)+** or **iOS / iPadOS 18+**.

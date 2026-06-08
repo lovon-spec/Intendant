@@ -336,14 +336,12 @@ where
                 }
                 Err(e) => {
                     let body = format!("failed to build mobileconfig: {e}");
-                    write_response(
-                        &mut stream,
-                        "500 Internal Server Error",
-                        "text/plain",
-                        body.as_bytes(),
-                        &[],
-                    )
-                    .await
+                    let status = if e.contains("non-RSA certificate material") {
+                        "409 Conflict"
+                    } else {
+                        "500 Internal Server Error"
+                    };
+                    write_response(&mut stream, status, "text/plain", body.as_bytes(), &[]).await
                 }
             }
         }
@@ -807,11 +805,11 @@ fn unlocked_platform_steps(
 <div class="box priority">
 <p><a class="btn" href="/intendant.mobileconfig">Download Apple profile</a></p>
 <ol>
-<li>Open the profile and install it in System Settings → Privacy & Security → Profiles.</li>
+<li>Open the profile and install it in System Settings → General → Device Management. If the pane is hidden, search System Settings for Profiles.</li>
 <li>If macOS does not fully trust the root automatically, open Keychain Access and set the Intendant CA to Always Trust.</li>
 <li>Open <code>{dashboard}</code>.</li>
 </ol>
-<p class="warn">The profile includes the client identity password. Keep it on the paired device only.</p>
+<p class="warn">The profile includes the client identity password. Keep it on the paired device only. If macOS reports that the certificate could not be verified, use the manual downloads below and regenerate old LAN certs with <code>intendant lan setup --force</code> so the Apple profile uses RSA certificate payloads.</p>
 </div>"#
         ),
         ClientPlatform::Android => format!(
@@ -879,7 +877,7 @@ fn alternate_downloads_html(password: &str) -> String {
 <li><code>ca.crt</code> is the Intendant LAN root CA. Trust it for websites.</li>
 <li><code>client.p12</code> is the password-protected client identity.</li>
 <li><code>client.pfx</code> is the same client identity with an Android/Windows-friendly extension.</li>
-<li><code>intendant.mobileconfig</code> bundles the CA and client identity for Apple platforms.</li>
+<li><code>intendant.mobileconfig</code> bundles the CA and client identity for Apple platforms. If it fails on macOS, install <code>ca.crt</code> and <code>client.p12</code> manually or regenerate old LAN certs with <code>intendant lan setup --force</code>.</li>
 </ul>
 </div>
 </details>"#,
@@ -894,6 +892,10 @@ fn mobileconfig_profile(
 ) -> Result<String, String> {
     let ca_der = super::certs::read_cert_der(&cert_dir.join("ca.crt"))
         .map_err(|e| format!("read ca.crt: {e}"))?;
+    ensure_apple_profile_rsa_cert(&ca_der, "ca.crt")?;
+    let client_der = super::certs::read_cert_der(&cert_dir.join("client.crt"))
+        .map_err(|e| format!("read client.crt: {e}"))?;
+    ensure_apple_profile_rsa_cert(&client_der, "client.crt")?;
     let p12 =
         std::fs::read(cert_dir.join("client.p12")).map_err(|e| format!("read client.p12: {e}"))?;
     Ok(mobileconfig_profile_from_bytes(
@@ -902,6 +904,21 @@ fn mobileconfig_profile(
         &ca_der,
         &p12,
     ))
+}
+
+fn ensure_apple_profile_rsa_cert(der: &[u8], label: &str) -> Result<(), String> {
+    use x509_parser::oid_registry::OID_PKCS1_RSAENCRYPTION;
+    use x509_parser::prelude::*;
+
+    let (_, cert) =
+        X509Certificate::from_der(der).map_err(|e| format!("parse {label} for profile: {e}"))?;
+    if cert.public_key().algorithm.algorithm == OID_PKCS1_RSAENCRYPTION {
+        Ok(())
+    } else {
+        Err(format!(
+            "{label} uses non-RSA certificate material. macOS may reject Apple configuration profiles for this legacy LAN cert directory; install ca.crt and client.p12 manually or regenerate old LAN certs with `intendant lan setup --force`."
+        ))
+    }
 }
 
 fn mobileconfig_profile_from_bytes(
@@ -1237,6 +1254,54 @@ mod tests {
         assert!(profile.contains("Lab &amp; Phone &lt;1&gt;"));
         assert!(profile.contains("p&amp;&lt;&quot;&gt;"));
         assert!(profile.contains("dev.intendant.lan.lab-phone-1"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn mobileconfig_profile_is_valid_plist_on_macos() {
+        let tmp = TempDir::new().unwrap();
+        let profile = mobileconfig_profile_from_bytes("Lab", "password", b"ca-der", b"p12-bytes");
+        let path = tmp.path().join("intendant.mobileconfig");
+        std::fs::write(&path, profile).unwrap();
+
+        let output = std::process::Command::new("plutil")
+            .arg("-lint")
+            .arg(&path)
+            .output()
+            .expect("run plutil");
+        assert!(
+            output.status.success(),
+            "plutil rejected generated mobileconfig: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn macos_enrollment_copy_points_to_device_management() {
+        let html = unlocked_platform_steps(ClientPlatform::AppleDesktop, "192.0.2.10", 8443, "pw");
+        assert!(html.contains("System Settings → General → Device Management"));
+        assert!(html.contains("certificate could not be verified"));
+        assert!(!html.contains("Privacy & Security → Profiles"));
+    }
+
+    #[test]
+    fn mobileconfig_rejects_legacy_non_rsa_cert_material() {
+        let tmp = TempDir::new().unwrap();
+        let mut params = rcgen::CertificateParams::new(vec![]).unwrap();
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "Legacy ECDSA");
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let key = rcgen::KeyPair::generate().unwrap();
+        let cert = params.self_signed(&key).unwrap();
+        std::fs::write(tmp.path().join("ca.crt"), cert.pem()).unwrap();
+        std::fs::write(tmp.path().join("client.crt"), cert.pem()).unwrap();
+        std::fs::write(tmp.path().join("client.p12"), b"dummy").unwrap();
+
+        let err = mobileconfig_profile(tmp.path(), "legacy", "pw").unwrap_err();
+        assert!(err.contains("non-RSA certificate material"));
+        assert!(err.contains("intendant lan setup --force"));
     }
 
     #[test]
