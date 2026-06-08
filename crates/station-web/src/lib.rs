@@ -4582,6 +4582,7 @@ impl StationInner {
         yy += 22.0;
         let mut actions = vec![
             ("show-log", "show log", 78.0, C_TEAL_CSS.to_string()),
+            ("copy-id", "copy ID", 70.0, C_BLUE_CSS.to_string()),
             ("copy-event", "copy text", 82.0, C_BLUE_CSS.to_string()),
             (
                 "copy-event-json",
@@ -4592,6 +4593,13 @@ impl StationInner {
         ];
         if !event.session_id.is_empty() {
             actions.push(("activity-session", "session", 70.0, C_PEACH_CSS.to_string()));
+            actions.push((
+                "focus-session",
+                "focus session",
+                106.0,
+                C_TEAL_CSS.to_string(),
+            ));
+            actions.push(("activity-context", "context", 74.0, C_BLUE_CSS.to_string()));
         }
         if activity_event_is_managed(&event) {
             actions.push(("activity-managed", "managed", 78.0, C_MAUVE_CSS.to_string()));
@@ -5047,6 +5055,23 @@ impl StationInner {
         yy = self.draw_context_replay_controls(x, yy, panel_w, &ctx);
         self.section_title(x, yy, "Token pressure");
         yy += 18.0;
+        if !ctx.pressure_state.label.is_empty() || !ctx.pressure_state.detail.is_empty() {
+            self.panel_row_color(
+                x,
+                yy,
+                "state",
+                &truncate(
+                    &nonempty(&ctx.pressure_state.label, &ctx.pressure_state.value),
+                    42,
+                ),
+                tone_color_css(&ctx.pressure_state.tone),
+            );
+            yy += 20.0;
+            if !ctx.pressure_state.detail.is_empty() {
+                self.panel_row(x, yy, "detail", &truncate(&ctx.pressure_state.detail, 42));
+                yy += 20.0;
+            }
+        }
         self.meter(
             x + 12.0,
             yy,
@@ -5314,6 +5339,44 @@ impl StationInner {
                 managed.lineage_groups, managed.fission_groups, managed.branches
             ),
         );
+        yy += 22.0;
+        if !managed.pressure_state.detail.is_empty() || !managed.pressure_state.label.is_empty() {
+            self.panel_row_color(
+                x,
+                yy,
+                "pressure state",
+                &truncate(
+                    &nonempty(&managed.pressure_state.label, &managed.pressure_state.value),
+                    42,
+                ),
+                tone_color_css(&managed.pressure_state.tone),
+            );
+            yy += 22.0;
+        }
+        if !managed.latest_rewind.id.is_empty() {
+            self.panel_row(
+                x,
+                yy,
+                "latest rewind",
+                &truncate(
+                    &nonempty(&managed.latest_rewind.label, &managed.latest_rewind.id),
+                    42,
+                ),
+            );
+            yy += 22.0;
+        }
+        if !managed.latest_backout.id.is_empty() {
+            self.panel_row(
+                x,
+                yy,
+                "backout record",
+                &truncate(
+                    &nonempty(&managed.latest_backout.label, &managed.latest_backout.id),
+                    42,
+                ),
+            );
+            yy += 22.0;
+        }
         yy += 30.0;
         self.section_title_color(x, yy, "Actions", C_MAUVE_CSS);
         yy += 22.0;
@@ -9943,6 +10006,7 @@ struct StationContextSummary {
     replay_index: u32,
     replay_time: String,
     exact_status: String,
+    pressure_state: StationDetailRow,
     top_categories: Vec<StationBreakdown>,
     top_items: Vec<StationDetailRow>,
 }
@@ -9973,6 +10037,7 @@ impl Default for StationContextSummary {
             replay_index: 0,
             replay_time: String::new(),
             exact_status: "none".into(),
+            pressure_state: StationDetailRow::default(),
             top_categories: Vec::new(),
             top_items: Vec::new(),
         }
@@ -10004,6 +10069,9 @@ struct StationManagedSummary {
     error: String,
     action_state: StationManagedActionState,
     activity_signal: StationDetailRow,
+    pressure_state: StationDetailRow,
+    latest_rewind: StationDetailRow,
+    latest_backout: StationDetailRow,
     recent_records: Vec<StationDetailRow>,
     recent_anchors: Vec<StationDetailRow>,
     recent_branches: Vec<StationDetailRow>,
@@ -10034,6 +10102,9 @@ impl Default for StationManagedSummary {
             error: String::new(),
             action_state: StationManagedActionState::default(),
             activity_signal: StationDetailRow::default(),
+            pressure_state: StationDetailRow::default(),
+            latest_rewind: StationDetailRow::default(),
+            latest_backout: StationDetailRow::default(),
             recent_records: Vec::new(),
             recent_anchors: Vec::new(),
             recent_branches: Vec::new(),

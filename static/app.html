@@ -20495,11 +20495,16 @@ function stationHandleActivityAction(action) {
     stationClearActivityLog();
     return;
   }
-  if (id && ['show-log', 'copy-event', 'copy-event-json', 'activity-session', 'activity-managed', 'edit', 'branch'].includes(op)) {
+  if (id && ['show-log', 'copy-id', 'copy-event', 'copy-event-json', 'activity-session', 'focus-session', 'activity-context', 'activity-managed', 'edit', 'branch'].includes(op)) {
     const ev = eventForId();
     if (!ev) return;
     if (op === 'show-log') {
       focusActivityLogEvent(id);
+      return;
+    }
+    if (op === 'copy-id') {
+      copyTextToClipboard(id)
+        .then(() => showControlToast?.('success', 'Copied Station activity event ID'));
       return;
     }
     if (op === 'copy-event') {
@@ -20516,6 +20521,19 @@ function stationHandleActivityAction(action) {
       if (!sessionId) return;
       if (stationRenderedSelectPanel('system:sessions', 'Activity session selected')) return;
       stationRenderSessionsDock(sessionId);
+      return;
+    }
+    if (op === 'focus-session') {
+      const sessionId = ev.sessionId || ev.session_id || '';
+      if (!sessionId) return;
+      focusSessionWindow(sessionId);
+      return;
+    }
+    if (op === 'activity-context') {
+      const sessionId = ev.sessionId || ev.session_id || '';
+      if (sessionId) focusSessionWindow(sessionId);
+      if (stationRenderedSelectPanel('system:context', 'Activity context selected')) return;
+      stationRenderContextDock(stationSelectedContextPart);
       return;
     }
     if (op === 'activity-managed') {
@@ -20808,6 +20826,7 @@ function stationBuildContextSummary() {
       replayIndex: replay.timeline.length ? replay.index + 1 : 0,
       replayTime: '',
       exactStatus: 'none',
+      pressureState: {},
     };
   }
   const analysis = analyzeContextSnapshot(snapshot);
@@ -20848,6 +20867,20 @@ function stationBuildContextSummary() {
         tone: 'context',
       };
     });
+  const pressurePct = effectiveWindow ? managedContextPercent(analysis.totalTokens || snapshot.token_count, effectiveWindow) : null;
+  const pressureState = {
+    id: sessionId || 'context',
+    sessionId,
+    action: 'pressure',
+    label: pressurePct === null ? 'context pressure' : `${pressurePct.toFixed(1)}% context`,
+    value: `${stationCompactNumber(analysis.totalTokens || snapshot.token_count)} / ${stationCompactNumber(effectiveWindow)} tokens`,
+    detail: [
+      categories[0]?.label ? `top ${categories[0].label}` : '',
+      stationContextExactStatus(replay.snapshot || snapshot),
+      replay.timeline.length ? `replay ${replay.index + 1}/${replay.timeline.length}` : '',
+    ].filter(Boolean).join(' / '),
+    tone: pressurePct !== null && pressurePct >= 90 ? 'warning' : 'context',
+  };
   return {
     available: true,
     label: snapshot.label || snapshot.source || 'model',
@@ -20874,6 +20907,7 @@ function stationBuildContextSummary() {
     replayIndex: replay.timeline.length ? replay.index + 1 : 0,
     replayTime: formatContextTimestamp(replay.snapshot?.ts),
     exactStatus: stationContextExactStatus(replay.snapshot || snapshot),
+    pressureState,
   };
 }
 
@@ -21018,9 +21052,28 @@ function stationBuildManagedSummary(contextSummary) {
   );
   const usedTokens = stationNum(pressure.used_tokens || contextSummary.tokens);
   const rewindOnlyLimit = live ? managedContextPositiveNumber(pressure.rewind_only_limit) : null;
+  const requiredAction = String(pressure.required_action || '').trim();
+  const remainingToRewindOnly = rewindOnlyLimit === null ? null : Math.max(0, rewindOnlyLimit - usedTokens);
   const mode = sessionId
     ? managedContextEffectiveMode(sessionId, meta)
     : (controlCodexConfig.managed_context || 'vanilla');
+  const recentRecords = stationManagedRecordRows();
+  const recentAnchors = stationManagedAnchorRows(sessionId);
+  const pressureState = {
+    id: sessionId || 'managed-context',
+    sessionId: sessionId || '',
+    action: 'pressure',
+    label: pressure.rewind_only ? 'rewind-only pressure' : (requiredAction || pressure.status || 'context pressure'),
+    value: `${stationCompactNumber(usedTokens)} / ${stationCompactNumber(effectiveWindow)} effective`,
+    detail: [
+      hardWindow ? `${stationCompactNumber(usedTokens)} / ${stationCompactNumber(hardWindow)} hard` : '',
+      remainingToRewindOnly !== null ? `${stationCompactNumber(remainingToRewindOnly)} to rewind-only` : '',
+      requiredAction && requiredAction !== pressure.status ? requiredAction : '',
+    ].filter(Boolean).join(' / '),
+    tone: pressure.rewind_only ? 'red' : ((pressure.status === 'watch' || pressure.status === 'high' || pressure.status === 'critical') ? 'warning' : 'managed'),
+  };
+  const latestRewind = recentRecords[0] || {};
+  const latestBackout = summaryBackoutRow(stationManagedDraftValue('record', 'managed-context-record-id', '') || latestRewind.id || '', latestRewind, sessionId);
   const summary = {
     sessionId: sessionId || '',
     sessionLabel: identity.sessionLabel || '',
@@ -21039,7 +21092,7 @@ function stationBuildManagedSummary(contextSummary) {
     effectivePct: managedContextPercent(usedTokens, effectiveWindow),
     hardPct: managedContextPercent(usedTokens, hardWindow),
     rewindOnlyLimit,
-    remainingToRewindOnly: rewindOnlyLimit === null ? null : Math.max(0, rewindOnlyLimit - usedTokens),
+    remainingToRewindOnly,
     rewindOnly: !!pressure.rewind_only,
     records: Array.isArray(managedContextRecords) ? managedContextRecords.length : 0,
     anchors: stationManagedAnchorCount(sessionId),
@@ -21047,8 +21100,11 @@ function stationBuildManagedSummary(contextSummary) {
     fissionGroups: ledgers.fissionGroups,
     branches: ledgers.branches,
     error: managedContextLastError || '',
-    recentRecords: stationManagedRecordRows(),
-    recentAnchors: stationManagedAnchorRows(sessionId),
+    pressureState,
+    latestRewind,
+    latestBackout,
+    recentRecords,
+    recentAnchors,
     recentBranches: ledgers.recentBranches,
     activitySignal: stationManagedActivitySignal || {},
   };
@@ -21067,6 +21123,21 @@ function stationBuildManagedSummary(contextSummary) {
     canBackout: !!ready.canBackout,
   };
   return summary;
+}
+
+function summaryBackoutRow(recordId, latestRewind, sessionId) {
+  const id = String(recordId || '').trim();
+  if (!id) return {};
+  if (latestRewind?.id === id) return { ...latestRewind, action: 'backout', value: latestRewind.value || 'backout record' };
+  return {
+    id,
+    sessionId: sessionId || '',
+    action: 'backout',
+    label: id,
+    value: 'backout record',
+    detail: 'selected managed rewind record',
+    tone: 'managed',
+  };
 }
 
 function stationChangesKindLabel(kind) {
