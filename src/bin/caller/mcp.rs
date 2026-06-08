@@ -45,6 +45,7 @@ use crate::types::{LogLevel, Phase, Verbosity};
 use crate::FollowUpMessage;
 
 const CONTEXT_PRESSURE_REWIND_THRESHOLD_PCT: f64 = 85.0;
+const DENSITY_MAINTENANCE_SATISFIED_TOKEN_GROWTH_LIMIT: u64 = 8_000;
 
 // ---------------------------------------------------------------------------
 // Task launcher: allows MCP to start agent loops on demand
@@ -144,6 +145,10 @@ pub struct McpAppState {
     /// Last successful rewinds that did not reduce backend-reported pressure
     /// below the gate, keyed by Intendant/backend session id.
     insufficient_rewind_notices: std::collections::HashMap<String, InsufficientRewindNotice>,
+    /// Successful managed-context rewinds that satisfied the current density
+    /// handoff/follow-up requirement, keyed by Intendant/backend session id.
+    density_maintenance_satisfied:
+        std::collections::HashMap<String, DensityMaintenanceSatisfaction>,
 }
 
 #[derive(Debug, Clone)]
@@ -160,6 +165,14 @@ struct InsufficientRewindNotice {
     used_tokens: u64,
     rewind_only_limit: u64,
     context_window: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DensityMaintenanceSatisfaction {
+    record_id: String,
+    used_tokens: u64,
+    recommended_rewind_limit: u64,
+    rewind_only_limit: u64,
 }
 
 /// Tracks a pending approval info (responder is in the shared ApprovalRegistry).
@@ -226,6 +239,7 @@ impl McpAppState {
             session_sources: std::collections::HashMap::new(),
             pending_rewind_pressure_checks: std::collections::HashMap::new(),
             insufficient_rewind_notices: std::collections::HashMap::new(),
+            density_maintenance_satisfied: std::collections::HashMap::new(),
         }
     }
 
@@ -648,6 +662,12 @@ impl McpAppState {
         }
     }
 
+    fn remove_density_maintenance_satisfied_for_key(&mut self, key: &str) {
+        for related in self.rewind_related_keys(key) {
+            self.density_maintenance_satisfied.remove(&related);
+        }
+    }
+
     fn insert_insufficient_rewind_notice_for_key(
         &mut self,
         key: &str,
@@ -656,6 +676,17 @@ impl McpAppState {
         for related in self.rewind_related_keys(key) {
             self.insufficient_rewind_notices
                 .insert(related, notice.clone());
+        }
+    }
+
+    fn insert_density_maintenance_satisfied_for_key(
+        &mut self,
+        key: &str,
+        satisfied: DensityMaintenanceSatisfaction,
+    ) {
+        for related in self.rewind_related_keys(key) {
+            self.density_maintenance_satisfied
+                .insert(related, satisfied.clone());
         }
     }
 
@@ -681,6 +712,7 @@ impl McpAppState {
             // later (possibly stale) usage sample could otherwise resolve it into a
             // false "insufficient" notice against a record that never committed.
             self.remove_pending_rewind_pressure_check_for_key(&key);
+            self.remove_density_maintenance_satisfied_for_key(&key);
         }
     }
 
@@ -702,6 +734,7 @@ impl McpAppState {
             self.context_pressure_rewind_only_for(Some(&key))
         {
             let context_window = self.session_usage_values(Some(&key)).1;
+            self.remove_density_maintenance_satisfied_for_key(&key);
             self.insert_insufficient_rewind_notice_for_key(
                 &key,
                 InsufficientRewindNotice {
@@ -713,6 +746,24 @@ impl McpAppState {
             );
         } else {
             self.remove_insufficient_rewind_notice_for_key(&key);
+            let (used_tokens, context_window, _hard_context_window) =
+                self.session_usage_values(Some(&key));
+            if context_window > 0 {
+                let recommended_rewind_limit =
+                    (context_window as f64 * CONTEXT_PRESSURE_REWIND_THRESHOLD_PCT / 100.0).floor()
+                        as u64;
+                self.insert_density_maintenance_satisfied_for_key(
+                    &key,
+                    DensityMaintenanceSatisfaction {
+                        record_id,
+                        used_tokens,
+                        recommended_rewind_limit,
+                        rewind_only_limit: context_window,
+                    },
+                );
+            } else {
+                self.remove_density_maintenance_satisfied_for_key(&key);
+            }
         }
     }
 
@@ -724,6 +775,28 @@ impl McpAppState {
         self.rewind_related_keys(&key)
             .into_iter()
             .find_map(|related| self.insufficient_rewind_notices.get(&related))
+    }
+
+    fn density_maintenance_satisfied_for(
+        &self,
+        session_id: Option<&str>,
+        used_tokens: u64,
+        recommended_rewind_limit: u64,
+        rewind_only_limit: u64,
+    ) -> Option<&DensityMaintenanceSatisfaction> {
+        let key = self.rewind_session_key(session_id)?;
+        self.rewind_related_keys(&key)
+            .into_iter()
+            .find_map(|related| self.density_maintenance_satisfied.get(&related))
+            .filter(|satisfied| {
+                satisfied.rewind_only_limit == rewind_only_limit
+                    && used_tokens < rewind_only_limit
+                    && used_tokens
+                        <= satisfied
+                            .used_tokens
+                            .saturating_add(DENSITY_MAINTENANCE_SATISFIED_TOKEN_GROWTH_LIMIT)
+                    && recommended_rewind_limit == satisfied.recommended_rewind_limit
+            })
     }
 
     fn managed_context_mode(enabled: bool) -> &'static str {
@@ -802,6 +875,7 @@ impl McpAppState {
                 "message": "Backend-reported context pressure is unavailable. Normal tools are allowed unless a later status reports rewind_only=true; continue ordinary work while pressure is unknown.",
                 "managed_context": Self::managed_context_mode(managed_context),
                 "last_rewind_insufficient": null,
+                "density_maintenance_satisfied": null,
             });
         }
 
@@ -823,7 +897,20 @@ impl McpAppState {
         };
         let rewind_only = managed_context && (status == "high" || status == "critical");
         let density_pressure = used_tokens >= recommended_rewind_limit;
-        let density_maintenance_recommended = managed_context && density_pressure && !rewind_only;
+        let density_maintenance_satisfied = if managed_context && density_pressure && !rewind_only {
+            self.density_maintenance_satisfied_for(
+                session_id,
+                used_tokens,
+                recommended_rewind_limit,
+                rewind_only_limit,
+            )
+        } else {
+            None
+        };
+        let density_maintenance_recommended = managed_context
+            && density_pressure
+            && !rewind_only
+            && density_maintenance_satisfied.is_none();
         let normal_tools_allowed = !rewind_only;
         let broad_followup_allowed = normal_tools_allowed && !density_maintenance_recommended;
         let narrow_inflight_validation_allowed = normal_tools_allowed;
@@ -831,6 +918,8 @@ impl McpAppState {
             "rewind_context"
         } else if density_maintenance_recommended {
             "density_handoff_before_broad_work"
+        } else if density_maintenance_satisfied.is_some() {
+            "continue_after_density_rewind"
         } else if density_pressure {
             "continue_or_rewind_optional"
         } else {
@@ -838,6 +927,8 @@ impl McpAppState {
         };
         let message = if rewind_only {
             "Managed context is in rewind-only mode. Use rewind_context before ordinary model-facing tools."
+        } else if density_maintenance_satisfied.is_some() {
+            "Managed context is above the recommended density threshold but below the rewind-only limit. A successful managed-context rewind already satisfied the current density handoff; continue the concrete follow-up work, and only repeat density maintenance after meaningful new context growth or if pressure reaches rewind-only."
         } else if density_pressure {
             if managed_context {
                 "Managed context is above the recommended density threshold but below the rewind-only limit. Normal tools remain allowed for status/anchor inspection and one narrow in-flight validation or build to finish, but before broad follow-up work perform exact-anchor density maintenance when it materially improves density, or produce a concise no-rewind density handoff."
@@ -876,6 +967,16 @@ impl McpAppState {
                     "rewind_only_limit": notice.rewind_only_limit,
                     "context_window": notice.context_window,
                     "message": "The previous managed-context rewind did not reduce backend-reported pressure enough. Call list_rewind_anchors to inspect recovery candidates; pass include_non_recovery=true only for diagnostics, and never pass a recovery_eligible=false audit row to rewind_context. Use inspect_rewind_anchor when a compact row is ambiguous, then choose an exact returned item_id and position whose row or inspection supports enough pruning, with a denser carry-forward primer before using ordinary tools.",
+                })
+            }),
+            "density_maintenance_satisfied": density_maintenance_satisfied.map(|satisfied| {
+                serde_json::json!({
+                    "record_id": satisfied.record_id,
+                    "used_tokens": satisfied.used_tokens,
+                    "recommended_rewind_limit": satisfied.recommended_rewind_limit,
+                    "rewind_only_limit": satisfied.rewind_only_limit,
+                    "token_growth_limit": DENSITY_MAINTENANCE_SATISFIED_TOKEN_GROWTH_LIMIT,
+                    "message": "A successful managed-context rewind already satisfied the current density handoff; forward progress is allowed while pressure remains below rewind-only and token growth stays bounded.",
                 })
             }),
         })
@@ -4886,6 +4987,7 @@ pub fn spawn_event_listener(
                         }
                         s.pending_rewind_pressure_checks.remove(session_id);
                         s.insufficient_rewind_notices.remove(session_id);
+                        s.density_maintenance_satisfied.remove(session_id);
                         s.push_log(
                             LogLevel::Info,
                             format!("Session ended: {} — {}", session_id, reason),
@@ -5285,6 +5387,7 @@ fn apply_observed_event_to_mcp_state(s: &mut McpAppState, event: &AppEvent) -> b
             }
             s.pending_rewind_pressure_checks.remove(session_id);
             s.insufficient_rewind_notices.remove(session_id);
+            s.density_maintenance_satisfied.remove(session_id);
             true
         }
         AppEvent::SessionDirChanged { path } => {
@@ -11655,6 +11758,80 @@ mod tests {
         assert!(s.insufficient_rewind_notices.get("codex-thread").is_none());
         assert_eq!(
             s.context_pressure_snapshot()["last_rewind_insufficient"],
+            serde_json::Value::Null
+        );
+    }
+
+    #[test]
+    fn successful_rewind_then_watch_usage_satisfies_current_density_handoff() {
+        let mut s = McpAppState::new(
+            "none".to_string(),
+            "none".to_string(),
+            autonomy::shared_autonomy(AutonomyState::default()),
+            std::path::PathBuf::from("/tmp/test_session"),
+        );
+        s.session_id = "codex-thread".to_string();
+        s.active_session_source = Some("codex".to_string());
+        s.codex_managed_context = true;
+
+        apply_observed_event_to_mcp_state(
+            &mut s,
+            &AppEvent::CodexThreadActionResult {
+                session_id: Some("codex-thread".to_string()),
+                action: "rewind_context".to_string(),
+                success: true,
+                message: "Rewound Codex thread and saved record rewind-density.".to_string(),
+            },
+        );
+        apply_observed_event_to_mcp_state(
+            &mut s,
+            &AppEvent::UsageSnapshot {
+                session_id: Some("codex-thread".to_string()),
+                main: frontend::ModelUsageSnapshot {
+                    provider: "openai".to_string(),
+                    model: "gpt-5.2-codex".to_string(),
+                    tokens_used: 90_000,
+                    context_window: 100_000,
+                    hard_context_window: Some(120_000),
+                    usage_pct: 90.0,
+                    prompt_tokens: 88_000,
+                    completion_tokens: 2_000,
+                    cached_tokens: 0,
+                },
+                presence: None,
+            },
+        );
+
+        let pressure = s.context_pressure_snapshot();
+        assert_eq!(pressure["status"], "watch");
+        assert_eq!(pressure["density_pressure"], true);
+        assert_eq!(pressure["density_maintenance_recommended"], false);
+        assert_eq!(pressure["broad_followup_allowed"], true);
+        assert_eq!(pressure["required_action"], "continue_after_density_rewind");
+        assert_eq!(
+            pressure.pointer("/density_maintenance_satisfied/record_id"),
+            Some(&serde_json::Value::String("rewind-density".to_string()))
+        );
+        assert!(s.rewind_only_gate_message("execute_cu_actions").is_none());
+
+        s.apply_main_usage_snapshot(frontend::ModelUsageSnapshot {
+            provider: "openai".to_string(),
+            model: "gpt-5.2-codex".to_string(),
+            tokens_used: 99_000,
+            context_window: 100_000,
+            hard_context_window: Some(120_000),
+            usage_pct: 99.0,
+            prompt_tokens: 96_000,
+            completion_tokens: 3_000,
+            cached_tokens: 0,
+        });
+
+        let pressure = s.context_pressure_snapshot();
+        assert_eq!(pressure["status"], "watch");
+        assert_eq!(pressure["density_maintenance_recommended"], true);
+        assert_eq!(pressure["broad_followup_allowed"], false);
+        assert_eq!(
+            pressure["density_maintenance_satisfied"],
             serde_json::Value::Null
         );
     }

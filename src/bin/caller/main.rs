@@ -4664,6 +4664,7 @@ async fn send_external_context_rewind_resume_turn(
         resume.side_sessions.as_deref_mut(),
         followup.managed_context_recovery_kickstart,
         followup.managed_context_density_handoff,
+        followup.managed_context_density_handoff_completed,
     )
     .await)
 }
@@ -5301,20 +5302,6 @@ fn managed_context_density_active_steer_text(
         recommended = pressure.recommended_rewind_limit,
         hard = hard,
         in_flight = in_flight,
-    )
-}
-
-fn managed_context_density_rewind_retry_text(pressure: ManagedContextDensityPressure) -> String {
-    let hard = pressure
-        .hard_context_window
-        .map(|hard| format!(" hard_limit={hard}"))
-        .unwrap_or_default();
-    format!(
-        "<managed_context_density_handoff>\nThe previous density-handoff rewind was applied, but backend-reported Codex context pressure is still watch ({used}/{limit} tokens, recommended_density_threshold={recommended}{hard}). That rewind is not enough to count as successful density maintenance, and Intendant will not replay ordinary follow-up work yet. Do not continue implementation, exploration, or broad ordinary-tool work. If another exact managed-context rewind can reduce backend pressure below the recommended density threshold while preserving completed work, use list_rewind_anchors with density_candidates_only=true and include_pruning_estimates=true, and inspect_rewind_anchor as needed, then call rewind_context with one exact returned item_id and a dense carry-forward primer. Otherwise reply with a concise handoff that crystallizes durable facts, changed files, verification results, user constraints, and remaining decisions, and state that you are leaving context at the current rewind point. Do not use auto anchors, N-turn rewinds, synthesized item ids, anchors from failed examples, or managed-context maintenance calls as rewind targets.\n</managed_context_density_handoff>",
-        used = pressure.used_tokens,
-        limit = pressure.rewind_only_limit,
-        recommended = pressure.recommended_rewind_limit,
-        hard = hard,
     )
 }
 
@@ -7063,6 +7050,7 @@ async fn drain_external_child_turn(
         None,
         false,
         false,
+        false,
     )
     .await
     {
@@ -7482,6 +7470,7 @@ async fn drain_external_agent_events(
     mut side_sessions: Option<&mut ExternalSideSessionState<'_>>,
     managed_context_recovery_kickstart: bool,
     managed_context_density_handoff: bool,
+    managed_context_density_handoff_completed: bool,
 ) -> DrainOutcome {
     use std::sync::atomic::Ordering;
 
@@ -7521,8 +7510,9 @@ async fn drain_external_agent_events(
     let mut pending_backend_recovery: Option<ExternalBackendRecovery> = None;
     let mut managed_context_rewind_only_pressure: Option<ManagedContextRewindOnlyPressure> = None;
     let mut managed_context_pressure_interrupt_sent = false;
-    let mut managed_context_density_steer_sent =
-        managed_context_recovery_kickstart || managed_context_density_handoff;
+    let mut managed_context_density_steer_sent = managed_context_recovery_kickstart
+        || managed_context_density_handoff
+        || managed_context_density_handoff_completed;
     let mut managed_context_blocked_tool_items: HashSet<String> = HashSet::new();
 
     // Background watcher: if an interrupt arrives while an approval handler
@@ -9611,6 +9601,7 @@ impl FollowUpMessage {
     }
 
     fn after_managed_context_density_handoff(mut self) -> Self {
+        self.managed_context_density_handoff = false;
         self.managed_context_density_handoff_completed = true;
         self
     }
@@ -9741,7 +9732,7 @@ fn managed_context_followup_replay_after_rewind(
 
     let mut followup = FollowUpMessage::with_attachments(text, active_followup.attachments.clone());
     if active_followup.managed_context_density_handoff {
-        followup = followup.managed_context_density_handoff();
+        followup = followup.after_managed_context_density_handoff();
     }
     Some(followup)
 }
@@ -9774,20 +9765,6 @@ fn managed_context_recovery_without_rewind_blocks_held_replay(
     pending_replays: &std::collections::VecDeque<FollowUpMessage>,
 ) -> bool {
     managed_context_recovery_kickstart && !pending_replays.is_empty()
-}
-
-fn managed_context_density_retry_after_rewind(
-    active_followup: &FollowUpMessage,
-    post_rewind_snapshot: Option<&external_agent::AgentContextSnapshot>,
-) -> Option<FollowUpMessage> {
-    if !active_followup.managed_context_density_handoff {
-        return None;
-    }
-    let pressure = managed_context_density_pressure(post_rewind_snapshot?)?;
-    Some(
-        FollowUpMessage::text(managed_context_density_rewind_retry_text(pressure))
-            .managed_context_density_handoff(),
-    )
 }
 
 type FollowUpReceiver = tokio::sync::mpsc::Receiver<FollowUpMessage>;
@@ -12050,6 +12027,7 @@ mod tests {
             None,
             false,
             false,
+            false,
         )
         .await;
 
@@ -12188,6 +12166,7 @@ mod tests {
             None,
             false,
             false,
+            false,
         )
         .await;
 
@@ -12236,6 +12215,111 @@ mod tests {
         assert!(
             saw_tool_output,
             "watch pressure should allow active tool output"
+        );
+    }
+
+    #[tokio::test]
+    async fn managed_context_completed_density_handoff_does_not_resteer_watch_replay() {
+        let bus = EventBus::new();
+        let mut bus_rx_for_drain = bus.subscribe();
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        let session_log: SharedSessionLog = Arc::new(Mutex::new(
+            session_log::SessionLog::open(log_dir.clone()).unwrap(),
+        ));
+        let approval_registry: event::ApprovalRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let context_injection: event::ContextInjectionQueue = Arc::new(Mutex::new(Vec::new()));
+        let autonomy = autonomy::shared_autonomy(AutonomyState::default());
+        let config = DrainConfig {
+            bus: &bus,
+            web_port: None,
+            session_id: Some("thread-1".to_string()),
+            alias_session_id: None,
+            autonomy,
+            session_log: &session_log,
+            project_root: dir.path(),
+            log_dir: &log_dir,
+            approval_registry: &approval_registry,
+            json_approval: None,
+            agent_source: Some("Codex".to_string()),
+            suppress_agent_started: false,
+            persist_model_responses_inline: true,
+            headless: true,
+            context_injection: &context_injection,
+        };
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+        event_tx
+            .send(external_agent::AgentEvent::Usage {
+                usage: external_agent::AgentUsageSnapshot {
+                    provider: "openai".to_string(),
+                    model: "gpt-5.2-codex".to_string(),
+                    tokens_used: 227_000,
+                    context_window: 258_400,
+                    hard_context_window: Some(272_000),
+                    usage_pct: 87.8,
+                    prompt_tokens: 226_000,
+                    completion_tokens: 1_000,
+                    cached_tokens: 0,
+                },
+            })
+            .unwrap();
+        event_tx
+            .send(external_agent::AgentEvent::ToolStarted {
+                item_id: "shot-1".to_string(),
+                tool_name: "mcp".to_string(),
+                preview: "take_screenshot".to_string(),
+            })
+            .unwrap();
+        event_tx
+            .send(external_agent::AgentEvent::ToolCompleted {
+                item_id: "shot-1".to_string(),
+                status: external_agent::ToolCompletionStatus::Success,
+            })
+            .unwrap();
+        event_tx
+            .send(external_agent::AgentEvent::TurnCompleted { message: None })
+            .unwrap();
+        drop(event_tx);
+
+        let interrupts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let steers = Arc::new(Mutex::new(Vec::new()));
+        let mut agent: Box<dyn external_agent::ExternalAgent> = Box::new(ManagedDrainTestAgent {
+            interrupts: interrupts.clone(),
+            steers: steers.clone(),
+        });
+        let mut stats = LoopStats::default();
+        let mut diff_tracker = ExternalDiffDeltaTracker::default();
+        let mut pending_runtime_steers = std::collections::VecDeque::new();
+        let mut handled_steer_ids = std::collections::HashSet::new();
+        let mut cancelled_follow_ups = HashSet::new();
+        let mut dedupe = CodexThreadActionDedupe::default();
+
+        let outcome = drain_external_agent_events(
+            &mut agent,
+            &mut event_rx,
+            &mut bus_rx_for_drain,
+            &config,
+            &mut stats,
+            &mut diff_tracker,
+            &mut pending_runtime_steers,
+            &mut handled_steer_ids,
+            &mut cancelled_follow_ups,
+            &mut dedupe,
+            None,
+            false,
+            false,
+            true,
+        )
+        .await;
+
+        match outcome {
+            DrainOutcome::TurnCompleted { .. } => {}
+            _ => panic!("expected TurnCompleted"),
+        }
+        assert_eq!(interrupts.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(
+            steers.lock().unwrap().is_empty(),
+            "completed density handoff replay must not be steered back into density maintenance"
         );
     }
 
@@ -12299,6 +12383,7 @@ mod tests {
             &mut cancelled_follow_ups,
             &mut dedupe,
             None,
+            false,
             false,
             false,
         )
@@ -12400,43 +12485,25 @@ mod tests {
     }
 
     #[test]
-    fn managed_context_density_retry_after_rewind_blocks_normal_replay_when_still_watch() {
+    fn managed_context_density_rewind_marks_replay_handoff_completed() {
         let active =
             FollowUpMessage::text("density handoff".into()).managed_context_density_handoff();
-        let watch = external_agent::AgentContextSnapshot {
-            source: "codex".to_string(),
-            label: "Codex resolved request payload".to_string(),
-            request_id: Some("req-1".to_string()),
-            request_index: Some(1),
-            rollout_path: None,
-            format: "openai.responses.resolved_request.v1".to_string(),
-            token_count: Some(252_500),
-            token_count_kind: Some(external_agent::AgentContextTokenCountKind::BackendReported),
-            context_window: Some(258_400),
-            hard_context_window: Some(272_000),
-            item_count: Some(458),
-            raw: serde_json::json!({}),
-        };
+        let mut pending = std::collections::VecDeque::from([FollowUpMessage::text(
+            "Run the next narrow browser QA step.".into(),
+        )]);
 
-        let retry = managed_context_density_retry_after_rewind(&active, Some(&watch))
-            .expect("still-watch density should require another handoff");
-        assert!(retry.managed_context_density_handoff);
-        assert!(retry
-            .text
-            .contains("not enough to count as successful density maintenance"));
-        assert!(retry
-            .text
-            .contains("will not replay ordinary follow-up work yet"));
-        assert!(retry.text.contains("current rewind point"));
+        let continuation = managed_context_rewind_continuation(
+            &mut pending,
+            &active,
+            None,
+            &ManagedContextRewindTurnStopStatus::NotRequested,
+        )
+        .expect("held follow-up should replay")
+        .after_managed_context_density_handoff();
 
-        let below = external_agent::AgentContextSnapshot {
-            token_count: Some(219_000),
-            ..watch
-        };
-        assert!(managed_context_density_retry_after_rewind(&active, Some(&below)).is_none());
-
-        let normal = FollowUpMessage::text("ordinary follow-up".into());
-        assert!(managed_context_density_retry_after_rewind(&normal, Some(&below)).is_none());
+        assert_eq!(continuation.text, "Run the next narrow browser QA step.");
+        assert!(continuation.managed_context_density_handoff_completed);
+        assert!(!continuation.managed_context_density_handoff);
     }
 
     #[test]
@@ -21453,6 +21520,7 @@ async fn run_with_presence(
                 Some(&mut side_session_state),
                 false,
                 false,
+                false,
             )
             .await
             {
@@ -23650,6 +23718,7 @@ async fn run_external_agent_mode(
                         Some(&mut side_session_state),
                         false,
                         false,
+                        false,
                     )
                     .await
                     {
@@ -23918,6 +23987,7 @@ async fn run_external_agent_mode(
             Some(&mut side_session_state),
             managed_context_recovery_kickstart,
             managed_context_density_handoff,
+            managed_context_density_handoff_completed,
         )
         .await
         {
@@ -24210,42 +24280,15 @@ async fn run_external_agent_mode(
                 .await
                 {
                     Ok(automatic_resume) => {
-                        let post_rewind_snapshot = if managed_context_density_handoff {
-                            match refresh_external_context_usage_snapshot(&mut agent, &drain_config)
-                                .await
-                            {
-                                Ok(snapshot) => snapshot,
-                                Err(e) => {
-                                    slog(&session_log, |l| {
-                                        l.debug(&format!(
-                                            "Could not re-read Codex context pressure after density-handoff rewind: {}",
-                                            e
-                                        ))
-                                    });
-                                    None
-                                }
-                            }
-                        } else {
-                            None
-                        };
-                        if let Some(retry) = managed_context_density_retry_after_rewind(
-                            &active_followup_for_rewind_replay,
-                            post_rewind_snapshot.as_ref(),
-                        ) {
-                            slog(&session_log, |l| {
-                                l.warn(
-                                    "Managed-context density handoff rewind remained above the recommended threshold; sending another maintenance handoff instead of replaying follow-up",
-                                )
-                            });
-                            next_turn = Some(retry);
-                            continue 'outer;
-                        }
-                        if let Some(continuation) = managed_context_rewind_continuation(
+                        if let Some(mut continuation) = managed_context_rewind_continuation(
                             &mut pending_managed_context_replays,
                             &active_followup_for_rewind_replay,
                             automatic_resume,
                             &turn_stop_status,
                         ) {
+                            if managed_context_density_handoff {
+                                continuation = continuation.after_managed_context_density_handoff();
+                            }
                             slog(&session_log, |l| {
                                 l.info(
                                     "Managed-context rewind succeeded; continuing queued follow-up",
