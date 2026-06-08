@@ -197,7 +197,7 @@ fn trusted_env_value(key: &str, value: &str) -> bool {
     }
 
     let uid = crate::platform::current_uid();
-    trusted_env_value_for_uid(key, value, uid, std::path::Path::new)
+    trusted_env_value_for_uid(key, value, uid, std::path::Path::exists)
 }
 
 #[cfg(target_os = "linux")]
