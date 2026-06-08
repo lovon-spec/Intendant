@@ -21148,6 +21148,26 @@ function stationBuildSessionsSummary() {
     .sort((a, b) => stationSessionUpdatedMs(b) - stationSessionUpdatedMs(a))
     .slice(0, 6)
     .map(session => stationSessionRowForDock(session, indexedIds));
+  let externalTargets = [];
+  try {
+    externalTargets = stationExternalTargetRowsForDock(5).map(row => ({
+      id: row.id || '',
+      sessionId: row.sid || row.id || '',
+      action: 'focus',
+      label: row.label || shortSessionId(row.id) || 'external session',
+      value: `${prettyAgentName(row.source) || row.source || 'external'} / ${row.target ? 'target' : (row.status || 'idle')}`,
+      detail: row.detail || [row.liveId ? `window ${shortSessionId(row.liveId)}` : '', row.detached ? 'detached' : ''].filter(Boolean).join(' / '),
+      tone: row.target ? 'ok' : (row.active ? 'peer' : 'session'),
+      isCodex: !!row.isCodex,
+      threadActionSessionId: row.actionId || row.id || '',
+      canResume: !!row.canResume,
+      canConfig: !!row.canConfig,
+      canAttach: !!row.attachId,
+      canStop: !!row.stopId,
+    }));
+  } catch (err) {
+    console.warn('Station external target snapshot failed:', err);
+  }
   return {
     total: sessions.length,
     active,
@@ -21162,6 +21182,7 @@ function stationBuildSessionsSummary() {
     indexStatus: sessionsLoaded
       ? 'loaded'
       : (stationSessionsIndexLoading ? 'indexing' : (stationSessionsIndexError ? 'error' : 'cold')),
+    externalTargets,
     recent,
     ...worktrees,
   };

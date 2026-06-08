@@ -5427,6 +5427,19 @@ impl StationInner {
             },
         ));
         yy += 28.0;
+        if !sessions.external_targets.is_empty() {
+            self.section_title_color(x, yy, "External control", C_PEACH_CSS);
+            yy += 18.0;
+            yy = self.session_detail_rows(
+                x,
+                yy,
+                panel_w,
+                &sessions.external_targets,
+                "No external targets",
+                3,
+            );
+            yy += 14.0;
+        }
         self.section_title(x, yy, "Latest session");
         yy += 18.0;
         self.round_rect(
@@ -8489,6 +8502,7 @@ struct StationSessionsSummary {
     latest_source: String,
     latest_updated: String,
     index_status: String,
+    external_targets: Vec<StationDetailRow>,
     recent: Vec<StationDetailRow>,
     recent_worktrees: Vec<StationDetailRow>,
 }
@@ -8512,6 +8526,7 @@ impl Default for StationSessionsSummary {
             latest_source: String::new(),
             latest_updated: String::new(),
             index_status: String::new(),
+            external_targets: Vec::new(),
             recent: Vec::new(),
             recent_worktrees: Vec::new(),
         }
