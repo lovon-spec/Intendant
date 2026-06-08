@@ -11347,6 +11347,7 @@ let stationChangesHistoryLoading = false;
 let stationSelectedManagedAnchor = '';
 let stationSelectedManagedRecord = '';
 let stationManagedActionResult = '';
+let stationManagedActivitySignal = null;
 let stationSessionConfigResult = { sessionId: '', text: '', kind: '' };
 let stationSessionRenameResult = { sessionId: '', text: '', kind: '' };
 const stationSessionRenameDrafts = new Map();
@@ -13643,7 +13644,19 @@ function stationActivityEventIsManaged(ev) {
 }
 
 function stationOpenManagedFromActivity(ev) {
-  if (ev?.sessionId) stationSetManagedSession(ev.sessionId);
+  const sessionId = String(ev?.sessionId || ev?.session_id || '').trim();
+  if (sessionId) stationSetManagedSession(sessionId);
+  if (ev) {
+    stationManagedActivitySignal = {
+      id: stationActivityEventKey(ev),
+      sessionId,
+      action: 'activity-managed',
+      label: stationActivitySourceFor(ev) || 'activity',
+      value: `${stationActivityLevelFor(ev)} ${ev.ts || ''}`.trim(),
+      detail: compactSessionText(stationActivityEventCopyText(ev)),
+      tone: 'managed',
+    };
+  }
   if (stationRenderedSelectPanel('system:managed', 'Managed activity selected')) return;
   stationRenderManagedDock(/\b(backout|record)\b/i.test(ev?.msg || ev?.source || '') ? 'backout' : '');
 }
@@ -20106,9 +20119,14 @@ function stationHandleManagedAction(action) {
   const op = String(action.action || '').trim();
   const id = String(action.id || '').trim();
   const sessionId = String(action.session_id || '').trim();
-  const idOptionalOps = new Set(['rewind', 'backout', 'refresh', 'use-target', 'copy-status']);
+  const idOptionalOps = new Set(['rewind', 'backout', 'refresh', 'use-target', 'copy-status', 'clear-activity-signal']);
   if (!id && !idOptionalOps.has(op)) return;
   if (sessionId) stationSetManagedSession(sessionId);
+  if (op === 'clear-activity-signal') {
+    stationManagedActivitySignal = null;
+    stationRenderedSelectPanel('system:managed', 'Managed activity signal cleared');
+    return;
+  }
   if (op === 'anchor-inspect') {
     stationApplyManagedAction('anchor', id, sessionId)
       .then(() => stationInspectManagedAnchorFromDock())
@@ -20744,6 +20762,7 @@ function stationBuildManagedSummary(contextSummary) {
     recentRecords: stationManagedRecordRows(),
     recentAnchors: stationManagedAnchorRows(sessionId),
     recentBranches: ledgers.recentBranches,
+    activitySignal: stationManagedActivitySignal || {},
   };
 }
 

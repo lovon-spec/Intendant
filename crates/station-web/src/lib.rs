@@ -4733,6 +4733,7 @@ impl StationInner {
             "normal",
         );
         yy += 38.0;
+        yy = self.draw_managed_activity_signal(x, yy, panel_w, &managed);
         self.section_title_color(x, yy, "Recent rewinds", C_MAUVE_CSS);
         yy += 18.0;
         yy = self.managed_detail_rows(
@@ -4765,6 +4766,88 @@ impl StationInner {
             "No claimable fission branches",
             3,
         );
+    }
+
+    fn draw_managed_activity_signal(
+        &mut self,
+        x: f32,
+        y: f32,
+        panel_w: f32,
+        managed: &StationManagedSummary,
+    ) -> f32 {
+        let signal = &managed.activity_signal;
+        if signal.id.is_empty() {
+            return y;
+        }
+        self.section_title_color(x, y, "Activity signal", C_TEAL_CSS);
+        let card_y = y + 18.0;
+        self.round_rect(
+            x + 12.0,
+            card_y - 10.0,
+            panel_w - 24.0,
+            67.0,
+            4.0,
+            "rgba(17,17,27,0.76)",
+            "rgba(148,226,213,0.46)",
+        );
+        self.ctx.set_fill_style(&JsValue::from_str(C_TEAL_CSS));
+        self.ctx
+            .fill_rect((x + 20.0) as f64, (card_y - 2.0) as f64, 3.0, 31.0);
+        self.text(
+            &truncate(&nonempty(&signal.label, "managed activity"), 27),
+            x + 30.0,
+            card_y + 3.0,
+            9.5,
+            C_TEAL_CSS,
+            "bold",
+        );
+        self.text(
+            &truncate(&signal.value, 27),
+            x + panel_w - 122.0,
+            card_y + 3.0,
+            8.5,
+            C_TEXT_CSS,
+            "normal",
+        );
+        self.text(
+            &truncate(&signal.detail, 45),
+            x + 30.0,
+            card_y + 20.0,
+            8.5,
+            C_SUBTEXT0_CSS,
+            "normal",
+        );
+
+        let mut buttons = vec![
+            ("log", "show-log", 42.0, C_TEAL_CSS),
+            ("copy", "copy-event-json", 48.0, C_BLUE_CSS),
+        ];
+        if !signal.session_id.is_empty() {
+            buttons.push(("session", "activity-session", 64.0, C_PEACH_CSS));
+        }
+        buttons.push(("clear", "clear-activity-signal", 48.0, C_OVERLAY1_CSS));
+        let total_w = buttons.iter().map(|(_, _, w, _)| *w).sum::<f32>()
+            + buttons.len().saturating_sub(1) as f32 * 6.0;
+        let mut bx = x + panel_w - total_w - 28.0;
+        for (label, action, width, color) in buttons {
+            self.pill_at(bx, card_y + 34.0, width, 19.0, label, color);
+            let hit = if action == "clear-activity-signal" {
+                HitAction::ManagedAction {
+                    action: action.to_string(),
+                    id: String::new(),
+                    session_id: managed.session_id.clone(),
+                }
+            } else {
+                HitAction::ActivityAction {
+                    action: action.to_string(),
+                    id: signal.id.clone(),
+                }
+            };
+            self.hit_zones
+                .push(HitZone::new(bx, card_y + 34.0, width, 19.0, hit));
+            bx += width + 6.0;
+        }
+        card_y + 69.0
     }
 
     fn draw_changes_info(&mut self, x: f32, y: f32, panel_w: f32) {
@@ -7900,6 +7983,7 @@ struct StationManagedSummary {
     fission_groups: u32,
     branches: u32,
     error: String,
+    activity_signal: StationDetailRow,
     recent_records: Vec<StationDetailRow>,
     recent_anchors: Vec<StationDetailRow>,
     recent_branches: Vec<StationDetailRow>,
@@ -7921,6 +8005,7 @@ impl Default for StationManagedSummary {
             fission_groups: 0,
             branches: 0,
             error: String::new(),
+            activity_signal: StationDetailRow::default(),
             recent_records: Vec::new(),
             recent_anchors: Vec::new(),
             recent_branches: Vec::new(),
