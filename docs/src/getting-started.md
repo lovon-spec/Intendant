@@ -340,21 +340,15 @@ uses profile-compatible RSA certificate payloads with client-auth extensions.
 
 #### Apple device requirement for `client.p12`
 
-`client.p12` is packaged with modern PKCS#12 encryption — PBES2 (PBKDF2-HMAC-
-SHA256 + AES-256-CBC) with a SHA-256 MAC, the algorithm set Apple's current
-importer (`SecPKCS12Import`) accepts. New LAN cert material uses RSA-2048
-certificates with SHA-256 signatures, matching Apple's documented certificate
+`client.p12` is packaged in Apple auto-detect-compatible PKCS#12 form: PBES1
+3DES-CBC with a SHA-1 MAC. This is intentionally less modern than PBES2/AES
+because macOS profile installation and `security import` can reject PBES2/AES
+bundles as a password/MAC authentication error unless the caller explicitly
+forces PKCS#12 format. New LAN cert material still uses RSA-2048 certificates
+with SHA-256 signatures, matching Apple's documented certificate
 configuration-profile payload compatibility.
 
-> **Supported environment:** importing `client.p12` on an Apple device requires
-> **macOS 15 (Sequoia)+** or **iOS / iPadOS 18+**.
-
-Older Apple releases only accept the legacy RC2-40 / 3DES + SHA-1 packaging,
-which Intendant intentionally no longer produces (dropping it is what let the
-cert subsystem become pure-Rust). Android and desktop Chrome/Firefox import the
-modern bundle with no version floor. To serve a pre-15 macOS or pre-18 iOS
-client, convert the bundle yourself with `openssl pkcs12 -legacy` on a machine
-that has OpenSSL.
+Android and desktop Chrome/Firefox also import the Apple-compatible bundle.
 
 ## Testing
 
