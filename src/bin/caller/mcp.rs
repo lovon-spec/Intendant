@@ -8321,10 +8321,14 @@ impl IntendantServer {
 
         if let Some(result) = results.first() {
             if let Some(ref screenshot) = result.screenshot {
-                return Ok(image_tool_result(
-                    "screenshot captured",
-                    screenshot.base64_png.clone(),
-                ));
+                let text = serde_json::json!({
+                    "status": "screenshot captured",
+                    "screenshot_path": screenshot.path,
+                    "width": screenshot.width,
+                    "height": screenshot.height,
+                })
+                .to_string();
+                return Ok(image_tool_result(text, screenshot.base64_png.clone()));
             }
             if let Some(ref err) = result.error {
                 return Ok(text_tool_error(format!("Screenshot error: {}", err)));

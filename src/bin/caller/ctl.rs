@@ -1215,7 +1215,17 @@ fn print_tool_response(
         return print_json(result);
     }
     if let Some(path) = output_path {
-        save_first_image(result, &path)?;
+        if result
+            .get("isError")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            for text in text_contents(result) {
+                println!("{text}");
+            }
+            return Err("tool returned isError=true".to_string());
+        }
+        save_first_image_or_path(result, &path)?;
         for text in text_contents(result) {
             println!("{text}");
         }
@@ -1287,14 +1297,42 @@ fn image_contents(result: &Value) -> impl Iterator<Item = (&str, &str)> {
         })
 }
 
-fn save_first_image(result: &Value, path: &PathBuf) -> Result<(), String> {
-    let (data, _mime) = image_contents(result)
-        .next()
-        .ok_or_else(|| "tool result did not include an image content block".to_string())?;
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(data)
-        .map_err(|e| format!("failed to decode image data: {e}"))?;
-    std::fs::write(path, bytes).map_err(|e| format!("failed to write {}: {e}", path.display()))
+fn save_first_image_or_path(result: &Value, path: &PathBuf) -> Result<(), String> {
+    if let Some((data, _mime)) = image_contents(result).next() {
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(data)
+            .map_err(|e| format!("failed to decode image data: {e}"))?;
+        return std::fs::write(path, bytes)
+            .map_err(|e| format!("failed to write {}: {e}", path.display()));
+    }
+
+    if let Some(source) = screenshot_path_from_text(result) {
+        std::fs::copy(&source, path).map_err(|e| {
+            format!(
+                "failed to copy screenshot from {} to {}: {e}",
+                source.display(),
+                path.display()
+            )
+        })?;
+        return Ok(());
+    }
+
+    Err(
+        "tool result did not include an image content block or readable screenshot_path"
+            .to_string(),
+    )
+}
+
+fn screenshot_path_from_text(result: &Value) -> Option<PathBuf> {
+    text_contents(result)
+        .filter_map(|text| serde_json::from_str::<Value>(text).ok())
+        .find_map(|value| {
+            value
+                .get("screenshot_path")
+                .or_else(|| value.get("path"))
+                .and_then(Value::as_str)
+                .map(PathBuf::from)
+        })
 }
 
 fn print_json(value: &Value) -> Result<(), String> {
@@ -1712,5 +1750,58 @@ mod tests {
             value.pointer("/orchestrate").and_then(Value::as_bool),
             Some(false)
         );
+    }
+
+    #[test]
+    fn save_output_copies_screenshot_path_when_image_block_is_missing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let source = dir.path().join("captured.png");
+        let output = dir.path().join("requested.png");
+        let png_bytes = b"\x89PNG\r\n\x1a\npath-backed";
+        std::fs::write(&source, png_bytes).expect("write source");
+
+        let result = serde_json::json!({
+            "content": [{
+                "type": "text",
+                "text": serde_json::json!({
+                    "status": "screenshot captured",
+                    "screenshot_path": source,
+                    "width": 10,
+                    "height": 20
+                }).to_string()
+            }]
+        });
+
+        save_first_image_or_path(&result, &output).expect("save from screenshot_path");
+        assert_eq!(std::fs::read(output).expect("read output"), png_bytes);
+    }
+
+    #[test]
+    fn save_output_prefers_inline_image_block_over_screenshot_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let source = dir.path().join("captured.png");
+        let output = dir.path().join("requested.png");
+        std::fs::write(&source, b"path-backed").expect("write source");
+
+        let inline_bytes = b"\x89PNG\r\n\x1a\ninline";
+        let inline = base64::engine::general_purpose::STANDARD.encode(inline_bytes);
+        let result = serde_json::json!({
+            "content": [
+                {
+                    "type": "text",
+                    "text": serde_json::json!({
+                        "screenshot_path": source
+                    }).to_string()
+                },
+                {
+                    "type": "image",
+                    "data": inline,
+                    "mimeType": "image/png"
+                }
+            ]
+        });
+
+        save_first_image_or_path(&result, &output).expect("save from image block");
+        assert_eq!(std::fs::read(output).expect("read output"), inline_bytes);
     }
 }
