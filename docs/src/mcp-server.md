@@ -60,8 +60,11 @@ The full MCP tool surface (dispatched in `call_tool_by_name`) is broad. For
 model clients that front-load tool schemas into every request, prefer the
 HTTP transport's `tool_profile=core` query parameter and the `intendant ctl`
 CLI for lazy discovery. `tool_profile=core` advertises only status, shared-view
-collaboration, and managed-context rewind/backout tools when managed context is
-enabled; omitting `tool_profile` keeps the historical full tool list.
+collaboration, and, when managed context is enabled, managed-context
+rewind/backout plus the minimal real-display/CU tools (`list_displays`,
+`grant_user_display`, `revoke_user_display`, `take_screenshot`,
+`execute_cu_actions`); omitting `tool_profile` keeps the historical full tool
+list.
 With the patched managed Codex binary, `rewind_backout mode="fork"` creates a
 new Codex thread while inheriting the lineage prompt-cache key from the saved
 rollout; same-thread `restore` remains available when the current thread should
@@ -74,6 +77,8 @@ context:
 "${INTENDANT:-intendant}" ctl --help
 "${INTENDANT:-intendant}" ctl tools list
 "${INTENDANT:-intendant}" ctl tools schema take_screenshot
+"${INTENDANT:-intendant}" ctl tools call grant_user_display --args '{}'
+"${INTENDANT:-intendant}" ctl display grant-user
 "${INTENDANT:-intendant}" ctl display screenshot --target user_session --output screen.png
 ```
 
@@ -109,6 +114,8 @@ Full MCP tool groups:
 | `list_displays`      | Enumerate displays with their session state. | — |
 | `take_display`       | Take control of a display. | `display_id` |
 | `release_display`    | Release control of a display. | `display_id`, `note?` |
+| `grant_user_display` | Grant access to the user's real display session; on Wayland, approve the portal dialog before capture. | `display_id?` |
+| `revoke_user_display` | Revoke access to the user's real display session. | `display_id?`, `note?` |
 | `take_screenshot`    | Capture a screenshot (returns image content). | display params |
 | `execute_cu_actions` | Run a batch of [computer-use](./computer-use-and-audio.md) actions. | CU action params |
 | `list_frames`        | List captured video frames. | filter params |

@@ -150,8 +150,10 @@ features they lack.
 
   Codex uses `tool_profile=core` by default to avoid MCP tool-schema bloat. The
   core profile keeps a small bootstrap surface (`get_status`, shared-view tools,
-  and managed-context tools when enabled). Broad or rare Intendant operations
-  should be discovered lazily through `intendant ctl --help`,
+  and, when managed context is enabled, managed-context tools plus the minimal
+  display/CU path: `list_displays`, `grant_user_display`, `revoke_user_display`,
+  `take_screenshot`, and `execute_cu_actions`). Broad or rare Intendant
+  operations should be discovered lazily through `intendant ctl --help`,
   `intendant ctl tools list`, and focused subcommand help. Supervised Codex
   sessions receive `INTENDANT=/absolute/path/to/intendant`, `INTENDANT_MCP_URL`,
   `INTENDANT_SESSION_ID`, and `INTENDANT_MANAGED_CONTEXT`, so agent shells can

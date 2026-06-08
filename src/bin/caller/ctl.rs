@@ -392,6 +392,33 @@ async fn run_display(
             let response = call_tool(client, config, "release_display", Value::Object(map)).await?;
             print_tool_response(response, config, None)?;
         }
+        "grant-user" | "grant_user" | "grant-user-display" | "grant_user_display" => {
+            let args = parse_command_args(&raw[1..], &["--display-id"], &[])?;
+            let mut map = Map::new();
+            if let Some(id) = args.one("--display-id") {
+                insert_u32(&mut map, "display_id", Some(id))?;
+            } else if !args.positional.is_empty() {
+                let id = positional_u32(&args, 0, "display grant-user requires a display id")?;
+                map.insert("display_id".to_string(), Value::from(id));
+            }
+            let response =
+                call_tool(client, config, "grant_user_display", Value::Object(map)).await?;
+            print_tool_response(response, config, None)?;
+        }
+        "revoke-user" | "revoke_user" | "revoke-user-display" | "revoke_user_display" => {
+            let args = parse_command_args(&raw[1..], &["--display-id", "--note"], &[])?;
+            let mut map = Map::new();
+            if let Some(id) = args.one("--display-id") {
+                insert_u32(&mut map, "display_id", Some(id))?;
+            } else if !args.positional.is_empty() {
+                let id = positional_u32(&args, 0, "display revoke-user requires a display id")?;
+                map.insert("display_id".to_string(), Value::from(id));
+            }
+            insert_string(&mut map, "note", args.one("--note"));
+            let response =
+                call_tool(client, config, "revoke_user_display", Value::Object(map)).await?;
+            print_tool_response(response, config, None)?;
+        }
         other => return Err(format!("unknown display command '{other}'")),
     }
     Ok(())
@@ -1595,6 +1622,8 @@ fn help_display() {
   intendant ctl display frames [--stream NAME] [--count N]\n\
   intendant ctl display read-frame [latest|ID] [--stream NAME]\n\
   intendant ctl display screenshot [--target TARGET] [--output out.png]\n\
+  intendant ctl display grant-user [DISPLAY_ID|--display-id ID]\n\
+  intendant ctl display revoke-user [DISPLAY_ID|--display-id ID] [--note TEXT]\n\
   intendant ctl display take DISPLAY_ID\n\
   intendant ctl display release DISPLAY_ID [--note TEXT]"
     );

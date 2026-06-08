@@ -51,8 +51,12 @@ CU actions operate on a `DisplayTarget` (`#[serde(tag = "kind")]`):
   autonomy system.
 
 User-session access uses a **session-grant** model: approve once (the `d` hotkey
-in the TUI, or the dashboard control), and the grant holds for the rest of the
-session until revoked. See [TUI & Autonomy](./tui.md) for the approval surface.
+in the TUI, the dashboard control, MCP `grant_user_display`, or
+`intendant ctl display grant-user`), and the grant holds for the rest of the
+session until revoked. On Wayland, granting starts the portal flow; the user
+must also approve the physical screen-sharing dialog before `take_screenshot` or
+`execute_cu_actions` can target `user_session`. See [TUI & Autonomy](./tui.md)
+for the approval surface.
 
 ### CU-First Routing
 

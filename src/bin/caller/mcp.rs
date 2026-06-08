@@ -1102,7 +1102,11 @@ fn tool_allowed_for_profile(name: &str, managed_context: bool, profile: Option<&
                 && (managed_context_tool(name)
                     || matches!(
                         name,
-                        "list_displays" | "take_screenshot" | "execute_cu_actions"
+                        "list_displays"
+                            | "grant_user_display"
+                            | "revoke_user_display"
+                            | "take_screenshot"
+                            | "execute_cu_actions"
                     )))
         }
         "screen" | "display" => {
@@ -1116,6 +1120,8 @@ fn tool_allowed_for_profile(name: &str, managed_context: bool, profile: Option<&
                     | "close_browser_workspace"
                     | "acquire_browser_workspace"
                     | "release_browser_workspace"
+                    | "grant_user_display"
+                    | "revoke_user_display"
                     | "take_screenshot"
                     | "execute_cu_actions"
                     | "list_frames"
@@ -1241,6 +1247,22 @@ fn append_manual_http_tool_definitions(
             "list_displays",
             "Enumerate available displays with their IDs, names, and resolutions.",
             EmptyToolParams
+        ),
+    );
+    push(
+        "grant_user_display",
+        manual_http_tool_definition!(
+            "grant_user_display",
+            "Grant access to the user's real display session. On Wayland this starts the screen-sharing portal flow; approve the physical portal dialog before taking screenshots or executing CU actions against user_session.",
+            GrantUserDisplayParams
+        ),
+    );
+    push(
+        "revoke_user_display",
+        manual_http_tool_definition!(
+            "revoke_user_display",
+            "Revoke access to the user's real display session.",
+            RevokeUserDisplayParams
         ),
     );
     push(
@@ -5666,6 +5688,23 @@ pub struct ReleaseDisplayParams {
     pub note: Option<String>,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct GrantUserDisplayParams {
+    /// User session display ID to grant. Omit for the primary display (0).
+    #[serde(default)]
+    pub display_id: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct RevokeUserDisplayParams {
+    /// User session display ID to revoke. Omit for the primary display (0).
+    #[serde(default)]
+    pub display_id: Option<u32>,
+    /// Optional note explaining why access was revoked.
+    #[serde(default)]
+    pub note: Option<String>,
+}
+
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct SpawnLiveAudioParams {
     /// Unique identifier for this live audio session.
@@ -6414,6 +6453,14 @@ impl IntendantServer {
             "release_display" => {
                 let params = parse_params::<ReleaseDisplayParams>(args)?;
                 Ok(text_tool_result(self.release_display(params).await))
+            }
+            "grant_user_display" => {
+                let params = parse_params::<GrantUserDisplayParams>(args)?;
+                Ok(text_tool_result(self.grant_user_display(params).await))
+            }
+            "revoke_user_display" => {
+                let params = parse_params::<RevokeUserDisplayParams>(args)?;
+                Ok(text_tool_result(self.revoke_user_display(params).await))
             }
             "show_shared_view" => {
                 let Parameters(params) = parse_params::<ShowSharedViewParams>(args)?;
@@ -8074,6 +8121,47 @@ impl IntendantServer {
             note: params.note.clone(),
         });
         format!("Released control of :{}", params.display_id)
+    }
+
+    #[tool(
+        description = "Grant access to the user's real display session. On Wayland this starts the screen-sharing portal flow; approve the physical portal dialog before taking screenshots or executing CU actions against user_session."
+    )]
+    async fn grant_user_display(
+        &self,
+        Parameters(params): Parameters<GrantUserDisplayParams>,
+    ) -> String {
+        let display_id = params.display_id.unwrap_or(0);
+        {
+            let state = self.state.read().await;
+            let autonomy = state.autonomy.clone();
+            drop(state);
+            let mut autonomy = autonomy.write().await;
+            autonomy.user_display_granted = true;
+        }
+        std::env::set_var("INTENDANT_USER_DISPLAY_GRANTED", "1");
+        self.bus.send(AppEvent::UserDisplayGranted { display_id });
+        format!("User display access granted (display_id: {display_id})")
+    }
+
+    #[tool(description = "Revoke access to the user's real display session.")]
+    async fn revoke_user_display(
+        &self,
+        Parameters(params): Parameters<RevokeUserDisplayParams>,
+    ) -> String {
+        let display_id = params.display_id.unwrap_or(0);
+        {
+            let state = self.state.read().await;
+            let autonomy = state.autonomy.clone();
+            drop(state);
+            let mut autonomy = autonomy.write().await;
+            autonomy.user_display_granted = false;
+        }
+        std::env::remove_var("INTENDANT_USER_DISPLAY_GRANTED");
+        self.bus.send(AppEvent::UserDisplayRevoked {
+            display_id,
+            note: params.note.clone(),
+        });
+        format!("User display access revoked (display_id: {display_id})")
     }
 
     async fn emit_shared_view(
@@ -9941,6 +10029,8 @@ mod tests {
             assert!(vanilla_names.contains(&"request_shared_view_input"));
             assert!(vanilla_names.contains(&"capture_shared_view_frame"));
             assert!(vanilla_names.contains(&"hide_shared_view"));
+            assert!(!vanilla_names.contains(&"grant_user_display"));
+            assert!(!vanilla_names.contains(&"revoke_user_display"));
             assert!(!vanilla_names.contains(&"execute_cu_actions"));
             assert!(!vanilla_names.contains(&"spawn_live_audio"));
             assert!(!vanilla_names.contains(&"list_rewind_anchors"));
@@ -9960,9 +10050,25 @@ mod tests {
             assert!(managed_names.contains(&"rewind_context"));
             assert!(managed_names.contains(&"rewind_backout"));
             assert!(managed_names.contains(&"list_displays"));
+            assert!(managed_names.contains(&"grant_user_display"));
+            assert!(managed_names.contains(&"revoke_user_display"));
             assert!(managed_names.contains(&"take_screenshot"));
             assert!(managed_names.contains(&"execute_cu_actions"));
             assert!(!managed_names.contains(&"spawn_live_audio"));
+
+            let grant_schema = managed["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|tool| tool["name"] == "grant_user_display")
+                .and_then(|tool| tool.pointer("/inputSchema/properties/display_id"))
+                .expect("grant_user_display display_id schema");
+            assert!(
+                grant_schema["type"]
+                    .as_array()
+                    .is_some_and(|types| types.iter().any(|ty| ty.as_str() == Some("integer"))),
+                "grant_user_display display_id schema: {grant_schema:?}"
+            );
 
             let list_description = managed["tools"]
                 .as_array()
@@ -9985,6 +10091,66 @@ mod tests {
                 .and_then(|tool| tool["description"].as_str())
                 .expect("rewind_context description");
             assert!(rewind_description.contains("do not use for ordinary low-pressure"));
+        });
+    }
+
+    #[test]
+    fn grant_user_display_tool_routes_and_emits_event() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            std::env::remove_var("INTENDANT_USER_DISPLAY_GRANTED");
+            let state = test_state();
+            let bus = EventBus::new();
+            let mut rx = bus.subscribe();
+            let server = IntendantServer::new(state.clone(), bus);
+
+            let result = server
+                .call_tool_by_name_for_session(
+                    "grant_user_display",
+                    serde_json::json!({ "display_id": 2 }),
+                    Some("managed-session"),
+                    Some(true),
+                )
+                .await
+                .expect("grant_user_display should route");
+            assert!(!result.is_error.unwrap_or(false));
+
+            match timeout(Duration::from_secs(1), rx.recv()).await {
+                Ok(Ok(AppEvent::UserDisplayGranted { display_id })) => {
+                    assert_eq!(display_id, 2);
+                }
+                other => panic!("expected UserDisplayGranted event, got {other:?}"),
+            }
+            assert_eq!(
+                std::env::var("INTENDANT_USER_DISPLAY_GRANTED").as_deref(),
+                Ok("1")
+            );
+            let autonomy = { state.read().await.autonomy.clone() };
+            assert!(autonomy.read().await.user_display_granted);
+
+            let result = server
+                .call_tool_by_name_for_session(
+                    "revoke_user_display",
+                    serde_json::json!({ "display_id": 2, "note": "done" }),
+                    Some("managed-session"),
+                    Some(true),
+                )
+                .await
+                .expect("revoke_user_display should route");
+            assert!(!result.is_error.unwrap_or(false));
+
+            match timeout(Duration::from_secs(1), rx.recv()).await {
+                Ok(Ok(AppEvent::UserDisplayRevoked { display_id, note })) => {
+                    assert_eq!(display_id, 2);
+                    assert_eq!(note.as_deref(), Some("done"));
+                }
+                other => panic!("expected UserDisplayRevoked event, got {other:?}"),
+            }
+            assert!(std::env::var("INTENDANT_USER_DISPLAY_GRANTED").is_err());
+            assert!(!autonomy.read().await.user_display_granted);
         });
     }
 

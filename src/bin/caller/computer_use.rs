@@ -979,8 +979,9 @@ fn no_wayland_session_message(target: &DisplayTarget) -> String {
             } else {
                 format!(
                     "No active display capture session on Wayland. User display access \
-                 has not been granted — call grant_user_display first, then approve \
-                 the screen-sharing portal dialog on the physical display. \
+                 has not been granted — call grant_user_display first (or run \
+                 `intendant ctl display grant-user`), then approve the \
+                 screen-sharing portal dialog on the physical display. \
                  Alternatively, target a virtual Xvfb display (e.g. \
                  display_target=\":99\").{}",
                     diagnostic
@@ -1532,6 +1533,11 @@ mod tests {
         assert!(
             msg.contains("grant_user_display"),
             "ungranted message: {}",
+            msg
+        );
+        assert!(
+            msg.contains("ctl display grant-user"),
+            "ungranted message should mention ctl grant command: {}",
             msg
         );
 
