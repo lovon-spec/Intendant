@@ -20632,6 +20632,18 @@ function stationHandleSessionAction(action) {
     resumeSession(session);
     return;
   }
+  if (op === 'continue') {
+    const msg = detachedSessionResumeMessage(sessionId, '', true, []);
+    if (msg) {
+      dispatchControlMsg(msg);
+      markSessionWindowPendingActive(sessionId);
+      showControlToast('info', `Continuing session ${shortSessionId(sessionId)}`);
+    } else {
+      focusSessionWindow(live?.liveId || sessionId);
+      showControlToast('info', `Focused session ${shortSessionId(sessionId)}`);
+    }
+    return;
+  }
   if (op === 'open-log') {
     stationRenderSessionsDock(stationSessionId(session) || sessionId);
     stationLoadSessionLogForDock(session);
@@ -22145,6 +22157,7 @@ function stationBuildControlsSummary() {
     sessionCanConfig,
     sessionCanInterrupt,
   });
+  const launchReadiness = stationBuildLaunchReadiness();
   return {
     backend: backend || 'none',
     command,
@@ -22258,6 +22271,16 @@ function stationBuildControlsSummary() {
     selectedDisplayCanCapture: !!displayTarget.can_capture,
     latestOperationalActivity: latestOperationalActivity.detail || '',
     latestOperationalActivityLabel: latestOperationalActivity.label || '',
+    launchReady: !!launchReadiness.ready,
+    launchMissing: (launchReadiness.missing || []).join(', '),
+    launchAgent: launchReadiness.agent || '',
+    launchAgentLabel: launchReadiness.agentLabel || '',
+    launchCommand: launchReadiness.command || '',
+    launchTaskChars: stationNum(launchReadiness.taskChars),
+    launchProject: launchReadiness.project ? compactPathLabel(launchReadiness.project, true) : '',
+    launchMode: launchReadiness.direct ? 'direct' : 'orchestrated',
+    launchAttachments: stationNum(launchReadiness.attachments),
+    launchNotice: launchReadiness.notice || '',
   };
 }
 

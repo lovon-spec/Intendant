@@ -6354,6 +6354,67 @@ impl StationInner {
         ));
         yy += 28.0;
         let controls = self.snapshot.controls.clone();
+        self.section_title_color(x, yy, "Launch readiness", C_TEAL_CSS);
+        yy += 22.0;
+        let launch_state = if controls.launch_ready {
+            "ready".to_string()
+        } else {
+            truncate(
+                &format!("blocked {}", nonempty(&controls.launch_missing, "--")),
+                42,
+            )
+        };
+        self.panel_row_color(
+            x,
+            yy,
+            "state",
+            &launch_state,
+            if controls.launch_ready {
+                C_GREEN_CSS
+            } else {
+                C_YELLOW_CSS
+            },
+        );
+        yy += 22.0;
+        self.panel_row(
+            x,
+            yy,
+            "backend",
+            &truncate(&nonempty(&controls.launch_agent_label, "--"), 42),
+        );
+        yy += 22.0;
+        self.panel_row(
+            x,
+            yy,
+            "binary",
+            &truncate(&nonempty(&controls.launch_command, "--"), 42),
+        );
+        yy += 22.0;
+        self.panel_row(
+            x,
+            yy,
+            "task",
+            &format!(
+                "{} chars · {} · {} attach",
+                controls.launch_task_chars,
+                nonempty(&controls.launch_mode, "orchestrated"),
+                controls.launch_attachments
+            ),
+        );
+        yy += 22.0;
+        if !controls.launch_project.is_empty() || !controls.launch_notice.is_empty() {
+            self.panel_row(
+                x,
+                yy,
+                "project",
+                &truncate(
+                    &nonempty(&controls.launch_project, &controls.launch_notice),
+                    42,
+                ),
+            );
+            yy += 22.0;
+        }
+        yy += 8.0;
         if !controls.session_id.is_empty() {
             self.section_title_color(x, yy, "Selected backend", C_PEACH_CSS);
             yy += 22.0;
@@ -6397,6 +6458,26 @@ impl StationInner {
                 ),
             );
             yy += 22.0;
+            if !controls.session_action_id.is_empty()
+                || !controls.session_attach_id.is_empty()
+                || !controls.session_stop_id.is_empty()
+            {
+                self.panel_row(
+                    x,
+                    yy,
+                    "actions",
+                    &truncate(
+                        &format!(
+                            "thread {} · attach {} · stop {}",
+                            short_id(&controls.session_action_id),
+                            short_id(&controls.session_attach_id),
+                            short_id(&controls.session_stop_id)
+                        ),
+                        42,
+                    ),
+                );
+                yy += 22.0;
+            }
             self.panel_row(
                 x,
                 yy,
@@ -6418,6 +6499,26 @@ impl StationInner {
                 ),
             );
             yy += 22.0;
+            if !controls.session_sandbox.is_empty() || !controls.session_approval_policy.is_empty() {
+                self.panel_row(
+                    x,
+                    yy,
+                    "policy",
+                    &truncate(
+                        &format!(
+                            "{} · {}",
+                            nonempty(&controls.session_sandbox, "sandbox --"),
+                            nonempty(&controls.session_approval_policy, "approval --")
+                        ),
+                        42,
+                    ),
+                );
+                yy += 22.0;
+            }
+            if !controls.session_service_tier.is_empty() {
+                self.panel_row(x, yy, "tier", &controls.session_service_tier);
+                yy += 22.0;
+            }
             if controls.session_can_config {
                 self.panel_row_color(
                     x,
@@ -6441,6 +6542,20 @@ impl StationInner {
                     },
                 );
                 yy += 22.0;
+                if !controls.session_config_result.is_empty() {
+                    self.panel_row_color(
+                        x,
+                        yy,
+                        "config",
+                        &truncate(&controls.session_config_result, 42),
+                        if controls.session_config_result_kind == "error" {
+                            C_RED_CSS
+                        } else {
+                            C_GREEN_CSS
+                        },
+                    );
+                    yy += 22.0;
+                }
             }
             let mut target_actions = Vec::new();
             if controls.session_can_focus {
@@ -6467,6 +6582,12 @@ impl StationInner {
                     C_TEAL_CSS.to_string(),
                 ));
                 target_actions.push((
+                    "continue".to_string(),
+                    "continue".to_string(),
+                    76.0,
+                    C_GREEN_CSS.to_string(),
+                ));
+                target_actions.push((
                     "open-log".to_string(),
                     "open log".to_string(),
                     78.0,
@@ -6484,6 +6605,14 @@ impl StationInner {
                     "copy-backend".to_string(),
                     "copy backend".to_string(),
                     108.0,
+                    C_BLUE_CSS.to_string(),
+                ));
+            }
+            if !controls.session_intendant_id.is_empty() {
+                target_actions.push((
+                    "copy-intendant".to_string(),
+                    "copy wrapper".to_string(),
+                    106.0,
                     C_BLUE_CSS.to_string(),
                 ));
             }
@@ -11176,6 +11305,16 @@ struct StationControlsSummary {
     shared_view_action: String,
     shared_view_note: String,
     shared_view_can_take_input: bool,
+    launch_ready: bool,
+    launch_missing: String,
+    launch_agent: String,
+    launch_agent_label: String,
+    launch_command: String,
+    launch_task_chars: u32,
+    launch_project: String,
+    launch_mode: String,
+    launch_attachments: u32,
+    launch_notice: String,
     selected_display_kind: String,
     selected_display_label: String,
     selected_display_target: String,
@@ -11284,6 +11423,16 @@ impl Default for StationControlsSummary {
             shared_view_action: String::new(),
             shared_view_note: String::new(),
             shared_view_can_take_input: false,
+            launch_ready: false,
+            launch_missing: String::new(),
+            launch_agent: String::new(),
+            launch_agent_label: String::new(),
+            launch_command: String::new(),
+            launch_task_chars: 0,
+            launch_project: String::new(),
+            launch_mode: String::new(),
+            launch_attachments: 0,
+            launch_notice: String::new(),
             selected_display_kind: String::new(),
             selected_display_label: String::new(),
             selected_display_target: String::new(),
