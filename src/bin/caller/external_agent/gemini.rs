@@ -20,14 +20,27 @@ use super::{
     ExternalAgent, ToolCompletionStatus,
 };
 
+/// Appended to the first prompt when an Intendant web port is available.
 /// Gemini CU uses a 0-1000 normalized coordinate grid. Tell the model to pass
-/// coordinate_space so we denormalize before executing clicks.
+/// coordinate_space so we denormalize before executing clicks. Also points the
+/// agent at the dashboard validation helper instead of ad-hoc CDP scripting.
 const GEMINI_CU_ADDENDUM: &str = "\n\n\
 ### Coordinate Space\n\
 When calling `execute_cu_actions`, ALWAYS pass `\"coordinate_space\": \"normalized_1000\"` \
 as a parameter. Your click/scroll/move coordinates use a 0-1000 normalized grid \
 and need to be converted to display pixels. Without this parameter, coordinates \
-will be interpreted as raw pixel values and clicks will miss their targets.\n";
+will be interpreted as raw pixel values and clicks will miss their targets.\n\
+\n\
+### Dashboard Validation\n\
+For browser/dashboard/Station validation, use `node scripts/validate-dashboard.cjs` \
+and prefer its named probes such as `--station-probe rendered` over ad-hoc \
+Chromium/CDP scripts; its `--help` is the authoritative flag reference, and \
+docs/src/external-agent-orchestration.md has the full Station QA recipes. For a \
+temporary dashboard, use the helper's owned lifecycle: `--launch-dashboard \
+--port <throwaway_port>` for a one-shot smoke, or `--hold-dashboard` kept in \
+the foreground while separate CU/browser steps run against the printed URL, \
+then interrupted for helper-owned cleanup. Do not start a separate \
+foreground/nohup/setsid dashboard just so another tool can connect.\n";
 
 // ---------------------------------------------------------------------------
 // JSON-RPC wire types (same framing as Codex — JSONL over stdio)

@@ -15,6 +15,21 @@ use super::{
     ToolCompletionStatus,
 };
 
+/// Appended to the first user message when an Intendant web port is
+/// available, pointing Claude Code at the dashboard validation helper
+/// instead of ad-hoc Chromium/CDP scripting.
+const CLAUDE_CODE_VALIDATION_ADDENDUM: &str = "\n\n\
+### Dashboard Validation\n\
+For browser/dashboard/Station validation, use `node scripts/validate-dashboard.cjs` \
+and prefer its named probes such as `--station-probe rendered` over ad-hoc \
+Chromium/CDP scripts; its `--help` is the authoritative flag reference, and \
+docs/src/external-agent-orchestration.md has the full Station QA recipes. For a \
+temporary dashboard, use the helper's owned lifecycle: `--launch-dashboard \
+--port <throwaway_port>` for a one-shot smoke, or `--hold-dashboard` kept in \
+the foreground while separate CU/browser steps run against the printed URL, \
+then interrupted for helper-owned cleanup. Do not start a separate \
+foreground/nohup/setsid dashboard just so another tool can connect.\n";
+
 // ---------------------------------------------------------------------------
 // Claude Code JSONL protocol types (stdin/stdout)
 // ---------------------------------------------------------------------------
@@ -119,6 +134,8 @@ pub struct ClaudeCodeAgent {
     reader_handle: Option<tokio::task::JoinHandle<()>>,
     /// Session ID from the first result message, used for multi-turn.
     session_id: Option<String>,
+    /// Whether the first prompt (carrying the validation addendum) was sent.
+    prompt_sent: bool,
 }
 
 impl ClaudeCodeAgent {
@@ -142,6 +159,7 @@ impl ClaudeCodeAgent {
             pending_approvals: Arc::new(Mutex::new(HashMap::new())),
             reader_handle: None,
             session_id: None,
+            prompt_sent: false,
         }
     }
 }
@@ -443,6 +461,7 @@ impl ExternalAgent for ClaudeCodeAgent {
 
         // MCP config for Intendant display/CU tools
         let web_port = config.web_port.or(self.web_port);
+        self.web_port = web_port;
         if let Some(port) = web_port {
             let mcp_config = serde_json::json!({
                 "mcpServers": {
@@ -514,13 +533,22 @@ impl ExternalAgent for ClaudeCodeAgent {
         _thread: &AgentThread,
         message: &str,
     ) -> Result<(), CallerError> {
+        // Claude Code has no separate developer-instructions channel here, so
+        // Intendant-specific guidance rides on the first prompt (same pattern
+        // as the Gemini CU addendum).
+        let augmented = if self.web_port.is_some() && !self.prompt_sent {
+            self.prompt_sent = true;
+            format!("{}{}", message, CLAUDE_CODE_VALIDATION_ADDENDUM)
+        } else {
+            message.to_string()
+        };
         let user_msg = CcUserMessage {
             msg_type: "user".into(),
             message: CcMessageContent {
                 role: "user".into(),
                 content: vec![CcContentBlock {
                     block_type: "text".into(),
-                    text: message.to_string(),
+                    text: augmented,
                 }],
             },
             session_id: self.session_id.clone(),

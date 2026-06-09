@@ -1,19 +1,204 @@
 //! Build script for the intendant binary.
 //!
-//! Checks whether the compiled WASM files in `static/wasm-web/` are older than
-//! the Rust source in `crates/presence-web/src/`. If stale, auto-rebuilds via
-//! `wasm-pack build` using a separate target directory to avoid deadlocking
-//! with the parent cargo process.
+//! Checks whether the compiled WASM artifacts of each browser WASM crate
+//! (`crates/presence-web` → `static/wasm-web/`, `crates/station-web` →
+//! `static/wasm-station/`) are older than their Rust sources. If stale,
+//! auto-rebuilds via `wasm-pack build` using a separate target directory to
+//! avoid deadlocking with the parent cargo process.
 
 use std::path::Path;
 use std::process::Command;
 
+/// A browser WASM crate whose wasm-pack artifacts are embedded into the
+/// gateway binary via `include_str!`/`include_bytes!`.
+struct WasmCrate {
+    /// Crate directory, relative to the repo root.
+    crate_dir: &'static str,
+    /// wasm-pack output directory, relative to the repo root.
+    artifact_dir: &'static str,
+    /// `--out-name` passed to wasm-pack (artifact file stem).
+    out_name: &'static str,
+    /// Additional source directories that feed this crate (path deps).
+    extra_src_dirs: &'static [&'static str],
+}
+
+const WASM_CRATES: &[WasmCrate] = &[
+    WasmCrate {
+        crate_dir: "crates/presence-web",
+        artifact_dir: "static/wasm-web",
+        out_name: "presence_web",
+        extra_src_dirs: &["crates/presence-core/src"],
+    },
+    WasmCrate {
+        crate_dir: "crates/station-web",
+        artifact_dir: "static/wasm-station",
+        out_name: "station_web",
+        extra_src_dirs: &[],
+    },
+];
+
+impl WasmCrate {
+    fn src_dir(&self) -> String {
+        format!("{}/src", self.crate_dir)
+    }
+
+    fn wasm_bin(&self) -> String {
+        format!("{}/{}_bg.wasm", self.artifact_dir, self.out_name)
+    }
+
+    fn js_glue(&self) -> String {
+        format!("{}/{}.js", self.artifact_dir, self.out_name)
+    }
+
+    /// The manual fallback command printed when the auto-rebuild fails.
+    fn manual_build_command(&self) -> String {
+        format!(
+            "cd {} && wasm-pack build --target web --out-dir ../../{} --out-name {}",
+            self.crate_dir, self.artifact_dir, self.out_name
+        )
+    }
+
+    /// Re-run the build script if the crate's sources or compiled artifacts
+    /// change.
+    fn emit_rerun_directives(&self) {
+        println!("cargo:rerun-if-changed={}/", self.src_dir());
+        for dir in self.extra_src_dirs {
+            println!("cargo:rerun-if-changed={}/", dir);
+        }
+        println!("cargo:rerun-if-changed={}", self.wasm_bin());
+        println!("cargo:rerun-if-changed={}", self.js_glue());
+    }
+
+    /// Rebuild the WASM artifacts via wasm-pack when any source file is newer
+    /// than the compiled `.wasm`.
+    fn rebuild_if_stale(&self) {
+        let wasm_bin = self.wasm_bin();
+        let wasm_bin = Path::new(&wasm_bin);
+        let src_dir = self.src_dir();
+        let src_dir = Path::new(&src_dir);
+
+        if !wasm_bin.exists() || !src_dir.exists() {
+            return;
+        }
+
+        let wasm_modified = wasm_bin.metadata().and_then(|m| m.modified()).ok();
+
+        let src_modified = std::iter::once(src_dir.to_path_buf())
+            .chain(self.extra_src_dirs.iter().map(std::path::PathBuf::from))
+            .filter_map(|d| newest_in_dir(&d))
+            .max();
+
+        let stale = match (wasm_modified, src_modified) {
+            (Some(w), Some(s)) => s > w,
+            _ => false,
+        };
+
+        if !stale {
+            return;
+        }
+
+        println!(
+            "cargo:warning={} WASM is stale — auto-rebuilding via wasm-pack...",
+            self.crate_dir
+        );
+
+        // Use a separate target directory to avoid deadlocking with the parent
+        // cargo process. The parent holds a lock on `target/`, so wasm-pack's
+        // internal `cargo build --target wasm32` must write elsewhere. Create
+        // it up front and pass an absolute path: a relative CARGO_TARGET_DIR
+        // would resolve against the wasm crate dir, not the repo root.
+        let wasm_target = Path::new("target/wasm-build");
+        let _ = std::fs::create_dir_all(wasm_target);
+        let wasm_target_abs = std::fs::canonicalize(wasm_target).unwrap_or_else(|_| {
+            std::env::current_dir()
+                .map(|d| d.join(wasm_target))
+                .unwrap_or_else(|_| wasm_target.to_path_buf())
+        });
+
+        let result = Command::new("wasm-pack")
+            .args([
+                "build",
+                "--target",
+                "web",
+                "--out-dir",
+                &format!("../../{}", self.artifact_dir),
+                "--out-name",
+                self.out_name,
+            ])
+            .current_dir(self.crate_dir)
+            // Cargo exports the host build's resolved rustflags to build
+            // scripts via CARGO_ENCODED_RUSTFLAGS. The nested cargo inside
+            // wasm-pack would apply them to the wasm32 target (env rustflags
+            // beat config), so host-only link args like the macOS
+            // `-Wl,-rpath,/usr/lib/swift` from .cargo/config.toml break
+            // rust-lld. Scrub them so the inner build resolves flags fresh.
+            .env_remove("CARGO_ENCODED_RUSTFLAGS")
+            .env_remove("RUSTFLAGS")
+            .env("CARGO_TARGET_DIR", &wasm_target_abs)
+            .status();
+
+        match result {
+            Ok(status) if status.success() => {
+                println!("cargo:warning={} WASM rebuilt successfully", self.crate_dir);
+            }
+            Ok(status) => {
+                println!(
+                    "cargo:warning=wasm-pack failed (exit {}) for {}. Run manually: {}",
+                    status,
+                    self.crate_dir,
+                    self.manual_build_command()
+                );
+            }
+            Err(_) => {
+                println!(
+                    "cargo:warning=wasm-pack not found; {} WASM stays stale. Install: cargo install wasm-pack, or run manually: {}",
+                    self.crate_dir,
+                    self.manual_build_command()
+                );
+            }
+        }
+    }
+
+    /// Write a content hash of the WASM artifacts to OUT_DIR. Cargo always
+    /// tracks OUT_DIR for changes, so when the WASM is rebuilt the hash file
+    /// changes and cargo recompiles the crate (re-running `include_bytes!`).
+    /// `rerun-if-changed` on binary files can be flaky across worktrees;
+    /// writing a derived file to OUT_DIR is bulletproof because cargo always
+    /// checks OUT_DIR contents.
+    fn write_artifact_hash(&self) {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        use std::io::Read;
+
+        let out_dir = match std::env::var("OUT_DIR") {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+
+        let mut hasher = DefaultHasher::new();
+        for path in [self.wasm_bin(), self.js_glue()] {
+            if let Ok(mut f) = std::fs::File::open(path) {
+                let mut buf = Vec::new();
+                let _ = f.read_to_end(&mut buf);
+                buf.hash(&mut hasher);
+            }
+        }
+        let hash = format!("{:016x}", hasher.finish());
+
+        let hash_path = Path::new(&out_dir).join(format!("{}_hash.txt", self.out_name));
+        // Only write if changed, to avoid unnecessary rebuilds
+        let existing = std::fs::read_to_string(&hash_path).unwrap_or_default();
+        if existing.trim() != hash {
+            let _ = std::fs::write(&hash_path, &hash);
+        }
+    }
+}
+
 fn main() {
-    // Re-run if any presence-web source file changes.
-    println!("cargo:rerun-if-changed=crates/presence-web/src/");
-    println!("cargo:rerun-if-changed=crates/presence-core/src/");
-    println!("cargo:rerun-if-changed=static/wasm-web/presence_web_bg.wasm");
-    println!("cargo:rerun-if-changed=static/wasm-web/presence_web.js");
+    // Re-run if any WASM crate source or artifact changes.
+    for krate in WASM_CRATES {
+        krate.emit_rerun_directives();
+    }
 
     // Expose the current git commit SHA as an env var so `/config` can
     // report it. The multi-host dashboard compares the primary's SHA
@@ -65,111 +250,11 @@ fn main() {
     };
     println!("cargo:rustc-env=INTENDANT_GIT_SHA={sha_with_dirty}");
 
-    // Write a hash of the WASM binary to OUT_DIR so cargo detects changes
-    // reliably. `rerun-if-changed` on binary files can be flaky across
-    // worktrees; writing a derived file to OUT_DIR is bulletproof because
-    // cargo always checks OUT_DIR contents.
-    write_wasm_hash();
-
-    let wasm_bin = Path::new("static/wasm-web/presence_web_bg.wasm");
-    let src_dir = Path::new("crates/presence-web/src");
-    let core_dir = Path::new("crates/presence-core/src");
-
-    if !wasm_bin.exists() || !src_dir.exists() {
-        return;
-    }
-
-    let wasm_modified = wasm_bin.metadata().and_then(|m| m.modified()).ok();
-
-    let src_modified = [src_dir, core_dir]
-        .iter()
-        .filter_map(|d| newest_in_dir(d))
-        .max();
-
-    let stale = match (wasm_modified, src_modified) {
-        (Some(w), Some(s)) => s > w,
-        _ => false,
-    };
-
-    if !stale {
-        return;
-    }
-
-    println!("cargo:warning=WASM is stale — auto-rebuilding via wasm-pack...");
-
-    // Use a separate target directory to avoid deadlocking with the parent
-    // cargo process. The parent holds a lock on `target/`, so wasm-pack's
-    // internal `cargo build --target wasm32` must write elsewhere.
-    let wasm_target = Path::new("target/wasm-build");
-
-    let result = Command::new("wasm-pack")
-        .args([
-            "build",
-            "--target",
-            "web",
-            "--out-dir",
-            "../../static/wasm-web",
-            "--out-name",
-            "presence_web",
-        ])
-        .current_dir("crates/presence-web")
-        .env(
-            "CARGO_TARGET_DIR",
-            std::fs::canonicalize(wasm_target).unwrap_or_else(|_| {
-                // Create the directory if it doesn't exist
-                let _ = std::fs::create_dir_all(wasm_target);
-                wasm_target.to_path_buf()
-            }),
-        )
-        .status();
-
-    match result {
-        Ok(status) if status.success() => {
-            println!("cargo:warning=WASM rebuilt successfully");
-        }
-        Ok(status) => {
-            println!(
-                "cargo:warning=wasm-pack failed (exit {}). Run manually: cd crates/presence-web && wasm-pack build --target web --out-dir ../../static/wasm-web --out-name presence_web",
-                status
-            );
-        }
-        Err(_) => {
-            println!("cargo:warning=wasm-pack not found. Install: cargo install wasm-pack");
-        }
-    }
-}
-
-/// Write a content hash of the WASM files to OUT_DIR. Cargo always tracks
-/// OUT_DIR for changes, so when the WASM is rebuilt the hash file changes
-/// and cargo recompiles the crate (re-running `include_bytes!`).
-fn write_wasm_hash() {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    use std::io::Read;
-
-    let out_dir = match std::env::var("OUT_DIR") {
-        Ok(d) => d,
-        Err(_) => return,
-    };
-
-    let mut hasher = DefaultHasher::new();
-    for path in &[
-        "static/wasm-web/presence_web_bg.wasm",
-        "static/wasm-web/presence_web.js",
-    ] {
-        if let Ok(mut f) = std::fs::File::open(path) {
-            let mut buf = Vec::new();
-            let _ = f.read_to_end(&mut buf);
-            buf.hash(&mut hasher);
-        }
-    }
-    let hash = format!("{:016x}", hasher.finish());
-
-    let hash_path = Path::new(&out_dir).join("wasm_hash.txt");
-    // Only write if changed, to avoid unnecessary rebuilds
-    let existing = std::fs::read_to_string(&hash_path).unwrap_or_default();
-    if existing.trim() != hash {
-        let _ = std::fs::write(&hash_path, &hash);
+    // Rebuild stale WASM first, then hash the (possibly fresh) artifacts so
+    // OUT_DIR reflects what `include_bytes!` will embed in this build.
+    for krate in WASM_CRATES {
+        krate.rebuild_if_stale();
+        krate.write_artifact_hash();
     }
 }
 
