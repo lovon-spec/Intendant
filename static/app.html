@@ -29793,6 +29793,7 @@ function sessionWindowTranscriptSignaturesFromParts(parts, options = {}) {
   const signatures = [];
   if (parts.itemId) signatures.push(['item', parts.sessionId, parts.itemId].join('\u001f'));
   if (parts.outputId) signatures.push(['output', parts.sessionId, parts.kind, parts.outputId].join('\u001f'));
+  const canUseTextSignature = parts.level === 'model' || parts.level === 'detail';
   const textParts = [
     parts.sessionId,
     parts.level,
@@ -29803,7 +29804,7 @@ function sessionWindowTranscriptSignaturesFromParts(parts, options = {}) {
     parts.replacementTurnIndex,
     parts.content,
   ];
-  if (options.includeText !== false || !parts.ts) {
+  if (canUseTextSignature && (options.includeText !== false || !parts.ts)) {
     signatures.push(['text', ...textParts].join('\u001f'));
   }
   if (parts.ts) signatures.push(['exact', parts.ts, ...textParts].join('\u001f'));
@@ -31569,11 +31570,34 @@ function appendSessionWindowRenderedTailItems(win, items, startIndex, historyLen
   return true;
 }
 
+function addSessionWindowHistorySignatures(set, item, fallbackSessionId = '') {
+  if (!set) return;
+  for (const signature of sessionWindowTranscriptSignaturesForHistoryItem(item, fallbackSessionId)) {
+    set.add(signature);
+  }
+}
+
+function sessionWindowHistorySignatureSet(win, fallbackSessionId = '') {
+  const signatures = new Set();
+  for (const item of ensureSessionWindowHistory(win)) {
+    addSessionWindowHistorySignatures(signatures, item, fallbackSessionId);
+  }
+  return signatures;
+}
+
+function sessionWindowHistoryHasMatchingSignature(signatures, item, fallbackSessionId = '') {
+  if (!signatures) return false;
+  const itemSignatures = sessionWindowTranscriptSignaturesForHistoryItem(item, fallbackSessionId);
+  return itemSignatures.length > 0 && itemSignatures.some(signature => signatures.has(signature));
+}
+
 function appendSessionWindowHistory(win, entry, shouldFollow) {
   if (!win || !entry) return;
   const history = ensureSessionWindowHistory(win);
   const wasRenderingTail = sessionWindowIsRenderingTail(win, history.length);
   const item = prepareSessionWindowHistoryItem(entry);
+  const signatures = sessionWindowHistorySignatureSet(win, win.sessionId);
+  if (sessionWindowHistoryHasMatchingSignature(signatures, item, win.sessionId)) return;
   stationTrackSessionWindowHistoryAnchor(item, win.sessionId);
   history.push(item);
   const renderedIncrementally = wasRenderingTail
@@ -31589,14 +31613,18 @@ function appendSessionWindowHistoryBatch(win, entries, shouldFollow) {
   const history = ensureSessionWindowHistory(win);
   const startIndex = history.length;
   const wasRenderingTail = sessionWindowIsRenderingTail(win, history.length);
+  const signatures = sessionWindowHistorySignatureSet(win, win.sessionId);
   const items = [];
   for (const entry of entries) {
     if (!entry) continue;
     const item = prepareSessionWindowHistoryItem(entry);
+    if (sessionWindowHistoryHasMatchingSignature(signatures, item, win.sessionId)) continue;
     stationTrackSessionWindowHistoryAnchor(item, win.sessionId);
     history.push(item);
     items.push(item);
+    addSessionWindowHistorySignatures(signatures, item, win.sessionId);
   }
+  if (items.length === 0) return;
   const renderedIncrementally = wasRenderingTail
     && items.length <= SESSION_WINDOW_PREPEND_CHUNK
     && appendSessionWindowRenderedTailItems(win, items, startIndex, history.length);
