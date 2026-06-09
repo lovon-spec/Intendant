@@ -25927,13 +25927,14 @@ async fn deactivate_user_display(
     }
 }
 
-fn reject_user_display_activation(bus: &EventBus, display_id: u32, reason: impl Into<String>) {
+fn report_user_display_capture_unavailable(
+    bus: &EventBus,
+    display_id: u32,
+    reason: impl Into<String>,
+) {
     let reason = reason.into();
     eprintln!("[user_display] {reason}");
-    bus.send(AppEvent::UserDisplayRevoked {
-        display_id,
-        note: Some(reason),
-    });
+    bus.send(AppEvent::DisplayCaptureLost { display_id, reason });
 }
 
 /// Handle user display grant: create a `DisplaySession` and emit
@@ -26014,14 +26015,27 @@ async fn activate_user_display(
                 return;
             }
             Ok(Err(e)) => {
-                eprintln!("[user_display] Wayland display session failed: {}", e);
+                report_user_display_capture_unavailable(
+                    bus,
+                    display_id,
+                    format!(
+                        "Wayland portal activation failed: {e}. Re-request user display access \
+                         and approve the GNOME portal with Allow Remote Interaction enabled."
+                    ),
+                );
+                return;
             }
             Err(_) => {
-                eprintln!(
-                    "[user_display] Wayland portal timed out after \
-                     {WAYLAND_PORTAL_APPROVAL_TIMEOUT_SECS}s \
-                     (screen-sharing dialog was not approved), trying X11"
+                report_user_display_capture_unavailable(
+                    bus,
+                    display_id,
+                    format!(
+                        "Wayland portal timed out after {WAYLAND_PORTAL_APPROVAL_TIMEOUT_SECS}s \
+                         (screen-sharing dialog was not approved). Re-request user display access \
+                         and approve the GNOME portal with Allow Remote Interaction enabled."
+                    ),
                 );
+                return;
             }
         }
     }
@@ -26078,7 +26092,7 @@ async fn activate_user_display(
                     if wayland_session_detected && x11_fallback_session_is_all_black(&session).await
                     {
                         session.stop().await;
-                        reject_user_display_activation(
+                        report_user_display_capture_unavailable(
                             bus,
                             display_id,
                             "Wayland portal was not approved and X11 fallback captured an \
@@ -26113,7 +26127,7 @@ async fn activate_user_display(
             if let Some(info) = displays.iter().find(|d| d.id == target_display_id) {
                 display::macos::MacOSBackend::with_display_id(info.platform_id as u32)
             } else {
-                reject_user_display_activation(
+                report_user_display_capture_unavailable(
                     bus,
                     display_id,
                     format!("display {target_display_id} is not available on this Mac"),
@@ -26125,7 +26139,7 @@ async fn activate_user_display(
         };
         let session = display::DisplaySession::new(display_id, Arc::new(backend));
         if let Err(e) = session.start(30, frame_registry, Some(bus.clone())).await {
-            reject_user_display_activation(
+            report_user_display_capture_unavailable(
                 bus,
                 display_id,
                 format!("macOS display session failed: {e}"),
@@ -26155,7 +26169,7 @@ async fn activate_user_display(
             if let Some(info) = displays.iter().find(|d| d.id == target_display_id) {
                 display::windows::WindowsBackend::with_output_index(info.platform_id as u32)
             } else {
-                reject_user_display_activation(
+                report_user_display_capture_unavailable(
                     bus,
                     display_id,
                     format!("display {target_display_id} is not available on this Windows host"),
@@ -26167,7 +26181,7 @@ async fn activate_user_display(
         };
         let session = display::DisplaySession::new(display_id, Arc::new(backend));
         if let Err(e) = session.start(30, frame_registry, Some(bus.clone())).await {
-            reject_user_display_activation(
+            report_user_display_capture_unavailable(
                 bus,
                 display_id,
                 format!("Windows display session failed: {e}"),
@@ -26189,7 +26203,11 @@ async fn activate_user_display(
 
     #[allow(unreachable_code)]
     {
-        reject_user_display_activation(bus, display_id, "no supported display backend detected");
+        report_user_display_capture_unavailable(
+            bus,
+            display_id,
+            "no supported display backend detected",
+        );
     }
 }
 

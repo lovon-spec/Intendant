@@ -970,10 +970,13 @@ fn no_wayland_session_message(target: &DisplayTarget) -> String {
         DisplayTarget::UserSession => {
             if granted {
                 format!(
-                    "No active display capture session on Wayland. The screen-sharing \
-                 portal dialog is either pending approval on the physical display \
-                 or was denied. Approve the dialog to enable capture, or target a \
-                 virtual Xvfb display (e.g. display_target=\":99\") instead.{}",
+                    "No active display capture session on Wayland. The previous portal grant \
+                 may have been lost, or a fresh screen-sharing portal dialog is pending \
+                 approval on the physical display. Approve the dialog with Allow Remote \
+                 Interaction enabled to enable capture and Computer Use input; if no dialog \
+                 is visible, re-request it with grant_user_display (or \
+                 `intendant ctl display grant-user`). Alternatively, target a virtual Xvfb \
+                 display (e.g. display_target=\":99\").{}",
                     diagnostic
                 )
             } else {
@@ -1069,18 +1072,25 @@ async fn execute_via_session(
                 let nx = *x as f64 / width as f64;
                 let ny = *y as f64 / height as f64;
                 let b = mouse_button_index(*button);
-                let down = session
+                let mut errors = Vec::new();
+                if let Err(e) = session
                     .inject_input(crate::display::InputEvent::MouseDown { x: nx, y: ny, b })
-                    .await;
+                    .await
+                {
+                    errors.push(format!("mouse down: {e}"));
+                }
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                let up = session
+                if let Err(e) = session
                     .inject_input(crate::display::InputEvent::MouseUp { x: nx, y: ny, b })
-                    .await;
-                let success = down.is_ok() && up.is_ok();
-                let error = if !success {
-                    Some("Click injection failed".to_string())
-                } else {
+                    .await
+                {
+                    errors.push(format!("mouse up: {e}"));
+                }
+                let success = errors.is_empty();
+                let error = if success {
                     None
+                } else {
+                    Some(format!("Click injection failed: {}", errors.join("; ")))
                 };
                 results.push(CuActionResult {
                     success,
@@ -1093,32 +1103,34 @@ async fn execute_via_session(
                 let nx = *x as f64 / width as f64;
                 let ny = *y as f64 / height as f64;
                 let b = mouse_button_index(*button);
-                let mut success = true;
+                let mut errors = Vec::new();
                 for _ in 0..2 {
-                    if session
+                    if let Err(e) = session
                         .inject_input(crate::display::InputEvent::MouseDown { x: nx, y: ny, b })
                         .await
-                        .is_err()
                     {
-                        success = false;
+                        errors.push(format!("mouse down: {e}"));
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(30)).await;
-                    if session
+                    if let Err(e) = session
                         .inject_input(crate::display::InputEvent::MouseUp { x: nx, y: ny, b })
                         .await
-                        .is_err()
                     {
-                        success = false;
+                        errors.push(format!("mouse up: {e}"));
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                 }
+                let success = errors.is_empty();
                 results.push(CuActionResult {
                     success,
                     screenshot: None,
                     error: if success {
                         None
                     } else {
-                        Some("DoubleClick injection failed".to_string())
+                        Some(format!(
+                            "DoubleClick injection failed: {}",
+                            errors.join("; ")
+                        ))
                     },
                 });
                 needs_auto_screenshot = true;
@@ -1212,32 +1224,47 @@ async fn execute_via_session(
                 let sy = *start_y as f64 / height as f64;
                 let ex = *end_x as f64 / width as f64;
                 let ey = *end_y as f64 / height as f64;
+                let mut errors = Vec::new();
                 // Drag uses left button (0).
-                let _ = session
+                if let Err(e) = session
                     .inject_input(crate::display::InputEvent::MouseDown { x: sx, y: sy, b: 0 })
-                    .await;
+                    .await
+                {
+                    errors.push(format!("mouse down: {e}"));
+                }
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                 // Interpolate intermediate points for smooth drag.
                 for i in 1..=5 {
                     let t = i as f64 / 5.0;
                     let mx = sx + (ex - sx) * t;
                     let my = sy + (ey - sy) * t;
-                    let _ = session
+                    if let Err(e) = session
                         .inject_input(crate::display::InputEvent::MouseMove {
                             x: mx,
                             y: my,
                             buttons: 0,
                         })
-                        .await;
+                        .await
+                    {
+                        errors.push(format!("mouse move: {e}"));
+                    }
                     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
                 }
-                let _ = session
+                if let Err(e) = session
                     .inject_input(crate::display::InputEvent::MouseUp { x: ex, y: ey, b: 0 })
-                    .await;
+                    .await
+                {
+                    errors.push(format!("mouse up: {e}"));
+                }
+                let success = errors.is_empty();
                 results.push(CuActionResult {
-                    success: true,
+                    success,
                     screenshot: None,
-                    error: None,
+                    error: if success {
+                        None
+                    } else {
+                        Some(format!("Drag injection failed: {}", errors.join("; ")))
+                    },
                 });
                 needs_auto_screenshot = true;
             }
