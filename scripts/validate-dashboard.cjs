@@ -16,7 +16,9 @@ const { spawn, spawnSync } = require('child_process');
 
 const DEFAULT_TIMEOUT_MS = 15000;
 const DEFAULT_CDP_TIMEOUT_MS = 10000;
+const DEFAULT_CDP_COMMAND_TIMEOUT_MS = 8000;
 const DEFAULT_DASHBOARD_TIMEOUT_MS = 15000;
+const SCREENSHOT_LIVENESS_TIMEOUT_MS = 1500;
 const DEFAULT_LOG_LINES = 8;
 const LOG_BUFFER_LIMIT = 80;
 const LOG_TEXT_LIMIT = 260;
@@ -514,10 +516,25 @@ async function main() {
       throw new Error(`temporary dashboard exited while holding (${status})`);
     }
     harness = await BrowserHarness.launch(opts, launchEnv);
-    const validation = await harness.validate(opts);
+    let validation = await harness.validate(opts);
     const artifacts = {};
+    const harnessRetries = {};
     if (opts.screenshotPath) {
-      artifacts.screenshot = await harness.captureScreenshot(opts.screenshotPath);
+      const screenshot = await captureValidationScreenshotWithRetry(
+        opts,
+        launchEnv,
+        harness,
+        (nextHarness) => {
+          harness = nextHarness;
+        },
+      );
+      artifacts.screenshot = screenshot.path;
+      if (screenshot.validation) {
+        validation = screenshot.validation;
+      }
+      if (screenshot.retried) {
+        harnessRetries.screenshotCapture = 1;
+      }
     }
     if (opts.keepArtifacts || opts.keepBrowser) {
       artifacts.browserUserDataDir = harness.userDataDir;
@@ -535,6 +552,7 @@ async function main() {
       stationInteraction: validation.stationInteraction,
       stationInteractions: validation.stationInteraction ? validation.stationInteraction.count : 0,
       stationState: validation.stationState,
+      harnessRetries: Object.keys(harnessRetries).length ? harnessRetries : undefined,
       staticIdentity,
       staticScripts: staticScriptResult,
     };
@@ -1286,6 +1304,80 @@ function replaceFirstPathAlias(line, aliases, replacement) {
   return undefined;
 }
 
+async function captureValidationScreenshotWithRetry(opts, launchEnv, harness, replaceHarness) {
+  try {
+    return {
+      path: await harness.captureScreenshot(opts.screenshotPath),
+      retried: false,
+    };
+  } catch (error) {
+    if (!isCdpScreenshotTimeout(error)) {
+      throw error;
+    }
+    const liveness = await harness.pageLiveness(SCREENSHOT_LIVENESS_TIMEOUT_MS);
+    if (!liveness.alive) {
+      await harness.close({ forceBrowser: true }).catch(() => {});
+      throw screenshotTimeoutError(error, { retried: false, liveness });
+    }
+    harness.pageLogs.push(
+      'harness',
+      `Page.captureScreenshot timed out; page alive (${formatPageLiveness(liveness)}); retrying once in a fresh browser`,
+    );
+    await harness.close({ forceBrowser: true });
+
+    const retryHarness = await BrowserHarness.launch(opts, launchEnv);
+    replaceHarness(retryHarness);
+    const validation = await retryHarness.validate(opts);
+    try {
+      return {
+        path: await retryHarness.captureScreenshot(opts.screenshotPath),
+        retried: true,
+        validation,
+      };
+    } catch (retryError) {
+      if (isCdpScreenshotTimeout(retryError)) {
+        await retryHarness.close({ forceBrowser: true }).catch(() => {});
+        throw screenshotTimeoutError(retryError, { retried: true, liveness });
+      }
+      throw retryError;
+    }
+  }
+}
+
+function isCdpScreenshotTimeout(errorOrReason) {
+  const text = errorOrReason && errorOrReason.message
+    ? errorOrReason.message
+    : String(errorOrReason || '');
+  return /^CDP Page\.captureScreenshot timed out$/.test(text)
+    || /^screenshot capture timed out\b/.test(text);
+}
+
+function screenshotTimeoutError(cause, details = {}) {
+  const causeText = cause && cause.message ? cause.message : String(cause || 'unknown timeout');
+  const retryText = details.retried ? ' after one retry' : '';
+  const aliveText = details.liveness && details.liveness.alive
+    ? `; page alive (${formatPageLiveness(details.liveness)})`
+    : `; page liveness check failed${details.liveness && details.liveness.reason ? ` (${details.liveness.reason})` : ''}`;
+  return new Error(`screenshot capture timed out${retryText}${aliveText}: ${causeText}`);
+}
+
+function formatPageLiveness(liveness) {
+  if (!liveness || typeof liveness !== 'object') {
+    return 'unknown';
+  }
+  const parts = [];
+  if (liveness.readyState) {
+    parts.push(`readyState=${liveness.readyState}`);
+  }
+  if (liveness.href) {
+    parts.push(`url=${truncateMiddle(liveness.href, 160)}`);
+  }
+  if (liveness.reason) {
+    parts.push(`reason=${truncateMiddle(liveness.reason, 160)}`);
+  }
+  return parts.join(' ') || 'unknown';
+}
+
 function recordChildOutput(stream, logs, kind) {
   if (!stream) {
     return;
@@ -1384,14 +1476,19 @@ class BrowserHarness {
       keepArtifacts: opts.keepArtifacts,
       keepBrowser: opts.keepBrowser,
     });
-    harness.activePort = await waitForDevToolsPort(userDataDir, child, stderr, opts.cdpTimeoutMs);
-    const version = await httpJson(`http://127.0.0.1:${harness.activePort.port}/json/version`);
-    const wsUrl = version.webSocketDebuggerUrl || `ws://127.0.0.1:${harness.activePort.port}${harness.activePort.path}`;
-    const socket = await openWebSocket(wsUrl, opts.cdpTimeoutMs);
-    harness.websocketKind = socket.kind;
-    harness.cdp = new CdpConnection(socket);
-    await harness.preparePage();
-    return harness;
+    try {
+      harness.activePort = await waitForDevToolsPort(userDataDir, child, stderr, opts.cdpTimeoutMs);
+      const version = await httpJson(`http://127.0.0.1:${harness.activePort.port}/json/version`);
+      const wsUrl = version.webSocketDebuggerUrl || `ws://127.0.0.1:${harness.activePort.port}${harness.activePort.path}`;
+      const socket = await openWebSocket(wsUrl, opts.cdpTimeoutMs);
+      harness.websocketKind = socket.kind;
+      harness.cdp = new CdpConnection(socket);
+      await harness.preparePage();
+      return harness;
+    } catch (error) {
+      await harness.close({ forceBrowser: true }).catch(() => {});
+      throw error;
+    }
   }
 
   constructor(browserExecutable, userDataDir, child, stderr, lifecycle = {}) {
@@ -1468,6 +1565,30 @@ class BrowserHarness {
     return String(result || '');
   }
 
+  async pageLiveness(timeoutMs = SCREENSHOT_LIVENESS_TIMEOUT_MS) {
+    try {
+      const result = await this.evaluate(
+        `(() => ({
+          readyState: document.readyState,
+          href: window.location.href,
+          hasBody: Boolean(document.body),
+        }))()`,
+        timeoutMs,
+      );
+      const readyState = String(result && result.readyState ? result.readyState : '');
+      return {
+        alive: Boolean(result && result.hasBody && readyState && readyState !== 'loading'),
+        readyState,
+        href: result && result.href ? String(result.href) : '',
+      };
+    } catch (error) {
+      return {
+        alive: false,
+        reason: error.message || String(error),
+      };
+    }
+  }
+
   async waitForSelector(selector, timeoutMs) {
     const expression = `Boolean(document.querySelector(${JSON.stringify(selector)}))`;
     await waitUntil(
@@ -1540,7 +1661,7 @@ class BrowserHarness {
     );
   }
 
-  async evaluate(expression) {
+  async evaluate(expression, timeoutMs = DEFAULT_CDP_COMMAND_TIMEOUT_MS) {
     const result = await this.cdp.send(
       'Runtime.evaluate',
       {
@@ -1549,6 +1670,7 @@ class BrowserHarness {
         returnByValue: true,
       },
       this.sessionId,
+      timeoutMs,
     );
     if (result.exceptionDetails) {
       throw new Error(exceptionText(result.exceptionDetails));
@@ -1691,18 +1813,19 @@ class BrowserHarness {
     return diagnostics;
   }
 
-  async close() {
+  async close(options = {}) {
     if (this.closed) {
       return;
     }
     this.closed = true;
-    if (this.cdp && !this.keepBrowser) {
+    const keepBrowser = this.keepBrowser && !options.forceBrowser;
+    if (this.cdp && !keepBrowser) {
       await Promise.race([this.cdp.send('Browser.close'), delay(1000)]).catch(() => {});
       this.cdp.close();
     } else if (this.cdp) {
       this.cdp.close();
     }
-    if (!this.keepBrowser && this.child && !this.child.killed) {
+    if (!keepBrowser && this.child && !this.child.killed) {
       await waitForExit(this.child, 800).catch(() => {
         this.child.kill('SIGKILL');
       });
@@ -2047,7 +2170,7 @@ class CdpConnection extends EventEmitter {
     socket.on('error', (error) => this.rejectAll(error));
   }
 
-  send(method, params = {}, sessionId) {
+  send(method, params = {}, sessionId, timeoutMs = DEFAULT_CDP_COMMAND_TIMEOUT_MS) {
     const id = this.nextId;
     this.nextId += 1;
     const payload = { id, method, params };
@@ -2056,12 +2179,15 @@ class CdpConnection extends EventEmitter {
     }
     this.socket.send(JSON.stringify(payload));
     return new Promise((resolve, reject) => {
-      this.pending.set(id, { resolve, reject });
-      setTimeout(() => {
+      const timer = setTimeout(() => {
         if (this.pending.delete(id)) {
           reject(new Error(`CDP ${method} timed out`));
         }
-      }, 8000).unref();
+      }, timeoutMs);
+      if (typeof timer.unref === 'function') {
+        timer.unref();
+      }
+      this.pending.set(id, { resolve, reject, timer });
     });
   }
 
@@ -2075,6 +2201,7 @@ class CdpConnection extends EventEmitter {
     if (message.id && this.pending.has(message.id)) {
       const pending = this.pending.get(message.id);
       this.pending.delete(message.id);
+      clearTimeout(pending.timer);
       if (message.error) {
         pending.reject(new Error(message.error.message || JSON.stringify(message.error)));
       } else {
@@ -2087,6 +2214,7 @@ class CdpConnection extends EventEmitter {
 
   rejectAll(error) {
     for (const pending of this.pending.values()) {
+      clearTimeout(pending.timer);
       pending.reject(error);
     }
     this.pending.clear();
@@ -3414,6 +3542,9 @@ function validationFailureNextStep(result) {
   if (result.failureKind === 'stale-static') {
     return 'rebuild and restart the dashboard controller from this worktree, then rerun with --require-current-static';
   }
+  if (result.failureKind === 'harness' && isCdpScreenshotTimeout(result.reason || '')) {
+    return 'treat as browser harness screenshot failure after the built-in single retry; keep Station validator failures separate and inspect browser/GPU stability';
+  }
   if (result.failureKind === 'probe' || result.failureKind === 'assertion') {
     return 'treat as probe/assertion failure; adjust the targeted condition or report partial validation; avoid further broad selector/source dumps and do not retry the same brittle wait';
   }
@@ -3442,6 +3573,9 @@ function validationFailureKind(reason) {
   }
   if (/^stale dashboard static asset/.test(text)) {
     return 'stale-static';
+  }
+  if (isCdpScreenshotTimeout(text)) {
+    return 'harness';
   }
   if (/^screenshot capture/.test(text)) {
     return 'artifact';
@@ -4135,6 +4269,32 @@ async function runSelfTest() {
     validationFailureKind('station interaction probe system:view did not pass (last value: false)'),
     'interaction',
   );
+  assert.strictEqual(isCdpScreenshotTimeout(new Error('CDP Page.captureScreenshot timed out')), true);
+  assert.strictEqual(isCdpScreenshotTimeout('screenshot capture returned no image data'), false);
+  assert.strictEqual(
+    validationFailureKind('CDP Page.captureScreenshot timed out'),
+    'harness',
+  );
+  const screenshotTimeout = screenshotTimeoutError(new Error('CDP Page.captureScreenshot timed out'), {
+    retried: true,
+    liveness: {
+      alive: true,
+      readyState: 'complete',
+      href: 'http://127.0.0.1:8956/#station',
+    },
+  });
+  assert.ok(screenshotTimeout.message.includes('after one retry'));
+  assert.strictEqual(validationFailureKind(screenshotTimeout.message), 'harness');
+  assert.ok(
+    validationFailureNextStep({
+      failureKind: 'harness',
+      reason: screenshotTimeout.message,
+    }).includes('built-in single retry'),
+  );
+  assert.strictEqual(
+    validationFailureKind('screenshot capture returned no image data'),
+    'artifact',
+  );
   assert.ok(
     validationFailureNextStep({
       failureKind: 'interaction',
@@ -4802,6 +4962,38 @@ async function runSelfTest() {
   log.push('b', 'second');
   log.push('c', 'third');
   assert.deepStrictEqual(log.excerpt(3), ['[b] second', '[c] third']);
+  class FakeCdpSocket extends EventEmitter {
+    constructor() {
+      super();
+      this.sent = [];
+    }
+
+    send(text) {
+      this.sent.push(JSON.parse(text));
+    }
+
+    close() {
+      this.emit('close');
+    }
+  }
+  const timeoutSocket = new FakeCdpSocket();
+  const timeoutCdp = new CdpConnection(timeoutSocket);
+  const timeoutKeepalive = delay(20);
+  await assert.rejects(
+    () => timeoutCdp.send('Page.captureScreenshot', {}, undefined, 5),
+    /CDP Page\.captureScreenshot timed out/,
+  );
+  await timeoutKeepalive;
+  assert.strictEqual(timeoutCdp.pending.size, 0);
+  const responseSocket = new FakeCdpSocket();
+  const responseCdp = new CdpConnection(responseSocket);
+  const responsePromise = responseCdp.send('Runtime.evaluate', {}, undefined, 100);
+  responseCdp.handleMessage(JSON.stringify({
+    id: responseSocket.sent[0].id,
+    result: { ok: true },
+  }));
+  assert.deepStrictEqual(await responsePromise, { ok: true });
+  assert.strictEqual(responseCdp.pending.size, 0);
   console.log('PASS dashboard-validation-self-test');
 }
 
