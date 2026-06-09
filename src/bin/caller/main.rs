@@ -5196,6 +5196,84 @@ fn managed_context_post_turn_density_handoff_enabled(
         && !managed_context_density_handoff_completed
 }
 
+#[derive(Debug, Clone)]
+enum ManagedContextPreflightDecision {
+    Recovery {
+        recovery_followup: FollowUpMessage,
+        held_followup: Option<FollowUpMessage>,
+        pressure: ManagedContextRewindOnlyPressure,
+    },
+    DensityHandoff {
+        handoff_followup: FollowUpMessage,
+        held_followup: FollowUpMessage,
+        pressure: ManagedContextDensityPressure,
+    },
+}
+
+fn managed_context_followup_for_replay(followup: &FollowUpMessage) -> FollowUpMessage {
+    let mut replay = followup.clone();
+    replay.managed_context_recovery_kickstart = false;
+    replay.managed_context_density_handoff = false;
+    replay.managed_context_density_handoff_completed = false;
+    replay
+}
+
+fn managed_context_preflight_decision(
+    codex_managed_context_enabled: bool,
+    followup: &FollowUpMessage,
+    snapshot: &external_agent::AgentContextSnapshot,
+) -> Option<ManagedContextPreflightDecision> {
+    let rewind_only_gate_enabled = managed_context_preflight_rewind_only_gate_enabled(
+        codex_managed_context_enabled,
+        followup.managed_context_recovery_kickstart,
+        followup.managed_context_density_handoff,
+    );
+    if !rewind_only_gate_enabled {
+        return None;
+    }
+
+    if let Some(pressure) = managed_context_rewind_only_pressure(snapshot) {
+        let drop_original = managed_context_drop_original_for_recovery(
+            &followup.text,
+            !followup.attachments.is_empty(),
+            followup.steer_id.is_some(),
+            followup.edit_user_turn_index.is_some(),
+        );
+        let held_followup = (!drop_original).then(|| managed_context_followup_for_replay(followup));
+        let mut recovery_followup = FollowUpMessage::text(managed_context_recovery_kickstart_text(
+            pressure,
+            held_followup.is_some(),
+        ))
+        .managed_context_recovery_kickstart();
+        if held_followup.is_none() {
+            recovery_followup = recovery_followup.with_follow_up_id(followup.follow_up_id.clone());
+        }
+        return Some(ManagedContextPreflightDecision::Recovery {
+            recovery_followup,
+            held_followup,
+            pressure,
+        });
+    }
+
+    if managed_context_preflight_density_gate_enabled(
+        rewind_only_gate_enabled,
+        followup.managed_context_density_handoff_completed,
+    ) {
+        if let Some(pressure) = managed_context_density_pressure(snapshot) {
+            return Some(ManagedContextPreflightDecision::DensityHandoff {
+                handoff_followup: FollowUpMessage::text(managed_context_density_handoff_text(
+                    pressure,
+                ))
+                .managed_context_density_handoff(),
+                held_followup: managed_context_followup_for_replay(followup),
+                pressure,
+            });
+        }
+    }
+
+    None
+}
+
 fn managed_context_density_pressure_from_usage(
     usage: &external_agent::AgentUsageSnapshot,
 ) -> Option<ManagedContextDensityPressure> {
@@ -12868,6 +12946,77 @@ mod tests {
         };
         assert_eq!(managed_context_density_pressure(&rewind_only), None);
         assert!(managed_context_rewind_only_pressure(&rewind_only).is_some());
+    }
+
+    #[test]
+    fn managed_context_preflight_decision_holds_density_followup() {
+        let snapshot = external_agent::AgentContextSnapshot {
+            source: "codex".to_string(),
+            label: "Codex resolved request payload".to_string(),
+            request_id: Some("req-1".to_string()),
+            request_index: Some(1),
+            rollout_path: None,
+            format: "openai.responses.resolved_request.v1".to_string(),
+            token_count: Some(225_440),
+            token_count_kind: Some(external_agent::AgentContextTokenCountKind::BackendReported),
+            context_window: Some(258_400),
+            hard_context_window: Some(272_000),
+            item_count: Some(458),
+            raw: serde_json::json!({}),
+        };
+        let followup = FollowUpMessage::text("Continue Station QA and fixes.".to_string());
+
+        let decision =
+            managed_context_preflight_decision(true, &followup, &snapshot).expect("decision");
+        match decision {
+            ManagedContextPreflightDecision::DensityHandoff {
+                handoff_followup,
+                held_followup,
+                pressure,
+            } => {
+                assert!(handoff_followup.managed_context_density_handoff);
+                assert_eq!(held_followup.text, "Continue Station QA and fixes.");
+                assert!(!held_followup.managed_context_density_handoff);
+                assert_eq!(pressure.used_tokens, 225_440);
+                assert_eq!(pressure.recommended_rewind_limit, 219_640);
+            }
+            other => panic!("expected density handoff, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn managed_context_preflight_decision_drops_trivial_recovery_kickstart() {
+        let snapshot = external_agent::AgentContextSnapshot {
+            source: "codex".to_string(),
+            label: "Codex resolved request payload".to_string(),
+            request_id: Some("req-1".to_string()),
+            request_index: Some(1),
+            rollout_path: None,
+            format: "openai.responses.resolved_request.v1".to_string(),
+            token_count: Some(258_400),
+            token_count_kind: Some(external_agent::AgentContextTokenCountKind::BackendReported),
+            context_window: Some(258_400),
+            hard_context_window: Some(272_000),
+            item_count: Some(458),
+            raw: serde_json::json!({}),
+        };
+        let followup = FollowUpMessage::text("continue".to_string());
+
+        let decision =
+            managed_context_preflight_decision(true, &followup, &snapshot).expect("decision");
+        match decision {
+            ManagedContextPreflightDecision::Recovery {
+                recovery_followup,
+                held_followup,
+                pressure,
+            } => {
+                assert!(recovery_followup.managed_context_recovery_kickstart);
+                assert!(held_followup.is_none());
+                assert_eq!(pressure.used_tokens, 258_400);
+                assert!(!recovery_followup.text.contains("held"));
+            }
+            other => panic!("expected recovery kickstart, got {:?}", other),
+        }
     }
 
     #[test]
@@ -20820,6 +20969,10 @@ async fn run_with_presence(
     let mut persistent_open_side_threads: HashMap<String, String> = HashMap::new();
     let mut persistent_side_rounds: HashMap<String, usize> = HashMap::new();
     let mut persistent_side_turn_revisions: HashMap<String, UserTurnRevisionState> = HashMap::new();
+    let mut persistent_pending_managed_context_replays: std::collections::VecDeque<
+        FollowUpMessage,
+    > = std::collections::VecDeque::new();
+    let mut persistent_managed_context_recovery_kickstarts_without_rewind = 0u8;
     let mut startup_resume_session = resume_session;
     // Track which backend the persistent agent was created for, so we can reset
     // when the web UI changes the selection between tasks.
@@ -21840,6 +21993,8 @@ async fn run_with_presence(
             // The external agent manages its own conversation; we keep the
             // agent + thread alive across tasks dispatched by presence.
             if persistent_agent.is_none() {
+                persistent_pending_managed_context_replays.clear();
+                persistent_managed_context_recovery_kickstarts_without_rewind = 0;
                 let mut proj = match Project::from_root(project_root.clone()) {
                     Ok(p) => p,
                     Err(e) => {
@@ -21941,453 +22096,600 @@ async fn run_with_presence(
                     };
             }
 
-            // Send the task as a new turn in the existing thread, with any
-            // user-attached frames passed as image inputs (Codex `LocalImage`,
-            // Gemini ACP `Image` content block).
-            //
-            // Merge in any steer items queued by the fallback path (backend
-            // returned Err from `steer_turn`). They prepend as `[User]`
-            // lines so the agent sees them in the same turn's input.
-            let agent = persistent_agent.as_mut().unwrap();
-            let thread = persistent_thread.as_ref().unwrap();
-            let merged_text = drain_steer_queue_as_followup(
-                &context_injection,
-                &task_text,
-                &bus,
-                session_log_id(&session_log).as_deref(),
-                None,
-            )
-            .unwrap_or_else(|| task_text.clone());
-            persistent_diff_tracker.seed_from_session_log(&project.root, &log_dir);
-            emit_external_turn_status(
-                &bus,
-                &autonomy,
-                session_log_id(&session_log).as_deref(),
-                cumulative_stats.rounds.saturating_add(1),
-                "thinking",
-                external_turn_status_task(
-                    agent.name(),
-                    cumulative_stats.rounds.saturating_add(1),
-                    &task_text,
-                ),
-            )
-            .await;
-            let send_result = if envelope.attachment_frame_ids.is_empty() {
-                agent.send_message(thread, &merged_text).await
+            let session_dir = session_log
+                .lock()
+                .ok()
+                .map(|l| l.dir().to_path_buf())
+                .unwrap_or_else(|| std::path::PathBuf::from("."));
+            let initial_attachments = if envelope.attachment_frame_ids.is_empty() {
+                UserAttachments::default()
             } else {
-                // Mixed attachments: frame ids (auto-prefixed "frame:" or bare)
-                // and upload ids (always "upload:<id>"). Grab the session dir
-                // from the live session log so upload lookups work after a
-                // session rotation.
-                let session_dir = session_log
-                    .lock()
-                    .ok()
-                    .map(|l| l.dir().to_path_buf())
-                    .unwrap_or_else(|| std::path::PathBuf::from("."));
-                let attachments = resolve_attachments(
-                    &envelope.attachment_frame_ids,
-                    &frame_registry,
-                    &session_dir,
-                    &project.root,
-                )
-                .await;
-                agent
-                    .send_message_with_attachments(thread, &merged_text, &attachments)
-                    .await
-            };
-            if let Err(e) = send_result {
-                bus.send(AppEvent::PresenceLog {
-                    message: format!("External agent send error: {}", e),
-                    level: Some(types::LogLevel::Error),
-                    turn: None,
-                });
-                turn_bus_rx = bus.subscribe();
-                continue;
-            }
-            if let Some(id) = envelope.steer_id.as_deref() {
-                bus.send(AppEvent::SteerDelivered {
-                    session_id: session_log_id(&session_log),
-                    id: id.to_string(),
-                    mid_turn: false,
-                });
-            }
-
-            // Drain events until this turn completes
-            let event_rx = persistent_event_rx.as_mut().unwrap();
-            let drain_config = DrainConfig {
-                bus: &bus,
-                web_port,
-                session_id: session_log_id(&session_log),
-                alias_session_id: if matches!(backend, external_agent::AgentBackend::Codex) {
-                    persistent_thread
-                        .as_ref()
-                        .map(|thread| thread.thread_id.clone())
-                } else {
-                    None
-                },
-                autonomy: autonomy.clone(),
-                session_log: &session_log,
-                project_root: &project.root,
-                log_dir: &log_dir,
-                approval_registry: &approval_registry,
-                json_approval: None,
-                agent_source: Some(backend.to_string()),
-                suppress_agent_started: true,
-                persist_model_responses_inline: false,
-                headless: false,
-                context_injection: &context_injection,
-            };
-            let mut side_session_state = ExternalSideSessionState {
-                open_side_threads: &mut persistent_open_side_threads,
-                side_rounds: &mut persistent_side_rounds,
-                side_turn_revisions: &mut persistent_side_turn_revisions,
-            };
-            match drain_external_agent_events(
-                agent,
-                event_rx,
-                &mut turn_bus_rx,
-                &drain_config,
-                &mut cumulative_stats,
-                &mut persistent_diff_tracker,
-                &mut persistent_pending_runtime_steers,
-                &mut persistent_handled_steer_ids,
-                &mut persistent_cancelled_follow_ups,
-                &mut codex_thread_action_dedupe,
-                Some(&mut side_session_state),
-                false,
-                false,
-                false,
-            )
-            .await
-            {
-                DrainOutcome::TurnCompleted {
-                    message,
-                    turns_in_round,
-                } => {
-                    cumulative_stats.turns += 1;
-                    cumulative_stats.rounds += 1;
-                    bus.send(AppEvent::DoneSignal {
-                        session_id: session_log_id(&session_log),
-                        message: message.clone(),
-                    });
-                    // External-agent rounds: no native conversation to snapshot.
-                    // Conversation rollback will use the backend's native
-                    // mechanism (Codex thread/rollback) or fall back to a
-                    // session reset (CC, Gemini).
-                    bus.send(AppEvent::RoundComplete {
-                        session_id: session_log_id(&session_log),
-                        round: cumulative_stats.rounds,
-                        turns_in_round,
-                        native_message_count: None,
-                    });
-                }
-                DrainOutcome::ContextRewindRequested {
-                    request,
-                    message,
-                    turns_in_round,
-                    ..
-                } => {
-                    cumulative_stats.turns += 1;
-                    cumulative_stats.rounds += 1;
-                    bus.send(AppEvent::DoneSignal {
-                        session_id: session_log_id(&session_log),
-                        message: message.clone(),
-                    });
-                    bus.send(AppEvent::RoundComplete {
-                        session_id: session_log_id(&session_log),
-                        round: cumulative_stats.rounds,
-                        turns_in_round,
-                        native_message_count: None,
-                    });
-                    match apply_external_context_rewind(
-                        agent,
-                        &thread.thread_id,
-                        &request,
-                        &drain_config,
+                UserAttachments::from_items(
+                    resolve_attachments(
+                        &envelope.attachment_frame_ids,
+                        &frame_registry,
+                        &session_dir,
+                        &project.root,
                     )
-                    .await
-                    {
-                        Ok(Some(followup)) => {
-                            let mut resume_side_state = ExternalSideSessionState {
-                                open_side_threads: &mut persistent_open_side_threads,
-                                side_rounds: &mut persistent_side_rounds,
-                                side_turn_revisions: &mut persistent_side_turn_revisions,
-                            };
-                            let mut resume = ExternalContextRewindResume {
-                                event_rx,
-                                turn_bus_rx: &mut turn_bus_rx,
-                                config: &drain_config,
-                                stats: &mut cumulative_stats,
-                                diff_tracker: &mut persistent_diff_tracker,
-                                pending_runtime_steers: &mut persistent_pending_runtime_steers,
-                                handled_steer_ids: &mut persistent_handled_steer_ids,
-                                cancelled_follow_ups: &mut persistent_cancelled_follow_ups,
-                                codex_thread_action_dedupe: &mut codex_thread_action_dedupe,
-                                side_sessions: Some(&mut resume_side_state),
-                            };
-                            match send_external_context_rewind_resume_turn(
-                                agent,
-                                thread,
-                                followup,
-                                &mut resume,
-                            )
-                            .await
-                            {
-                                Ok(DrainOutcome::TurnCompleted {
-                                    message,
-                                    turns_in_round,
-                                }) => {
-                                    cumulative_stats.turns += 1;
-                                    cumulative_stats.rounds += 1;
-                                    bus.send(AppEvent::DoneSignal {
-                                        session_id: session_log_id(&session_log),
-                                        message: message.clone(),
-                                    });
-                                    bus.send(AppEvent::RoundComplete {
-                                        session_id: session_log_id(&session_log),
-                                        round: cumulative_stats.rounds,
-                                        turns_in_round,
-                                        native_message_count: None,
-                                    });
-                                }
-                                Ok(DrainOutcome::ContextRewindRequested { request, .. }) => {
-                                    match apply_chained_context_rewind_resume_turns(
-                                        agent,
-                                        thread,
-                                        request,
-                                        &mut resume,
-                                    )
-                                    .await
-                                    {
-                                        Ok(Some(DrainOutcome::TurnCompleted {
-                                            message,
-                                            turns_in_round,
-                                        })) => {
-                                            cumulative_stats.turns += 1;
-                                            cumulative_stats.rounds += 1;
-                                            bus.send(AppEvent::DoneSignal {
-                                                session_id: session_log_id(&session_log),
-                                                message: message.clone(),
-                                            });
-                                            bus.send(AppEvent::RoundComplete {
-                                                session_id: session_log_id(&session_log),
-                                                round: cumulative_stats.rounds,
-                                                turns_in_round,
-                                                native_message_count: None,
-                                            });
+                    .await,
+                )
+            };
+            let mut initial_followup =
+                FollowUpMessage::with_attachments(task_text.clone(), initial_attachments);
+            initial_followup.steer_id = envelope.steer_id.clone();
+            let mut next_persistent_turn = Some(initial_followup);
+
+            while let Some(active_followup) = next_persistent_turn.take() {
+                let agent = persistent_agent.as_mut().unwrap();
+                let thread = persistent_thread.as_ref().unwrap();
+                let drain_config = DrainConfig {
+                    bus: &bus,
+                    web_port,
+                    session_id: session_log_id(&session_log),
+                    alias_session_id: if matches!(backend, external_agent::AgentBackend::Codex) {
+                        Some(thread.thread_id.clone())
+                    } else {
+                        None
+                    },
+                    autonomy: autonomy.clone(),
+                    session_log: &session_log,
+                    project_root: &project.root,
+                    log_dir: &log_dir,
+                    approval_registry: &approval_registry,
+                    json_approval: None,
+                    agent_source: Some(backend.to_string()),
+                    suppress_agent_started: true,
+                    persist_model_responses_inline: false,
+                    headless: false,
+                    context_injection: &context_injection,
+                };
+                let codex_managed_context_enabled =
+                    matches!(backend, external_agent::AgentBackend::Codex)
+                        && agent.supports_item_anchor_rewind();
+
+                if codex_managed_context_enabled {
+                    match refresh_external_context_usage_snapshot(agent, &drain_config).await {
+                        Ok(Some(snapshot)) => {
+                            if let Some(decision) = managed_context_preflight_decision(
+                                codex_managed_context_enabled,
+                                &active_followup,
+                                &snapshot,
+                            ) {
+                                match decision {
+                                    ManagedContextPreflightDecision::Recovery {
+                                        recovery_followup,
+                                        held_followup,
+                                        pressure,
+                                    } => {
+                                        let held_user_input = held_followup.is_some();
+                                        if let Some(held) = held_followup {
+                                            persistent_pending_managed_context_replays
+                                                .push_back(held);
                                         }
-                                        Ok(Some(DrainOutcome::RecoveryRequired {
-                                            message,
-                                            recovery_hint,
-                                            turns_in_round,
-                                        })) => {
-                                            cumulative_stats.rounds += 1;
-                                            bus.send(AppEvent::RoundComplete {
-                                                session_id: session_log_id(&session_log),
-                                                round: cumulative_stats.rounds,
-                                                turns_in_round,
-                                                native_message_count: None,
-                                            });
-                                            bus.send(AppEvent::PresenceLog {
-                                                message: recovery_required_message(
-                                                    &message,
-                                                    recovery_hint.as_deref(),
-                                                ),
-                                                level: Some(types::LogLevel::Warn),
-                                                turn: None,
-                                            });
-                                        }
-                                        Ok(Some(DrainOutcome::Interrupted { reason })) => {
-                                            bus.send(AppEvent::PresenceLog {
-                                                message: format!(
-                                                    "External agent interrupted during resumed context-rewind turn: {}",
-                                                    reason
-                                                ),
-                                                level: None,
-                                                turn: None,
-                                            });
-                                            cumulative_stats.rounds += 1;
-                                        }
-                                        Ok(Some(DrainOutcome::Terminated { reason, .. })) => {
-                                            bus.send(AppEvent::PresenceLog {
-                                                message: format!(
-                                                    "External agent terminated: {}",
-                                                    reason
-                                                ),
-                                                level: Some(types::LogLevel::Error),
-                                                turn: None,
-                                            });
-                                            persistent_agent = None;
-                                            persistent_thread = None;
-                                            persistent_event_rx = None;
-                                            persistent_diff_tracker =
-                                                ExternalDiffDeltaTracker::default();
-                                            persistent_pending_runtime_steers.clear();
-                                            persistent_handled_steer_ids.clear();
-                                            persistent_open_side_threads.clear();
-                                            persistent_side_rounds.clear();
-                                            persistent_side_turn_revisions.clear();
-                                        }
-                                        Ok(Some(DrainOutcome::ChannelClosed)) => {
-                                            persistent_agent = None;
-                                            persistent_thread = None;
-                                            persistent_event_rx = None;
-                                            persistent_diff_tracker =
-                                                ExternalDiffDeltaTracker::default();
-                                            persistent_pending_runtime_steers.clear();
-                                            persistent_handled_steer_ids.clear();
-                                            persistent_open_side_threads.clear();
-                                            persistent_side_rounds.clear();
-                                            persistent_side_turn_revisions.clear();
-                                        }
-                                        Ok(Some(DrainOutcome::ContextRewindRequested {
-                                            request,
-                                            ..
-                                        })) => {
-                                            emit_context_rewind_failure(
-                                                &request,
-                                                "chained context rewind returned an unexpected pending rewind"
-                                                    .to_string(),
-                                                &drain_config,
-                                            );
-                                        }
-                                        Ok(None) => {}
-                                        Err((request, message)) => {
-                                            emit_context_rewind_failure(
-                                                &request,
-                                                message,
-                                                &drain_config,
-                                            );
-                                        }
+                                        slog(&session_log, |l| {
+                                            l.info(&format!(
+                                                "Holding persistent Codex follow-up during managed-context {} pressure ({}/{} tokens); sending recovery kickstart",
+                                                pressure.status,
+                                                pressure.used_tokens,
+                                                pressure.rewind_only_limit
+                                            ))
+                                        });
+                                        bus.send(AppEvent::LogEntry {
+                                            session_id: session_log_id(&session_log),
+                                            level: "info".to_string(),
+                                            source: "Intendant".to_string(),
+                                            content: format!(
+                                                "Managed context is in rewind-only pressure ({}/{} tokens); {}.",
+                                                pressure.used_tokens,
+                                                pressure.rewind_only_limit,
+                                                if held_user_input {
+                                                    "holding the user follow-up until recovery succeeds"
+                                                } else {
+                                                    "using the request as a recovery kickstart"
+                                                }
+                                            ),
+                                            turn: None,
+                                        });
+                                        next_persistent_turn = Some(recovery_followup);
+                                        continue;
                                     }
-                                }
-                                Ok(DrainOutcome::RecoveryRequired {
-                                    message,
-                                    recovery_hint,
-                                    turns_in_round,
-                                }) => {
-                                    cumulative_stats.rounds += 1;
-                                    bus.send(AppEvent::RoundComplete {
-                                        session_id: session_log_id(&session_log),
-                                        round: cumulative_stats.rounds,
-                                        turns_in_round,
-                                        native_message_count: None,
-                                    });
-                                    bus.send(AppEvent::PresenceLog {
-                                        message: recovery_required_message(
-                                            &message,
-                                            recovery_hint.as_deref(),
-                                        ),
-                                        level: Some(types::LogLevel::Warn),
-                                        turn: None,
-                                    });
-                                }
-                                Ok(DrainOutcome::Interrupted { reason }) => {
-                                    bus.send(AppEvent::PresenceLog {
-                                        message: format!(
-                                            "External agent interrupted during resumed context-rewind turn: {}",
-                                            reason
-                                        ),
-                                        level: None,
-                                        turn: None,
-                                    });
-                                    cumulative_stats.rounds += 1;
-                                }
-                                Ok(DrainOutcome::Terminated { reason, .. }) => {
-                                    bus.send(AppEvent::PresenceLog {
-                                        message: format!("External agent terminated: {}", reason),
-                                        level: Some(types::LogLevel::Error),
-                                        turn: None,
-                                    });
-                                    persistent_agent = None;
-                                    persistent_thread = None;
-                                    persistent_event_rx = None;
-                                    persistent_diff_tracker = ExternalDiffDeltaTracker::default();
-                                    persistent_pending_runtime_steers.clear();
-                                    persistent_handled_steer_ids.clear();
-                                    persistent_open_side_threads.clear();
-                                    persistent_side_rounds.clear();
-                                    persistent_side_turn_revisions.clear();
-                                }
-                                Ok(DrainOutcome::ChannelClosed) => {
-                                    persistent_agent = None;
-                                    persistent_thread = None;
-                                    persistent_event_rx = None;
-                                    persistent_diff_tracker = ExternalDiffDeltaTracker::default();
-                                    persistent_pending_runtime_steers.clear();
-                                    persistent_handled_steer_ids.clear();
-                                    persistent_open_side_threads.clear();
-                                    persistent_side_rounds.clear();
-                                    persistent_side_turn_revisions.clear();
-                                }
-                                Err(message) => {
-                                    emit_context_rewind_failure(&request, message, &drain_config);
+                                    ManagedContextPreflightDecision::DensityHandoff {
+                                        handoff_followup,
+                                        held_followup,
+                                        pressure,
+                                    } => {
+                                        persistent_pending_managed_context_replays
+                                            .push_back(held_followup);
+                                        slog(&session_log, |l| {
+                                            l.info(&format!(
+                                                "Holding persistent Codex follow-up during managed-context density watch ({}/{} tokens, threshold {}); sending density handoff",
+                                                pressure.used_tokens,
+                                                pressure.rewind_only_limit,
+                                                pressure.recommended_rewind_limit
+                                            ))
+                                        });
+                                        bus.send(AppEvent::LogEntry {
+                                            session_id: session_log_id(&session_log),
+                                            level: "info".to_string(),
+                                            source: "Intendant".to_string(),
+                                            content: format!(
+                                                "Managed context is above the recommended density threshold ({}/{} tokens, threshold {}). Sending a density handoff before broad follow-up work. Normal tools remain allowed below rewind-only pressure.",
+                                                pressure.used_tokens,
+                                                pressure.rewind_only_limit,
+                                                pressure.recommended_rewind_limit
+                                            ),
+                                            turn: None,
+                                        });
+                                        next_persistent_turn = Some(handoff_followup);
+                                        continue;
+                                    }
                                 }
                             }
                         }
                         Ok(None) => {}
-                        Err(message) => {
-                            emit_context_rewind_failure(&request, message, &drain_config);
+                        Err(e) => {
+                            slog(&session_log, |l| {
+                                l.debug(&format!(
+                                    "Could not read Codex context snapshot before persistent follow-up gate: {}",
+                                    e
+                                ))
+                            });
                         }
                     }
                 }
-                DrainOutcome::RecoveryRequired {
-                    message,
-                    recovery_hint,
-                    turns_in_round,
-                } => {
-                    cumulative_stats.rounds += 1;
-                    bus.send(AppEvent::RoundComplete {
-                        session_id: session_log_id(&session_log),
-                        round: cumulative_stats.rounds,
-                        turns_in_round,
-                        native_message_count: None,
-                    });
+
+                // Send the task as a new turn in the existing thread, with any
+                // user-attached frames passed as image inputs (Codex `LocalImage`,
+                // Gemini ACP `Image` content block). Queued fallback steers are
+                // prepended as `[User]` lines in the same user turn.
+                let merged_text = drain_steer_queue_as_followup(
+                    &context_injection,
+                    &active_followup.text,
+                    &bus,
+                    session_log_id(&session_log).as_deref(),
+                    drain_config.alias_session_id.as_deref(),
+                )
+                .unwrap_or_else(|| active_followup.text.clone());
+                persistent_diff_tracker.seed_from_session_log(&project.root, &log_dir);
+                let round = cumulative_stats.rounds.saturating_add(1);
+                let status_text = if active_followup.text.trim().is_empty() {
+                    &merged_text
+                } else {
+                    &active_followup.text
+                };
+                emit_external_turn_status(
+                    &bus,
+                    &autonomy,
+                    session_log_id(&session_log).as_deref(),
+                    round,
+                    "thinking",
+                    external_turn_status_task(agent.name(), round, status_text),
+                )
+                .await;
+                let send_result = if active_followup.attachments.is_empty() {
+                    agent.send_message(thread, &merged_text).await
+                } else {
+                    agent
+                        .send_message_with_attachments(
+                            thread,
+                            &merged_text,
+                            &active_followup.attachments.items,
+                        )
+                        .await
+                };
+                if let Err(e) = send_result {
                     bus.send(AppEvent::PresenceLog {
-                        message: recovery_required_message(&message, recovery_hint.as_deref()),
-                        level: Some(types::LogLevel::Warn),
-                        turn: None,
-                    });
-                }
-                DrainOutcome::Interrupted { reason } => {
-                    // Interrupt acknowledged by the agent. The Interrupted
-                    // event was already emitted inside the drain — we just
-                    // surface a presence log and close out the round.
-                    bus.send(AppEvent::PresenceLog {
-                        message: format!("External agent interrupted: {}", reason),
-                        level: None,
-                        turn: None,
-                    });
-                    cumulative_stats.rounds += 1;
-                }
-                DrainOutcome::Terminated { reason, .. } => {
-                    bus.send(AppEvent::PresenceLog {
-                        message: format!("External agent terminated: {}", reason),
+                        message: format!("External agent send error: {}", e),
                         level: Some(types::LogLevel::Error),
                         turn: None,
                     });
-                    // Agent is gone — clear persistent state so next task re-initializes
-                    persistent_agent = None;
-                    persistent_thread = None;
-                    persistent_event_rx = None;
-                    persistent_diff_tracker = ExternalDiffDeltaTracker::default();
-                    persistent_pending_runtime_steers.clear();
-                    persistent_handled_steer_ids.clear();
-                    persistent_open_side_threads.clear();
-                    persistent_side_rounds.clear();
-                    persistent_side_turn_revisions.clear();
+                    break;
                 }
-                DrainOutcome::ChannelClosed => {
-                    // Channel closed unexpectedly
-                    persistent_agent = None;
-                    persistent_thread = None;
-                    persistent_event_rx = None;
-                    persistent_diff_tracker = ExternalDiffDeltaTracker::default();
-                    persistent_pending_runtime_steers.clear();
-                    persistent_handled_steer_ids.clear();
-                    persistent_open_side_threads.clear();
-                    persistent_side_rounds.clear();
-                    persistent_side_turn_revisions.clear();
+                if let Some(id) = active_followup.steer_id.as_deref() {
+                    bus.send(AppEvent::SteerDelivered {
+                        session_id: session_log_id(&session_log),
+                        id: id.to_string(),
+                        mid_turn: false,
+                    });
+                }
+
+                let event_rx = persistent_event_rx.as_mut().unwrap();
+                let mut side_session_state = ExternalSideSessionState {
+                    open_side_threads: &mut persistent_open_side_threads,
+                    side_rounds: &mut persistent_side_rounds,
+                    side_turn_revisions: &mut persistent_side_turn_revisions,
+                };
+                let outcome = drain_external_agent_events(
+                    agent,
+                    event_rx,
+                    &mut turn_bus_rx,
+                    &drain_config,
+                    &mut cumulative_stats,
+                    &mut persistent_diff_tracker,
+                    &mut persistent_pending_runtime_steers,
+                    &mut persistent_handled_steer_ids,
+                    &mut persistent_cancelled_follow_ups,
+                    &mut codex_thread_action_dedupe,
+                    Some(&mut side_session_state),
+                    active_followup.managed_context_recovery_kickstart,
+                    active_followup.managed_context_density_handoff,
+                    active_followup.managed_context_density_handoff_completed,
+                )
+                .await;
+
+                match outcome {
+                    DrainOutcome::TurnCompleted {
+                        message,
+                        turns_in_round,
+                    } => {
+                        cumulative_stats.turns += 1;
+                        cumulative_stats.rounds += 1;
+                        if codex_managed_context_enabled {
+                            match refresh_external_context_usage_snapshot(agent, &drain_config)
+                                .await
+                            {
+                                Ok(Some(snapshot)) => {
+                                    if let Some(pressure) =
+                                        managed_context_rewind_only_pressure(&snapshot)
+                                    {
+                                        persistent_managed_context_recovery_kickstarts_without_rewind =
+                                            persistent_managed_context_recovery_kickstarts_without_rewind
+                                                .saturating_add(1);
+                                        if persistent_managed_context_recovery_kickstarts_without_rewind
+                                            < MANAGED_CONTEXT_RECOVERY_MAX_KICKSTARTS_WITHOUT_REWIND
+                                        {
+                                            let held_user_input =
+                                                !persistent_pending_managed_context_replays
+                                                    .is_empty();
+                                            let recovery_text =
+                                                managed_context_recovery_kickstart_text(
+                                                    pressure,
+                                                    held_user_input,
+                                                );
+                                            let turn_kind = if active_followup
+                                                .managed_context_recovery_kickstart
+                                            {
+                                                "recovery kickstart"
+                                            } else {
+                                                "managed Codex turn"
+                                            };
+                                            slog(&session_log, |l| {
+                                                l.warn(&format!(
+                                                    "Persistent managed-context {turn_kind} completed without a context rewind while pressure remains {}/{} tokens; retrying recovery",
+                                                    pressure.used_tokens,
+                                                    pressure.rewind_only_limit
+                                                ))
+                                            });
+                                            bus.send(AppEvent::RoundComplete {
+                                                session_id: session_log_id(&session_log),
+                                                round: cumulative_stats.rounds,
+                                                turns_in_round,
+                                                native_message_count: None,
+                                            });
+                                            next_persistent_turn = Some(
+                                                FollowUpMessage::text(recovery_text)
+                                                    .managed_context_recovery_kickstart(),
+                                            );
+                                            continue;
+                                        }
+                                        let message = format!(
+                                            "Managed-context recovery completed without rewind_context while context remains above the rewind-only threshold ({}/{} tokens); refusing to send normal follow-ups.",
+                                            pressure.used_tokens,
+                                            pressure.rewind_only_limit
+                                        );
+                                        slog(&session_log, |l| l.warn(&message));
+                                        bus.send(AppEvent::RoundComplete {
+                                            session_id: session_log_id(&session_log),
+                                            round: cumulative_stats.rounds,
+                                            turns_in_round,
+                                            native_message_count: None,
+                                        });
+                                        bus.send(AppEvent::LoopError(message));
+                                        break;
+                                    }
+
+                                    persistent_managed_context_recovery_kickstarts_without_rewind =
+                                        0;
+                                    if managed_context_recovery_without_rewind_blocks_held_replay(
+                                        active_followup.managed_context_recovery_kickstart,
+                                        &persistent_pending_managed_context_replays,
+                                    ) {
+                                        let message = "Managed-context recovery turn completed without rewind_context; refusing to replay held normal follow-up until a successful rewind lowers context pressure.".to_string();
+                                        slog(&session_log, |l| l.warn(&message));
+                                        bus.send(AppEvent::RoundComplete {
+                                            session_id: session_log_id(&session_log),
+                                            round: cumulative_stats.rounds,
+                                            turns_in_round,
+                                            native_message_count: None,
+                                        });
+                                        bus.send(AppEvent::LoopError(message));
+                                        break;
+                                    }
+                                    if let Some(mut replay) =
+                                        persistent_pending_managed_context_replays.pop_front()
+                                    {
+                                        if active_followup.managed_context_density_handoff {
+                                            replay = replay.after_managed_context_density_handoff();
+                                            slog(&session_log, |l| {
+                                                l.info(
+                                                    "Persistent managed-context density handoff completed without a context rewind; replaying held follow-up",
+                                                )
+                                            });
+                                        } else {
+                                            slog(&session_log, |l| {
+                                                l.warn(
+                                                    "Persistent managed-context pressure cleared without a context rewind; replaying held follow-up",
+                                                )
+                                            });
+                                        }
+                                        bus.send(AppEvent::RoundComplete {
+                                            session_id: session_log_id(&session_log),
+                                            round: cumulative_stats.rounds,
+                                            turns_in_round,
+                                            native_message_count: None,
+                                        });
+                                        next_persistent_turn = Some(replay);
+                                        continue;
+                                    }
+                                    if managed_context_post_turn_density_handoff_enabled(
+                                        active_followup.managed_context_recovery_kickstart,
+                                        active_followup.managed_context_density_handoff,
+                                        active_followup.managed_context_density_handoff_completed,
+                                    ) {
+                                        if let Some(pressure) =
+                                            managed_context_density_pressure(&snapshot)
+                                        {
+                                            let handoff_text =
+                                                managed_context_density_handoff_text(pressure);
+                                            slog(&session_log, |l| {
+                                                l.info(&format!(
+                                                    "Persistent managed Codex completed at density-watch pressure ({}/{} tokens); sending one-shot context handoff before waiting for follow-up",
+                                                    pressure.used_tokens,
+                                                    pressure.rewind_only_limit
+                                                ))
+                                            });
+                                            bus.send(AppEvent::RoundComplete {
+                                                session_id: session_log_id(&session_log),
+                                                round: cumulative_stats.rounds,
+                                                turns_in_round,
+                                                native_message_count: None,
+                                            });
+                                            next_persistent_turn = Some(
+                                                FollowUpMessage::text(handoff_text)
+                                                    .managed_context_density_handoff(),
+                                            );
+                                            continue;
+                                        }
+                                    }
+                                }
+                                Ok(None) => {
+                                    if active_followup.managed_context_recovery_kickstart
+                                        || !persistent_pending_managed_context_replays.is_empty()
+                                    {
+                                        let message = "Managed-context recovery completed without rewind_context, and Codex context pressure could not be re-read; refusing to send normal follow-ups.".to_string();
+                                        slog(&session_log, |l| l.warn(&message));
+                                        bus.send(AppEvent::RoundComplete {
+                                            session_id: session_log_id(&session_log),
+                                            round: cumulative_stats.rounds,
+                                            turns_in_round,
+                                            native_message_count: None,
+                                        });
+                                        bus.send(AppEvent::LoopError(message));
+                                        break;
+                                    }
+                                }
+                                Err(e) => {
+                                    if active_followup.managed_context_recovery_kickstart
+                                        || !persistent_pending_managed_context_replays.is_empty()
+                                    {
+                                        let message = format!(
+                                            "Managed-context recovery completed without rewind_context, and Codex context pressure could not be re-read: {}; refusing to send normal follow-ups.",
+                                            e
+                                        );
+                                        slog(&session_log, |l| l.warn(&message));
+                                        bus.send(AppEvent::RoundComplete {
+                                            session_id: session_log_id(&session_log),
+                                            round: cumulative_stats.rounds,
+                                            turns_in_round,
+                                            native_message_count: None,
+                                        });
+                                        bus.send(AppEvent::LoopError(message));
+                                        break;
+                                    }
+                                    slog(&session_log, |l| {
+                                        l.debug(&format!(
+                                            "Could not re-read Codex context pressure after persistent managed turn: {}",
+                                            e
+                                        ))
+                                    });
+                                }
+                            }
+                        }
+
+                        bus.send(AppEvent::DoneSignal {
+                            session_id: session_log_id(&session_log),
+                            message: message.clone(),
+                        });
+                        bus.send(AppEvent::RoundComplete {
+                            session_id: session_log_id(&session_log),
+                            round: cumulative_stats.rounds,
+                            turns_in_round,
+                            native_message_count: None,
+                        });
+                    }
+                    DrainOutcome::ContextRewindRequested {
+                        request,
+                        message,
+                        turns_in_round,
+                        turn_stop_status,
+                    } => {
+                        persistent_managed_context_recovery_kickstarts_without_rewind = 0;
+                        cumulative_stats.turns += 1;
+                        cumulative_stats.rounds += 1;
+                        bus.send(AppEvent::RoundComplete {
+                            session_id: session_log_id(&session_log),
+                            round: cumulative_stats.rounds,
+                            turns_in_round,
+                            native_message_count: None,
+                        });
+                        match apply_external_context_rewind(
+                            agent,
+                            &thread.thread_id,
+                            &request,
+                            &drain_config,
+                        )
+                        .await
+                        {
+                            Ok(automatic_resume) => {
+                                if let Some(mut continuation) = managed_context_rewind_continuation(
+                                    &mut persistent_pending_managed_context_replays,
+                                    &active_followup,
+                                    automatic_resume,
+                                    &turn_stop_status,
+                                ) {
+                                    if active_followup.managed_context_density_handoff {
+                                        continuation =
+                                            continuation.after_managed_context_density_handoff();
+                                    }
+                                    slog(&session_log, |l| {
+                                        l.info(
+                                            "Persistent managed-context rewind succeeded; continuing queued follow-up",
+                                        )
+                                    });
+                                    next_persistent_turn = Some(continuation);
+                                    continue;
+                                }
+                                bus.send(AppEvent::DoneSignal {
+                                    session_id: session_log_id(&session_log),
+                                    message: message.clone(),
+                                });
+                            }
+                            Err(message) => {
+                                emit_context_rewind_failure(&request, message, &drain_config);
+                                bus.send(AppEvent::DoneSignal {
+                                    session_id: session_log_id(&session_log),
+                                    message: None,
+                                });
+                            }
+                        }
+                    }
+                    DrainOutcome::RecoveryRequired {
+                        message,
+                        recovery_hint,
+                        turns_in_round,
+                    } => {
+                        cumulative_stats.rounds += 1;
+                        if codex_managed_context_enabled {
+                            persistent_managed_context_recovery_kickstarts_without_rewind =
+                                persistent_managed_context_recovery_kickstarts_without_rewind
+                                    .saturating_add(1);
+                            if persistent_managed_context_recovery_kickstarts_without_rewind
+                                < MANAGED_CONTEXT_RECOVERY_MAX_KICKSTARTS_WITHOUT_REWIND
+                            {
+                                let pressure = match refresh_external_context_usage_snapshot(
+                                    agent,
+                                    &drain_config,
+                                )
+                                .await
+                                {
+                                    Ok(Some(snapshot)) => {
+                                        managed_context_recovery_pressure(&snapshot)
+                                    }
+                                    Ok(None) => None,
+                                    Err(e) => {
+                                        slog(&session_log, |l| {
+                                            l.debug(&format!(
+                                                "Could not read Codex context snapshot after persistent recovery-required outcome: {}",
+                                                e
+                                            ))
+                                        });
+                                        None
+                                    }
+                                };
+                                let held_user_input =
+                                    !persistent_pending_managed_context_replays.is_empty();
+                                let recovery_text = pressure
+                                    .map(|pressure| {
+                                        managed_context_recovery_kickstart_text(
+                                            pressure,
+                                            held_user_input,
+                                        )
+                                    })
+                                    .unwrap_or_else(|| {
+                                        managed_context_backend_recovery_kickstart_text(
+                                            &message,
+                                            recovery_hint.as_deref(),
+                                        )
+                                    });
+                                slog(&session_log, |l| {
+                                    l.warn(
+                                        "Persistent managed Codex reported recovery required; sending managed-context recovery kickstart instead of ending the session",
+                                    )
+                                });
+                                bus.send(AppEvent::RoundComplete {
+                                    session_id: session_log_id(&session_log),
+                                    round: cumulative_stats.rounds,
+                                    turns_in_round,
+                                    native_message_count: None,
+                                });
+                                next_persistent_turn = Some(
+                                    FollowUpMessage::text(recovery_text)
+                                        .managed_context_recovery_kickstart(),
+                                );
+                                continue;
+                            }
+                        }
+                        bus.send(AppEvent::RoundComplete {
+                            session_id: session_log_id(&session_log),
+                            round: cumulative_stats.rounds,
+                            turns_in_round,
+                            native_message_count: None,
+                        });
+                        bus.send(AppEvent::PresenceLog {
+                            message: recovery_required_message(&message, recovery_hint.as_deref()),
+                            level: Some(types::LogLevel::Warn),
+                            turn: None,
+                        });
+                    }
+                    DrainOutcome::Interrupted { reason } => {
+                        bus.send(AppEvent::PresenceLog {
+                            message: format!("External agent interrupted: {}", reason),
+                            level: None,
+                            turn: None,
+                        });
+                        cumulative_stats.rounds += 1;
+                    }
+                    DrainOutcome::Terminated { reason, .. } => {
+                        bus.send(AppEvent::PresenceLog {
+                            message: format!("External agent terminated: {}", reason),
+                            level: Some(types::LogLevel::Error),
+                            turn: None,
+                        });
+                        persistent_agent = None;
+                        persistent_thread = None;
+                        persistent_event_rx = None;
+                        persistent_diff_tracker = ExternalDiffDeltaTracker::default();
+                        persistent_pending_runtime_steers.clear();
+                        persistent_handled_steer_ids.clear();
+                        persistent_open_side_threads.clear();
+                        persistent_side_rounds.clear();
+                        persistent_side_turn_revisions.clear();
+                        persistent_pending_managed_context_replays.clear();
+                        break;
+                    }
+                    DrainOutcome::ChannelClosed => {
+                        persistent_agent = None;
+                        persistent_thread = None;
+                        persistent_event_rx = None;
+                        persistent_diff_tracker = ExternalDiffDeltaTracker::default();
+                        persistent_pending_runtime_steers.clear();
+                        persistent_handled_steer_ids.clear();
+                        persistent_open_side_threads.clear();
+                        persistent_side_rounds.clear();
+                        persistent_side_turn_revisions.clear();
+                        persistent_pending_managed_context_replays.clear();
+                        break;
+                    }
                 }
             }
             turn_bus_rx = bus.subscribe();
