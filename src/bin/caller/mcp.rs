@@ -45,6 +45,7 @@ use crate::types::{LogLevel, Phase, Verbosity};
 use crate::FollowUpMessage;
 
 const CONTEXT_PRESSURE_REWIND_THRESHOLD_PCT: f64 = 85.0;
+const DENSITY_MAINTENANCE_ANCHOR_LIST_LIMIT: usize = 1;
 // ---------------------------------------------------------------------------
 // Task launcher: allows MCP to start agent loops on demand
 // ---------------------------------------------------------------------------
@@ -1158,6 +1159,27 @@ impl McpAppState {
         Some((used_tokens, rewind_only_limit, status))
     }
 
+    fn context_pressure_density_watch_for(
+        &self,
+        session_id: Option<&str>,
+        managed_context_override: Option<bool>,
+    ) -> bool {
+        if !self.active_codex_managed_context_enabled_for(session_id, managed_context_override) {
+            return false;
+        }
+        let (used_tokens, context_window, hard_context_window) =
+            self.session_usage_values(session_id);
+        if context_window == 0
+            || used_tokens >= context_window
+            || hard_context_window.is_some_and(|hard| hard > 0 && used_tokens >= hard)
+        {
+            return false;
+        }
+        let recommended_rewind_limit =
+            (context_window as f64 * CONTEXT_PRESSURE_REWIND_THRESHOLD_PCT / 100.0).floor() as u64;
+        used_tokens >= recommended_rewind_limit
+    }
+
     fn rewind_anchor_recovery_candidates_only_for(
         &self,
         _session_id: Option<&str>,
@@ -1380,7 +1402,7 @@ fn append_manual_http_tool_definitions(
         "list_rewind_anchors",
         manual_http_tool_definition!(
             "list_rewind_anchors",
-            "Discover exact Codex rewind anchors only after you have already decided a managed-context rewind may be needed because recovery/density handoff guidance asked for it, context pressure is rewind-only or watch, or a recent completed tool result was genuinely noisy/unexpectedly large. Do not call during ordinary startup/status/search turns merely because managed_context=managed is enabled, or after bounded low-output searches while context_pressure.status is ok. By default returns the first bounded compact page of matching valid non-management anchors, with exact item_id values, accepted positions, item type/name/role, short semantic summaries, filtered_total, and next_offset; it does not select or recommend one anchor. Use offset/limit to inspect additional pages, query for a semantic or exact-id filter, reverse when newest-first order is useful, detail=true for diagnostic detailed pages, and inspect_rewind_anchor for one anchor's before/after context. For density compaction, pass density_candidates_only=true with include_pruning_estimates=true to hide anchors with no density-valid position and narrow positions to values accepted by rewind_context density validation. The default catalog hides managed-context maintenance calls such as list_rewind_anchors, inspect_rewind_anchor, rewind_context, and rewind_backout so recovery does not target its own tool calls; pass include_management_tools=true only when intentionally targeting those internals. Normal model-facing results hide anchors known to remain at/above the rewind-only limit or without enough resume headroom, and narrow positions to values accepted by rewind_context; recovery_candidates_only=false alone is ignored. Pass include_non_recovery=true only for diagnostics/audit, and never pass a recovery_eligible=false audit row to rewind_context. Use inspect_rewind_anchor on a candidate when the compact summary is ambiguous, then copy the chosen item_id and position_hint, or a value in positions, into rewind_context.",
+            "List exact Codex rewind anchors only after recovery/density guidance, rewind-only/watch pressure, or genuinely noisy/unexpectedly large output. Do not call during ordinary startup/status/search turns, or after bounded low-output searches while context_pressure.status is ok. Default output is a compact valid non-management page with exact item_id values, positions, summaries, filtered_total, and next_offset. Under managed density pressure, an omitted limit defaults to a one-anchor density/pruning page. Use offset/limit/query/reverse/detail for deliberate paging. For density, use density_candidates_only=true and include_pruning_estimates=true; rows hide anchors without density-valid positions and narrow positions to rewind_context-valid choices. include_non_recovery=true is diagnostic only; never pass recovery_eligible=false rows. Inspect ambiguous rows, then call rewind_context with an exact returned item_id and position.",
             ListRewindAnchorsParams
         ),
     );
@@ -7345,10 +7367,13 @@ impl IntendantServer {
                 Ok(text_tool_result(self.rewind_context(params).await))
             }
             "list_rewind_anchors" => {
-                let params = parse_params::<ListRewindAnchorsParams>(with_default_mcp_session_id(
-                    args, session_id,
-                ))?;
-                Ok(text_tool_result(self.list_rewind_anchors(params).await))
+                let Parameters(params) = parse_params::<ListRewindAnchorsParams>(
+                    with_default_mcp_session_id(args, session_id),
+                )?;
+                Ok(text_tool_result(
+                    self.list_rewind_anchors_with_context(params, managed_context_override)
+                        .await,
+                ))
             }
             "inspect_rewind_anchor" => {
                 let params = parse_params::<InspectRewindAnchorParams>(
@@ -8549,29 +8574,50 @@ impl IntendantServer {
     }
 
     #[tool(
-        description = "Discover exact Codex rewind anchors only after you have already decided a managed-context rewind may be needed because recovery/density handoff guidance asked for it, context pressure is rewind-only or watch, or a recent completed tool result was genuinely noisy/unexpectedly large. Do not call during ordinary startup/status/search turns merely because managed_context=managed is enabled, or after bounded low-output searches while context_pressure.status is ok. By default returns the first bounded compact page of matching valid non-management anchors, with exact item_id values, accepted positions, item type/name/role, short semantic summaries, filtered_total, and next_offset; it does not select or recommend one anchor. Use offset/limit to inspect additional pages, query for a semantic or exact-id filter, reverse when newest-first order is useful, detail=true for diagnostic detailed pages, and inspect_rewind_anchor for one anchor's before/after context. For density compaction, pass density_candidates_only=true with include_pruning_estimates=true to hide anchors with no density-valid position and narrow positions to values accepted by rewind_context density validation. The default catalog hides managed-context maintenance calls such as list_rewind_anchors, inspect_rewind_anchor, rewind_context, and rewind_backout so recovery does not target its own tool calls; pass include_management_tools=true only when intentionally targeting those internals. Normal model-facing results hide anchors known to remain at/above the rewind-only limit or without enough resume headroom, and narrow positions to values accepted by rewind_context; recovery_candidates_only=false alone is ignored. Pass include_non_recovery=true only for diagnostics/audit, and never pass a recovery_eligible=false audit row to rewind_context. Use inspect_rewind_anchor on a candidate when the compact summary is ambiguous, then copy the chosen item_id and position_hint, or a value in positions, into rewind_context."
+        description = "List exact Codex rewind anchors only after recovery/density guidance, rewind-only/watch pressure, or genuinely noisy/unexpectedly large output. Do not call during ordinary startup/status/search turns, or after bounded low-output searches while context_pressure.status is ok. Default output is a compact valid non-management page with exact item_id values, positions, summaries, filtered_total, and next_offset. Under managed density pressure, an omitted limit defaults to a one-anchor density/pruning page. Use offset/limit/query/reverse/detail for deliberate paging. For density, use density_candidates_only=true and include_pruning_estimates=true; rows hide anchors without density-valid positions and narrow positions to rewind_context-valid choices. include_non_recovery=true is diagnostic only; never pass recovery_eligible=false rows. Inspect ambiguous rows, then call rewind_context with an exact returned item_id and position."
     )]
     async fn list_rewind_anchors(
         &self,
         Parameters(params): Parameters<ListRewindAnchorsParams>,
     ) -> String {
+        self.list_rewind_anchors_with_context(params, None).await
+    }
+
+    async fn list_rewind_anchors_with_context(
+        &self,
+        params: ListRewindAnchorsParams,
+        managed_context_override: Option<bool>,
+    ) -> String {
         let state = self.state.read().await;
+        let density_watch = state.context_pressure_density_watch_for(
+            params.session_id.as_deref(),
+            managed_context_override,
+        );
         let recovery_candidates_only = state.rewind_anchor_recovery_candidates_only_for(
             params.session_id.as_deref(),
             params.recovery_candidates_only,
             params.include_non_recovery,
         );
         drop(state);
+        let density_maintenance_defaults =
+            density_watch && !params.include_non_recovery && !params.detail;
+        let effective_density_candidates_only =
+            params.density_candidates_only || density_maintenance_defaults;
+        let effective_include_pruning_estimates =
+            params.include_pruning_estimates || density_maintenance_defaults;
+        let effective_limit = params.limit.or_else(|| {
+            density_maintenance_defaults.then_some(DENSITY_MAINTENANCE_ANCHOR_LIST_LIMIT)
+        });
         let mut payload = serde_json::json!({
             "offset": params.offset.unwrap_or(0),
             "reverse": params.reverse,
             "include_management_tools": params.include_management_tools,
             "recovery_candidates_only": recovery_candidates_only,
             "include_non_recovery": params.include_non_recovery,
-            "density_candidates_only": params.density_candidates_only,
+            "density_candidates_only": effective_density_candidates_only,
             "compact_catalog": !params.detail && params.offset.is_none() && params.limit.is_none() && !params.include_non_recovery,
         });
-        if let Some(limit) = params.limit {
+        if let Some(limit) = effective_limit {
             if let Some(obj) = payload.as_object_mut() {
                 obj.insert(
                     "limit".to_string(),
@@ -8579,7 +8625,7 @@ impl IntendantServer {
                 );
             }
         }
-        if params.include_pruning_estimates {
+        if effective_include_pruning_estimates {
             if let Some(obj) = payload.as_object_mut() {
                 obj.insert(
                     "include_pruning_estimates".to_string(),
@@ -13137,6 +13183,90 @@ mod tests {
                     .and_then(|value| value.as_str()),
                 Some("{\"anchors\":[],\"limit\":5}")
             );
+            result_task.await.unwrap();
+        });
+    }
+
+    #[test]
+    fn list_rewind_anchors_defaults_to_tiny_density_page_under_watch_pressure() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let state = test_state();
+            {
+                let mut s = state.write().await;
+                s.session_id = "backend-session-1".to_string();
+                s.active_session_source = Some("codex".to_string());
+                s.codex_managed_context = true;
+                s.apply_main_usage_snapshot(frontend::ModelUsageSnapshot {
+                    provider: "openai".to_string(),
+                    model: "gpt-5.2-codex".to_string(),
+                    tokens_used: 253_793,
+                    context_window: 258_400,
+                    hard_context_window: Some(272_000),
+                    usage_pct: 98.3,
+                    prompt_tokens: 253_000,
+                    completion_tokens: 793,
+                    cached_tokens: 0,
+                });
+            }
+
+            let bus = EventBus::new();
+            let mut rx = bus.subscribe();
+            let responder_bus = bus.clone();
+            let server = IntendantServer::new(state, bus);
+
+            let result_task = tokio::spawn(async move {
+                loop {
+                    match rx.recv().await {
+                        Ok(AppEvent::ControlCommand(ControlMsg::CodexThreadAction {
+                            session_id,
+                            op,
+                            params,
+                            ..
+                        })) if op == "list_rewind_anchors" => {
+                            assert_eq!(session_id.as_deref(), Some("backend-session-1"));
+                            assert_eq!(params["offset"], 0);
+                            assert_eq!(params["limit"], DENSITY_MAINTENANCE_ANCHOR_LIST_LIMIT);
+                            assert_eq!(params["density_candidates_only"], true);
+                            assert_eq!(params["include_pruning_estimates"], true);
+                            assert_eq!(params["compact_catalog"], true);
+                            assert_eq!(params["recovery_candidates_only"], true);
+                            assert_eq!(params["include_non_recovery"], false);
+                            responder_bus.send(AppEvent::CodexThreadActionResult {
+                                session_id,
+                                action: op,
+                                success: true,
+                                message: "{\"anchors\":[{\"item_id\":\"call_density_0\",\"positions\":[\"after\"],\"position_hint\":\"after\"}],\"limit\":1}".to_string(),
+                            });
+                            break;
+                        }
+                        Ok(_) => continue,
+                        Err(e) => panic!("event bus closed: {e}"),
+                    }
+                }
+            });
+
+            let result = server
+                .call_tool_by_name_for_session(
+                    "list_rewind_anchors",
+                    serde_json::json!({}),
+                    Some("backend-session-1"),
+                    Some(true),
+                )
+                .await
+                .unwrap();
+
+            assert!(!result.is_error.unwrap_or(false));
+            let result_json = serde_json::to_value(&result).unwrap();
+            let text = result_json
+                .pointer("/content/0/text")
+                .and_then(|value| value.as_str())
+                .unwrap();
+            assert!(text.len() < 256, "density catalog result too large: {text}");
+            assert!(text.contains("call_density_0"));
             result_task.await.unwrap();
         });
     }

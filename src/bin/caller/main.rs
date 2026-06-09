@@ -5636,7 +5636,7 @@ fn managed_context_density_handoff_text(pressure: ManagedContextDensityPressure)
         .map(|hard| format!(" hard_limit={hard}"))
         .unwrap_or_default();
     format!(
-        "<managed_context_density_handoff>\nBackend-reported Codex context pressure is watch ({used}/{limit} tokens, recommended_density_threshold={recommended}{hard}). The previous implementation turn is complete, but the live transcript is above the recommended density threshold. Before handing control back, do a context-management handoff. If an exact managed-context rewind would materially improve density while preserving completed work, call list_rewind_anchors with density_candidates_only=true and include_pruning_estimates=true, use inspect_rewind_anchor as needed, then call rewind_context with one exact returned item_id, the returned position_hint or a value in positions, and a dense carry-forward primer. In density-candidate mode, list_rewind_anchors hides anchors without a density-valid position and narrows positions to values expected to reduce backend pressure below the recommended density threshold. If no rewind is worthwhile, do not continue implementation, exploration, or broad ordinary-tool work; reply with a concise handoff that crystallizes durable facts, changed files, verification results, user constraints, and remaining decisions, and state that you are leaving context unchanged. Normal tools are still allowed below rewind_only, but this maintenance turn should avoid ordinary tool use unless needed to inspect current status or anchors. Do not use auto anchors, N-turn rewinds, synthesized item ids, anchors from failed examples, or managed-context maintenance calls as rewind targets.\n</managed_context_density_handoff>",
+        "<managed_context_density_handoff>\nwatch {used}/{limit}; recommended_density_threshold={recommended}{hard}. Maintenance only. For a useful density rewind, call list_rewind_anchors with density_candidates_only=true, include_pruning_estimates=true, limit=1; inspect only if that row is ambiguous; then call rewind_context with one exact returned item_id, a returned position, and a dense primer. Density rows hide anchors without a density-valid position and narrow positions to choices expected below the threshold. If no exact anchor is clearly worthwhile, reply with a concise no-rewind handoff covering durable facts, changed files, verification, constraints, remaining decisions, and state that you are leaving context unchanged. Do not do broad ordinary-tool work. Do not use auto anchors, N-turn rewinds, synthesized ids, failed-example ids, or management-tool anchors.\n</managed_context_density_handoff>",
         used = pressure.used_tokens,
         limit = pressure.rewind_only_limit,
         recommended = pressure.recommended_rewind_limit,
@@ -13638,17 +13638,23 @@ mod tests {
             hard_context_window: Some(272_000),
         });
 
-        assert!(text.contains("context pressure is watch"));
+        assert!(text.contains("watch 241746/258400"));
         assert!(text.contains("recommended_density_threshold=219640"));
         assert!(text.contains("density_candidates_only=true"));
+        assert!(text.contains("limit=1"));
         assert!(text.contains("one exact returned item_id"));
-        assert!(text.contains("narrows positions"));
-        assert!(text.contains("crystallizes durable facts"));
+        assert!(text.contains("narrow positions"));
+        assert!(text.contains("concise no-rewind handoff"));
         assert!(text.contains("leaving context unchanged"));
         assert!(text.contains("Do not use auto anchors"));
         assert!(text.contains("N-turn rewinds"));
         assert!(!text.contains("call_"));
         assert!(!text.contains("rewind N"));
+        assert!(
+            text.len() < 1_000,
+            "density maintenance prompt should stay tiny: {} bytes",
+            text.len()
+        );
     }
 
     #[test]
@@ -16152,6 +16158,112 @@ mod tests {
             raw.len() <= CONTEXT_REWIND_ANCHOR_COMPACT_OUTPUT_MAX_BYTES,
             "catalog too large: {} bytes",
             raw.len()
+        );
+    }
+
+    #[test]
+    fn density_maintenance_prompt_and_catalog_stay_inside_soft_headroom() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rollout.jsonl");
+        let long_output = "large density diagnostic output ".repeat(80);
+        let lines = (0..12)
+            .flat_map(|idx| {
+                let call_id = format!("call_density_{idx}");
+                [
+                    serde_json::json!({
+                        "type": "response_item",
+                        "payload": {
+                            "type": "function_call",
+                            "name": "exec_command",
+                            "call_id": call_id,
+                            "arguments": format!("{{\"cmd\":\"density step {idx}\"}}")
+                        }
+                    }),
+                    serde_json::json!({
+                        "type": "response_item",
+                        "payload": {
+                            "type": "function_call_output",
+                            "call_id": call_id,
+                            "output": long_output
+                        }
+                    }),
+                    serde_json::json!({
+                        "type": "event_msg",
+                        "payload": {
+                            "type": "token_count",
+                            "info": {
+                                "last_token_usage": {
+                                    "input_tokens": 80_000 + idx,
+                                    "cached_input_tokens": 0,
+                                    "output_tokens": 0,
+                                    "total_tokens": 80_000 + idx
+                                },
+                                "model_context_window": 258_400
+                            }
+                        }
+                    }),
+                ]
+            })
+            .map(|value| value.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&path, lines).unwrap();
+
+        let raw = list_context_rewind_anchors_from_rollout(
+            &path,
+            &serde_json::json!({
+                "density_candidates_only": true,
+                "include_pruning_estimates": true,
+                "limit": 1,
+            }),
+        )
+        .expect("density maintenance catalog");
+        let catalog: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(catalog["catalog_format"].as_str(), Some("compact_page"));
+        assert_eq!(catalog["density_candidates_only"].as_bool(), Some(true));
+        assert_eq!(catalog["pruning_estimates_included"].as_bool(), Some(true));
+        assert_eq!(catalog["limit"].as_u64(), Some(1));
+        assert_eq!(catalog["next_offset"].as_u64(), Some(1));
+        let anchors = catalog["anchors"].as_array().unwrap();
+        assert_eq!(anchors.len(), 1);
+        let anchor = &anchors[0];
+        assert_eq!(anchor["item_id"].as_str(), Some("call_density_0"));
+        assert!(
+            anchor["positions"]
+                .as_array()
+                .is_some_and(|positions| !positions.is_empty()),
+            "density catalog must return an exact usable position: {anchor}"
+        );
+        assert!(
+            anchor["density_eligible_positions"]
+                .as_array()
+                .is_some_and(|positions| !positions.is_empty()),
+            "density catalog must expose density-valid positions: {anchor}"
+        );
+        assert!(
+            !raw.contains(&"large density diagnostic output ".repeat(8)),
+            "compact density catalog leaked raw output"
+        );
+        assert!(
+            raw.len() < 1_500,
+            "density catalog too large: {}",
+            raw.len()
+        );
+
+        let pressure = ManagedContextDensityPressure {
+            used_tokens: 253_793,
+            recommended_rewind_limit: 219_640,
+            rewind_only_limit: 258_400,
+            hard_context_window: Some(272_000),
+        };
+        let prompt = managed_context_density_handoff_text(pressure);
+        let overhead_bytes = prompt.len() + raw.len();
+        let soft_headroom = pressure
+            .rewind_only_limit
+            .saturating_sub(pressure.used_tokens);
+        assert!(
+            overhead_bytes as u64 <= soft_headroom,
+            "maintenance prompt+catalog should not cross rewind-only from overhead alone: {overhead_bytes} bytes over {soft_headroom} token headroom"
         );
     }
 
