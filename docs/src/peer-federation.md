@@ -385,10 +385,23 @@ intended for explicit local/debug use; `--no-tls` on a wildcard listener refuses
 startup when a public interface exists unless `--allow-public-plaintext` is
 passed.
 
-### Peer pairing — `intendant peer invite` / `join`
+### Peer pairing — dashboard or `intendant peer invite` / `join`
 
-Daemon-to-daemon mTLS uses the same access CA, but the UX is CLI-first so a peer
-can be paired without opening the dashboard:
+Daemon-to-daemon mTLS uses the same access CA. The dashboard's
+**Settings → Network → Daemons** panel is the normal operator flow:
+
+1. On the daemon that will accept inbound peer connections, click
+   **Create Invite**.
+2. Copy the generated `intendant-peer-v1...` invite.
+3. On the daemon that should connect to it, paste the invite into
+   **Join Invite**.
+
+Joining from the dashboard writes or updates `[[peer]]` in `intendant.toml`,
+stores the peer-issued client certificate/key in the local access cert store,
+and queues live registry registration so the daemon can connect without a
+restart.
+
+The same flow is available from the CLI for headless peers or terminals:
 
 ```bash
 # On the daemon that will accept inbound peer connections:

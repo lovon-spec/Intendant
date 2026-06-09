@@ -38,6 +38,32 @@ pub struct PeerInvite {
     pub issued_at_unix: i64,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct InviteOptions {
+    pub card_url: Option<String>,
+    pub label: Option<String>,
+    pub client_name: Option<String>,
+    pub port: u16,
+}
+
+impl Default for InviteOptions {
+    fn default() -> Self {
+        Self {
+            card_url: None,
+            label: None,
+            client_name: None,
+            port: DEFAULT_WEB_PORT,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct InviteOutcome {
+    pub invite: PeerInvite,
+    pub encoded: String,
+    pub server_cert_fingerprint: String,
+}
+
 #[derive(Debug, Default)]
 struct PeerArgs {
     action: PeerAction,
@@ -187,43 +213,15 @@ fn print_help() {
 }
 
 fn cmd_invite(args: PeerArgs) -> Result<(), CallerError> {
-    let cert_dir = access::backend::select_backend().cert_dir();
-    let label = args
-        .label
-        .clone()
-        .unwrap_or_else(access::resolve_host_label);
-    let client_name = args
-        .client_name
-        .as_deref()
-        .unwrap_or("paired Intendant peer");
-    let card_url = match args.card_url {
-        Some(url) => normalize_card_url(&url)?,
-        None => default_card_url(&cert_dir, args.port)?,
-    };
-    let identity =
-        access::certs::issue_client_identity(&cert_dir, client_name).map_err(access_error)?;
-    let server_cert_fingerprint = access::certs::read_server_cert_fingerprint(&cert_dir)
-        .ok_or_else(|| {
-            CallerError::Config(format!(
-                "no server.crt found in {} — run `intendant access setup` first",
-                cert_dir.display()
-            ))
-        })?;
-
-    crate::peer::transport::pinning::parse_fingerprint(&server_cert_fingerprint).map_err(|e| {
-        CallerError::Config(format!("local server cert fingerprint is invalid: {e}"))
+    let outcome = create_invite(InviteOptions {
+        card_url: args.card_url,
+        label: args.label,
+        client_name: args.client_name,
+        port: args.port,
     })?;
-
-    let invite = PeerInvite {
-        version: 1,
-        card_url,
-        label: Some(label),
-        server_cert_fingerprint: Some(server_cert_fingerprint.clone()),
-        client_cert_pem: identity.cert_pem,
-        client_key_pem: identity.key_pem,
-        issued_at_unix: unix_timestamp(),
-    };
-    let encoded = encode_invite(&invite)?;
+    let invite = outcome.invite;
+    let encoded = outcome.encoded;
+    let server_cert_fingerprint = outcome.server_cert_fingerprint;
 
     println!(":: issued peer invite for {}", invite.card_url);
     println!(":: pinned server cert fingerprint: {server_cert_fingerprint}");
@@ -262,6 +260,54 @@ fn cmd_join(args: PeerArgs) -> Result<(), CallerError> {
     println!(":: client key:  {}", outcome.client_key_path.display());
     println!(":: restart or reload the daemon to connect from startup config");
     Ok(())
+}
+
+pub(crate) fn create_invite(options: InviteOptions) -> Result<InviteOutcome, CallerError> {
+    let cert_dir = access::backend::select_backend().cert_dir();
+    create_invite_from_cert_dir(&cert_dir, options)
+}
+
+pub(crate) fn create_invite_from_cert_dir(
+    cert_dir: &Path,
+    options: InviteOptions,
+) -> Result<InviteOutcome, CallerError> {
+    let label = options.label.unwrap_or_else(access::resolve_host_label);
+    let client_name = options
+        .client_name
+        .unwrap_or_else(|| "paired Intendant peer".to_string());
+    let card_url = match options.card_url {
+        Some(url) => normalize_card_url(&url)?,
+        None => default_card_url(cert_dir, options.port)?,
+    };
+    let identity =
+        access::certs::issue_client_identity(cert_dir, &client_name).map_err(access_error)?;
+    let server_cert_fingerprint = access::certs::read_server_cert_fingerprint(cert_dir)
+        .ok_or_else(|| {
+            CallerError::Config(format!(
+                "no server.crt found in {} — run `intendant access setup` first",
+                cert_dir.display()
+            ))
+        })?;
+
+    crate::peer::transport::pinning::parse_fingerprint(&server_cert_fingerprint).map_err(|e| {
+        CallerError::Config(format!("local server cert fingerprint is invalid: {e}"))
+    })?;
+
+    let invite = PeerInvite {
+        version: 1,
+        card_url,
+        label: Some(label),
+        server_cert_fingerprint: Some(server_cert_fingerprint.clone()),
+        client_cert_pem: identity.cert_pem,
+        client_key_pem: identity.key_pem,
+        issued_at_unix: unix_timestamp(),
+    };
+    let encoded = encode_invite(&invite)?;
+    Ok(InviteOutcome {
+        invite,
+        encoded,
+        server_cert_fingerprint,
+    })
 }
 
 pub fn encode_invite(invite: &PeerInvite) -> Result<String, CallerError> {
@@ -305,7 +351,7 @@ fn validate_invite(invite: &PeerInvite) -> Result<(), CallerError> {
     Ok(())
 }
 
-fn join_peer_invite(
+pub(crate) fn join_peer_invite(
     project: &mut Project,
     cert_dir: &Path,
     invite: PeerInvite,
@@ -562,6 +608,37 @@ mod tests {
         assert_eq!(
             default_card_url(tmp.path(), 8766).unwrap(),
             "https://10.0.0.9:8766/.well-known/agent-card.json"
+        );
+    }
+
+    #[test]
+    fn create_invite_issues_client_identity_and_server_pin() {
+        let tmp = TempDir::new().unwrap();
+        ensure_certs(tmp.path(), &names("10.0.0.9"), "peer", false).unwrap();
+
+        let outcome = create_invite_from_cert_dir(
+            tmp.path(),
+            InviteOptions {
+                card_url: Some("wss://peer.example:8765/ws".into()),
+                label: Some("Peer Example".into()),
+                client_name: Some("dashboard pairing".into()),
+                ..InviteOptions::default()
+            },
+        )
+        .unwrap();
+        let decoded = decode_invite(&outcome.encoded).unwrap();
+
+        assert_eq!(decoded, outcome.invite);
+        assert_eq!(
+            decoded.card_url,
+            "https://peer.example:8765/.well-known/agent-card.json"
+        );
+        assert_eq!(decoded.label.as_deref(), Some("Peer Example"));
+        assert!(decoded.client_cert_pem.contains("BEGIN CERTIFICATE"));
+        assert!(decoded.client_key_pem.contains("BEGIN PRIVATE KEY"));
+        assert_eq!(
+            decoded.server_cert_fingerprint.as_deref(),
+            Some(outcome.server_cert_fingerprint.as_str())
         );
     }
 

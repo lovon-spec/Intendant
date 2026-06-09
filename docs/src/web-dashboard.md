@@ -219,7 +219,11 @@ system Chrome/Chromium apps require choosing `system_cdp` or setting
 
 ### Settings
 
-The configuration panel for the current session.
+The configuration panel for the current session. **Network → Daemons** is the
+dashboard entry point for peer pairing: create a one-time invite on the daemon
+that should accept inbound peer connections, then paste that invite into the
+daemon that should connect. The panel keeps the older manual runtime URL add
+path for already-enrolled peers, tunnels, and local/debug daemons.
 
 ## Late-join and session replay
 

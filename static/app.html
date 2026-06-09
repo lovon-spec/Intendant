@@ -1290,6 +1290,96 @@ html, body {
 .daemon-approval-actions button.skip    { color: var(--yellow); border-color: var(--yellow); }
 .daemon-approval-actions button:hover   { background: var(--surface1); }
 .daemon-approval-actions button:disabled { opacity: 0.5; cursor: not-allowed; }
+.daemon-pairing-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 10px;
+  margin: 10px 0 12px;
+}
+.daemon-pairing-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+  padding: 10px;
+  background: var(--mantle);
+  border: 1px solid var(--surface1);
+  border-radius: 4px;
+}
+.daemon-pairing-title,
+.daemon-manual-title {
+  color: var(--subtext0);
+  font-size: 11px;
+  font-weight: 700;
+}
+.daemon-pairing-row,
+.daemon-pairing-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.daemon-pairing-row {
+  flex-wrap: wrap;
+}
+.daemon-pairing-row input,
+.daemon-pairing-textarea {
+  flex: 1;
+  min-width: 150px;
+  padding: 6px 10px;
+  border: 1px solid var(--surface1);
+  border-radius: 4px;
+  background: var(--surface0);
+  color: var(--text);
+  font-size: 12px;
+}
+.daemon-pairing-textarea {
+  width: 100%;
+  min-height: 78px;
+  resize: vertical;
+  font-family: 'JetBrains Mono', 'Fira Code', monospace;
+  line-height: 1.35;
+}
+.daemon-pairing-row input:focus,
+.daemon-pairing-textarea:focus {
+  outline: none;
+  border-color: var(--blue);
+}
+.daemon-pairing-row button,
+.daemon-pairing-actions button {
+  flex-shrink: 0;
+  padding: 6px 14px;
+  border: none;
+  border-radius: 4px;
+  background: var(--blue);
+  color: var(--crust);
+  font-weight: 600;
+  cursor: pointer;
+  font-size: 12px;
+}
+.daemon-pairing-row button:disabled,
+.daemon-pairing-actions button:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+.daemon-pairing-status {
+  flex: 1;
+  min-width: 120px;
+  min-height: 14px;
+  color: var(--subtext0);
+  font-size: 11px;
+}
+.daemon-pairing-status.error { color: var(--red); }
+.daemon-pairing-status.ok { color: var(--green); }
+.daemon-pairing-secret {
+  color: var(--yellow);
+  font-size: 11px;
+}
+.daemon-manual-section {
+  margin-top: 8px;
+  padding-top: 10px;
+  border-top: 1px solid var(--surface1);
+}
 .daemon-add-row {
   display: flex;
   gap: 8px;
@@ -10050,21 +10140,52 @@ body.display-fullscreen-open {
             <fieldset class="settings-group">
               <legend>Daemons</legend>
               <p style="color:var(--subtext0);font-size:12px;margin:0 0 10px">
-                Connect to additional intendant daemons on other machines to observe their activity alongside this one. Use <code style="color:var(--blue)">https://</code> with enrolled access certificates for normal use; plain <code style="color:var(--blue)">http://</code> is only for explicit local/debug daemons started with <code style="color:var(--blue)">--no-tls</code>. Browser mixed-content rules apply — HTTPS pages can only reach HTTPS secondaries.
+                Pair Intendant daemons with one-time invites. The invite contains a peer-scoped client certificate and server pin; treat it as a secret until the other daemon imports it.
               </p>
               <div id="daemons-list" class="daemons-list"></div>
-              <div class="daemon-add-row">
-                <input id="daemon-add-url" type="text" placeholder="https://mac-work:8765" autocomplete="off">
-                <input id="daemon-add-label" type="text" placeholder="label (optional)" autocomplete="off">
-                <button id="daemon-add-btn" type="button">Add</button>
+              <div class="daemon-pairing-grid">
+                <div class="daemon-pairing-panel">
+                  <div class="daemon-pairing-title">Create Invite</div>
+                  <div class="daemon-pairing-row">
+                    <input id="daemon-invite-card-url" type="text" placeholder="advertised URL (optional)" autocomplete="off">
+                    <input id="daemon-invite-label" type="text" placeholder="label (optional)" autocomplete="off">
+                  </div>
+                  <div class="daemon-pairing-row">
+                    <input id="daemon-invite-client-name" type="text" placeholder="client name (optional)" autocomplete="off">
+                    <button id="daemon-invite-create-btn" type="button">Create</button>
+                  </div>
+                  <textarea id="daemon-invite-output" class="daemon-pairing-textarea" rows="4" readonly placeholder="Invite appears here"></textarea>
+                  <div class="daemon-pairing-actions">
+                    <button id="daemon-invite-copy-btn" type="button" disabled>Copy</button>
+                    <span id="daemon-invite-status" class="daemon-pairing-status"></span>
+                  </div>
+                  <div class="daemon-pairing-secret">Contains a client private key.</div>
+                </div>
+                <div class="daemon-pairing-panel">
+                  <div class="daemon-pairing-title">Join Invite</div>
+                  <textarea id="daemon-join-invite" class="daemon-pairing-textarea" rows="6" placeholder="Paste invite"></textarea>
+                  <div class="daemon-pairing-row">
+                    <input id="daemon-join-label" type="text" placeholder="label override (optional)" autocomplete="off">
+                    <button id="daemon-join-btn" type="button">Join</button>
+                  </div>
+                  <span id="daemon-join-status" class="daemon-pairing-status"></span>
+                </div>
               </div>
-              <div class="daemon-add-row daemon-add-row-via">
-                <input id="daemon-add-via" type="text" placeholder="via URL(s), e.g. ws://192.168.1.42:8766/ws — override card's transports (optional)" autocomplete="off">
+              <div class="daemon-manual-section">
+                <div class="daemon-manual-title">Manual Runtime Connection</div>
+                <div class="daemon-add-row">
+                  <input id="daemon-add-url" type="text" placeholder="https://mac-work:8765" autocomplete="off">
+                  <input id="daemon-add-label" type="text" placeholder="label (optional)" autocomplete="off">
+                  <button id="daemon-add-btn" type="button">Add</button>
+                </div>
+                <div class="daemon-add-row daemon-add-row-via">
+                  <input id="daemon-add-via" type="text" placeholder="via URL(s), e.g. ws://192.168.1.42:8766/ws — override card's transports (optional)" autocomplete="off">
+                </div>
+                <div class="daemon-add-row daemon-add-row-via">
+                  <input id="daemon-add-browser-tcp-via" type="text" placeholder="browser TCP URL, e.g. ws://192.168.1.42:8766/ws — WebRTC ICE-TCP when browser's view differs from via URL (optional)" autocomplete="off">
+                </div>
+                <span id="daemons-status" class="daemons-status"></span>
               </div>
-              <div class="daemon-add-row daemon-add-row-via">
-                <input id="daemon-add-browser-tcp-via" type="text" placeholder="browser TCP URL, e.g. ws://192.168.1.42:8766/ws — WebRTC ICE-TCP when browser's view differs from via URL (optional)" autocomplete="off">
-              </div>
-              <span id="daemons-status" class="daemons-status"></span>
             </fieldset>
 
             <fieldset class="settings-group">
@@ -44464,6 +44585,115 @@ function setDaemonsStatus(msg, kind) {
   el.className = 'daemons-status' + (kind ? ' ' + kind : '');
 }
 
+function setDaemonPairingStatus(id, msg, kind) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  el.textContent = msg || '';
+  el.className = 'daemon-pairing-status' + (kind ? ' ' + kind : '');
+}
+
+async function createDaemonInvite() {
+  const cardUrlInput = document.getElementById('daemon-invite-card-url');
+  const labelInput = document.getElementById('daemon-invite-label');
+  const clientNameInput = document.getElementById('daemon-invite-client-name');
+  const output = document.getElementById('daemon-invite-output');
+  const copyBtn = document.getElementById('daemon-invite-copy-btn');
+  const btn = document.getElementById('daemon-invite-create-btn');
+  if (!output || !btn) return;
+
+  const cardUrl = cardUrlInput ? cardUrlInput.value.trim() : '';
+  if (cardUrl && !/^(https?|wss?):\/\//.test(cardUrl)) {
+    setDaemonPairingStatus('daemon-invite-status', 'URL must start with http://, https://, ws://, or wss://', 'error');
+    return;
+  }
+
+  const body = {};
+  if (cardUrl) body.card_url = cardUrl;
+  if (labelInput && labelInput.value.trim()) body.label = labelInput.value.trim();
+  if (clientNameInput && clientNameInput.value.trim()) body.client_name = clientNameInput.value.trim();
+
+  btn.disabled = true;
+  setDaemonPairingStatus('daemon-invite-status', 'Creating...', '');
+  try {
+    const resp = await authedFetch('/api/peers/pairing/invite', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const result = await resp.json().catch(() => ({}));
+    if (!resp.ok) {
+      setDaemonPairingStatus('daemon-invite-status', `Failed: ${result.error || resp.status}`, 'error');
+      return;
+    }
+    output.value = result.invite || '';
+    if (copyBtn) copyBtn.disabled = !output.value;
+    const target = result.card_url ? ` for ${result.card_url}` : '';
+    setDaemonPairingStatus('daemon-invite-status', `Invite ready${target}`, 'ok');
+  } catch (e) {
+    setDaemonPairingStatus('daemon-invite-status', `Request failed: ${e.message}`, 'error');
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function copyDaemonInvite() {
+  const output = document.getElementById('daemon-invite-output');
+  if (!output || !output.value.trim()) return;
+  try {
+    if (navigator.clipboard && window.isSecureContext) {
+      await navigator.clipboard.writeText(output.value.trim());
+    } else {
+      output.focus();
+      output.select();
+      document.execCommand('copy');
+    }
+    setDaemonPairingStatus('daemon-invite-status', 'Copied', 'ok');
+  } catch (e) {
+    setDaemonPairingStatus('daemon-invite-status', `Copy failed: ${e.message}`, 'error');
+  }
+}
+
+async function joinDaemonInvite() {
+  const inviteInput = document.getElementById('daemon-join-invite');
+  const labelInput = document.getElementById('daemon-join-label');
+  const btn = document.getElementById('daemon-join-btn');
+  const invite = inviteInput ? inviteInput.value.trim() : '';
+  if (!invite) {
+    setDaemonPairingStatus('daemon-join-status', 'Invite is required', 'error');
+    return;
+  }
+
+  const body = { invite };
+  if (labelInput && labelInput.value.trim()) body.label = labelInput.value.trim();
+
+  if (btn) btn.disabled = true;
+  setDaemonPairingStatus('daemon-join-status', 'Joining...', '');
+  try {
+    const resp = await authedFetch('/api/peers/pairing/join', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const result = await resp.json().catch(() => ({}));
+    if (!resp.ok) {
+      setDaemonPairingStatus('daemon-join-status', `Failed: ${result.error || resp.status}`, 'error');
+      return;
+    }
+    const action = result.updated_existing ? 'Updated peer config' : 'Paired peer';
+    setDaemonPairingStatus('daemon-join-status', `${action}; connecting in background`, 'ok');
+    if (inviteInput) inviteInput.value = '';
+    if (labelInput) labelInput.value = '';
+    await refreshPeersFromApi();
+    window.setTimeout(() => {
+      refreshPeersFromApi().catch(() => {});
+    }, 1200);
+  } catch (e) {
+    setDaemonPairingStatus('daemon-join-status', `Request failed: ${e.message}`, 'error');
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
 async function addDaemon() {
   const urlInput = document.getElementById('daemon-add-url');
   const labelInput = document.getElementById('daemon-add-label');
@@ -44702,6 +44932,33 @@ async function initDaemons() {
 
   // Apply remembered Settings sub-tab now that the DOM is ready.
   applyInitialSettingsSubtab();
+
+  const inviteCreateBtn = document.getElementById('daemon-invite-create-btn');
+  if (inviteCreateBtn) inviteCreateBtn.addEventListener('click', createDaemonInvite);
+  const inviteCopyBtn = document.getElementById('daemon-invite-copy-btn');
+  if (inviteCopyBtn) inviteCopyBtn.addEventListener('click', copyDaemonInvite);
+  const joinBtn = document.getElementById('daemon-join-btn');
+  if (joinBtn) joinBtn.addEventListener('click', joinDaemonInvite);
+  for (const id of ['daemon-invite-card-url', 'daemon-invite-label', 'daemon-invite-client-name']) {
+    const el = document.getElementById(id);
+    if (el) {
+      el.addEventListener('keydown', e => {
+        if (e.key === 'Enter') createDaemonInvite();
+      });
+    }
+  }
+  const joinInviteEl = document.getElementById('daemon-join-invite');
+  if (joinInviteEl) {
+    joinInviteEl.addEventListener('keydown', e => {
+      if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) joinDaemonInvite();
+    });
+  }
+  const joinLabelEl = document.getElementById('daemon-join-label');
+  if (joinLabelEl) {
+    joinLabelEl.addEventListener('keydown', e => {
+      if (e.key === 'Enter') joinDaemonInvite();
+    });
+  }
 
   // Wire the add form.
   document.getElementById('daemon-add-btn').addEventListener('click', addDaemon);

@@ -17538,6 +17538,8 @@ pub fn spawn_web_gateway(
                         //   GET    /api/peers                  → list
                         //   POST   /api/peers                  → add
                         //   DELETE /api/peers                  → remove
+                        //   POST   /api/peers/pairing/invite   → issue pairing invite
+                        //   POST   /api/peers/pairing/join     → import pairing invite
                         //   POST   /api/peers/{id}/message     → send message
                         //   POST   /api/peers/{id}/task        → delegate task
                         //   POST   /api/peers/{id}/approval    → resolve approval
@@ -17572,77 +17574,105 @@ pub fn spawn_web_gateway(
                         let segments: Vec<&str> =
                             subpath.split('/').filter(|s| !s.is_empty()).collect();
 
-                        let (status, body) = match peer_registry.as_ref() {
-                            None => (
-                                503,
-                                serde_json::json!({
-                                    "error": "peer registry not configured"
-                                })
-                                .to_string(),
-                            ),
-                            Some(registry)
-                                if segments.is_empty() && request_line.starts_with("GET") =>
-                            {
-                                (200, peers_list_response_body(registry))
-                            }
-                            Some(registry)
-                                if segments.is_empty()
-                                    && (request_line.starts_with("POST")
-                                        || request_line.starts_with("DELETE")) =>
-                            {
-                                let body_text = read_request_body(&mut stream, &header_text).await;
-                                if request_line.starts_with("POST") {
-                                    peers_add(registry, &body_text).await
-                                } else {
-                                    peers_remove(registry, &body_text).await
+                        let (status, body) = if segments == ["pairing", "invite"]
+                            && request_line.starts_with("POST")
+                        {
+                            let body_text = read_request_body(&mut stream, &header_text).await;
+                            peers_pairing_invite(&body_text)
+                        } else {
+                            match peer_registry.as_ref() {
+                                None => (
+                                    503,
+                                    serde_json::json!({
+                                        "error": "peer registry not configured"
+                                    })
+                                    .to_string(),
+                                ),
+                                Some(registry)
+                                    if segments.is_empty() && request_line.starts_with("GET") =>
+                                {
+                                    (200, peers_list_response_body(registry))
                                 }
-                            }
-                            Some(registry)
-                                if segments == ["eligible"] && request_line.starts_with("GET") =>
-                            {
-                                // GET /api/peers/eligible?capability=display
-                                // — list peers that satisfy all listed
-                                // capabilities. The `eligible` segment is
-                                // a reserved sub-path on /api/peers; an
-                                // actual peer with that bare id would be
-                                // shadowed here, but PeerId values always
-                                // carry a `<kind>:` prefix so that's not
-                                // a real collision.
-                                peers_eligible(registry, query_str)
-                            }
-                            Some(registry)
-                                if segments.len() == 2 && request_line.starts_with("POST") =>
-                            {
-                                let id = segments[0];
-                                let op = segments[1];
-                                let body_text = read_request_body(&mut stream, &header_text).await;
-                                match op {
-                                    "message" => peers_send_message(registry, id, &body_text).await,
-                                    "task" => peers_delegate_task(registry, id, &body_text).await,
-                                    "approval" => {
-                                        peers_resolve_approval(registry, id, &body_text).await
+                                Some(registry)
+                                    if segments.is_empty()
+                                        && (request_line.starts_with("POST")
+                                            || request_line.starts_with("DELETE")) =>
+                                {
+                                    let body_text =
+                                        read_request_body(&mut stream, &header_text).await;
+                                    if request_line.starts_with("POST") {
+                                        peers_add(registry, &body_text).await
+                                    } else {
+                                        peers_remove(registry, &body_text).await
                                     }
-                                    "webrtc" => {
-                                        peers_webrtc_signal(registry, id, &body_text, &bus).await
-                                    }
-                                    other => (
-                                        404,
-                                        serde_json::json!({
-                                            "error": format!(
-                                                "unknown peer op: {other}"
-                                            )
-                                        })
-                                        .to_string(),
-                                    ),
                                 }
+                                Some(registry)
+                                    if segments == ["eligible"]
+                                        && request_line.starts_with("GET") =>
+                                {
+                                    // GET /api/peers/eligible?capability=display
+                                    // — list peers that satisfy all listed
+                                    // capabilities. The `eligible` segment is
+                                    // a reserved sub-path on /api/peers; an
+                                    // actual peer with that bare id would be
+                                    // shadowed here, but PeerId values always
+                                    // carry a `<kind>:` prefix so that's not
+                                    // a real collision.
+                                    peers_eligible(registry, query_str)
+                                }
+                                Some(registry)
+                                    if segments == ["pairing", "join"]
+                                        && request_line.starts_with("POST") =>
+                                {
+                                    let body_text =
+                                        read_request_body(&mut stream, &header_text).await;
+                                    peers_pairing_join(
+                                        registry,
+                                        project_root.as_deref(),
+                                        &body_text,
+                                    )
+                                    .await
+                                }
+                                Some(registry)
+                                    if segments.len() == 2 && request_line.starts_with("POST") =>
+                                {
+                                    let id = segments[0];
+                                    let op = segments[1];
+                                    let body_text =
+                                        read_request_body(&mut stream, &header_text).await;
+                                    match op {
+                                        "message" => {
+                                            peers_send_message(registry, id, &body_text).await
+                                        }
+                                        "task" => {
+                                            peers_delegate_task(registry, id, &body_text).await
+                                        }
+                                        "approval" => {
+                                            peers_resolve_approval(registry, id, &body_text).await
+                                        }
+                                        "webrtc" => {
+                                            peers_webrtc_signal(registry, id, &body_text, &bus)
+                                                .await
+                                        }
+                                        other => (
+                                            404,
+                                            serde_json::json!({
+                                                "error": format!(
+                                                    "unknown peer op: {other}"
+                                                )
+                                            })
+                                            .to_string(),
+                                        ),
+                                    }
+                                }
+                                Some(_) => (
+                                    405,
+                                    serde_json::json!({
+                                        "error": "method not allowed"
+                                    })
+                                    .to_string(),
+                                ),
                             }
-                            Some(_) => (
-                                405,
-                                serde_json::json!({
-                                    "error": "method not allowed"
-                                })
-                                .to_string(),
-                            ),
                         };
                         let reason = match status {
                             200 => "OK",
@@ -18176,6 +18206,25 @@ struct AddPeerRequest {
     browser_tcp_via_url: Option<String>,
 }
 
+#[derive(Deserialize, Default)]
+struct PairingInviteRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    card_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    client_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    port: Option<u16>,
+}
+
+#[derive(Deserialize)]
+struct PairingJoinRequest {
+    invite: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    label: Option<String>,
+}
+
 #[derive(Deserialize)]
 struct RemovePeerRequest {
     peer_id: String,
@@ -18224,6 +18273,170 @@ async fn peers_add(registry: &crate::peer::PeerRegistry, body_text: &str) -> (u1
         ),
         Err(e) => (502, serde_json::json!({"error": e.to_string()}).to_string()),
     }
+}
+
+/// Handle `POST /api/peers/pairing/invite`: issue a peer-scoped mTLS
+/// client identity from this daemon's access CA and return the same
+/// encoded invite string as `intendant peer invite`.
+fn peers_pairing_invite(body_text: &str) -> (u16, String) {
+    let req: PairingInviteRequest = if body_text.trim().is_empty() {
+        PairingInviteRequest::default()
+    } else {
+        match serde_json::from_str(body_text) {
+            Ok(r) => r,
+            Err(e) => {
+                return (
+                    400,
+                    serde_json::json!({"error": format!("invalid request body: {e}")}).to_string(),
+                );
+            }
+        }
+    };
+
+    let port = req.port.unwrap_or(DEFAULT_PORT);
+    if port == 0 {
+        return (
+            400,
+            serde_json::json!({"error": "port must be between 1 and 65535"}).to_string(),
+        );
+    }
+
+    match crate::peer::pairing::create_invite(crate::peer::pairing::InviteOptions {
+        card_url: req.card_url,
+        label: req.label,
+        client_name: req.client_name,
+        port,
+    }) {
+        Ok(outcome) => (
+            200,
+            serde_json::json!({
+                "invite": outcome.encoded,
+                "card_url": outcome.invite.card_url,
+                "label": outcome.invite.label,
+                "server_cert_fingerprint": outcome.server_cert_fingerprint,
+                "issued_at_unix": outcome.invite.issued_at_unix,
+            })
+            .to_string(),
+        ),
+        Err(e) => {
+            let status = match &e {
+                crate::error::CallerError::Config(msg) if msg.contains("--card-url") => 400,
+                _ => 500,
+            };
+            (
+                status,
+                serde_json::json!({"error": pairing_error_message(&e)}).to_string(),
+            )
+        }
+    }
+}
+
+fn pairing_error_message(err: &crate::error::CallerError) -> String {
+    match err {
+        crate::error::CallerError::Config(msg) => msg.clone(),
+        crate::error::CallerError::Json(e) => format!("invalid JSON: {e}"),
+        _ => err.to_string(),
+    }
+}
+
+/// Handle `POST /api/peers/pairing/join`: import an encoded invite,
+/// write/update the local `[[peer]]` config, store the peer-issued
+/// client identity on disk, and queue live registry registration.
+async fn peers_pairing_join(
+    registry: &crate::peer::PeerRegistry,
+    project_root: Option<&Path>,
+    body_text: &str,
+) -> (u16, String) {
+    let req: PairingJoinRequest = match serde_json::from_str(body_text) {
+        Ok(r) => r,
+        Err(e) => {
+            return (
+                400,
+                serde_json::json!({"error": format!("invalid request body: {e}")}).to_string(),
+            );
+        }
+    };
+    if req.invite.trim().is_empty() {
+        return (
+            400,
+            serde_json::json!({"error": "invite is required"}).to_string(),
+        );
+    }
+    let Some(project_root) = project_root else {
+        return (
+            503,
+            serde_json::json!({"error": "project root not available"}).to_string(),
+        );
+    };
+
+    let invite = match crate::peer::pairing::decode_invite(req.invite.trim()) {
+        Ok(invite) => invite,
+        Err(e) => {
+            return (
+                400,
+                serde_json::json!({"error": pairing_error_message(&e)}).to_string(),
+            );
+        }
+    };
+    let pinned_fingerprints = invite
+        .server_cert_fingerprint
+        .clone()
+        .map(|fp| vec![fp])
+        .unwrap_or_default();
+
+    let mut project = match crate::project::Project::from_root(project_root.to_path_buf()) {
+        Ok(project) => project,
+        Err(e) => return (500, serde_json::json!({"error": e.to_string()}).to_string()),
+    };
+    let cert_dir = crate::access::backend::select_backend().cert_dir();
+    let outcome = match crate::peer::pairing::join_peer_invite(
+        &mut project,
+        &cert_dir,
+        invite,
+        req.label.as_deref(),
+    ) {
+        Ok(outcome) => outcome,
+        Err(e) => return (500, serde_json::json!({"error": e.to_string()}).to_string()),
+    };
+
+    let registry_for_task = registry.clone();
+    let card_url_for_task = outcome.card_url.clone();
+    let client_identity = crate::peer::transport::tls_client::ClientIdentityPaths {
+        cert_path: outcome.client_cert_path.clone(),
+        key_path: outcome.client_key_path.clone(),
+    };
+    tokio::spawn(async move {
+        if let Err(e) = registry_for_task
+            .add_peer_with_credentials_and_client_identity(
+                &card_url_for_task,
+                Vec::new(),
+                None,
+                pinned_fingerprints,
+                None,
+                Some(client_identity),
+            )
+            .await
+        {
+            eprintln!(
+                "intendant: paired peer saved but live registration failed \
+                 ({card_url_for_task}): {e}"
+            );
+        }
+    });
+
+    (
+        200,
+        serde_json::json!({
+            "ok": true,
+            "card_url": outcome.card_url,
+            "config_path": outcome.config_path.to_string_lossy(),
+            "client_cert_path": outcome.client_cert_path.to_string_lossy(),
+            "client_key_path": outcome.client_key_path.to_string_lossy(),
+            "updated_existing": outcome.updated_existing,
+            "runtime_status": "connecting",
+        })
+        .to_string(),
+    )
 }
 
 /// Handle a `DELETE /api/peers` body: parse, call
@@ -28052,6 +28265,28 @@ mod tests {
         assert!(resp.contains("503"), "expected 503, got: {resp}");
         assert!(resp.contains("peer registry not configured"));
         handle.abort();
+    }
+
+    #[test]
+    fn test_api_peers_pairing_invite_rejects_bad_json() {
+        let (status, body) = peers_pairing_invite("{not-json");
+        assert_eq!(status, 400);
+        assert!(body.contains("invalid request body"));
+    }
+
+    #[tokio::test]
+    async fn test_api_peers_pairing_join_rejects_invalid_invite() {
+        let root = tempfile::TempDir::new().unwrap();
+        let (log_tx, _log_rx) =
+            tokio::sync::mpsc::channel::<crate::peer::event::TaggedPeerEvent>(8);
+        let registry = crate::peer::PeerRegistry::new(log_tx);
+        let body = serde_json::json!({"invite": "not an intendant invite"}).to_string();
+
+        let (status, response) = peers_pairing_join(&registry, Some(root.path()), &body).await;
+
+        assert_eq!(status, 400);
+        assert!(response.contains("invalid peer invite encoding"));
+        assert!(!response.contains("Config error"));
     }
 
     /// `GET /api/peers` on a registry with no peers returns
