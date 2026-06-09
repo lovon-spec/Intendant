@@ -1075,7 +1075,17 @@ impl SessionSupervisor {
             }
         };
         let is_external = external_backend.is_some();
-        let resume_token = resume_id.unwrap_or_else(|| session_id.clone());
+        let requested_resume_token = resume_id.unwrap_or_else(|| session_id.clone());
+        let resume_token = if is_external {
+            effective_external_resume_token(
+                &source_norm,
+                &session_id,
+                &requested_resume_token,
+                force_new,
+            )
+        } else {
+            requested_resume_token
+        };
         let external_attach_keys = if is_external && resume_task.is_none() && !force_new {
             external_attach_dedupe_keys(&source_norm, &session_id, &resume_token)
         } else {
@@ -3738,6 +3748,79 @@ fn persisted_external_identity_for_session(session_id: &str) -> Option<(String, 
     persisted_external_identity_for_session_in_home(&home, session_id)
 }
 
+fn effective_external_resume_token(
+    source: &str,
+    session_id: &str,
+    requested_resume_token: &str,
+    force_new: bool,
+) -> String {
+    let home = crate::platform::home_dir();
+    effective_external_resume_token_in_home(
+        &home,
+        source,
+        session_id,
+        requested_resume_token,
+        force_new,
+    )
+}
+
+fn effective_external_resume_token_in_home(
+    home: &Path,
+    source: &str,
+    session_id: &str,
+    requested_resume_token: &str,
+    force_new: bool,
+) -> String {
+    let requested_resume_token = requested_resume_token.trim();
+    if force_new {
+        return requested_resume_token.to_string();
+    }
+    let Some(source) = external_agent::AgentBackend::from_str_loose(source)
+        .map(|backend| backend.as_short_str().to_string())
+    else {
+        return requested_resume_token.to_string();
+    };
+
+    let mut candidates = Vec::new();
+    for candidate in [session_id.trim(), requested_resume_token] {
+        if !candidate.is_empty() && !candidates.iter().any(|id: &&str| *id == candidate) {
+            candidates.push(candidate);
+        }
+    }
+    for candidate in candidates {
+        if let Some((persisted_source, backend_session_id)) =
+            persisted_external_identity_for_session_in_home(home, candidate)
+        {
+            if persisted_source == source {
+                return backend_session_id;
+            }
+            continue;
+        }
+        if let Some(backend_session_id) =
+            persisted_external_identity_from_wrapper_index(home, &source, candidate)
+        {
+            return backend_session_id;
+        }
+    }
+
+    requested_resume_token.to_string()
+}
+
+fn persisted_external_identity_from_wrapper_index(
+    home: &Path,
+    source: &str,
+    intendant_session_id: &str,
+) -> Option<String> {
+    let intendant_session_id = intendant_session_id.trim();
+    if source.is_empty() || intendant_session_id.is_empty() {
+        return None;
+    }
+    crate::external_wrapper_index::wrappers_for_source(home, source)
+        .into_iter()
+        .find(|record| record.intendant_session_id == intendant_session_id)
+        .map(|record| record.backend_session_id)
+}
+
 fn persisted_external_identity_for_session_in_home(
     home: &Path,
     session_id: &str,
@@ -4052,6 +4135,18 @@ mod tests {
         parse_codex_slash_command(text)
             .expect("recognized slash command")
             .expect("valid slash command")
+    }
+
+    fn write_external_wrapper_identity(
+        home: &Path,
+        wrapper_id: &str,
+        source: &str,
+        backend_session_id: &str,
+    ) {
+        let wrapper_dir = home.join(".intendant").join("logs").join(wrapper_id);
+        let mut log = session_log::SessionLog::open(wrapper_dir).unwrap();
+        log.write_meta(None, Some("old task"));
+        log.session_identity(wrapper_id, source, backend_session_id);
     }
 
     #[test]
@@ -4504,6 +4599,113 @@ mod tests {
                 .expect("wrapper identity should parse");
         assert_eq!(identity.0, "codex");
         assert_eq!(identity.1, live_backend_id);
+    }
+
+    #[test]
+    fn external_resume_token_uses_persisted_wrapper_backend_session() {
+        let home = tempfile::tempdir().unwrap();
+        let stale_wrapper_id = "6036429e-54f9-4f93-b74d-04c060c79054";
+        let live_backend_id = "019ea99e-af1d-7c23-a57a-55a89c77f90b";
+        write_external_wrapper_identity(home.path(), stale_wrapper_id, "codex", live_backend_id);
+
+        let token = effective_external_resume_token_in_home(
+            home.path(),
+            "codex",
+            stale_wrapper_id,
+            stale_wrapper_id,
+            false,
+        );
+
+        assert_eq!(token, live_backend_id);
+    }
+
+    #[test]
+    fn external_resume_token_uses_wrapper_index_backend_session() {
+        let home = tempfile::tempdir().unwrap();
+        let stale_wrapper_id = "6036429e-54f9-4f93-b74d-04c060c79054";
+        let live_backend_id = "019ea99e-af1d-7c23-a57a-55a89c77f90b";
+        let wrapper_dir = home.path().join(".intendant/logs").join(stale_wrapper_id);
+        std::fs::create_dir_all(&wrapper_dir).unwrap();
+        crate::external_wrapper_index::upsert(
+            home.path(),
+            "codex",
+            live_backend_id,
+            stale_wrapper_id,
+            &wrapper_dir,
+            None,
+        )
+        .unwrap();
+
+        let token = effective_external_resume_token_in_home(
+            home.path(),
+            "codex",
+            stale_wrapper_id,
+            stale_wrapper_id,
+            false,
+        );
+
+        assert_eq!(token, live_backend_id);
+    }
+
+    #[test]
+    fn external_resume_token_keeps_wrapper_when_force_new() {
+        let home = tempfile::tempdir().unwrap();
+        let stale_wrapper_id = "6036429e-54f9-4f93-b74d-04c060c79054";
+        let live_backend_id = "019ea99e-af1d-7c23-a57a-55a89c77f90b";
+        write_external_wrapper_identity(home.path(), stale_wrapper_id, "codex", live_backend_id);
+
+        let token = effective_external_resume_token_in_home(
+            home.path(),
+            "codex",
+            stale_wrapper_id,
+            stale_wrapper_id,
+            true,
+        );
+
+        assert_eq!(token, stale_wrapper_id);
+    }
+
+    #[tokio::test]
+    async fn persisted_wrapper_resume_token_finds_live_backend_session() {
+        let home = tempfile::tempdir().unwrap();
+        let stale_wrapper_id = "6036429e-54f9-4f93-b74d-04c060c79054";
+        let live_backend_id = "019ea99e-af1d-7c23-a57a-55a89c77f90b";
+        write_external_wrapper_identity(home.path(), stale_wrapper_id, "codex", live_backend_id);
+
+        let bus = EventBus::new();
+        let supervisor = test_supervisor(PathBuf::from("/tmp/project"), bus);
+        {
+            let mut state = supervisor.state.lock().await;
+            state.sessions.insert(
+                live_backend_id.to_string(),
+                ManagedSession {
+                    session_id: live_backend_id.to_string(),
+                    source: "codex".to_string(),
+                    name: None,
+                    phase: "idle".to_string(),
+                    project_root: PathBuf::from("/tmp/project"),
+                    session_dir: PathBuf::from("/tmp/session"),
+                    follow_up_tx: mpsc::channel(1).0,
+                    approval_registry: event::ApprovalRegistry::default(),
+                    instance_id: 0,
+                    finished_rx: None,
+                },
+            );
+        }
+
+        let resume_token = effective_external_resume_token_in_home(
+            home.path(),
+            "codex",
+            stale_wrapper_id,
+            stale_wrapper_id,
+            false,
+        );
+        let existing = supervisor
+            .find_managed_session_id("codex", stale_wrapper_id, &resume_token)
+            .await;
+
+        assert_eq!(resume_token, live_backend_id);
+        assert_eq!(existing.as_deref(), Some(live_backend_id));
     }
 
     #[tokio::test]
