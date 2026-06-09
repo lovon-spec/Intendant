@@ -5118,6 +5118,93 @@ async fn refresh_external_context_usage_snapshot(
     Ok(snapshot)
 }
 
+fn latest_external_context_snapshot_from_log(
+    config: &DrainConfig<'_>,
+) -> Option<external_agent::AgentContextSnapshot> {
+    let session_path = config.log_dir.join("session.jsonl");
+    let contents = std::fs::read_to_string(session_path).ok()?;
+    let session_id = config.session_id.as_deref();
+    let alias_session_id = config.alias_session_id.as_deref();
+    let mut latest = None;
+
+    for line in contents.lines() {
+        let Ok(entry) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
+            continue;
+        };
+        let Some(AppEvent::ContextSnapshot {
+            session_id: snapshot_session_id,
+            source,
+            label,
+            request_id,
+            request_index,
+            format,
+            token_count,
+            token_count_kind,
+            context_window,
+            hard_context_window,
+            item_count,
+            raw,
+            ..
+        }) = session_log::session_log_entry_to_app_event(&entry, config.log_dir)
+        else {
+            continue;
+        };
+        let targets_session = match snapshot_session_id.as_deref() {
+            Some(id) => session_id == Some(id) || alias_session_id == Some(id),
+            None => true,
+        };
+        if !targets_session {
+            continue;
+        }
+        let token_count_kind = match token_count_kind.as_deref() {
+            Some("backend_reported") => {
+                Some(external_agent::AgentContextTokenCountKind::BackendReported)
+            }
+            Some("local_estimate") => {
+                Some(external_agent::AgentContextTokenCountKind::LocalEstimate)
+            }
+            _ => None,
+        };
+        latest = Some(external_agent::AgentContextSnapshot {
+            source,
+            label,
+            request_id,
+            request_index,
+            rollout_path: None,
+            format,
+            token_count,
+            token_count_kind,
+            context_window,
+            hard_context_window,
+            item_count,
+            raw,
+        });
+    }
+
+    latest
+}
+
+async fn refresh_external_context_usage_snapshot_for_preflight(
+    agent: &mut Box<dyn external_agent::ExternalAgent>,
+    config: &DrainConfig<'_>,
+) -> Result<Option<external_agent::AgentContextSnapshot>, CallerError> {
+    match refresh_external_context_usage_snapshot(agent, config).await? {
+        Some(snapshot) => Ok(Some(snapshot)),
+        None => {
+            let snapshot = latest_external_context_snapshot_from_log(config);
+            if let Some(snapshot) = snapshot.as_ref() {
+                emit_external_context_usage_snapshot(config, snapshot);
+                slog(config.session_log, |l| {
+                    l.debug(
+                        "Using latest session-log Codex context snapshot for managed-context preflight",
+                    )
+                });
+            }
+            Ok(snapshot)
+        }
+    }
+}
+
 fn managed_context_rewind_only_pressure(
     snapshot: &external_agent::AgentContextSnapshot,
 ) -> Option<ManagedContextRewindOnlyPressure> {
@@ -12060,6 +12147,82 @@ mod tests {
             }
             other => panic!("expected UsageSnapshot, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn managed_context_preflight_can_use_latest_session_log_snapshot() {
+        let bus = EventBus::new();
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        let session_log: SharedSessionLog = Arc::new(Mutex::new(
+            session_log::SessionLog::open(log_dir.clone()).unwrap(),
+        ));
+        {
+            let mut log = session_log.lock().unwrap();
+            log.context_snapshot_for_session(
+                Some("other-thread"),
+                "codex",
+                "Other Codex resolved request payload",
+                Some("req-other"),
+                Some(1),
+                Some(2),
+                "openai.responses.resolved_request.v1",
+                Some(100_000),
+                Some("backend_reported"),
+                Some(258_400),
+                Some(272_000),
+                Some(12),
+                &serde_json::json!({ "model": "gpt-5.2-codex" }),
+            );
+            log.context_snapshot_for_session(
+                Some("codex-thread"),
+                "codex",
+                "Codex resolved request payload",
+                Some("req-1"),
+                Some(4),
+                Some(8),
+                "openai.responses.resolved_request.v1",
+                Some(225_440),
+                Some("backend_reported"),
+                Some(258_400),
+                Some(272_000),
+                Some(632),
+                &serde_json::json!({ "model": "gpt-5.2-codex" }),
+            );
+        }
+        let approval_registry: event::ApprovalRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let context_injection: event::ContextInjectionQueue = Arc::new(Mutex::new(Vec::new()));
+        let autonomy = autonomy::shared_autonomy(AutonomyState::default());
+        let config = DrainConfig {
+            bus: &bus,
+            web_port: None,
+            session_id: Some("wrapper-session".to_string()),
+            alias_session_id: Some("codex-thread".to_string()),
+            autonomy,
+            session_log: &session_log,
+            project_root: dir.path(),
+            log_dir: &log_dir,
+            approval_registry: &approval_registry,
+            json_approval: None,
+            agent_source: Some("Codex".to_string()),
+            suppress_agent_started: false,
+            persist_model_responses_inline: true,
+            headless: true,
+            context_injection: &context_injection,
+        };
+
+        let snapshot = latest_external_context_snapshot_from_log(&config).expect("snapshot");
+        assert_eq!(snapshot.request_id.as_deref(), Some("req-1"));
+        assert_eq!(snapshot.token_count, Some(225_440));
+        assert_eq!(
+            snapshot.token_count_kind,
+            Some(external_agent::AgentContextTokenCountKind::BackendReported)
+        );
+        let followup = FollowUpMessage::text("Continue Station QA.".to_string());
+        assert!(matches!(
+            managed_context_preflight_decision(true, &followup, &snapshot),
+            Some(ManagedContextPreflightDecision::DensityHandoff { .. })
+        ));
     }
 
     #[test]
@@ -22148,7 +22311,12 @@ async fn run_with_presence(
                         && agent.supports_item_anchor_rewind();
 
                 if codex_managed_context_enabled {
-                    match refresh_external_context_usage_snapshot(agent, &drain_config).await {
+                    match refresh_external_context_usage_snapshot_for_preflight(
+                        agent,
+                        &drain_config,
+                    )
+                    .await
+                    {
                         Ok(Some(snapshot)) => {
                             if let Some(decision) = managed_context_preflight_decision(
                                 codex_managed_context_enabled,
@@ -24221,7 +24389,9 @@ async fn run_external_agent_mode(
                 managed_context_density_handoff,
             );
         if managed_context_rewind_only_preflight_enabled {
-            match refresh_external_context_usage_snapshot(&mut agent, &drain_config).await {
+            match refresh_external_context_usage_snapshot_for_preflight(&mut agent, &drain_config)
+                .await
+            {
                 Ok(Some(snapshot)) => {
                     if let Some(pressure) = managed_context_rewind_only_pressure(&snapshot) {
                         let drop_original = managed_context_drop_original_for_recovery(
