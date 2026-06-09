@@ -2195,6 +2195,136 @@ fn controller_loop_status_has_active_codex_for_session(
         })
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct ControllerLoopCodexIdentity {
+    backend_session_id: Option<String>,
+    intendant_session_id: Option<String>,
+    mcp_session_id: Option<String>,
+    managed_context: Option<bool>,
+}
+
+fn string_field(value: &serde_json::Value, field: &str) -> Option<String> {
+    value
+        .get(field)
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(str::to_string)
+}
+
+fn controller_loop_process_managed_context(process: &serde_json::Value) -> Option<bool> {
+    [
+        "managed_context",
+        "codex_managed_context",
+        "context_recovery",
+    ]
+    .into_iter()
+    .find_map(|field| {
+        process.get(field).and_then(|value| match value {
+            serde_json::Value::Bool(enabled) => Some(*enabled),
+            serde_json::Value::String(mode) => {
+                Some(crate::project::codex_managed_context_enabled(mode))
+            }
+            _ => None,
+        })
+    })
+    .or_else(|| {
+        let log_path = string_field(process, "log_path")?;
+        let config = crate::session_config::read_log_dir_config(std::path::Path::new(&log_path))?;
+        config
+            .codex_managed_context
+            .as_deref()
+            .map(crate::project::codex_managed_context_enabled)
+    })
+}
+
+fn controller_loop_active_codex_identity_for_session(
+    status: &serde_json::Value,
+    session_ids: &std::collections::HashSet<String>,
+) -> Option<ControllerLoopCodexIdentity> {
+    ["/active/wrappers", "/active/codex"]
+        .into_iter()
+        .filter_map(|ptr| status.pointer(ptr).and_then(serde_json::Value::as_array))
+        .flatten()
+        .filter(|process| {
+            controller_loop_process_reports_active(process)
+                && controller_loop_process_matches_session(process, session_ids)
+        })
+        .map(|process| ControllerLoopCodexIdentity {
+            backend_session_id: string_field(process, "backend_session_id"),
+            intendant_session_id: string_field(process, "intendant_session_id")
+                .or_else(|| string_field(process, "session_id")),
+            mcp_session_id: string_field(process, "mcp_session_id"),
+            managed_context: controller_loop_process_managed_context(process),
+        })
+        .max_by_key(|identity| {
+            usize::from(identity.managed_context.is_some()) * 10
+                + usize::from(identity.backend_session_id.is_some())
+                + usize::from(identity.intendant_session_id.is_some())
+                + usize::from(identity.mcp_session_id.is_some())
+        })
+}
+
+fn mcp_state_promote_controller_loop_active_codex_for_session(
+    s: &mut McpAppState,
+    session_id: &str,
+) -> bool {
+    let mut session_ids = s
+        .session_related_ids(session_id)
+        .into_iter()
+        .chain(std::iter::once(session_id.trim().to_string()))
+        .filter(|id| !id.is_empty())
+        .collect::<std::collections::HashSet<_>>();
+    if session_ids.is_empty() {
+        return false;
+    }
+    let status = mcp_state_controller_loop_status(s);
+    let Some(identity) = controller_loop_active_codex_identity_for_session(&status, &session_ids)
+    else {
+        return false;
+    };
+
+    if let Some(id) = identity.backend_session_id.as_deref() {
+        session_ids.insert(id.to_string());
+    }
+    if let Some(id) = identity.intendant_session_id.as_deref() {
+        session_ids.insert(id.to_string());
+    }
+    if let Some(id) = identity.mcp_session_id.as_deref() {
+        session_ids.insert(id.to_string());
+    }
+    if let (Some(wrapper_id), Some(backend_id)) = (
+        identity
+            .intendant_session_id
+            .as_deref()
+            .or(identity.mcp_session_id.as_deref()),
+        identity.backend_session_id.as_deref(),
+    ) {
+        s.link_session_aliases(wrapper_id, backend_id);
+    }
+    for id in session_ids.iter().filter(|id| !id.is_empty()) {
+        s.session_sources.insert(id.clone(), "codex".to_string());
+    }
+
+    let managed_context = identity
+        .managed_context
+        .or_else(|| {
+            session_ids
+                .iter()
+                .find_map(|id| s.session_codex_managed_context.get(id).copied())
+        })
+        .unwrap_or(s.codex_managed_context || s.configured_codex_managed_context);
+    for id in session_ids.iter().filter(|id| !id.is_empty()) {
+        s.session_codex_managed_context
+            .insert(id.clone(), managed_context);
+    }
+    if s.session_id.is_empty() || session_ids.iter().any(|id| id == &s.session_id) {
+        s.active_session_source = Some("codex".to_string());
+        s.codex_managed_context = managed_context;
+    }
+    true
+}
+
 fn mcp_state_controller_loop_has_active_codex_for_session(
     s: &McpAppState,
     session_id: &str,
@@ -7539,6 +7669,10 @@ impl IntendantServer {
                 .map(str::to_string)
                 .unwrap_or_else(|| s.session_id.clone());
             if !target_session_id.is_empty() {
+                mcp_state_promote_controller_loop_active_codex_for_session(
+                    &mut s,
+                    &target_session_id,
+                );
                 let mut target_phase = s
                     .session_status_for_id(&target_session_id)
                     .map(|status| status.phase.clone())
@@ -12059,6 +12193,116 @@ mod tests {
                 }
                 Ok(other) => panic!("unexpected extra event: {other:?}"),
             }
+        });
+    }
+
+    #[test]
+    fn get_status_promotes_live_controller_loop_codex_managed_context() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let wrapper_session_id = "6036429e-54f9-4f93-b74d-04c060c79054";
+            let backend_session_id = "019ea99e-live-resumed-backend";
+            let log_dir = tempdir().unwrap();
+            crate::session_config::write_log_dir_config(
+                log_dir.path(),
+                &crate::session_config::SessionAgentConfig {
+                    source: Some("codex".to_string()),
+                    codex_managed_context: Some("managed".to_string()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let state = test_state();
+            {
+                let mut s = state.write().await;
+                s.session_id = wrapper_session_id.to_string();
+                s.controller_loop_status_override = Some(serde_json::json!({
+                    "lock": {
+                        "present": true,
+                        "owner_pid": 4242,
+                        "owner_alive": true
+                    },
+                    "latest": {
+                        "pid": 4242,
+                        "pid_alive": true
+                    },
+                    "active": {
+                        "wrapper_count": 1,
+                        "codex_count": 1,
+                        "wrappers": [{
+                            "source": "external_wrapper_index",
+                            "backend_source": "codex",
+                            "backend_session_id": backend_session_id,
+                            "intendant_session_id": wrapper_session_id,
+                            "app_server_pid": 5252,
+                            "app_server_active": true,
+                            "log_path": log_dir.path().to_string_lossy(),
+                            "project_root": "/home/user/projects/intendant-station-mainline-123e28c",
+                            "status": "running_agent"
+                        }],
+                        "codex": [{
+                            "source": "process_tree",
+                            "backend_session_id": backend_session_id,
+                            "intendant_session_id": wrapper_session_id,
+                            "mcp_session_id": wrapper_session_id,
+                            "pid": 5252,
+                            "app_server_active": true,
+                            "project_root": "/home/user/projects/intendant-station-mainline-123e28c"
+                        }]
+                    }
+                }));
+            }
+            let server = IntendantServer::new(state.clone(), EventBus::new());
+
+            let status: serde_json::Value = serde_json::from_str(
+                &server
+                    .get_status_for_session(Some(wrapper_session_id), None)
+                    .await,
+            )
+            .unwrap();
+            assert_eq!(status.pointer("/phase"), Some(&"thinking".into()));
+            assert_eq!(
+                status.pointer("/context_pressure/managed_context"),
+                Some(&"managed".into())
+            );
+
+            let backend_status: serde_json::Value = serde_json::from_str(
+                &server
+                    .get_status_for_session(Some(backend_session_id), None)
+                    .await,
+            )
+            .unwrap();
+            assert_eq!(backend_status.pointer("/phase"), Some(&"thinking".into()));
+            assert_eq!(
+                backend_status.pointer("/context_pressure/managed_context"),
+                Some(&"managed".into())
+            );
+
+            let s = state.read().await;
+            assert_eq!(s.active_session_source.as_deref(), Some("codex"));
+            assert_eq!(
+                s.session_source_for_id(wrapper_session_id),
+                Some("codex")
+            );
+            assert_eq!(
+                s.session_source_for_id(backend_session_id),
+                Some("codex")
+            );
+            assert_eq!(
+                s.session_codex_managed_context
+                    .get(wrapper_session_id)
+                    .copied(),
+                Some(true)
+            );
+            assert_eq!(
+                s.session_codex_managed_context
+                    .get(backend_session_id)
+                    .copied(),
+                Some(true)
+            );
         });
     }
 

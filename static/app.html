@@ -21553,8 +21553,16 @@ function stationBuildContextSummary() {
 
 function stationManagedSessionCandidate() {
   const selected = managedContextCurrentSessionId();
-  if (selected) return selected;
+  if (selected) {
+    const selectedMeta = managedContextSessionMeta(selected);
+    if (managedContextSessionIsLive(selected, selectedMeta)) return selected;
+  }
   const options = managedContextSessionOptions();
+  const liveCodex = options.find(([sid, meta]) =>
+    managedContextSessionIsLive(sid, meta) && managedContextIsCodexLike(meta)
+  );
+  if (liveCodex) return liveCodex[0];
+  if (selected) return selected;
   if (options.length) return options[0][0];
   return resolvePromptTargetSessionId();
 }
