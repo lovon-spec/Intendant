@@ -39,7 +39,7 @@ expose them only to a **secure context**.
 Use a secure dashboard context when you need:
 
 - **Station WebGPU rendering** (`navigator.gpu`) — otherwise Station falls back
-  to its DOM renderer.
+  to its canvas-2D WASM renderer.
 - **Microphone and camera** (`navigator.mediaDevices`, `getUserMedia`) for live
   voice, browser-side audio/video capture, or camera recording.
 - **Screen/window capture from the browser** (`getDisplayMedia`) when a browser
@@ -142,36 +142,23 @@ existing dashboard WebSocket.
 
 ### Station
 
-An immersive WASM/WGPU-style control center for the same operational surfaces as
-the rest of the dashboard. The left control-center cards summarize Activity,
-Context, Managed context, Changes, Sessions, Peers/displays, and Control. Each
-card opens a power-user detail panel; actionable rows jump back into the
-canonical dashboard surface, such as a changed file row opening
-**Activity → Changes** with that file's diff selected.
+An immersive WASM-rendered control center for the same operational surfaces as
+the rest of the dashboard — Activity, Context, Managed context, Changes,
+Sessions, Peers/displays, and Control. The `station-web` crate draws the whole
+scene into a single canvas: WebGPU when the browser exposes it (a secure
+context is required — see Secure Browser Contexts above), with a canvas-2D
+WASM fallback used automatically when WebGPU is unavailable or forced with
+`?station_gpu=canvas`. The renderer runs on `requestAnimationFrame` and
+re-renders only when state or view input changes, so an idle Station stays
+cheap.
 
-The Station detail panels are also direct launch points for common operations:
-Activity rows focus the matching log entry, and the Activity panel can set log
-verbosity, clear the host filter, or jump to the live log bottom through the
-same state used by **Activity → Log**. Context rows open the selected context
-item, and the Context panel can jump into live/replay mode, focus view, raw
-rendering, or reset view through the canonical **Activity → Context** toolbar.
-Managed rows select rewind anchors or saved rewind records, and the Managed
-panel can jump straight into the rewind, backout/restore, or refresh workflows.
-Changed-file rows open the canonical diff viewer, and the Changes panel exposes
-refresh, redo, and prune through **Activity → Changes**, including the existing
-prune confirmation. Session rows can resume or open Launch config, and the
-Sessions panel links straight to New Session, Deep Search, and Worktrees, with
-a refresh shortcut for the canonical session index. The Peers panel links to
-both the Network settings and the Video display surface, and can start the
-canonical local display-share flow. The Control panel exposes the full Codex
-thread, goal, setup, and memory action groups through the same dispatcher,
-prompts, and confirmations used by
-**Activity → Control**, plus the active external session's per-session binary
-and managed-context launch configuration when that backend supports it, with a
-direct restart-with-saved-config action for applying those settings immediately.
-After a page refresh, if no prompt target or session window is active, Station
-falls back to the most recently updated configurable external session so these
-controls remain reachable without hunting through the full session list.
+There is no DOM dock: the rendered scene is the UI. An invisible hotspot
+overlay mirrors the scene's interactive elements so they stay reachable from
+the keyboard. Station actions dispatch through the same control plane as the
+classic tabs, so anything triggered from Station behaves exactly like its
+canonical dashboard equivalent. View settings shape the scene: layout
+(`orbital` / `constellation`), mood (`calm` / `cockpit`), and fov, motion, ar,
+and density tuning.
 
 ### Sessions
 

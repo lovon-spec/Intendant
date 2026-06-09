@@ -2261,6 +2261,7 @@ dependencies = [
  "dotenvy",
  "env-libvpx-sys",
  "env_logger",
+ "flate2",
  "futures-util",
  "html2text",
  "if-addrs",

@@ -2981,6 +2981,340 @@ fn asset_version_hash() -> String {
     format!("{:016x}", hasher.finish())
 }
 
+/// Process-wide cached [`asset_version_hash`] — the embedded assets are
+/// compile-time constants, so the hash never changes at runtime and there
+/// is no point re-hashing ~4 MB per request.
+fn asset_version() -> &'static str {
+    static ASSET_VERSION: OnceLock<String> = OnceLock::new();
+    ASSET_VERSION.get_or_init(asset_version_hash)
+}
+
+/// Strong per-asset ETag token (16 hex chars of a content hash). Rendered
+/// on the wire as a quoted strong ETag: `ETag: "<token>"`.
+fn asset_etag(body: &[u8]) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    body.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
+/// Gzip-compress `data` (pure-Rust miniz_oxide backend via flate2).
+fn gzip_compress(data: &[u8]) -> Vec<u8> {
+    use flate2::{write::GzEncoder, Compression};
+    use std::io::Write;
+    let mut encoder = GzEncoder::new(Vec::with_capacity(data.len() / 2), Compression::default());
+    // Writing to a Vec cannot fail.
+    let _ = encoder.write_all(data);
+    encoder.finish().unwrap_or_default()
+}
+
+/// Below this size gzip isn't worth the header bytes + CPU — the response
+/// fits in a packet or two either way (e.g. audio-processor.js, ~1.4 KB).
+const GZIP_MIN_BYTES: usize = 4096;
+
+/// One embedded static asset with its lazily computed ETag and (where it
+/// pays) a pre-gzipped body, served by the static-asset routing arms.
+struct EmbeddedStaticAsset {
+    content_type: &'static str,
+    body: &'static [u8],
+    etag: String,
+    /// Pre-gzipped body; `None` when compression doesn't pay (tiny files,
+    /// already-compressed PNG).
+    gzip: Option<Vec<u8>>,
+}
+
+impl EmbeddedStaticAsset {
+    fn view(&self) -> StaticAssetView<'_> {
+        StaticAssetView {
+            content_type: self.content_type,
+            body: self.body,
+            etag: &self.etag,
+            gzip: self.gzip.as_deref(),
+            cache_control: None,
+        }
+    }
+}
+
+/// Map from exact request path to embedded asset. Built once, on first
+/// static-asset request; gzipping the ~4 MB of embedded assets is paid a
+/// single time per process.
+fn embedded_static_asset(path: &str) -> Option<&'static EmbeddedStaticAsset> {
+    static EMBEDDED_STATIC_ASSETS: OnceLock<HashMap<&'static str, EmbeddedStaticAsset>> =
+        OnceLock::new();
+    let assets = EMBEDDED_STATIC_ASSETS.get_or_init(|| {
+        let mut map = HashMap::new();
+        let mut insert =
+            |path: &'static str, content_type: &'static str, body: &'static [u8], compressible| {
+                let gzip = (compressible && body.len() >= GZIP_MIN_BYTES)
+                    .then(|| gzip_compress(body))
+                    .filter(|gz| gz.len() < body.len());
+                map.insert(
+                    path,
+                    EmbeddedStaticAsset {
+                        content_type,
+                        body,
+                        etag: asset_etag(body),
+                        gzip,
+                    },
+                );
+            };
+        insert(
+            "/wasm-web/presence_web_bg.wasm",
+            "application/wasm",
+            WASM_WEB_BIN,
+            true,
+        );
+        insert(
+            "/wasm-station/station_web_bg.wasm",
+            "application/wasm",
+            WASM_STATION_BIN,
+            true,
+        );
+        insert(
+            "/wasm-web/presence_web.js",
+            "application/javascript",
+            WASM_WEB_JS.as_bytes(),
+            true,
+        );
+        insert(
+            "/wasm-station/station_web.js",
+            "application/javascript",
+            WASM_STATION_JS.as_bytes(),
+            true,
+        );
+        insert(
+            "/three.module.min.js",
+            "application/javascript",
+            THREE_MODULE_JS.as_bytes(),
+            true,
+        );
+        insert(
+            "/audio-processor.js",
+            "application/javascript",
+            AUDIO_PROCESSOR_JS.as_bytes(),
+            true,
+        );
+        // PNG is already deflate-compressed; gzip would only add overhead.
+        insert("/icon-128.png", "image/png", ICON_128_PNG, false);
+        insert("/favicon.ico", "image/png", ICON_128_PNG, false);
+        map
+    });
+    assets.get(path)
+}
+
+/// GET/HEAD + exact-path gate for one static-asset routing arm.
+///
+/// Returns the embedded asset only when the method is GET or HEAD *and*
+/// `path` (the request target with its query string already stripped) is
+/// one of `paths`; `None` lets the request fall through to later routing
+/// arms. Exact-path matching is what prevents the historical shadowing
+/// bug where `request_line.contains(...)` swallowed API requests that
+/// merely mentioned an asset path in a query parameter (e.g.
+/// `GET /api/fs/stat?path=/wasm-station/station_web_bg.wasm`).
+fn static_asset_arm(
+    method: &str,
+    path: &str,
+    paths: &[&str],
+) -> Option<&'static EmbeddedStaticAsset> {
+    if method != "GET" && method != "HEAD" {
+        return None;
+    }
+    if !paths.contains(&path) {
+        return None;
+    }
+    embedded_static_asset(path)
+}
+
+/// Split an HTTP request line (`GET /path?query HTTP/1.1`) into
+/// `(method, path, query)`. The query string is returned without the `?`;
+/// missing pieces come back as empty strings.
+fn parse_request_target(request_line: &str) -> (&str, &str, &str) {
+    let mut parts = request_line.split_whitespace();
+    let method = parts.next().unwrap_or("");
+    let target = parts.next().unwrap_or("");
+    let (path, query) = match target.split_once('?') {
+        Some((path, query)) => (path, query),
+        None => (target, ""),
+    };
+    (method, path, query)
+}
+
+/// Whether the request head's `Accept-Encoding` admits gzip (tolerant:
+/// case-insensitive header name and token, `x-gzip` alias, `;q=0` rejects).
+fn accept_encoding_allows_gzip(header_text: &str) -> bool {
+    for line in header_text.lines() {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        if !name.trim().eq_ignore_ascii_case("accept-encoding") {
+            continue;
+        }
+        for part in value.split(',') {
+            let mut sections = part.split(';');
+            let token = sections.next().unwrap_or("").trim();
+            if !token.eq_ignore_ascii_case("gzip") && !token.eq_ignore_ascii_case("x-gzip") {
+                continue;
+            }
+            let q_zero = sections.any(|param| {
+                let mut kv = param.splitn(2, '=');
+                let key = kv.next().unwrap_or("").trim();
+                let value = kv.next().unwrap_or("").trim();
+                key.eq_ignore_ascii_case("q")
+                    && value.parse::<f32>().map(|q| q <= 0.0).unwrap_or(false)
+            });
+            if !q_zero {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Whether the request head carries an `If-None-Match` matching
+/// `etag_token` (the bare hash, without quotes). Tolerant of `W/` weak
+/// prefixes, quoted/unquoted tokens, comma-separated lists, and `*`.
+fn if_none_match_matches(header_text: &str, etag_token: &str) -> bool {
+    for line in header_text.lines() {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        if !name.trim().eq_ignore_ascii_case("if-none-match") {
+            continue;
+        }
+        for candidate in value.split(',') {
+            let candidate = candidate.trim();
+            if candidate == "*" {
+                return true;
+            }
+            let candidate = candidate
+                .strip_prefix("W/")
+                .or_else(|| candidate.strip_prefix("w/"))
+                .unwrap_or(candidate)
+                .trim()
+                .trim_matches('"');
+            if candidate == etag_token {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Cache-Control policy for the versioned static assets: a request whose
+/// query string carries the *current* cache-busting hash (`?v=<hash>`, as
+/// rewritten into app.html) may cache forever — a new build changes the
+/// hash and thus the URL. Anything else (stale buster, no buster) stays on
+/// cheap ETag revalidation.
+fn asset_cache_control(query: &str, current_version: &str) -> &'static str {
+    let versioned = query
+        .split('&')
+        .any(|pair| pair.strip_prefix("v=") == Some(current_version));
+    if versioned {
+        "public, max-age=31536000, immutable"
+    } else {
+        "no-cache, must-revalidate"
+    }
+}
+
+/// Borrowed view of one static asset for [`build_static_asset_response`].
+struct StaticAssetView<'a> {
+    content_type: &'a str,
+    body: &'a [u8],
+    /// Bare ETag token (no quotes); rendered as a quoted strong ETag.
+    etag: &'a str,
+    /// Pre-gzipped body, when compression pays for this asset.
+    gzip: Option<&'a [u8]>,
+    /// `Some(...)` pins Cache-Control (app.html stays `no-cache` — it is
+    /// the entry point carrying the rewritten `?v=` busters); `None`
+    /// applies [`asset_cache_control`]'s `?v=` policy.
+    cache_control: Option<&'static str>,
+}
+
+/// Build a complete HTTP/1.1 response (header bytes + body) for a static
+/// asset: conditional requests (`If-None-Match` → `304 Not Modified` with
+/// an empty body), gzip negotiation via `Accept-Encoding`, HEAD (same
+/// headers as GET, no body), CORS, and the `?v=` Cache-Control policy.
+fn build_static_asset_response(
+    method: &str,
+    header_text: &str,
+    query: &str,
+    current_version: &str,
+    asset: StaticAssetView<'_>,
+) -> Vec<u8> {
+    let cache_control = asset
+        .cache_control
+        .unwrap_or_else(|| asset_cache_control(query, current_version));
+    // Encoding varies by Accept-Encoding for assets with a gzip variant,
+    // so caches must key on it.
+    let vary = if asset.gzip.is_some() {
+        "Vary: Accept-Encoding\r\n"
+    } else {
+        ""
+    };
+    if if_none_match_matches(header_text, asset.etag) {
+        return format!(
+            "HTTP/1.1 304 Not Modified\r\n\
+             ETag: \"{etag}\"\r\n\
+             Cache-Control: {cache_control}\r\n\
+             {vary}Access-Control-Allow-Origin: *\r\n\
+             Connection: close\r\n\
+             \r\n",
+            etag = asset.etag,
+        )
+        .into_bytes();
+    }
+    let gzip_body = asset
+        .gzip
+        .filter(|_| accept_encoding_allows_gzip(header_text));
+    let (payload, content_encoding) = match gzip_body {
+        Some(gz) => (gz, "Content-Encoding: gzip\r\n"),
+        None => (asset.body, ""),
+    };
+    let mut response = format!(
+        "HTTP/1.1 200 OK\r\n\
+         Content-Type: {content_type}\r\n\
+         Content-Length: {len}\r\n\
+         {content_encoding}ETag: \"{etag}\"\r\n\
+         Cache-Control: {cache_control}\r\n\
+         {vary}Access-Control-Allow-Origin: *\r\n\
+         Connection: close\r\n\
+         \r\n",
+        content_type = asset.content_type,
+        len = payload.len(),
+        etag = asset.etag,
+    )
+    .into_bytes();
+    if method != "HEAD" {
+        response.extend_from_slice(payload);
+    }
+    response
+}
+
+/// Rewrite every occurrence of `path` in `html` to `path?v={version}`,
+/// normalizing any `?v=<token>` already following the path so the result
+/// always carries exactly one buster (idempotent; never `?v=a?v=b`, even
+/// if the source HTML hardcodes a stale buster like `?v=wgpu29`).
+fn rewrite_asset_url_with_version(html: &str, path: &str, version: &str) -> String {
+    let mut out = String::with_capacity(html.len() + 64);
+    let mut rest = html;
+    while let Some(idx) = rest.find(path) {
+        out.push_str(&rest[..idx]);
+        out.push_str(path);
+        out.push_str("?v=");
+        out.push_str(version);
+        let mut tail = &rest[idx + path.len()..];
+        if let Some(stripped) = tail.strip_prefix("?v=") {
+            let token_len = stripped
+                .find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.')))
+                .unwrap_or(stripped.len());
+            tail = &stripped[token_len..];
+        }
+        rest = tail;
+    }
+    out.push_str(rest);
+    out
+}
+
 /// Build a zip containing the current session's text artifacts for the
 /// Settings → "Download session report" feature. Includes session.jsonl,
 /// session_meta.json, transcript.jsonl, summary.json, daemon.log,
@@ -13155,7 +13489,7 @@ pub fn spawn_web_gateway(
     });
 
     // Inject content-hash version into WASM/JS URLs for cache-busting.
-    let v = asset_version_hash();
+    let v = asset_version().to_string();
     let session_provider = config.provider.clone();
     let session_model = config.model.clone();
     let voice_debug = Arc::new(Mutex::new(VoiceDebugState::default()));
@@ -13444,29 +13778,24 @@ pub fn spawn_web_gateway(
     }
 
     let app_html = Arc::new(
-        APP_HTML
-            .replace(
-                "/wasm-web/presence_web.js",
-                &format!("/wasm-web/presence_web.js?v={}", v),
-            )
-            .replace(
-                "/wasm-web/presence_web_bg.wasm",
-                &format!("/wasm-web/presence_web_bg.wasm?v={}", v),
-            )
-            .replace(
-                "/wasm-station/station_web.js",
-                &format!("/wasm-station/station_web.js?v={}", v),
-            )
-            .replace(
-                "/wasm-station/station_web_bg.wasm",
-                &format!("/wasm-station/station_web_bg.wasm?v={}", v),
-            )
-            .replace(
-                "/three.module.min.js",
-                &format!("/three.module.min.js?v={}", v),
-            )
-            .replace("/icon-128.png", &format!("/icon-128.png?v={}", v)),
+        [
+            "/wasm-web/presence_web.js",
+            "/wasm-web/presence_web_bg.wasm",
+            "/wasm-station/station_web.js",
+            "/wasm-station/station_web_bg.wasm",
+            "/three.module.min.js",
+            "/icon-128.png",
+        ]
+        .iter()
+        .fold(APP_HTML.to_string(), |html, path| {
+            rewrite_asset_url_with_version(&html, path, &v)
+        }),
     );
+    // Lazily computed (ETag token, gzipped body) for the rewritten
+    // app.html — once per gateway spawn, on the first page load. The
+    // rewritten HTML is gateway-scoped (unlike the `include_*!` constants
+    // behind `embedded_static_asset`), so its cache lives here.
+    let app_html_cache: Arc<OnceLock<(String, Vec<u8>)>> = Arc::new(OnceLock::new());
 
     tokio::spawn(async move {
         let port = listener.local_addr().map(|a| a.port()).unwrap_or(0);
@@ -13496,6 +13825,7 @@ pub fn spawn_web_gateway(
             let session_provider = session_provider.clone();
             let session_model = session_model.clone();
             let app_html = app_html.clone();
+            let app_html_cache = app_html_cache.clone();
             let transcriber = transcriber.clone();
             let active_presence = active_presence.clone();
             let display_input_authority = display_input_authority.clone();
@@ -16323,6 +16653,12 @@ pub fn spawn_web_gateway(
                     use tokio::io::AsyncReadExt;
                     let _ = stream.read_exact(&mut discard).await;
 
+                    // Parse the request target once: the static-asset arms
+                    // below match on the *exact* path (query stripped), so
+                    // an API request that merely mentions an asset path in
+                    // a query parameter can no longer be shadowed by them.
+                    let (req_method, req_path, req_query) = parse_request_target(request_line);
+
                     // CORS preflight: respond to OPTIONS with permissive headers.
                     // Needed when the page is served from a custom scheme (intendant://)
                     // in the macOS app bundle — API fetches become cross-origin.
@@ -16427,43 +16763,37 @@ pub fn spawn_web_gateway(
                     }
 
                     // Route WASM binaries (need async write_all for large payloads)
-                    let wasm_binary = if request_line.contains("/wasm-web/presence_web_bg.wasm") {
-                        Some(WASM_WEB_BIN)
-                    } else if request_line.contains("/wasm-station/station_web_bg.wasm") {
-                        Some(WASM_STATION_BIN)
-                    } else {
-                        None
-                    };
-
-                    if let Some(wasm_data) = wasm_binary {
-                        let header = format!(
-                            "HTTP/1.1 200 OK\r\n\
-                             Content-Type: application/wasm\r\n\
-                             Content-Length: {}\r\n\
-                             Cache-Control: no-cache, must-revalidate\r\n\
-                             Connection: close\r\n\
-                             \r\n",
-                            wasm_data.len()
+                    if let Some(asset) = static_asset_arm(
+                        req_method,
+                        req_path,
+                        &[
+                            "/wasm-web/presence_web_bg.wasm",
+                            "/wasm-station/station_web_bg.wasm",
+                        ],
+                    ) {
+                        let response = build_static_asset_response(
+                            req_method,
+                            &header_text,
+                            req_query,
+                            asset_version(),
+                            asset.view(),
                         );
                         use tokio::io::AsyncWriteExt;
-                        let _ = stream.write_all(header.as_bytes()).await;
-                        let _ = stream.write_all(wasm_data).await;
-                    } else if request_line.contains("/icon-128.png")
-                        || request_line.contains("/favicon.ico")
-                    {
-                        let header = format!(
-                            "HTTP/1.1 200 OK\r\n\
-                             Content-Type: image/png\r\n\
-                             Content-Length: {}\r\n\
-                             Cache-Control: no-cache\r\n\
-                             Access-Control-Allow-Origin: *\r\n\
-                             Connection: close\r\n\
-                             \r\n",
-                            ICON_128_PNG.len()
+                        let _ = stream.write_all(&response).await;
+                    } else if let Some(asset) = static_asset_arm(
+                        req_method,
+                        req_path,
+                        &["/icon-128.png", "/favicon.ico"],
+                    ) {
+                        let response = build_static_asset_response(
+                            req_method,
+                            &header_text,
+                            req_query,
+                            asset_version(),
+                            asset.view(),
                         );
                         use tokio::io::AsyncWriteExt;
-                        let _ = stream.write_all(header.as_bytes()).await;
-                        let _ = stream.write_all(ICON_128_PNG).await;
+                        let _ = stream.write_all(&response).await;
                     } else if request_line.contains(" /frames/") {
                         // Serve HQ frame images from the frame registry.
                         // URL format: /frames/<frame_id> (not /api/session/*/frames/*)
@@ -18628,45 +18958,37 @@ pub fn spawn_web_gateway(
                                 let _ = stream.write_all(&bytes).await;
                             }
                         }
-                    } else {
-                        let (content_type, body, cache) =
-                            if request_line.contains("/wasm-web/presence_web.js") {
-                                (
-                                    "application/javascript",
-                                    WASM_WEB_JS.to_string(),
-                                    "no-cache, must-revalidate",
-                                )
-                            } else if request_line.contains("/wasm-station/station_web.js") {
-                                (
-                                    "application/javascript",
-                                    WASM_STATION_JS.to_string(),
-                                    "no-cache, must-revalidate",
-                                )
-                            } else if request_line.contains("/three.module.min.js") {
-                                (
-                                    "application/javascript",
-                                    THREE_MODULE_JS.to_string(),
-                                    "no-cache, must-revalidate",
-                                )
-                            } else if request_line.contains("/audio-processor.js") {
-                                (
-                                    "application/javascript",
-                                    AUDIO_PROCESSOR_JS.to_string(),
-                                    "no-cache",
-                                )
-                            } else if request_line.contains("/.well-known/agent-card.json") {
-                                // Canonical peer identity + capability surface.
-                                // Served alongside /config so the browser and
-                                // federated peers can discover who this daemon
-                                // is without parsing the voice-runtime config.
-                                ("application/json", agent_card_json.clone(), "no-cache")
-                            } else if request_line.contains("/config") {
-                                ("application/json", config_json.clone(), "no-cache")
-                            } else {
-                                // Default: serve app.html (also matches /app for backward compat)
-                                ("text/html; charset=utf-8", app_html.to_string(), "no-cache")
-                            };
-
+                    } else if let Some(asset) = static_asset_arm(
+                        req_method,
+                        req_path,
+                        &[
+                            "/wasm-web/presence_web.js",
+                            "/wasm-station/station_web.js",
+                            "/three.module.min.js",
+                            "/audio-processor.js",
+                        ],
+                    ) {
+                        let response = build_static_asset_response(
+                            req_method,
+                            &header_text,
+                            req_query,
+                            asset_version(),
+                            asset.view(),
+                        );
+                        use tokio::io::AsyncWriteExt;
+                        let _ = stream.write_all(&response).await;
+                    } else if request_line.contains("/.well-known/agent-card.json")
+                        || request_line.contains("/config")
+                    {
+                        let body = if request_line.contains("/.well-known/agent-card.json") {
+                            // Canonical peer identity + capability surface.
+                            // Served alongside /config so the browser and
+                            // federated peers can discover who this daemon
+                            // is without parsing the voice-runtime config.
+                            agent_card_json.clone()
+                        } else {
+                            config_json.clone()
+                        };
                         // CORS: allow the multi-host dashboard to
                         // `fetch()` /config and /.well-known/agent-card.json
                         // on this daemon from a page served by a sibling
@@ -18674,17 +18996,60 @@ pub fn spawn_web_gateway(
                         // fetches don't send credentials.
                         let response = format!(
                             "HTTP/1.1 200 OK\r\n\
-                             Content-Type: {}\r\n\
+                             Content-Type: application/json\r\n\
                              Content-Length: {}\r\n\
-                             Cache-Control: {}\r\n\
+                             Cache-Control: no-cache\r\n\
                              Access-Control-Allow-Origin: *\r\n\
                              Connection: close\r\n\
                              \r\n\
                              {}",
-                            content_type,
                             body.len(),
-                            cache,
                             body
+                        );
+                        use tokio::io::AsyncWriteExt;
+                        let _ = stream.write_all(response.as_bytes()).await;
+                    } else if req_method == "GET" || req_method == "HEAD" {
+                        // Default: serve app.html (also matches /app for
+                        // backward compat). The entry point stays no-cache —
+                        // it carries the rewritten `?v=` busters — but gets
+                        // an ETag (cheap 304 revalidation) and gzip. ETag +
+                        // gzip are computed once per gateway spawn, on first
+                        // page load: the rewritten HTML is gateway-scoped,
+                        // unlike the constants behind `embedded_static_asset`.
+                        let (etag, gzip) = app_html_cache.get_or_init(|| {
+                            (
+                                asset_etag(app_html.as_bytes()),
+                                gzip_compress(app_html.as_bytes()),
+                            )
+                        });
+                        let response = build_static_asset_response(
+                            req_method,
+                            &header_text,
+                            req_query,
+                            asset_version(),
+                            StaticAssetView {
+                                content_type: "text/html; charset=utf-8",
+                                body: app_html.as_bytes(),
+                                etag,
+                                gzip: Some(gzip),
+                                cache_control: Some("no-cache"),
+                            },
+                        );
+                        use tokio::io::AsyncWriteExt;
+                        let _ = stream.write_all(&response).await;
+                    } else {
+                        // Non-GET/HEAD fallback: plain app.html, as before.
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\n\
+                             Content-Type: text/html; charset=utf-8\r\n\
+                             Content-Length: {}\r\n\
+                             Cache-Control: no-cache\r\n\
+                             Access-Control-Allow-Origin: *\r\n\
+                             Connection: close\r\n\
+                             \r\n\
+                             {}",
+                            app_html.len(),
+                            app_html
                         );
                         use tokio::io::AsyncWriteExt;
                         let _ = stream.write_all(response.as_bytes()).await;
@@ -26698,6 +27063,291 @@ mod tests {
     }
 
     #[test]
+    fn parse_request_target_splits_method_path_query() {
+        assert_eq!(
+            parse_request_target("GET /wasm-station/station_web_bg.wasm?v=abc123 HTTP/1.1"),
+            ("GET", "/wasm-station/station_web_bg.wasm", "v=abc123")
+        );
+        assert_eq!(
+            parse_request_target("HEAD /app HTTP/1.1"),
+            ("HEAD", "/app", "")
+        );
+        assert_eq!(
+            parse_request_target("POST /api/settings HTTP/1.1"),
+            ("POST", "/api/settings", "")
+        );
+        assert_eq!(parse_request_target(""), ("", "", ""));
+    }
+
+    const STATION_WASM_ARM_PATHS: &[&str] = &[
+        "/wasm-web/presence_web_bg.wasm",
+        "/wasm-station/station_web_bg.wasm",
+    ];
+
+    #[test]
+    fn api_request_mentioning_asset_path_in_query_is_not_shadowed() {
+        // Regression: the old `request_line.contains(...)` routing served
+        // the station wasm for *any* request line containing its path —
+        // including API calls that merely mention it in a query parameter.
+        let request_line = "GET /api/fs/stat?path=/wasm-station/station_web_bg.wasm HTTP/1.1";
+        let (method, path, _query) = parse_request_target(request_line);
+        assert_eq!(path, "/api/fs/stat");
+        assert!(
+            static_asset_arm(method, path, STATION_WASM_ARM_PATHS).is_none(),
+            "API path embedding an asset path must fall through to the API routes"
+        );
+
+        // The exact path (with or without a query string) still serves
+        // the asset, for both GET and HEAD.
+        let (method, path, query) =
+            parse_request_target("GET /wasm-station/station_web_bg.wasm?v=abc HTTP/1.1");
+        assert_eq!(query, "v=abc");
+        let asset = static_asset_arm(method, path, STATION_WASM_ARM_PATHS)
+            .expect("exact wasm path must serve the wasm");
+        assert_eq!(asset.content_type, "application/wasm");
+        assert_eq!(asset.body, WASM_STATION_BIN);
+        assert!(
+            static_asset_arm("HEAD", "/wasm-station/station_web_bg.wasm", STATION_WASM_ARM_PATHS)
+                .is_some()
+        );
+
+        // Non-GET/HEAD methods and superstring paths fall through.
+        assert!(static_asset_arm(
+            "POST",
+            "/wasm-station/station_web_bg.wasm",
+            STATION_WASM_ARM_PATHS
+        )
+        .is_none());
+        assert!(static_asset_arm(
+            "GET",
+            "/wasm-station/station_web_bg.wasm.map",
+            STATION_WASM_ARM_PATHS
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn embedded_static_assets_precompress_large_assets() {
+        for path in [
+            "/wasm-web/presence_web_bg.wasm",
+            "/wasm-station/station_web_bg.wasm",
+            "/wasm-web/presence_web.js",
+            "/wasm-station/station_web.js",
+            "/three.module.min.js",
+        ] {
+            let asset = embedded_static_asset(path).expect(path);
+            assert_eq!(asset.etag, asset_etag(asset.body));
+            let gzip = asset
+                .gzip
+                .as_ref()
+                .unwrap_or_else(|| panic!("{path} should be pre-gzipped"));
+            assert!(gzip.len() < asset.body.len(), "{path} gzip must shrink");
+        }
+        // PNG is already deflate-compressed: no gzip variant.
+        let icon = embedded_static_asset("/icon-128.png").unwrap();
+        assert!(icon.gzip.is_none());
+        // The favicon alias serves the same PNG.
+        assert_eq!(embedded_static_asset("/favicon.ico").unwrap().body, ICON_128_PNG);
+        // The gzip gate is size-based: tiny assets stay identity-only.
+        let audio = embedded_static_asset("/audio-processor.js").unwrap();
+        assert_eq!(audio.gzip.is_some(), audio.body.len() >= GZIP_MIN_BYTES);
+        // Unknown paths are not assets.
+        assert!(embedded_static_asset("/api/fs/stat").is_none());
+    }
+
+    #[test]
+    fn if_none_match_tolerates_quotes_weak_prefix_and_lists() {
+        assert!(if_none_match_matches(
+            "GET / HTTP/1.1\r\nIf-None-Match: \"abc\"\r\n",
+            "abc"
+        ));
+        assert!(if_none_match_matches("If-None-Match: W/\"abc\"", "abc"));
+        assert!(if_none_match_matches("if-none-match: w/\"abc\"", "abc"));
+        assert!(if_none_match_matches(
+            "If-None-Match: \"x\", W/\"abc\" , \"y\"",
+            "abc"
+        ));
+        assert!(if_none_match_matches("If-None-Match: abc", "abc"));
+        assert!(if_none_match_matches("If-None-Match: *", "abc"));
+        assert!(!if_none_match_matches("If-None-Match: \"def\"", "abc"));
+        assert!(!if_none_match_matches("X-Custom: \"abc\"", "abc"));
+        assert!(!if_none_match_matches("GET / HTTP/1.1\r\n", "abc"));
+    }
+
+    #[test]
+    fn accept_encoding_gzip_negotiation() {
+        assert!(accept_encoding_allows_gzip(
+            "GET / HTTP/1.1\r\nAccept-Encoding: gzip, deflate, br\r\n"
+        ));
+        assert!(accept_encoding_allows_gzip("Accept-Encoding: GZIP"));
+        assert!(accept_encoding_allows_gzip("accept-encoding: x-gzip;q=0.5"));
+        assert!(accept_encoding_allows_gzip("Accept-Encoding: br, gzip;q=0.8"));
+        assert!(!accept_encoding_allows_gzip("Accept-Encoding: br"));
+        assert!(!accept_encoding_allows_gzip("Accept-Encoding: gzip;q=0"));
+        assert!(!accept_encoding_allows_gzip("Accept-Encoding: gzip;q=0.0"));
+        assert!(!accept_encoding_allows_gzip("GET / HTTP/1.1\r\n"));
+    }
+
+    #[test]
+    fn asset_cache_control_immutable_only_for_current_version() {
+        let immutable = "public, max-age=31536000, immutable";
+        let revalidate = "no-cache, must-revalidate";
+        assert_eq!(asset_cache_control("v=abc", "abc"), immutable);
+        assert_eq!(asset_cache_control("foo=1&v=abc", "abc"), immutable);
+        assert_eq!(asset_cache_control("v=stale", "abc"), revalidate);
+        assert_eq!(asset_cache_control("vv=abc", "abc"), revalidate);
+        assert_eq!(asset_cache_control("", "abc"), revalidate);
+    }
+
+    fn test_asset_view<'a>(body: &'a [u8], gzip: Option<&'a [u8]>) -> StaticAssetView<'a> {
+        StaticAssetView {
+            content_type: "application/javascript",
+            body,
+            etag: "feedface00000000",
+            gzip,
+            cache_control: None,
+        }
+    }
+
+    fn split_http_response(response: &[u8]) -> (String, &[u8]) {
+        let split = response
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .expect("header terminator")
+            + 4;
+        (
+            String::from_utf8(response[..split].to_vec()).unwrap(),
+            &response[split..],
+        )
+    }
+
+    #[test]
+    fn static_asset_response_serves_gzip_when_accepted() {
+        let body = vec![b'a'; 16384];
+        let gz = gzip_compress(&body);
+        let response = build_static_asset_response(
+            "GET",
+            "GET /x.js?v=cur HTTP/1.1\r\nAccept-Encoding: gzip, br\r\n",
+            "v=cur",
+            "cur",
+            test_asset_view(&body, Some(&gz)),
+        );
+        let (head, payload) = split_http_response(&response);
+        assert!(head.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(head.contains("Content-Encoding: gzip\r\n"));
+        assert!(head.contains(&format!("Content-Length: {}\r\n", gz.len())));
+        assert!(head.contains("ETag: \"feedface00000000\"\r\n"));
+        assert!(head.contains("Cache-Control: public, max-age=31536000, immutable\r\n"));
+        assert!(head.contains("Vary: Accept-Encoding\r\n"));
+        assert!(head.contains("Access-Control-Allow-Origin: *\r\n"));
+        assert_eq!(payload, &gz[..]);
+        // The gzip payload round-trips back to the original body.
+        use std::io::Read as _;
+        let mut decoded = Vec::new();
+        flate2::read::GzDecoder::new(payload)
+            .read_to_end(&mut decoded)
+            .unwrap();
+        assert_eq!(decoded, body);
+    }
+
+    #[test]
+    fn static_asset_response_identity_without_accept_encoding() {
+        let body = vec![b'b'; 8192];
+        let gz = gzip_compress(&body);
+        let response = build_static_asset_response(
+            "GET",
+            "GET /x.js HTTP/1.1\r\n",
+            "",
+            "cur",
+            test_asset_view(&body, Some(&gz)),
+        );
+        let (head, payload) = split_http_response(&response);
+        assert!(head.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(!head.contains("Content-Encoding"));
+        assert!(head.contains(&format!("Content-Length: {}\r\n", body.len())));
+        assert!(head.contains("Cache-Control: no-cache, must-revalidate\r\n"));
+        assert!(head.contains("Vary: Accept-Encoding\r\n"));
+        assert_eq!(payload, &body[..]);
+    }
+
+    #[test]
+    fn static_asset_response_304_on_etag_match() {
+        let body = b"0123456789".repeat(1000);
+        let gz = gzip_compress(&body);
+        let response = build_static_asset_response(
+            "GET",
+            "GET /x.js HTTP/1.1\r\nAccept-Encoding: gzip\r\nIf-None-Match: W/\"feedface00000000\"\r\n",
+            "",
+            "cur",
+            test_asset_view(&body, Some(&gz)),
+        );
+        let (head, payload) = split_http_response(&response);
+        assert!(head.starts_with("HTTP/1.1 304 Not Modified\r\n"));
+        assert!(payload.is_empty(), "304 must carry no body");
+        assert!(head.contains("ETag: \"feedface00000000\"\r\n"));
+        assert!(head.contains("Cache-Control: no-cache, must-revalidate\r\n"));
+        assert!(head.contains("Access-Control-Allow-Origin: *\r\n"));
+        assert!(!head.contains("Content-Encoding"));
+        assert!(!head.contains("Content-Length"));
+    }
+
+    #[test]
+    fn static_asset_response_head_sends_headers_only() {
+        let body = vec![b'c'; 8192];
+        let gz = gzip_compress(&body);
+        let response = build_static_asset_response(
+            "HEAD",
+            "HEAD /x.js HTTP/1.1\r\nAccept-Encoding: gzip\r\n",
+            "",
+            "cur",
+            test_asset_view(&body, Some(&gz)),
+        );
+        let (head, payload) = split_http_response(&response);
+        assert!(head.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(payload.is_empty(), "HEAD must carry no body");
+        // Headers (including Content-Length) match what GET would send.
+        assert!(head.contains(&format!("Content-Length: {}\r\n", gz.len())));
+        assert!(head.contains("Content-Encoding: gzip\r\n"));
+    }
+
+    #[test]
+    fn asset_url_rewrite_is_idempotent_and_normalizes_stale_busters() {
+        let v = "0123456789abcdef";
+        // The source HTML hardcodes a stale buster on one asset (the old
+        // `?v=wgpu29` station-wasm case) and none on another.
+        let html = "<script src=\"/wasm-station/station_web.js?v=wgpu29\"></script>\n\
+                    import('/wasm-station/station_web_bg.wasm');";
+        let rewritten =
+            rewrite_asset_url_with_version(html, "/wasm-station/station_web.js", v);
+        let rewritten =
+            rewrite_asset_url_with_version(&rewritten, "/wasm-station/station_web_bg.wasm", v);
+        assert!(rewritten.contains("/wasm-station/station_web.js?v=0123456789abcdef\""));
+        assert!(rewritten.contains("/wasm-station/station_web_bg.wasm?v=0123456789abcdef'"));
+        assert!(!rewritten.contains("wgpu29"), "stale buster must be replaced");
+        assert!(
+            !rewritten.contains("?v=0123456789abcdef?v="),
+            "never a malformed double query"
+        );
+
+        // Idempotent: re-applying the rewrite changes nothing.
+        let twice = rewrite_asset_url_with_version(&rewritten, "/wasm-station/station_web.js", v);
+        let twice =
+            rewrite_asset_url_with_version(&twice, "/wasm-station/station_web_bg.wasm", v);
+        assert_eq!(twice, rewritten);
+
+        // Multiple occurrences are all rewritten.
+        let multi = rewrite_asset_url_with_version(
+            "/icon-128.png /icon-128.png?v=old /icon-128.png",
+            "/icon-128.png",
+            v,
+        );
+        assert_eq!(
+            multi,
+            "/icon-128.png?v=0123456789abcdef /icon-128.png?v=0123456789abcdef /icon-128.png?v=0123456789abcdef"
+        );
+    }
+
+    #[test]
     fn changes_request_decodes_nested_file_path() {
         let snapshot = tempfile::TempDir::new().unwrap();
         let project = tempfile::TempDir::new().unwrap();
@@ -28939,6 +29589,93 @@ mod tests {
     /// because the /api/peers tests all make a handful of these.
     async fn http_request(port: u16, request: &str) -> String {
         String::from_utf8_lossy(&http_request_bytes(port, request).await).into_owned()
+    }
+
+    /// End-to-end exercise of the static-asset arms through a real
+    /// gateway socket: exact-path routing (the `/api/...?path=<asset>`
+    /// shadowing regression), conditional requests, gzip negotiation,
+    /// the `?v=` cache policy, and HEAD.
+    #[tokio::test]
+    async fn test_static_asset_serving_end_to_end() {
+        let (port, handle) = spawn_test_gateway_with_registry(None).await;
+
+        // Exact path serves the wasm with ETag + CORS + revalidation
+        // caching (no current `?v=` buster on the request).
+        let resp = http_request_bytes(
+            port,
+            "GET /wasm-station/station_web_bg.wasm HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        )
+        .await;
+        let split = resp.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+        let head = String::from_utf8_lossy(&resp[..split]).into_owned();
+        assert!(head.starts_with("HTTP/1.1 200 OK\r\n"), "got: {head}");
+        assert!(head.contains("Content-Type: application/wasm\r\n"));
+        assert!(head.contains("Access-Control-Allow-Origin: *\r\n"));
+        assert!(head.contains("Cache-Control: no-cache, must-revalidate\r\n"));
+        assert_eq!(&resp[split..], WASM_STATION_BIN);
+        let etag_line = head
+            .lines()
+            .find(|l| l.starts_with("ETag: "))
+            .expect("ETag header on asset response")
+            .to_string();
+
+        // The same asset path mentioned inside an API query parameter is
+        // no longer shadowed by the asset arm: /api/fs/stat answers JSON.
+        let resp = http_request(
+            port,
+            "GET /api/fs/stat?path=/wasm-station/station_web_bg.wasm HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        )
+        .await;
+        let head = resp.split("\r\n\r\n").next().unwrap_or("");
+        assert!(
+            head.contains("Content-Type: application/json"),
+            "fs API must answer JSON, not the wasm asset; got: {head}"
+        );
+
+        // Conditional revalidation: matching If-None-Match → 304, no body.
+        let etag = etag_line.trim_start_matches("ETag: ").trim();
+        let req = format!(
+            "GET /wasm-station/station_web_bg.wasm HTTP/1.1\r\nHost: localhost\r\nIf-None-Match: {etag}\r\n\r\n"
+        );
+        let resp = http_request_bytes(port, &req).await;
+        let split = resp.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+        let head = String::from_utf8_lossy(&resp[..split]).into_owned();
+        assert!(head.starts_with("HTTP/1.1 304 Not Modified\r\n"), "got: {head}");
+        assert!(head.contains(&etag_line));
+        assert!(head.contains("Access-Control-Allow-Origin: *\r\n"));
+        assert_eq!(resp.len(), split, "304 must carry no body");
+
+        // Current-version buster + gzip: immutable caching and a gzip
+        // body that round-trips to the original bytes.
+        let req = format!(
+            "GET /wasm-station/station_web_bg.wasm?v={} HTTP/1.1\r\nHost: localhost\r\nAccept-Encoding: gzip, deflate\r\n\r\n",
+            asset_version()
+        );
+        let resp = http_request_bytes(port, &req).await;
+        let split = resp.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+        let head = String::from_utf8_lossy(&resp[..split]).into_owned();
+        assert!(head.contains("Cache-Control: public, max-age=31536000, immutable\r\n"));
+        assert!(head.contains("Content-Encoding: gzip\r\n"));
+        assert!(head.contains("Vary: Accept-Encoding\r\n"));
+        use std::io::Read as _;
+        let mut decoded = Vec::new();
+        flate2::read::GzDecoder::new(&resp[split..])
+            .read_to_end(&mut decoded)
+            .unwrap();
+        assert_eq!(decoded, WASM_STATION_BIN);
+
+        // HEAD: status + headers only.
+        let resp = http_request_bytes(
+            port,
+            "HEAD /wasm-station/station_web_bg.wasm HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        )
+        .await;
+        let split = resp.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+        let head = String::from_utf8_lossy(&resp[..split]).into_owned();
+        assert!(head.starts_with("HTTP/1.1 200 OK\r\n"), "got: {head}");
+        assert_eq!(resp.len(), split, "HEAD must carry no body");
+
+        handle.abort();
     }
 
     /// Same as `spawn_test_gateway_with_registry` but also wires an

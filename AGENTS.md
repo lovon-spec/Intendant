@@ -54,8 +54,9 @@ cargo test --bins         # unit tests (fast, no API keys)
 cargo clippy              # lint
 ```
 
-**WASM** (`crates/presence-web`): `build.rs` auto-detects stale WASM and rebuilds it via `wasm-pack`, then re-embeds, on a normal `cargo build` (wasm-pack must be installed). Manual fallback only if that fails:
-`cd crates/presence-web && wasm-pack build --target web --out-dir ../../static/wasm-web --out-name presence_web`.
+**WASM** (`crates/presence-web` → `static/wasm-web/`, `crates/station-web` → `static/wasm-station/`): `build.rs` auto-detects stale WASM in either crate and rebuilds it via `wasm-pack`, then re-embeds, on a normal `cargo build` (wasm-pack must be installed). Manual fallback only if that fails:
+`cd crates/presence-web && wasm-pack build --target web --out-dir ../../static/wasm-web --out-name presence_web` or
+`cd crates/station-web && wasm-pack build --target web --out-dir ../../static/wasm-station --out-name station_web`.
 
 Common invocations (full flag reference in `docs/src/getting-started.md`):
 
@@ -70,7 +71,7 @@ Common invocations (full flag reference in `docs/src/getting-started.md`):
 
 Requires an API key in `.env` (searched: cwd + parents → project root → `~/.config/intendant/.env`). `.env` and `intendant.toml` are git-ignored.
 
-**Tests:** unit tests are inline `#[cfg(test)]` modules. `tests/e2e/main.rs` is an empty stub; end-to-end scenarios now live as SKILL.md files under `tests/skills/` and are **not** in CI (they make real API calls / need a display). Run `cargo test --bins` and `cargo clippy` locally before committing.
+**Tests:** unit tests are inline `#[cfg(test)]` modules. `tests/e2e/main.rs` is an empty stub; end-to-end scenarios now live as SKILL.md files under `tests/skills/` and are **not** in CI (they make real API calls / need a display). `scripts/validate-dashboard.cjs` is the dashboard/Station QA harness (drives a real browser over CDP; also not in CI). Run `cargo test --bins` and `cargo clippy` locally before committing.
 
 ## Repository Layout
 
@@ -93,11 +94,11 @@ src/
     ├── session_log.rs, session_names.rs, knowledge.rs, project.rs, app_state_pricing.rs
     ├── sandbox.rs, platform.rs, daemon_log_tee.rs, diagnostics.rs, …
     └── tui/                    # ratatui TUI (display-only client of the control plane)
-crates/{presence-core, presence-web}   # WASM-shared presence types/tools/dispatch + browser WASM client
-static/         # app.html dashboard SPA + compiled wasm-web/
+crates/{presence-core, presence-web, station-web}   # WASM: shared presence types/tools/dispatch, browser presence client, Station renderer
+static/         # app.html dashboard SPA + compiled wasm-web/ + wasm-station/
 macos-app/      # native macOS WKWebView wrapper (built by scripts/bundle-macos.sh)
 vendor/         # vortex-guest-tools (macOS Vortex Audio HAL plugin)
-scripts/        # setup-{linux,macos,windows}, setup-lan*, bundle-macos, …
+scripts/        # setup-{linux,macos,windows}, setup-lan*, bundle-macos, validate-dashboard.cjs (dashboard/Station QA), …
 skills/         # phone-call, voice-call-app, wayland-portal-e2e
 docs/src/       # this project's mdBook — the deep reference (see the table above)
 SysPrompt*.md   # per-role system prompts (base, tools, user, orchestrator, research, implementation, presence, live audio)

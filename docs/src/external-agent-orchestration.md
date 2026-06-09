@@ -188,7 +188,11 @@ features they lack.
   readiness, supports selector/function waits plus named Station probes and
   optional headed Station interaction/screenshot artifacts, falls back when Node
   has no WebSocket module, and prints compact PASS/FAIL output with bounded log
-  excerpts on failure. Use `--require-station-state
+  excerpts on failure. Station renders canvas-only — a WebGPU scene with a
+  canvas-2D WASM fallback and an invisible hotspot overlay for keyboard
+  access, with no DOM dock — so the named probes assert against the rendered
+  scene: `dock-hidden` passes when the legacy DOM dock is absent from the
+  page, and the interaction probe drives the rendered hotspots. Use `--require-station-state
   --require-managed-context-state --require-ai-provider-session
   --require-external-agent codex --station-interaction-probe --screenshot <png>
   --json` for meaningful headed Station QA instead of scraping the helper's
