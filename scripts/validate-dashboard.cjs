@@ -19,6 +19,9 @@ const DEFAULT_CDP_TIMEOUT_MS = 10000;
 const DEFAULT_CDP_COMMAND_TIMEOUT_MS = 8000;
 const DEFAULT_DASHBOARD_TIMEOUT_MS = 15000;
 const SCREENSHOT_LIVENESS_TIMEOUT_MS = 1500;
+const FAILURE_SCREENSHOT_TIMEOUT_MS = 3000;
+const FAILURE_SCREENSHOT_NAVIGATION_TIMEOUT_MS = 5000;
+const FAILURE_SCREENSHOT_SETTLE_MS = 300;
 const DEFAULT_LOG_LINES = 8;
 const LOG_BUFFER_LIMIT = 80;
 const LOG_TEXT_LIMIT = 260;
@@ -481,6 +484,7 @@ async function main() {
   const started = Date.now();
   let dashboard;
   let harness;
+  let launchEnv;
   const closeOwnedProcesses = async () => {
     const closeTasks = [];
     if (harness) {
@@ -495,7 +499,7 @@ async function main() {
     await closeOwnedProcesses();
   });
   try {
-    const launchEnv = resolveLaunchEnvironment(opts);
+    launchEnv = resolveLaunchEnvironment(opts);
     if (opts.launchDashboard) {
       dashboard = await TemporaryDashboard.launch(opts, launchEnv);
     }
@@ -558,6 +562,17 @@ async function main() {
     };
     printResult(opts, result);
   } catch (error) {
+    const harnessFallbacks = harness
+      ? await captureStationRuntimeTimeoutEvidence(
+          opts,
+          launchEnv,
+          harness,
+          error,
+          (nextHarness) => {
+            harness = nextHarness;
+          },
+        )
+      : undefined;
     const diagnostics = shouldCollectFailureDiagnostics(opts, error) && harness
       ? await harness.failureDiagnostics(opts).catch((diagError) => ({
           error: diagError.message || String(diagError),
@@ -575,6 +590,7 @@ async function main() {
       logs: collectFailureLogs(opts.logLines, dashboard, harness),
       diagnostics,
       diagnosticsAuto: Boolean(diagnostics && !opts.diagnostics),
+      harnessFallbacks,
     };
     printResult(opts, result);
     process.exitCode = 1;
@@ -736,6 +752,9 @@ function printResult(opts, result) {
   for (const line of formatArtifactLines(displayResult.artifacts)) {
     console.error(`  ${line}`);
   }
+  for (const line of formatHarnessFallbackLines(displayResult.harnessFallbacks)) {
+    console.error(`  ${line}`);
+  }
   for (const line of formatDiagnostics(displayResult.diagnostics)) {
     console.error(`  ${line}`);
   }
@@ -774,6 +793,21 @@ function formatArtifactLines(artifacts) {
   }
   if (artifacts.browserUserDataDir) {
     lines.push(`artifact browserUserDataDir=${quote(artifacts.browserUserDataDir)}`);
+  }
+  return lines;
+}
+
+function formatHarnessFallbackLines(fallbacks) {
+  if (!fallbacks || typeof fallbacks !== 'object') {
+    return [];
+  }
+  const lines = [];
+  if (fallbacks.stationRuntimeEvaluateTimeout) {
+    const screenshot = fallbacks.screenshot || {};
+    const reason = screenshot.reason ? ` reason=${quote(screenshot.reason)}` : '';
+    lines.push(
+      `harness fallback stationRuntimeEvaluateTimeout=true screenshot=${quote(screenshot.status || 'unknown')} mode=${quote(screenshot.mode || 'unknown')}${reason}`,
+    );
   }
   return lines;
 }
@@ -1344,6 +1378,119 @@ async function captureValidationScreenshotWithRetry(opts, launchEnv, harness, re
   }
 }
 
+async function captureStationRuntimeTimeoutEvidence(
+  opts,
+  launchEnv,
+  harness,
+  error,
+  replaceHarness,
+  launchHarness = BrowserHarness.launch,
+) {
+  if (!shouldCaptureStationRuntimeTimeoutScreenshot(opts, error)) {
+    return undefined;
+  }
+  removeExistingScreenshotArtifact(opts.screenshotPath);
+
+  const fallback = {
+    stationRuntimeEvaluateTimeout: true,
+    screenshot: {
+      status: 'not-captured',
+      mode: 'same-browser',
+    },
+  };
+
+  const first = await tryCaptureFailureScreenshot(
+    harness,
+    opts.screenshotPath,
+    FAILURE_SCREENSHOT_TIMEOUT_MS,
+    'same-browser',
+  );
+  if (first.ok) {
+    fallback.screenshot = {
+      status: 'captured',
+      mode: 'same-browser',
+    };
+    return fallback;
+  }
+
+  fallback.screenshot.reason = first.reason;
+  fallback.screenshot.status = 'failed';
+  if (!launchEnv) {
+    return fallback;
+  }
+
+  await harness.close({ forceBrowser: true }).catch(() => {});
+  let retryHarness;
+  try {
+    retryHarness = await launchHarness(opts, launchEnv);
+    replaceHarness(retryHarness);
+    await retryHarness.navigateForScreenshot(opts, FAILURE_SCREENSHOT_NAVIGATION_TIMEOUT_MS);
+    const retry = await tryCaptureFailureScreenshot(
+      retryHarness,
+      opts.screenshotPath,
+      FAILURE_SCREENSHOT_TIMEOUT_MS,
+      'fresh-browser',
+    );
+    fallback.screenshot.mode = 'fresh-browser';
+    if (retry.ok) {
+      fallback.screenshot.status = 'captured';
+      delete fallback.screenshot.reason;
+    } else {
+      fallback.screenshot.reason = retry.reason;
+    }
+  } catch (retryError) {
+    fallback.screenshot.mode = retryHarness ? 'fresh-browser' : 'fresh-browser-launch';
+    fallback.screenshot.reason = retryError.message || String(retryError);
+    if (retryHarness) {
+      replaceHarness(retryHarness);
+    }
+  }
+  return fallback;
+}
+
+function removeExistingScreenshotArtifact(filePath) {
+  try {
+    fs.rmSync(filePath, { force: true });
+  } catch (_) {
+    // A stale screenshot is less useful than an explicit capture failure.
+  }
+}
+
+async function tryCaptureFailureScreenshot(harness, filePath, timeoutMs, mode) {
+  try {
+    await harness.captureScreenshot(filePath, timeoutMs);
+    if (harness.pageLogs) {
+      harness.pageLogs.push('harness', `captured failure screenshot via ${mode}`);
+    }
+    return { ok: true };
+  } catch (error) {
+    const reason = error.message || String(error);
+    if (harness.pageLogs) {
+      harness.pageLogs.push('harness', `failure screenshot via ${mode} failed: ${truncateMiddle(reason, LOG_TEXT_LIMIT)}`);
+    }
+    return {
+      ok: false,
+      reason,
+    };
+  }
+}
+
+function shouldCaptureStationRuntimeTimeoutScreenshot(opts, error) {
+  return Boolean(
+    opts
+      && opts.screenshotPath
+      && isStationFocusedCheck(opts)
+      && isCdpRuntimeEvaluateTimeout(error),
+  );
+}
+
+function isCdpRuntimeEvaluateTimeout(errorOrReason) {
+  const text = errorOrReason && errorOrReason.message
+    ? errorOrReason.message
+    : String(errorOrReason || '');
+  return /\bCDP Runtime\.evaluate timed out\b/.test(text);
+}
+
 function isCdpScreenshotTimeout(errorOrReason) {
   const text = errorOrReason && errorOrReason.message
     ? errorOrReason.message
@@ -1560,6 +1707,32 @@ class BrowserHarness {
     }
   }
 
+  async navigateForScreenshot(opts, timeoutMs = FAILURE_SCREENSHOT_NAVIGATION_TIMEOUT_MS) {
+    let loaded = false;
+    const onEvent = (message) => {
+      if (message.sessionId === this.sessionId && message.method === 'Page.loadEventFired') {
+        loaded = true;
+      }
+    };
+    this.cdp.on('event', onEvent);
+    try {
+      const nav = await this.cdp.send('Page.navigate', { url: opts.url }, this.sessionId, timeoutMs);
+      if (nav.errorText) {
+        throw new Error(`navigation failed before screenshot fallback: ${nav.errorText}`);
+      }
+      await waitUntil(
+        () => loaded,
+        timeoutMs,
+        `page load event did not fire before screenshot fallback at ${opts.url}`,
+      ).catch((error) => {
+        this.pageLogs.push('harness', truncateMiddle(error.message || String(error), LOG_TEXT_LIMIT));
+      });
+      await delay(FAILURE_SCREENSHOT_SETTLE_MS);
+    } finally {
+      this.cdp.off('event', onEvent);
+    }
+  }
+
   async documentReadyState() {
     const result = await this.evaluate('document.readyState');
     return String(result || '');
@@ -1680,7 +1853,7 @@ class BrowserHarness {
       : undefined;
   }
 
-  async captureScreenshot(filePath) {
+  async captureScreenshot(filePath, timeoutMs = DEFAULT_CDP_COMMAND_TIMEOUT_MS) {
     const result = await this.cdp.send(
       'Page.captureScreenshot',
       {
@@ -1689,6 +1862,7 @@ class BrowserHarness {
         fromSurface: true,
       },
       this.sessionId,
+      timeoutMs,
     );
     if (!result.data) {
       throw new Error('screenshot capture returned no image data');
@@ -3379,8 +3553,30 @@ function compactResultForOutput(opts, result) {
       suppressControls: isStationFocusedCheck(opts) && !opts.diagnostics,
     });
   }
+  if (compact.harnessFallbacks) {
+    compact.harnessFallbacks = compactHarnessFallbacks(compact.harnessFallbacks);
+  }
   if (compact.status === 'fail') {
     compact.next = validationFailureNextStep(compact);
+  }
+  return compact;
+}
+
+function compactHarnessFallbacks(fallbacks) {
+  if (!fallbacks || typeof fallbacks !== 'object') {
+    return fallbacks;
+  }
+  const compact = {
+    stationRuntimeEvaluateTimeout: Boolean(fallbacks.stationRuntimeEvaluateTimeout),
+  };
+  if (fallbacks.screenshot && typeof fallbacks.screenshot === 'object') {
+    compact.screenshot = {
+      status: String(fallbacks.screenshot.status || ''),
+      mode: String(fallbacks.screenshot.mode || ''),
+    };
+    if (fallbacks.screenshot.reason) {
+      compact.screenshot.reason = truncateMiddle(fallbacks.screenshot.reason, RESULT_REASON_LIMIT);
+    }
   }
   return compact;
 }
@@ -3542,6 +3738,9 @@ function validationFailureNextStep(result) {
   if (result.failureKind === 'stale-static') {
     return 'rebuild and restart the dashboard controller from this worktree, then rerun with --require-current-static';
   }
+  if (result.failureKind === 'harness' && isCdpRuntimeEvaluateTimeout(result.reason || '')) {
+    return 'treat as browser harness Runtime.evaluate timeout; use the screenshot artifact/fallback facts as product evidence and inspect browser/GPU stability before rerunning';
+  }
   if (result.failureKind === 'harness' && isCdpScreenshotTimeout(result.reason || '')) {
     return 'treat as browser harness screenshot failure after the built-in single retry; keep Station validator failures separate and inspect browser/GPU stability';
   }
@@ -3581,6 +3780,9 @@ function validationFailureKind(reason) {
     return 'artifact';
   }
   if (/^station probe .* did not pass/.test(text)) {
+    if (isCdpRuntimeEvaluateTimeout(text)) {
+      return 'harness';
+    }
     return text.includes('"failureKind":"renderer"') ? 'renderer' : 'probe';
   }
   if (/^wait-for-function did not become truthy/.test(text)) {
@@ -3810,6 +4012,9 @@ function shouldCollectFailureDiagnostics(opts, error) {
     return true;
   }
   const reason = error && (error.message || String(error));
+  if (isCdpRuntimeEvaluateTimeout(reason)) {
+    return false;
+  }
   return isWaitFailureReason(reason);
 }
 
@@ -4266,6 +4471,10 @@ async function runSelfTest() {
     'renderer',
   );
   assert.strictEqual(
+    validationFailureKind('station probe rendered did not pass (last error: CDP Runtime.evaluate timed out)'),
+    'harness',
+  );
+  assert.strictEqual(
     validationFailureKind('station interaction probe system:view did not pass (last value: false)'),
     'interaction',
   );
@@ -4274,6 +4483,21 @@ async function runSelfTest() {
   assert.strictEqual(
     validationFailureKind('CDP Page.captureScreenshot timed out'),
     'harness',
+  );
+  assert.strictEqual(isCdpRuntimeEvaluateTimeout(new Error('CDP Runtime.evaluate timed out')), true);
+  assert.strictEqual(
+    shouldCaptureStationRuntimeTimeoutScreenshot(
+      { screenshotPath: '/tmp/station-timeout.png', stationProbes: ['rendered'], functions: [], selectors: [] },
+      new Error('CDP Runtime.evaluate timed out'),
+    ),
+    true,
+  );
+  assert.strictEqual(
+    shouldCaptureStationRuntimeTimeoutScreenshot(
+      { stationProbes: ['rendered'], functions: [], selectors: [] },
+      new Error('CDP Runtime.evaluate timed out'),
+    ),
+    false,
   );
   const screenshotTimeout = screenshotTimeoutError(new Error('CDP Page.captureScreenshot timed out'), {
     retried: true,
@@ -4290,6 +4514,12 @@ async function runSelfTest() {
       failureKind: 'harness',
       reason: screenshotTimeout.message,
     }).includes('built-in single retry'),
+  );
+  assert.ok(
+    validationFailureNextStep({
+      failureKind: 'harness',
+      reason: 'CDP Runtime.evaluate timed out',
+    }).includes('Runtime.evaluate timeout'),
   );
   assert.strictEqual(
     validationFailureKind('screenshot capture returned no image data'),
@@ -4747,9 +4977,128 @@ async function runSelfTest() {
       '[log.warning] canvas fallback path selected',
     ],
   );
+  const fallbackDir = fs.mkdtempSync(path.join(os.tmpdir(), 'validate-dashboard-fallback-'));
+  try {
+    const sameBrowserShot = path.join(fallbackDir, 'same-browser.png');
+    let sameBrowserTimeout = 0;
+    const sameBrowserHarness = {
+      pageLogs: new BoundedLog(LOG_BUFFER_LIMIT),
+      captureScreenshot: async (filePath, timeoutMs) => {
+        sameBrowserTimeout = timeoutMs;
+        fs.writeFileSync(filePath, 'png');
+        return filePath;
+      },
+    };
+    const sameBrowserFallback = await captureStationRuntimeTimeoutEvidence(
+      {
+        url: 'http://127.0.0.1:8956/#station',
+        screenshotPath: sameBrowserShot,
+        stationProbes: ['rendered'],
+        selectors: [],
+        functions: [],
+      },
+      { env: {} },
+      sameBrowserHarness,
+      new Error('CDP Runtime.evaluate timed out'),
+      () => {},
+    );
+    assert.strictEqual(sameBrowserFallback.screenshot.status, 'captured');
+    assert.strictEqual(sameBrowserFallback.screenshot.mode, 'same-browser');
+    assert.strictEqual(sameBrowserTimeout, FAILURE_SCREENSHOT_TIMEOUT_MS);
+    assert.strictEqual(fs.existsSync(sameBrowserShot), true);
+
+    const freshBrowserShot = path.join(fallbackDir, 'fresh-browser.png');
+    let firstClosed = false;
+    let replacedHarness;
+    let navigationTimeout = 0;
+    const firstHarness = {
+      pageLogs: new BoundedLog(LOG_BUFFER_LIMIT),
+      captureScreenshot: async () => {
+        throw new Error('CDP Page.captureScreenshot timed out');
+      },
+      close: async () => {
+        firstClosed = true;
+      },
+    };
+    const retryHarness = {
+      pageLogs: new BoundedLog(LOG_BUFFER_LIMIT),
+      navigateForScreenshot: async (_opts, timeoutMs) => {
+        navigationTimeout = timeoutMs;
+      },
+      captureScreenshot: async (filePath) => {
+        fs.writeFileSync(filePath, 'png');
+        return filePath;
+      },
+    };
+    const freshBrowserFallback = await captureStationRuntimeTimeoutEvidence(
+      {
+        url: 'http://127.0.0.1:8956/#station',
+        screenshotPath: freshBrowserShot,
+        stationProbes: ['rendered'],
+        selectors: [],
+        functions: [],
+      },
+      { env: {} },
+      firstHarness,
+      new Error('CDP Runtime.evaluate timed out'),
+      (nextHarness) => {
+        replacedHarness = nextHarness;
+      },
+      async () => retryHarness,
+    );
+    assert.strictEqual(firstClosed, true);
+    assert.strictEqual(replacedHarness, retryHarness);
+    assert.strictEqual(navigationTimeout, FAILURE_SCREENSHOT_NAVIGATION_TIMEOUT_MS);
+    assert.strictEqual(freshBrowserFallback.screenshot.status, 'captured');
+    assert.strictEqual(freshBrowserFallback.screenshot.mode, 'fresh-browser');
+    assert.strictEqual(fs.existsSync(freshBrowserShot), true);
+    const staleShot = path.join(fallbackDir, 'stale.png');
+    fs.writeFileSync(staleShot, 'old');
+    const staleFallback = await captureStationRuntimeTimeoutEvidence(
+      {
+        url: 'http://127.0.0.1:8956/#station',
+        screenshotPath: staleShot,
+        stationProbes: ['rendered'],
+        selectors: [],
+        functions: [],
+      },
+      undefined,
+      {
+        pageLogs: new BoundedLog(LOG_BUFFER_LIMIT),
+        captureScreenshot: async () => {
+          throw new Error('CDP Page.captureScreenshot timed out');
+        },
+      },
+      new Error('CDP Runtime.evaluate timed out'),
+      () => {},
+    );
+    assert.strictEqual(staleFallback.screenshot.status, 'failed');
+    assert.strictEqual(fs.existsSync(staleShot), false);
+    assert.strictEqual(
+      compactHarnessFallbacks({
+        stationRuntimeEvaluateTimeout: true,
+        screenshot: {
+          status: 'failed',
+          mode: 'fresh-browser',
+          reason: 'x'.repeat(RESULT_REASON_LIMIT + 20),
+        },
+      }).screenshot.reason.length,
+      RESULT_REASON_LIMIT,
+    );
+  } finally {
+    fs.rmSync(fallbackDir, { recursive: true, force: true });
+  }
   assert.strictEqual(shouldCollectFailureDiagnostics({ diagnostics: true }, new Error('boom')), true);
   assert.strictEqual(
     shouldCollectFailureDiagnostics({ diagnostics: false }, new Error('wait-for-function did not become truthy')),
+    true,
+  );
+  assert.strictEqual(
+    shouldCollectFailureDiagnostics({ diagnostics: false }, new Error('CDP Runtime.evaluate timed out')),
+    false,
+  );
+  assert.strictEqual(
+    shouldCollectFailureDiagnostics({ diagnostics: true }, new Error('CDP Runtime.evaluate timed out')),
     true,
   );
   assert.strictEqual(
