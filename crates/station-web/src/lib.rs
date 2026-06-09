@@ -240,6 +240,7 @@ struct StationInner {
     /// Timestamp of the previously rendered frame, for frame-rate-independent
     /// accumulation (auto-orbit drift).
     last_tick_ms: f64,
+    last_present_ms: f64,
 }
 
 impl StationInner {
@@ -308,6 +309,7 @@ impl StationInner {
             raf_cb: None,
             raf_pending: false,
             last_tick_ms: 0.0,
+            last_present_ms: 0.0,
         };
         inner.rebuild_layout_cache();
         inner.resize();
@@ -386,7 +388,9 @@ impl StationInner {
                 if !s.active {
                     false
                 } else {
-                    s.render(time_ms);
+                    if s.frame_due(time_ms) {
+                        s.render(time_ms);
+                    }
                     s.is_animating()
                 }
             };
@@ -397,6 +401,21 @@ impl StationInner {
 
         inner.borrow_mut().raf_cb = Some(cb);
         StationInner::schedule_frame(&inner);
+    }
+
+    /// Frame-rate governor. Within 150ms of real input everything renders at
+    /// display rate so drags, hovers, and slider scrubs stay fluid; ambient
+    /// frames (video thumbnails, WebGPU surface keepalive, slow orbit drift,
+    /// particles) are capped at ~30fps — they're 30fps sources or sub-pixel
+    /// motion anyway, and the full scene+HUD repaint is the dominant GPU cost
+    /// on weaker iGPUs. Skipped ticks still re-arm, so nothing stalls.
+    fn frame_due(&mut self, time_ms: f64) -> bool {
+        let interactive = time_ms - self.last_input_ms < 150.0;
+        if interactive || time_ms - self.last_present_ms >= 31.0 {
+            self.last_present_ms = time_ms;
+            return true;
+        }
+        false
     }
 
     /// Request one animation frame if the tab is active and none is pending.

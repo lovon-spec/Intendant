@@ -16170,6 +16170,11 @@ function stationClearLogState() {
 
 function stationRegisterVideoSource(sourceId, hostId, displayId, label, kind, videoEl) {
   if (!station || !videoEl || !sourceId) return;
+  // Videos parked in offscreen containers don't (re)start on autoplay;
+  // a paused element renders as a frozen black pane in the Station. Kick
+  // play() on every registration — covers local slots, peer panes, and
+  // re-registrations after DOM re-renders alike.
+  if (videoEl.paused && videoEl.srcObject) videoEl.play().catch(() => {});
   try {
     station.register_display_source(String(sourceId), String(hostId), String(displayId), String(label), String(kind || 'video'), videoEl);
     stationRegisteredSources.add(String(sourceId));
