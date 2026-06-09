@@ -10869,9 +10869,8 @@ error: build failed
         assert!(developer_instructions.contains("--hold-dashboard"));
         assert!(developer_instructions.contains("--require-managed-context-state"));
         assert!(developer_instructions.contains("review the screenshot path"));
-        assert!(
-            developer_instructions.contains("Do not start a separate foreground/nohup/setsid dashboard")
-        );
+        assert!(developer_instructions
+            .contains("Do not start a separate foreground/nohup/setsid dashboard"));
         assert!(developer_instructions.contains("compact PASS/FAIL"));
         assert!(developer_instructions.contains("--diagnostics --json"));
         assert!(developer_instructions.contains("one primary helper smoke"));

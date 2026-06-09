@@ -9935,10 +9935,8 @@ fn managed_context_followup_replay_after_rewind(
         managed_context_active_followup_resume_text(turn_stop_status)
     };
 
-    let mut followup = FollowUpMessage::with_attachments(text, active_followup.attachments.clone());
-    if active_followup.managed_context_density_handoff {
-        followup = followup.after_managed_context_density_handoff();
-    }
+    let followup = FollowUpMessage::with_attachments(text, active_followup.attachments.clone())
+        .after_managed_context_density_handoff();
     Some(followup)
 }
 
@@ -12877,6 +12875,45 @@ mod tests {
         assert_eq!(continuation.text, "Run the next narrow browser QA step.");
         assert!(continuation.managed_context_density_handoff_completed);
         assert!(!continuation.managed_context_density_handoff);
+    }
+
+    #[test]
+    fn managed_context_active_rewind_replay_suppresses_repeat_density_handoff() {
+        let active = FollowUpMessage::text("Continue the narrow Station QA loop.".into());
+        let mut pending = std::collections::VecDeque::new();
+
+        let continuation = managed_context_rewind_continuation(
+            &mut pending,
+            &active,
+            None,
+            &ManagedContextRewindTurnStopStatus::StopRequestedUnfinished {
+                pending: 1,
+                success: 0,
+                failed: 0,
+                cancelled: 0,
+            },
+        )
+        .expect("active follow-up should replay after rewind");
+
+        assert!(managed_context_is_active_followup_resume(
+            &continuation.text
+        ));
+        assert!(continuation.managed_context_density_handoff_completed);
+        assert!(!continuation.managed_context_density_handoff);
+        assert!(managed_context_preflight_rewind_only_gate_enabled(
+            true,
+            continuation.managed_context_recovery_kickstart,
+            continuation.managed_context_density_handoff,
+        ));
+        assert!(!managed_context_preflight_density_gate_enabled(
+            true,
+            continuation.managed_context_density_handoff_completed,
+        ));
+        assert!(!managed_context_post_turn_density_handoff_enabled(
+            false,
+            false,
+            continuation.managed_context_density_handoff_completed,
+        ));
     }
 
     #[test]
