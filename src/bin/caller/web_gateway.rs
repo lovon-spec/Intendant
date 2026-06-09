@@ -4,7 +4,7 @@ use crate::types::{LogLevel, SessionGoal};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::{BufRead, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -89,6 +89,8 @@ static INTENDANT_SESSION_LIST_CACHE: OnceLock<
 
 const EXTERNAL_SESSION_SCAN_LIMIT: usize = 2_000;
 const EXTERNAL_SESSION_READ_LIMIT: u64 = 512 * 1024;
+const CODEX_SESSION_LIST_PREFIX_READ_LIMIT: u64 = 8 * 1024 * 1024;
+const CODEX_SESSION_LIST_PREFIX_LINE_LIMIT: usize = 64;
 // Exact fork baselines are a synchronous `/api/sessions` refinement. The scanner
 // below parses compact Codex token lines without materializing full JSON values.
 const CODEX_PARENT_BASELINE_MAX_FILE_BYTES: u64 = 1024 * 1024 * 1024;
@@ -164,6 +166,7 @@ struct CodexSessionListSummary {
     provider: Option<String>,
     usage: SessionUsage,
     usage_events: Vec<CodexUsageEvent>,
+    daily_usage: BTreeMap<String, SessionUsage>,
     goal: Option<SessionGoal>,
     task: Option<String>,
     turns: u64,
@@ -4982,6 +4985,21 @@ fn read_text_head_tail(path: &Path, head_bytes: u64, tail_bytes: u64) -> Option<
     Some(out)
 }
 
+fn read_text_tail(path: &Path, tail_bytes: u64) -> Option<String> {
+    let mut file = std::fs::File::open(path).ok()?;
+    let len = file.metadata().ok().map(|m| m.len()).unwrap_or(0);
+    if len <= tail_bytes {
+        let mut buf = Vec::new();
+        file.read_to_end(&mut buf).ok()?;
+        return Some(String::from_utf8_lossy(&buf).to_string());
+    }
+
+    file.seek(SeekFrom::End(-(tail_bytes as i64))).ok()?;
+    let mut tail = Vec::new();
+    file.read_to_end(&mut tail).ok()?;
+    Some(String::from_utf8_lossy(&tail).to_string())
+}
+
 fn file_mtime_string(path: &Path) -> Option<String> {
     mtime_secs_to_string(file_mtime_secs(path))
 }
@@ -5046,6 +5064,35 @@ fn value_u64_at(value: &serde_json::Value, paths: &[&str]) -> Option<u64> {
         .find_map(|path| value.pointer(path).and_then(|v| v.as_u64()))
 }
 
+fn usage_day_from_timestamp(value: Option<&str>) -> Option<String> {
+    let value = value?.trim();
+    if value.is_empty() {
+        return None;
+    }
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(value) {
+        let local: chrono::DateTime<chrono::Local> = dt.with_timezone(&chrono::Local);
+        return Some(local.format("%Y-%m-%d").to_string());
+    }
+    for format in ["%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S"] {
+        if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(value, format) {
+            if let Some(local) = dt.and_local_timezone(chrono::Local).single() {
+                return Some(local.format("%Y-%m-%d").to_string());
+            }
+        }
+    }
+    value
+        .get(0..10)
+        .filter(|s| {
+            s.len() == 10
+                && s.as_bytes()[4] == b'-'
+                && s.as_bytes()[7] == b'-'
+                && s.chars()
+                    .enumerate()
+                    .all(|(idx, ch)| idx == 4 || idx == 7 || ch.is_ascii_digit())
+        })
+        .map(|s| s.to_string())
+}
+
 fn apply_session_usage(session: &mut serde_json::Value, usage: SessionUsage, model: Option<&str>) {
     if usage.is_empty() {
         return;
@@ -5088,6 +5135,47 @@ fn apply_session_usage(session: &mut serde_json::Value, usage: SessionUsage, mod
             "pricing_known".to_string(),
             serde_json::json!(estimated_cost.is_some()),
         );
+    }
+}
+
+fn apply_session_daily_usage(
+    session: &mut serde_json::Value,
+    daily_usage: &BTreeMap<String, SessionUsage>,
+    model: Option<&str>,
+) {
+    if daily_usage.is_empty() {
+        return;
+    }
+    let rows = daily_usage
+        .iter()
+        .filter(|(_, usage)| !usage.is_empty())
+        .map(|(day, usage)| {
+            let estimated_cost = model.and_then(|m| {
+                crate::app_state_pricing::estimate_session_cost(
+                    m,
+                    usage.prompt_tokens,
+                    usage.completion_tokens,
+                    usage.cached_tokens,
+                    usage.cache_creation_tokens,
+                )
+            });
+            serde_json::json!({
+                "day": day,
+                "total_tokens": usage.total_tokens,
+                "prompt_tokens": usage.prompt_tokens,
+                "completion_tokens": usage.completion_tokens,
+                "cached_tokens": usage.cached_tokens,
+                "cache_creation_tokens": usage.cache_creation_tokens,
+                "estimated_cost": estimated_cost.unwrap_or(0.0),
+                "pricing_known": estimated_cost.is_some(),
+            })
+        })
+        .collect::<Vec<_>>();
+    if rows.is_empty() {
+        return;
+    }
+    if let Some(obj) = session.as_object_mut() {
+        obj.insert("daily_usage".to_string(), serde_json::json!(rows));
     }
 }
 
@@ -5545,7 +5633,7 @@ fn codex_usage_from_compact_total_bucket(bucket: &str) -> Option<SessionUsage> {
     })
 }
 
-fn codex_token_count_usage_from_line(line: &str) -> Option<(i64, SessionUsage)> {
+fn codex_token_count_usage_from_line(line: &str) -> Option<(i64, String, SessionUsage)> {
     if line.contains("\"type\":\"event_msg\"") && line.contains("\"type\":\"token_count\"") {
         let timestamp = json_compact_string_field(line, "timestamp")?;
         let event_ts = timestamp_sort_secs(timestamp);
@@ -5556,7 +5644,7 @@ fn codex_token_count_usage_from_line(line: &str) -> Option<(i64, SessionUsage)> 
             .or_else(|| json_compact_object_for_key(line, "totalTokenUsage"))
             .or_else(|| json_compact_object_for_key(line, "total"))?;
         let usage = codex_usage_from_compact_total_bucket(bucket)?;
-        return Some((event_ts, usage));
+        return Some((event_ts, timestamp.to_string(), usage));
     }
 
     let Ok(obj) = serde_json::from_str::<serde_json::Value>(line) else {
@@ -5570,14 +5658,12 @@ fn codex_token_count_usage_from_line(line: &str) -> Option<(i64, SessionUsage)> 
         return None;
     }
     let parsed = codex_session_usage_from_payload(payload)?;
-    let event_ts = value_str(&obj, "timestamp")
-        .as_deref()
-        .map(timestamp_sort_secs)
-        .unwrap_or(0);
+    let timestamp = value_str(&obj, "timestamp")?;
+    let event_ts = timestamp_sort_secs(&timestamp);
     if event_ts <= 0 {
         return None;
     }
-    Some((event_ts, parsed))
+    Some((event_ts, timestamp, parsed))
 }
 
 fn codex_usage_baselines_from_file(
@@ -5654,7 +5740,7 @@ fn codex_usage_baselines_from_file_uncached(
         if line.is_empty() || !line.contains("\"token_count\"") {
             continue;
         }
-        let Some((event_ts, parsed)) = codex_token_count_usage_from_line(line) else {
+        let Some((event_ts, _, parsed)) = codex_token_count_usage_from_line(line) else {
             continue;
         };
 
@@ -5677,13 +5763,13 @@ fn codex_usage_baselines_from_file_uncached(
     baselines
 }
 
-fn codex_incremental_session_usage(
+fn codex_parent_baseline_for_summary(
     summary: &CodexSessionListSummary,
     usage_events_by_id: &HashMap<String, Vec<CodexUsageEvent>>,
     exact_parent_baselines: &HashMap<(String, i64), Option<SessionUsage>>,
-) -> SessionUsage {
+) -> Option<SessionUsage> {
     let Some(parent_id) = summary.parent_id.as_deref() else {
-        return summary.usage;
+        return None;
     };
 
     let cutoff = summary
@@ -5694,81 +5780,115 @@ fn codex_incremental_session_usage(
     if cutoff > 0 {
         let exact_key = (parent_id.to_string(), cutoff);
         if let Some(exact_baseline) = exact_parent_baselines.get(&exact_key) {
-            return exact_baseline
-                .map(|baseline| summary.usage.saturating_sub(baseline))
-                .unwrap_or(summary.usage);
+            return Some(exact_baseline.unwrap_or_default());
         }
     }
 
     let Some(parent_events) = usage_events_by_id.get(parent_id) else {
-        return summary.usage;
+        return None;
     };
-    let Some(baseline) = codex_usage_at_or_before(parent_events, summary.created_at.as_deref())
-    else {
-        return summary.usage;
-    };
-    summary.usage.saturating_sub(baseline)
+    codex_usage_at_or_before(parent_events, summary.created_at.as_deref())
 }
 
-fn codex_session_list_summary_from_file(path: &Path) -> Option<CodexSessionListSummary> {
-    let key = session_list_cache_key("codex", path, "")?;
-    if let Some(entry) = cached_codex_session_list_entry(&key) {
-        return Some(entry.summary);
-    }
-
-    let contents = read_text_head_tail(
-        path,
-        EXTERNAL_SESSION_READ_LIMIT,
-        EXTERNAL_SESSION_READ_LIMIT,
-    )?;
-    let mut id = None;
-    let mut created_at = None;
-    let mut session_cwd = None;
-    let mut turn_cwd = None;
-    let mut command_cwd = None;
-    let mut model = None;
-    let mut forked_from_id = None;
-    let mut provider = Some("Codex".to_string());
-    let mut usage = SessionUsage::default();
-    let mut usage_events = Vec::new();
-    let mut goal: Option<SessionGoal> = None;
-    let mut task_started_turns = 0u64;
-    let mut saw_user_message_event = false;
-    let mut event_user_turns: Vec<Option<String>> = Vec::new();
-    let mut fallback_user_turns: Vec<Option<String>> = Vec::new();
-    for line in contents.lines() {
-        let line = line.trim();
-        if line.is_empty() || !codex_line_may_affect_session_list(line) {
+fn codex_daily_usage_from_events(
+    summary: &CodexSessionListSummary,
+    baseline: Option<SessionUsage>,
+) -> BTreeMap<String, SessionUsage> {
+    let mut daily: BTreeMap<String, SessionUsage> = BTreeMap::new();
+    let mut previous = baseline.unwrap_or_default();
+    for event in &summary.usage_events {
+        let delta = event.usage.saturating_sub(previous);
+        previous = event.usage;
+        if delta.is_empty() {
             continue;
         }
+        let day = usage_day_from_timestamp(event.timestamp.as_deref())
+            .or_else(|| usage_day_from_timestamp(summary.file_updated_at.as_deref()));
+        if let Some(day) = day {
+            daily.entry(day).or_default().add(delta);
+        }
+    }
+    if daily.is_empty() && !summary.usage.is_empty() {
+        let day = usage_day_from_timestamp(summary.created_at.as_deref())
+            .or_else(|| usage_day_from_timestamp(summary.file_updated_at.as_deref()));
+        if let Some(day) = day {
+            let usage = baseline
+                .map(|baseline| summary.usage.saturating_sub(baseline))
+                .unwrap_or(summary.usage);
+            if !usage.is_empty() {
+                daily.insert(day, usage);
+            }
+        }
+    }
+    daily
+}
+
+#[derive(Default)]
+struct CodexSessionListAccumulator {
+    id: Option<String>,
+    created_at: Option<String>,
+    session_cwd: Option<String>,
+    turn_cwd: Option<String>,
+    command_cwd: Option<String>,
+    model: Option<String>,
+    forked_from_id: Option<String>,
+    provider: Option<String>,
+    usage: SessionUsage,
+    usage_events: Vec<CodexUsageEvent>,
+    daily_usage: BTreeMap<String, SessionUsage>,
+    goal: Option<SessionGoal>,
+    task_started_turns: u64,
+    saw_user_message_event: bool,
+    event_user_turns: Vec<Option<String>>,
+    fallback_user_turns: Vec<Option<String>>,
+}
+
+impl CodexSessionListAccumulator {
+    fn new() -> Self {
+        Self {
+            provider: Some("Codex".to_string()),
+            ..Self::default()
+        }
+    }
+
+    fn process_line(&mut self, line: &str) {
+        let line = line.trim();
+        if line.is_empty() || !codex_line_may_affect_session_list(line) {
+            return;
+        }
         let Ok(obj) = serde_json::from_str::<serde_json::Value>(line) else {
-            continue;
+            return;
         };
         match obj.get("type").and_then(|v| v.as_str()).unwrap_or("") {
             "session_meta" => {
                 if let Some(payload) = obj.get("payload") {
-                    id = id.or_else(|| value_str(payload, "id"));
-                    forked_from_id =
-                        forked_from_id.or_else(|| value_str(payload, "forked_from_id"));
-                    created_at = created_at.or_else(|| value_str(payload, "timestamp"));
+                    self.id = self.id.take().or_else(|| value_str(payload, "id"));
+                    self.forked_from_id = self
+                        .forked_from_id
+                        .take()
+                        .or_else(|| value_str(payload, "forked_from_id"));
+                    self.created_at = self
+                        .created_at
+                        .take()
+                        .or_else(|| value_str(payload, "timestamp"));
                     if let Some(value) = value_str(payload, "cwd") {
-                        if session_cwd.is_none() {
-                            session_cwd = Some(value);
+                        if self.session_cwd.is_none() {
+                            self.session_cwd = Some(value);
                         }
                     }
-                    model = model.or_else(|| value_str(payload, "model"));
-                    provider = value_str(payload, "model_provider").or(provider);
+                    self.model = self.model.take().or_else(|| value_str(payload, "model"));
+                    self.provider = value_str(payload, "model_provider").or(self.provider.take());
                 }
             }
             "turn_context" => {
                 if let Some(payload) = obj.get("payload") {
                     if let Some(value) = value_str(payload, "cwd") {
-                        if session_cwd.is_none() {
-                            session_cwd = Some(value.clone());
+                        if self.session_cwd.is_none() {
+                            self.session_cwd = Some(value.clone());
                         }
-                        turn_cwd = Some(value);
+                        self.turn_cwd = Some(value);
                     }
-                    model = model.or_else(|| value_str(payload, "model"));
+                    self.model = self.model.take().or_else(|| value_str(payload, "model"));
                 }
             }
             "event_msg" => {
@@ -5776,34 +5896,30 @@ fn codex_session_list_summary_from_file(path: &Path) -> Option<CodexSessionListS
                     let payload_type = payload.get("type").and_then(|v| v.as_str()).unwrap_or("");
                     if payload_type.starts_with("exec_command") {
                         if let Some(value) = value_str(payload, "cwd") {
-                            command_cwd = Some(value);
+                            self.command_cwd = Some(value);
                         }
                     }
                     match payload_type {
                         "task_started" => {
-                            task_started_turns += 1;
+                            self.task_started_turns += 1;
                         }
                         "token_count" => {
                             if let Some(parsed) = codex_session_usage_from_payload(payload) {
-                                usage = parsed;
-                                usage_events.push(CodexUsageEvent {
-                                    timestamp: value_str(&obj, "timestamp"),
-                                    usage: parsed,
-                                });
+                                self.record_token_usage(value_str(&obj, "timestamp"), parsed);
                             }
                         }
                         "thread_goal_updated" => {
-                            goal = codex_session_goal_from_thread_payload(payload);
+                            self.goal = codex_session_goal_from_thread_payload(payload);
                         }
                         "thread_goal_cleared" => {
-                            goal = None;
+                            self.goal = None;
                         }
                         "user_message" => {
-                            saw_user_message_event = true;
+                            self.saw_user_message_event = true;
                             let text = value_str(payload, "message")
                                 .filter(|s| !s.trim().is_empty())
                                 .map(|s| compact_text(&s, 180));
-                            event_user_turns.push(text);
+                            self.event_user_turns.push(text);
                         }
                         "thread_rolled_back" => {
                             let num_turns = payload
@@ -5811,10 +5927,11 @@ fn codex_session_list_summary_from_file(path: &Path) -> Option<CodexSessionListS
                                 .and_then(|v| v.as_u64())
                                 .unwrap_or(0);
                             for _ in 0..num_turns {
-                                let _ = event_user_turns.pop();
-                                let _ = fallback_user_turns.pop();
+                                let _ = self.event_user_turns.pop();
+                                let _ = self.fallback_user_turns.pop();
                             }
-                            task_started_turns = task_started_turns.saturating_sub(num_turns);
+                            self.task_started_turns =
+                                self.task_started_turns.saturating_sub(num_turns);
                         }
                         _ => {}
                     }
@@ -5823,11 +5940,12 @@ fn codex_session_list_summary_from_file(path: &Path) -> Option<CodexSessionListS
             "response_item" => {
                 if let Some(payload) = obj.get("payload") {
                     if let Some(value) = codex_exec_command_workdir(payload) {
-                        command_cwd = Some(value);
+                        self.command_cwd = Some(value);
                     }
                     if let Some((role, text)) = codex_payload_text(payload) {
                         if role == "user" && !is_codex_injected_user_text(&text) {
-                            fallback_user_turns.push(Some(compact_text(&text, 180)));
+                            self.fallback_user_turns
+                                .push(Some(compact_text(&text, 180)));
                         }
                     }
                 }
@@ -5835,37 +5953,147 @@ fn codex_session_list_summary_from_file(path: &Path) -> Option<CodexSessionListS
             _ => {}
         }
     }
-    let id = id?;
-    let task = event_user_turns
-        .iter()
-        .find_map(|t| t.clone())
-        .or_else(|| fallback_user_turns.iter().find_map(|t| t.clone()));
-    let turns = if saw_user_message_event {
-        event_user_turns.len() as u64
-    } else if task_started_turns > 0 {
-        task_started_turns
-    } else if !fallback_user_turns.is_empty() {
-        fallback_user_turns.len() as u64
+
+    fn clear_token_usage(&mut self) {
+        self.usage = SessionUsage::default();
+        self.usage_events.clear();
+        self.daily_usage.clear();
+    }
+
+    fn record_token_usage(&mut self, timestamp: Option<String>, parsed: SessionUsage) {
+        let delta = parsed.saturating_sub(self.usage);
+        if !delta.is_empty() {
+            if let Some(day) = usage_day_from_timestamp(timestamp.as_deref()) {
+                self.daily_usage.entry(day).or_default().add(delta);
+            }
+        }
+        self.usage = parsed;
+        self.usage_events.push(CodexUsageEvent {
+            timestamp,
+            usage: parsed,
+        });
+    }
+
+    fn finish(self, path: &Path) -> Option<CodexSessionListSummary> {
+        let id = self.id?;
+        let task = self
+            .event_user_turns
+            .iter()
+            .find_map(|t| t.clone())
+            .or_else(|| self.fallback_user_turns.iter().find_map(|t| t.clone()));
+        let turns = if self.saw_user_message_event {
+            self.event_user_turns.len() as u64
+        } else if self.task_started_turns > 0 {
+            self.task_started_turns
+        } else if !self.fallback_user_turns.is_empty() {
+            self.fallback_user_turns.len() as u64
+        } else {
+            0
+        };
+        let effective_cwd = self
+            .command_cwd
+            .or(self.turn_cwd)
+            .or_else(|| self.session_cwd.clone());
+        Some(CodexSessionListSummary {
+            id,
+            created_at: self.created_at,
+            session_cwd: self.session_cwd,
+            effective_cwd,
+            model: self.model,
+            parent_id: self.forked_from_id,
+            provider: self.provider,
+            usage: self.usage,
+            usage_events: self.usage_events,
+            daily_usage: self.daily_usage,
+            goal: self.goal,
+            task,
+            turns,
+            file_updated_at: file_mtime_string(path),
+            bytes: file_size(path),
+        })
+    }
+}
+
+fn process_codex_session_list_prefix(path: &Path, acc: &mut CodexSessionListAccumulator) {
+    let Ok(file) = std::fs::File::open(path) else {
+        return;
+    };
+    let mut reader = std::io::BufReader::new(file);
+    let mut bytes_read = 0u64;
+    for _ in 0..CODEX_SESSION_LIST_PREFIX_LINE_LIMIT {
+        let mut line = String::new();
+        let Ok(n) = reader.read_line(&mut line) else {
+            break;
+        };
+        if n == 0 {
+            break;
+        }
+        bytes_read = bytes_read.saturating_add(n as u64);
+        acc.process_line(&line);
+        if bytes_read >= CODEX_SESSION_LIST_PREFIX_READ_LIMIT {
+            break;
+        }
+    }
+}
+
+fn process_codex_token_counts_full(path: &Path, acc: &mut CodexSessionListAccumulator) {
+    let Ok(file) = std::fs::File::open(path) else {
+        return;
+    };
+    let reader = std::io::BufReader::new(file);
+    let mut saw_usage = false;
+    let mut parsed_events = Vec::new();
+    for line in reader.lines().map_while(Result::ok) {
+        let line = line.trim();
+        if line.is_empty() || !line.contains("\"token_count\"") {
+            continue;
+        }
+        let Some((_, timestamp, usage)) = codex_token_count_usage_from_line(line) else {
+            continue;
+        };
+        saw_usage = true;
+        parsed_events.push((timestamp, usage));
+    }
+    if !saw_usage {
+        return;
+    }
+    acc.clear_token_usage();
+    for (timestamp, usage) in parsed_events {
+        acc.record_token_usage(Some(timestamp), usage);
+    }
+}
+
+fn codex_session_list_summary_from_excerpt(path: &Path) -> Option<CodexSessionListSummary> {
+    let len = file_size(path);
+    let mut acc = CodexSessionListAccumulator::new();
+    if len <= EXTERNAL_SESSION_READ_LIMIT.saturating_mul(2) {
+        let contents = read_text_head_tail(
+            path,
+            EXTERNAL_SESSION_READ_LIMIT,
+            EXTERNAL_SESSION_READ_LIMIT,
+        )?;
+        for line in contents.lines() {
+            acc.process_line(line);
+        }
     } else {
-        0
-    };
-    let effective_cwd = command_cwd.or(turn_cwd).or_else(|| session_cwd.clone());
-    let summary = CodexSessionListSummary {
-        id,
-        created_at,
-        session_cwd,
-        effective_cwd,
-        model,
-        parent_id: forked_from_id,
-        provider,
-        usage,
-        usage_events,
-        goal,
-        task,
-        turns,
-        file_updated_at: file_mtime_string(path),
-        bytes: file_size(path),
-    };
+        process_codex_session_list_prefix(path, &mut acc);
+        process_codex_token_counts_full(path, &mut acc);
+        if let Some(tail) = read_text_tail(path, EXTERNAL_SESSION_READ_LIMIT) {
+            for line in tail.lines() {
+                acc.process_line(line);
+            }
+        }
+    }
+    acc.finish(path)
+}
+
+fn codex_session_list_summary_from_file(path: &Path) -> Option<CodexSessionListSummary> {
+    let key = session_list_cache_key("codex", path, "")?;
+    if let Some(entry) = cached_codex_session_list_entry(&key) {
+        return Some(entry.summary);
+    }
+
+    let summary = codex_session_list_summary_from_excerpt(path)?;
     store_codex_session_list_entry(key, summary.clone());
     Some(summary)
 }
@@ -6043,9 +6271,21 @@ fn list_codex_sessions_with_limit(home: &Path, scan_limit: usize) -> Vec<serde_j
             Some(path.to_string_lossy().to_string()),
             summary.bytes,
         );
-        let usage =
-            codex_incremental_session_usage(&summary, &usage_events_by_id, &exact_parent_baselines);
+        let parent_baseline = codex_parent_baseline_for_summary(
+            &summary,
+            &usage_events_by_id,
+            &exact_parent_baselines,
+        );
+        let usage = parent_baseline
+            .map(|baseline| summary.usage.saturating_sub(baseline))
+            .unwrap_or(summary.usage);
         apply_session_usage(&mut session, usage, summary.model.as_deref());
+        let daily_usage = if summary.parent_id.is_some() {
+            codex_daily_usage_from_events(&summary, parent_baseline)
+        } else {
+            summary.daily_usage.clone()
+        };
+        apply_session_daily_usage(&mut session, &daily_usage, summary.model.as_deref());
         if let Some(goal) = summary.goal.as_ref() {
             if let Some(obj) = session.as_object_mut() {
                 obj.insert("goal".to_string(), serde_json::json!(goal));
@@ -6100,6 +6340,7 @@ fn claude_session_list_row_from_file(path: &Path) -> Option<serde_json::Value> {
     let mut task = None;
     let mut model = None;
     let mut usage = SessionUsage::default();
+    let mut daily_usage: BTreeMap<String, SessionUsage> = BTreeMap::new();
     let mut seen_usage = HashSet::new();
     let mut turns = 0u64;
     for (line_idx, line_result) in reader.lines().enumerate() {
@@ -6140,6 +6381,11 @@ fn claude_session_list_row_from_file(path: &Path) -> Option<serde_json::Value> {
                     .unwrap_or_else(|| format!("line-{line_idx}"));
                 if seen_usage.insert(key) {
                     usage.add(parsed);
+                    if let Some(day) =
+                        usage_day_from_timestamp(value_str(&obj, "timestamp").as_deref())
+                    {
+                        daily_usage.entry(day).or_default().add(parsed);
+                    }
                 }
             }
         }
@@ -6167,6 +6413,7 @@ fn claude_session_list_row_from_file(path: &Path) -> Option<serde_json::Value> {
         file_size(path),
     );
     apply_session_usage(&mut session, usage, model.as_deref());
+    apply_session_daily_usage(&mut session, &daily_usage, model.as_deref());
     store_session_list_row(key, &session);
     Some(session)
 }
@@ -6237,11 +6484,20 @@ fn gemini_session_list_row_from_file(
     let mut turns = 0u64;
     let mut model = value_str(&obj, "model");
     let mut usage = SessionUsage::default();
+    let mut daily_usage: BTreeMap<String, SessionUsage> = BTreeMap::new();
+    let session_started_at = value_str(&obj, "startTime");
     if let Some(messages) = obj.get("messages").and_then(|v| v.as_array()) {
         for msg in messages {
             model = model.or_else(|| value_str(msg, "model"));
             if let Some(parsed) = msg.get("tokens").and_then(gemini_usage_from_tokens) {
                 usage.add(parsed);
+                let timestamp = value_str(msg, "timestamp")
+                    .or_else(|| value_str(msg, "createdAt"))
+                    .or_else(|| value_str(msg, "time"))
+                    .or_else(|| session_started_at.clone());
+                if let Some(day) = usage_day_from_timestamp(timestamp.as_deref()) {
+                    daily_usage.entry(day).or_default().add(parsed);
+                }
             }
             let role = msg
                 .get("role")
@@ -6283,6 +6539,7 @@ fn gemini_session_list_row_from_file(
         file_size(path),
     );
     apply_session_usage(&mut session, usage, model.as_deref());
+    apply_session_daily_usage(&mut session, &daily_usage, model.as_deref());
     store_session_list_row(key, &session);
     Some(session)
 }
@@ -8377,6 +8634,7 @@ fn intendant_session_list_row_from_dir(dir: &Path, session_id: &str) -> Option<s
     let mut prompt_tokens: u64 = 0;
     let mut completion_tokens: u64 = 0;
     let mut cached_tokens: u64 = 0;
+    let mut daily_usage: BTreeMap<String, SessionUsage> = BTreeMap::new();
     let mut role: Option<String> = None;
     let mut external_resume_id: Option<String> = None;
     let mut external_source: Option<String> = None;
@@ -8468,17 +8726,36 @@ fn intendant_session_list_row_from_dir(dir: &Path, session_id: &str) -> Option<s
                 }
                 "model_response" => {
                     if let Some(tok) = obj.get("data").and_then(|d| d.get("tokens")) {
+                        let mut event_usage = SessionUsage::default();
                         if let Some(t) = tok.get("total").and_then(|v| v.as_u64()) {
                             total_tokens += t;
+                            event_usage.total_tokens = t;
                         }
                         if let Some(p) = tok.get("prompt").and_then(|v| v.as_u64()) {
                             prompt_tokens += p;
+                            event_usage.prompt_tokens = p;
                         }
                         if let Some(c) = tok.get("completion").and_then(|v| v.as_u64()) {
                             completion_tokens += c;
+                            event_usage.completion_tokens = c;
                         }
                         if let Some(cached) = tok.get("cached").and_then(|v| v.as_u64()) {
                             cached_tokens += cached;
+                            event_usage.cached_tokens = cached;
+                        }
+                        if event_usage.total_tokens == 0 {
+                            event_usage.total_tokens =
+                                event_usage.prompt_tokens + event_usage.completion_tokens;
+                        }
+                        if !event_usage.is_empty() {
+                            let day = usage_day_from_timestamp(
+                                obj.get("ts")
+                                    .or_else(|| obj.get("timestamp"))
+                                    .and_then(|v| v.as_str()),
+                            );
+                            if let Some(day) = day {
+                                daily_usage.entry(day).or_default().add(event_usage);
+                            }
                         }
                     }
                 }
@@ -8695,6 +8972,7 @@ fn intendant_session_list_row_from_dir(dir: &Path, session_id: &str) -> Option<s
     if let Some(config) = session_agent_config.as_ref() {
         crate::session_config::apply_config_to_session_json(&mut wrapper_session, config);
     }
+    apply_session_daily_usage(&mut wrapper_session, &daily_usage, model.as_deref());
 
     store_intendant_session_list_row(fingerprint, &wrapper_session);
     Some(wrapper_session)
@@ -22780,6 +23058,109 @@ mod tests {
     }
 
     #[test]
+    fn list_codex_sessions_parses_large_prefix_and_daily_usage() {
+        let _codex_home = EnvVarGuard::unset("CODEX_HOME");
+        let home = tempfile::tempdir().unwrap();
+        let sessions_dir = home
+            .path()
+            .join(".codex")
+            .join("sessions")
+            .join("2026")
+            .join("05")
+            .join("17");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+
+        let id = "019e37c5-large-prefix-daily";
+        let large_prompt = "x".repeat(EXTERNAL_SESSION_READ_LIMIT as usize + 1024);
+        let filler = "y".repeat(EXTERNAL_SESSION_READ_LIMIT as usize + 1024);
+        let lines = [
+            serde_json::json!({
+                "timestamp": "2026-05-17T10:00:00",
+                "type": "session_meta",
+                "payload": {
+                    "id": id,
+                    "timestamp": "2026-05-17T10:00:00",
+                    "cwd": "/Users/vm/projects/intendant",
+                    "model_provider": "openai",
+                    "base_instructions": {"text": large_prompt}
+                }
+            })
+            .to_string(),
+            serde_json::json!({
+                "timestamp": "2026-05-17T10:00:01",
+                "type": "turn_context",
+                "payload": {
+                    "cwd": "/Users/vm/projects/intendant",
+                    "model": "gpt-5.4"
+                }
+            })
+            .to_string(),
+            serde_json::json!({
+                "timestamp": "2026-05-17T10:00:02",
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "total_token_usage": {
+                            "input_tokens": 80,
+                            "cached_input_tokens": 20,
+                            "output_tokens": 20,
+                            "total_tokens": 100
+                        }
+                    }
+                }
+            })
+            .to_string(),
+            filler,
+            serde_json::json!({
+                "timestamp": "2026-05-18T10:00:02",
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "total_token_usage": {
+                            "input_tokens": 200,
+                            "cached_input_tokens": 50,
+                            "output_tokens": 50,
+                            "total_tokens": 250
+                        }
+                    }
+                }
+            })
+            .to_string(),
+        ];
+        std::fs::write(
+            sessions_dir.join(format!("rollout-2026-05-17T10-00-00-{id}.jsonl")),
+            lines.join("\n"),
+        )
+        .unwrap();
+
+        let sessions = list_codex_sessions(home.path());
+        let session = sessions
+            .iter()
+            .find(|s| s.get("session_id").and_then(|v| v.as_str()) == Some(id))
+            .expect("codex session should be listed");
+        assert_eq!(session["model"].as_str(), Some("gpt-5.4"));
+        assert_eq!(session["prompt_tokens"].as_u64(), Some(200));
+        assert_eq!(session["completion_tokens"].as_u64(), Some(50));
+        assert_eq!(session["cached_tokens"].as_u64(), Some(50));
+        assert_eq!(session["total_tokens"].as_u64(), Some(250));
+
+        let daily = session["daily_usage"].as_array().expect("daily usage");
+        let by_day = daily
+            .iter()
+            .map(|row| {
+                (
+                    row["day"].as_str().unwrap().to_string(),
+                    row["total_tokens"].as_u64().unwrap(),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        assert_eq!(by_day.get("2026-05-17"), Some(&100));
+        assert_eq!(by_day.get("2026-05-18"), Some(&150));
+    }
+
+    #[test]
     fn list_codex_sessions_subtracts_parent_usage_from_forks() {
         let home = tempfile::tempdir().unwrap();
         let sessions_dir = home
@@ -23500,6 +23881,11 @@ mod tests {
         assert_eq!(session["pricing_known"].as_bool(), Some(true));
         let cost = session["estimated_cost"].as_f64().unwrap();
         assert!((cost - 0.0004105).abs() < 1e-12, "unexpected cost {cost}");
+        let daily = session["daily_usage"].as_array().expect("daily usage");
+        assert_eq!(daily.len(), 1);
+        assert_eq!(daily[0]["day"].as_str(), Some("2026-05-18"));
+        assert_eq!(daily[0]["total_tokens"].as_u64(), Some(1055));
+        assert_eq!(daily[0]["estimated_cost"].as_f64(), Some(cost));
     }
 
     #[test]

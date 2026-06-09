@@ -3993,6 +3993,13 @@ body.context-focus-active {
 }
 .cost-grid .label { color: var(--overlay1); }
 .cost-grid .value { text-align: right; color: var(--green); font-weight: 600; }
+#daily-usage-grid .label.today {
+  color: var(--text);
+  font-weight: 650;
+}
+#daily-usage-grid .value.total {
+  color: var(--text);
+}
 
 /* Token activity */
 .token-activity-section {
@@ -4139,15 +4146,72 @@ body.context-focus-active {
   height: 12px;
   border-radius: 3px;
   background: var(--surface0);
+  border: 1px solid transparent;
 }
 .token-activity-day.future {
   opacity: 0.45;
+}
+.token-activity-day:not(.future) {
+  cursor: pointer;
+}
+.token-activity-day:not(.future):hover,
+.token-activity-day:not(.future):focus-visible {
+  border-color: var(--text);
+  outline: none;
+}
+.token-activity-day.selected {
+  border-color: var(--text);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--blue) 45%, transparent);
 }
 .token-activity-day.level-1 { background: color-mix(in srgb, var(--blue) 22%, var(--surface0)); }
 .token-activity-day.level-2 { background: color-mix(in srgb, var(--sapphire) 42%, var(--surface0)); }
 .token-activity-day.level-3 { background: color-mix(in srgb, var(--green) 56%, var(--surface0)); }
 .token-activity-day.level-4 { background: color-mix(in srgb, var(--yellow) 72%, var(--surface0)); }
 .token-activity-day.level-5 { background: color-mix(in srgb, var(--peach) 88%, var(--surface0)); }
+.token-activity-detail {
+  margin-top: 14px;
+  padding: 10px 12px;
+  border: 1px solid var(--surface0);
+  border-radius: 8px;
+  background: var(--mantle);
+}
+.token-activity-detail-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 8px;
+}
+.token-activity-detail-day {
+  color: var(--text);
+  font-size: 14px;
+  font-weight: 650;
+}
+.token-activity-detail-agent {
+  color: var(--overlay1);
+  font-size: 11px;
+}
+.token-activity-detail-grid {
+  display: grid;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  gap: 8px;
+}
+.token-activity-detail-metric {
+  min-width: 0;
+}
+.token-activity-detail-metric .label {
+  color: var(--overlay1);
+  font-size: 11px;
+}
+.token-activity-detail-metric .value {
+  color: var(--green);
+  font-size: 13px;
+  font-weight: 650;
+  font-variant-numeric: tabular-nums;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .token-activity-empty {
   padding: 12px 0;
   color: var(--overlay1);
@@ -4162,6 +4226,9 @@ body.context-focus-active {
     justify-content: flex-start;
   }
   .token-activity-stats {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .token-activity-detail-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
   .token-activity-stat:nth-child(2) {
@@ -8363,6 +8430,7 @@ body.display-fullscreen-open {
   }
   #all-sessions-grid { min-width: 480px; }
   #agent-usage-grid { min-width: 560px; }
+  #daily-usage-grid { min-width: 640px; }
   .usage-card { min-width: unset; }
   .usage-cards { flex-direction: column; }
   .sessions-header,
@@ -9333,10 +9401,15 @@ body.display-fullscreen-open {
             <div class="token-activity-months" id="token-activity-months"></div>
             <div class="token-activity-heatmap" id="token-activity-heatmap"></div>
           </div>
+          <div class="token-activity-detail" id="token-activity-detail" style="display:none"></div>
         </div>
         <div class="cost-section" id="all-sessions-usage" style="display:none">
           <div class="cost-title">All Sessions</div>
           <div class="cost-grid" id="all-sessions-grid"></div>
+        </div>
+        <div class="cost-section" id="daily-usage-section" style="display:none">
+          <div class="cost-title">Daily Usage</div>
+          <div class="cost-grid" id="daily-usage-grid"></div>
         </div>
         <div class="cost-section" id="agent-usage-section" style="display:none">
           <div class="cost-title">By Agent</div>
@@ -45614,6 +45687,7 @@ function renderStatsSessionSections(sessions) {
   setStatsSessionLoading(currentStatsHostKey(), false);
   renderTokenActivity(sessions);
   renderAllSessionsUsage(sessions);
+  renderDailyUsage(sessions);
   renderDiskUsage(sessions);
 }
 
@@ -45621,6 +45695,7 @@ function clearStatsSessionSections() {
   for (const id of [
     'token-activity-section',
     'all-sessions-usage',
+    'daily-usage-section',
     'agent-usage-section',
     'disk-usage-section',
   ]) {
@@ -45632,7 +45707,9 @@ function clearStatsSessionSections() {
     'token-activity-skyline',
     'token-activity-months',
     'token-activity-heatmap',
+    'token-activity-detail',
     'all-sessions-grid',
+    'daily-usage-grid',
     'agent-usage-grid',
     'disk-usage-grid',
   ]) {
@@ -45701,10 +45778,92 @@ function sessionDate(session) {
   return Number.isNaN(parsed) ? null : new Date(parsed);
 }
 
+function localIsoDay(date) {
+  if (!(date instanceof Date) || Number.isNaN(date.getTime())) return null;
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, '0');
+  const day = String(date.getDate()).padStart(2, '0');
+  return `${year}-${month}-${day}`;
+}
+
+function localDateFromIsoDay(iso) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(String(iso || ''))) return null;
+  const [year, month, day] = iso.split('-').map(Number);
+  const date = new Date(year, month - 1, day);
+  return Number.isNaN(date.getTime()) ? null : date;
+}
+
+function tokenActivityIsoToday() {
+  return localIsoDay(new Date());
+}
+
+function parseIsoDayMs(iso) {
+  const date = localDateFromIsoDay(iso);
+  return date ? date.getTime() : null;
+}
+
+function isoDayFromMs(ms) {
+  return localIsoDay(new Date(ms));
+}
+
+function addIsoDays(iso, days) {
+  const date = localDateFromIsoDay(iso);
+  if (!date) return null;
+  date.setDate(date.getDate() + days);
+  return localIsoDay(date);
+}
+
+function startOfWeekIso(iso) {
+  const date = localDateFromIsoDay(iso);
+  if (!date) return tokenActivityIsoToday();
+  date.setDate(date.getDate() - date.getDay());
+  return localIsoDay(date);
+}
+
+function sessionActivityDay(session) {
+  return localIsoDay(sessionDate(session));
+}
+
+function usageEntryDay(entry, fallbackDay) {
+  const raw = entry && entry.day;
+  if (/^\d{4}-\d{2}-\d{2}$/.test(String(raw || ''))) return raw;
+  return fallbackDay || null;
+}
+
+function sessionUsageEntries(session) {
+  const fallbackDay = sessionActivityDay(session);
+  const daily = Array.isArray(session && session.daily_usage) ? session.daily_usage : [];
+  const entries = daily
+    .map(entry => ({
+      day: usageEntryDay(entry, fallbackDay),
+      input: sessionNumber(entry.prompt_tokens),
+      cached: sessionNumber(entry.cached_tokens),
+      output: sessionNumber(entry.completion_tokens),
+      total: sessionNumber(entry.total_tokens) || sessionNumber(entry.prompt_tokens) + sessionNumber(entry.completion_tokens),
+      cost: sessionCost(entry.estimated_cost),
+    }))
+    .filter(entry => entry.day && (entry.total > 0 || entry.input > 0 || entry.output > 0 || entry.cost > 0));
+  if (entries.length > 0) return entries;
+  if (!fallbackDay) return [];
+  const input = sessionNumber(session && session.prompt_tokens);
+  const output = sessionNumber(session && session.completion_tokens);
+  return [{
+    day: fallbackDay,
+    input,
+    cached: sessionNumber(session && session.cached_tokens),
+    output,
+    total: sessionNumber(session && session.total_tokens) || input + output,
+    cost: sessionCost(session && session.estimated_cost),
+  }];
+}
+
+function usageEntryInCalendarWeek(day, todayIso) {
+  if (!day || !todayIso || day > todayIso) return false;
+  return day >= startOfWeekIso(todayIso);
+}
+
 function summarizeSessionUsage(sessions) {
-  const now = new Date();
-  const oneDayAgo = new Date(now - 24*60*60*1000);
-  const oneWeekAgo = new Date(now - 7*24*60*60*1000);
+  const todayIso = tokenActivityIsoToday();
   const totals = {
     sessions: sessions.length,
     turns: 0,
@@ -45728,10 +45887,10 @@ function summarizeSessionUsage(sessions) {
     totals.allOutput += output;
     totals.allTokens += total;
     totals.allCost += cost;
-    const ts = sessionDate(s);
-    if (!ts) continue;
-    if (ts >= oneDayAgo) totals.todayCost += cost;
-    if (ts >= oneWeekAgo) totals.weekCost += cost;
+    for (const entry of sessionUsageEntries(s)) {
+      if (entry.day === todayIso) totals.todayCost += entry.cost;
+      if (usageEntryInCalendarWeek(entry.day, todayIso)) totals.weekCost += entry.cost;
+    }
   }
   return totals;
 }
@@ -45805,12 +45964,13 @@ function summarizeUsageByAgent(sessions) {
   return Array.from(buckets.values()).filter(b => b.sessions > 0);
 }
 
-let tokenActivityAgent = 'codex';
+let tokenActivityAgent = 'all';
 let tokenActivityView = 'daily';
+let tokenActivitySelectedDay = null;
 const TOKEN_ACTIVITY_WEEKS = 53;
 const TOKEN_ACTIVITY_DAYS = TOKEN_ACTIVITY_WEEKS * 7;
 const TOKEN_ACTIVITY_SKYLINE_DAYS = 84;
-const DAY_MS = 24 * 60 * 60 * 1000;
+const DAILY_USAGE_ROW_LIMIT = 30;
 
 function tokenActivityAgentLabel(key) {
   return {
@@ -45821,42 +45981,6 @@ function tokenActivityAgentLabel(key) {
     intendant: 'Intendant',
     other: 'Other',
   }[key] || key;
-}
-
-function tokenActivityIsoToday() {
-  return new Date().toISOString().slice(0, 10);
-}
-
-function parseIsoDayMs(iso) {
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(String(iso || ''))) return null;
-  const [year, month, day] = iso.split('-').map(Number);
-  return Date.UTC(year, month - 1, day);
-}
-
-function isoDayFromMs(ms) {
-  return new Date(ms).toISOString().slice(0, 10);
-}
-
-function addIsoDays(iso, days) {
-  const ms = parseIsoDayMs(iso);
-  return ms == null ? null : isoDayFromMs(ms + days * DAY_MS);
-}
-
-function startOfWeekIso(iso) {
-  const ms = parseIsoDayMs(iso);
-  if (ms == null) return tokenActivityIsoToday();
-  const d = new Date(ms);
-  return isoDayFromMs(ms - d.getUTCDay() * DAY_MS);
-}
-
-function sessionActivityDay(session) {
-  const raw = session && (session.updated_at || session.created_at);
-  if (!raw) return null;
-  const text = String(raw);
-  const m = /^(\d{4}-\d{2}-\d{2})/.exec(text);
-  if (m) return m[1];
-  const parsed = Date.parse(text);
-  return Number.isNaN(parsed) ? null : new Date(parsed).toISOString().slice(0, 10);
 }
 
 function formatCompactNumber(value, digits = 1) {
@@ -45874,7 +45998,6 @@ function formatShortIsoDate(iso) {
   return new Intl.DateTimeFormat(undefined, {
     day: 'numeric',
     month: 'short',
-    timeZone: 'UTC',
   }).format(new Date(ms));
 }
 
@@ -45883,8 +46006,24 @@ function formatMonthLabel(iso) {
   if (ms == null) return '';
   return new Intl.DateTimeFormat(undefined, {
     month: 'short',
-    timeZone: 'UTC',
   }).format(new Date(ms));
+}
+
+function formatDailyUsageDay(iso, todayIso) {
+  if (iso === todayIso) return 'Today';
+  if (iso === addIsoDays(todayIso, -1)) return 'Yesterday';
+  const date = localDateFromIsoDay(iso);
+  if (!date) return iso || '--';
+  const now = new Date();
+  const options = date.getFullYear() === now.getFullYear()
+    ? { day: 'numeric', month: 'short' }
+    : { day: 'numeric', month: 'short', year: 'numeric' };
+  return new Intl.DateTimeFormat(undefined, options).format(date);
+}
+
+function exactNumber(value) {
+  const n = Number(value || 0);
+  return Number.isFinite(n) ? Math.round(n).toLocaleString() : '0';
 }
 
 function tokenActivitySessionMatches(session, agentKey) {
@@ -45895,8 +46034,7 @@ function tokenActivitySessionMatches(session, agentKey) {
 function tokenActivityAvailableAgents(sessions) {
   const available = new Set(['all']);
   for (const s of sessions) {
-    const total = sessionNumber(s.total_tokens) || sessionNumber(s.prompt_tokens) + sessionNumber(s.completion_tokens);
-    if (total > 0) available.add(agentUsageKey(s));
+    if (sessionUsageEntries(s).some(entry => entry.total > 0)) available.add(agentUsageKey(s));
   }
   return available;
 }
@@ -45908,23 +46046,50 @@ function ensureTokenActivityAgent(sessions) {
   return available;
 }
 
-function buildTokenActivityDaily(sessions, agentKey) {
-  const daily = new Map();
-  let lifetime = 0;
-  let activeSessions = 0;
+function buildDailyUsageBuckets(sessions, agentKey = 'all') {
+  const buckets = new Map();
   for (const s of sessions) {
     if (!tokenActivitySessionMatches(s, agentKey)) continue;
-    const day = sessionActivityDay(s);
-    if (!day) continue;
-    const input = sessionNumber(s.prompt_tokens);
-    const output = sessionNumber(s.completion_tokens);
-    const total = sessionNumber(s.total_tokens) || input + output;
-    if (total <= 0) continue;
-    activeSessions += 1;
-    lifetime += total;
-    daily.set(day, (daily.get(day) || 0) + total);
+    const countedDays = new Set();
+    for (const entry of sessionUsageEntries(s)) {
+      if (!entry.day) continue;
+      const hasUsage = entry.total > 0 || entry.input > 0 || entry.output > 0 || entry.cached > 0 || entry.cost > 0;
+      if (!hasUsage) continue;
+      if (!buckets.has(entry.day)) {
+        buckets.set(entry.day, {
+          day: entry.day,
+          sessions: 0,
+          input: 0,
+          cached: 0,
+          output: 0,
+          total: 0,
+          cost: 0,
+        });
+      }
+      const bucket = buckets.get(entry.day);
+      if (!countedDays.has(entry.day)) {
+        bucket.sessions += 1;
+        countedDays.add(entry.day);
+      }
+      bucket.input += entry.input;
+      bucket.cached += entry.cached;
+      bucket.output += entry.output;
+      bucket.total += entry.total;
+      bucket.cost += entry.cost;
+    }
   }
-  return { daily, lifetime, activeSessions };
+  return buckets;
+}
+
+function buildTokenActivityDaily(sessions, agentKey) {
+  const buckets = buildDailyUsageBuckets(sessions, agentKey);
+  const daily = new Map();
+  let lifetime = 0;
+  for (const [day, bucket] of buckets) {
+    daily.set(day, bucket.total);
+    lifetime += bucket.total;
+  }
+  return { daily, lifetime, buckets };
 }
 
 function buildTokenActivityWeeks(daily) {
@@ -46056,12 +46221,57 @@ function renderTokenActivityHeatmap(days, startIso, todayIso) {
     const value = tokenActivityValueForCell(cell);
     const div = document.createElement('div');
     const level = tokenActivityCellLevel(cell.future ? 0 : value, max);
-    div.className = `token-activity-day level-${level}${cell.future ? ' future' : ''}`;
+    const selected = tokenActivitySelectedDay === cell.day && !cell.future;
+    div.className = `token-activity-day level-${level}${cell.future ? ' future' : ''}${selected ? ' selected' : ''}`;
     div.title = cell.future
       ? formatShortIsoDate(cell.day)
       : `${formatCompactNumber(value)} tokens, ${formatShortIsoDate(cell.day)}`;
+    div.dataset.day = cell.day;
+    if (!cell.future) {
+      div.role = 'button';
+      div.tabIndex = 0;
+      div.setAttribute('aria-label', `${formatDailyUsageDay(cell.day, todayIso)}: ${exactNumber(value)} tokens`);
+      div.setAttribute('aria-pressed', selected ? 'true' : 'false');
+    }
     el.appendChild(div);
   }
+}
+
+function tokenActivityMetricHtml(label, value) {
+  return `
+    <div class="token-activity-detail-metric">
+      <div class="label">${escapeHtml(label)}</div>
+      <div class="value">${escapeHtml(value)}</div>
+    </div>
+  `;
+}
+
+function renderTokenActivitySelectedDay(buckets, todayIso) {
+  const el = document.getElementById('token-activity-detail');
+  if (!el) return;
+  const day = tokenActivitySelectedDay;
+  const bucket = day ? buckets.get(day) : null;
+  if (!bucket) {
+    el.style.display = 'none';
+    el.innerHTML = '';
+    return;
+  }
+
+  el.innerHTML = `
+    <div class="token-activity-detail-head">
+      <div class="token-activity-detail-day">${escapeHtml(formatDailyUsageDay(day, todayIso))}</div>
+      <div class="token-activity-detail-agent">${escapeHtml(tokenActivityAgentLabel(tokenActivityAgent))}</div>
+    </div>
+    <div class="token-activity-detail-grid">
+      ${tokenActivityMetricHtml('Total', exactNumber(bucket.total))}
+      ${tokenActivityMetricHtml('Input', exactNumber(bucket.input))}
+      ${tokenActivityMetricHtml('Cached', exactNumber(bucket.cached))}
+      ${tokenActivityMetricHtml('Output', exactNumber(bucket.output))}
+      ${tokenActivityMetricHtml('Cost', formatUsd(bucket.cost, 4))}
+      ${tokenActivityMetricHtml('Sessions', exactNumber(bucket.sessions))}
+    </div>
+  `;
+  el.style.display = 'block';
 }
 
 function renderTokenActivity(sessions) {
@@ -46077,7 +46287,7 @@ function renderTokenActivity(sessions) {
 
   renderTokenActivityControls(sessions);
   const todayIso = tokenActivityIsoToday();
-  const { daily, lifetime, activeSessions } = buildTokenActivityDaily(sessions, tokenActivityAgent);
+  const { daily, lifetime, buckets } = buildTokenActivityDaily(sessions, tokenActivityAgent);
   const activeDays = Array.from(daily.values()).filter(v => v > 0).length;
   if (activeDays === 0) {
     section.style.display = 'none';
@@ -46109,6 +46319,7 @@ function renderTokenActivity(sessions) {
   const { startIso, days } = tokenActivityBuildSeries(daily, todayIso);
   renderTokenActivitySkyline(days, todayIso);
   renderTokenActivityHeatmap(days, startIso, todayIso);
+  renderTokenActivitySelectedDay(buckets, todayIso);
   section.style.display = 'block';
 }
 
@@ -46220,11 +46431,13 @@ function renderAllSessionsUsageError(message) {
   const emptyEl = document.getElementById('usage-empty');
   const diskEl = document.getElementById('disk-usage-section');
   const agentEl = document.getElementById('agent-usage-section');
+  const dailyEl = document.getElementById('daily-usage-section');
   if (!el || !grid) return;
   if (emptyEl) emptyEl.style.display = 'none';
   el.style.display = 'block';
   grid.style.gridTemplateColumns = '1fr';
   grid.innerHTML = `<span class="label" style="color:var(--red)">${escapeHtml(message)}</span>`;
+  if (dailyEl) dailyEl.style.display = 'none';
   if (agentEl) agentEl.style.display = 'none';
   if (diskEl) diskEl.style.display = 'none';
 }
@@ -46238,9 +46451,7 @@ function renderAllSessionsUsage(sessions) {
   renderSessionStatsFallback(sessions);
   renderAgentUsage(sessions);
 
-  const now = new Date();
-  const oneDayAgo = new Date(now - 24*60*60*1000);
-  const oneWeekAgo = new Date(now - 7*24*60*60*1000);
+  const todayIso = tokenActivityIsoToday();
 
   let allInput = 0, allOutput = 0, allCached = 0, allCost = 0;
   let todayInput = 0, todayOutput = 0, todayCached = 0, todayCost = 0;
@@ -46256,10 +46467,20 @@ function renderAllSessionsUsage(sessions) {
     allCached += cached;
     allCost += cost;
 
-    const ts = sessionDate(s);
-    if (!ts) continue;
-    if (ts >= oneDayAgo) { todayInput += input; todayOutput += output; todayCached += cached; todayCost += cost; }
-    if (ts >= oneWeekAgo) { weekInput += input; weekOutput += output; weekCached += cached; weekCost += cost; }
+    for (const entry of sessionUsageEntries(s)) {
+      if (entry.day === todayIso) {
+        todayInput += entry.input;
+        todayOutput += entry.output;
+        todayCached += entry.cached;
+        todayCost += entry.cost;
+      }
+      if (usageEntryInCalendarWeek(entry.day, todayIso)) {
+        weekInput += entry.input;
+        weekOutput += entry.output;
+        weekCached += entry.cached;
+        weekCost += entry.cost;
+      }
+    }
   }
 
   el.style.display = 'block';
@@ -46288,6 +46509,49 @@ function renderAllSessionsUsage(sessions) {
       <span class="value" style="color:var(--green)">${cached.toLocaleString()}</span>
       <span class="value">${output.toLocaleString()}</span>
       <span class="value" style="color:var(--green)">${formatUsd(cost)}</span>
+    `;
+  }
+}
+
+function renderDailyUsage(sessions) {
+  const el = document.getElementById('daily-usage-section');
+  const grid = document.getElementById('daily-usage-grid');
+  if (!el || !grid) return;
+
+  const todayIso = tokenActivityIsoToday();
+  const rows = Array.from(buildDailyUsageBuckets(sessions, 'all').values())
+    .filter(row => row.total > 0 || row.input > 0 || row.output > 0 || row.cached > 0 || row.cost > 0)
+    .sort((a, b) => b.day.localeCompare(a.day))
+    .slice(0, DAILY_USAGE_ROW_LIMIT);
+
+  if (rows.length === 0) {
+    el.style.display = 'none';
+    grid.innerHTML = '';
+    return;
+  }
+
+  el.style.display = 'block';
+  grid.style.gridTemplateColumns = 'auto 0.75fr 1fr 1fr 1fr 1fr 1fr';
+  grid.innerHTML = `
+    <span class="label" style="font-weight:600"></span>
+    <span class="value" style="font-size:10px;color:var(--overlay1)">Sessions</span>
+    <span class="value" style="font-size:10px;color:var(--overlay1)">Total</span>
+    <span class="value" style="font-size:10px;color:var(--overlay1)">Input</span>
+    <span class="value" style="font-size:10px;color:var(--overlay1)">Cached</span>
+    <span class="value" style="font-size:10px;color:var(--overlay1)">Output</span>
+    <span class="value" style="font-size:10px;color:var(--overlay1)">Est. Cost</span>
+  `;
+
+  for (const row of rows) {
+    const isToday = row.day === todayIso;
+    grid.innerHTML += `
+      <span class="label${isToday ? ' today' : ''}" title="${escapeHtml(row.day)}">${escapeHtml(formatDailyUsageDay(row.day, todayIso))}</span>
+      <span class="value">${exactNumber(row.sessions)}</span>
+      <span class="value total">${exactNumber(row.total)}</span>
+      <span class="value">${exactNumber(row.input)}</span>
+      <span class="value" style="color:var(--green)">${exactNumber(row.cached)}</span>
+      <span class="value">${exactNumber(row.output)}</span>
+      <span class="value" style="color:var(--green)">${formatUsd(row.cost, 4)}</span>
     `;
   }
 }
@@ -46376,6 +46640,14 @@ function renderDiskUsage(sessions) {
   `;
 }
 
+function selectTokenActivityDayFromCell(cell) {
+  if (!cell || cell.classList.contains('future')) return;
+  const day = cell.dataset.day;
+  if (!day) return;
+  tokenActivitySelectedDay = day;
+  renderCachedStatsSessionSections(currentStatsHostKey());
+}
+
 document.getElementById('token-activity-agent')?.addEventListener('click', (event) => {
   const btn = event.target.closest('button[data-agent]');
   if (!btn || btn.disabled) return;
@@ -46388,6 +46660,18 @@ document.getElementById('token-activity-view')?.addEventListener('click', (event
   if (!btn || btn.disabled) return;
   tokenActivityView = btn.dataset.view || 'daily';
   renderCachedStatsSessionSections(currentStatsHostKey());
+});
+
+document.getElementById('token-activity-heatmap')?.addEventListener('click', (event) => {
+  selectTokenActivityDayFromCell(event.target.closest('.token-activity-day[data-day]'));
+});
+
+document.getElementById('token-activity-heatmap')?.addEventListener('keydown', (event) => {
+  if (event.key !== 'Enter' && event.key !== ' ') return;
+  const cell = event.target.closest('.token-activity-day[data-day]');
+  if (!cell) return;
+  event.preventDefault();
+  selectTokenActivityDayFromCell(cell);
 });
 
 function focusActivityForSessionEvent(options = {}) {
