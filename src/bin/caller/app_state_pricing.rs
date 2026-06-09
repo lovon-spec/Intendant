@@ -155,6 +155,15 @@ const TABLE: &[(&str, Pricing)] = &[
         },
     ),
     (
+        "claude-fable-5",
+        Pricing {
+            input: 10.0e-6,
+            cache_write: 12.5e-6,
+            cached: 1.0e-6,
+            output: 50.0e-6,
+        },
+    ),
+    (
         "claude-opus-4-6",
         Pricing {
             input: 5.0e-6,
@@ -497,5 +506,19 @@ mod tests {
         let cost =
             estimate_session_cost("claude-opus-4-8-20260528", 1_000_000, 1_000_000, 0, 0).unwrap();
         assert!((cost - 30.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn fable_5_session_cost_uses_anthropic_pricing() {
+        let cost = estimate_session_cost("claude-fable-5", 1_000, 500, 200, 100).unwrap();
+        let expected = 700.0 * 10.0e-6 + 100.0 * 12.5e-6 + 200.0 * 1.0e-6 + 500.0 * 50.0e-6;
+        assert!((cost - expected).abs() < 1e-12);
+    }
+
+    #[test]
+    fn fable_5_pricing_matches_version_suffixes() {
+        let cost =
+            estimate_session_cost("claude-fable-5-20260609", 1_000_000, 1_000_000, 0, 0).unwrap();
+        assert!((cost - 60.0).abs() < 1e-12);
     }
 }

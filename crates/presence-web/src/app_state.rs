@@ -528,6 +528,14 @@ const PRICING_TABLE: &[(&str, ModelPricing)] = &[
         },
     ),
     (
+        "claude-fable-5",
+        ModelPricing {
+            input: 10.0e-6,
+            cached: 1.0e-6,
+            output: 50.0e-6,
+        },
+    ),
+    (
         "claude-opus-4-6",
         ModelPricing {
             input: 5.0e-6,
@@ -3338,6 +3346,14 @@ mod tests {
         // Model with extra suffix
         let p = find_pricing("gemini-2.5-flash-preview").unwrap();
         assert!((p.input - 0.3e-6).abs() < 1e-12);
+    }
+
+    #[test]
+    fn pricing_fable_5_match() {
+        let p = find_pricing("claude-fable-5-20260609").unwrap();
+        assert!((p.input - 10.0e-6).abs() < 1e-12);
+        assert!((p.cached - 1.0e-6).abs() < 1e-12);
+        assert!((p.output - 50.0e-6).abs() < 1e-12);
     }
 
     #[test]
