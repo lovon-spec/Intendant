@@ -85,7 +85,8 @@ Checks:
   --selector CSS              Wait until document.querySelector(CSS) exists
   --wait-for-selector CSS     Alias for --selector
   --wait-for-function JS      Wait until a JS expression/function returns truthy
-  --station-probe NAME        Named Station probe: status, canvas, rendered, dock, dock-hidden, dock-controls, webgpu
+  --station-probe NAME        Named Station probe: status, canvas, rendered, dock-hidden, webgpu
+                              (dock-hidden passes when the legacy #station-dock is absent or hidden)
 
 Options:
   --host HOST                 Host used with --port (default: 127.0.0.1)
@@ -337,13 +338,11 @@ function normalizeStationProbeName(raw) {
     ['surface', 'rendered'],
     ['rendered-surface', 'rendered'],
     ['canvas-rendered', 'rendered'],
-    ['dock-nav', 'dock-controls'],
-    ['controls-dock', 'dock-controls'],
     ['hidden-dock', 'dock-hidden'],
     ['gpu', 'webgpu'],
   ]);
   const normalized = aliases.get(value) || value;
-  const allowed = new Set(['status', 'canvas', 'rendered', 'dock', 'dock-hidden', 'dock-controls', 'webgpu']);
+  const allowed = new Set(['status', 'canvas', 'rendered', 'dock-hidden', 'webgpu']);
   if (!allowed.has(normalized)) {
     throw new Error(`unknown Station probe '${raw}'; expected one of ${Array.from(allowed).join(', ')}`);
   }
@@ -2896,7 +2895,6 @@ function stationProbeSource() {
     const canvas = (diagnostics && diagnostics.canvas) || {};
     const pixels = (diagnostics && diagnostics.pixels) || {};
     const dock = document.getElementById('station-dock');
-    const controlsNav = document.querySelector('#station-dock-nav [data-station-dock-nav="system:controls"]');
     const getGlobalLabel = (name) => {
       try {
         const fn = globalThis[name];
@@ -2947,10 +2945,9 @@ function stationProbeSource() {
         error: pixels.error ? String(pixels.error) : '',
       },
       dock: {
+        // Station is dock-less; an absent #station-dock is the expected state.
         found: Boolean(dock),
         hidden: Boolean(dock && dock.classList && dock.classList.contains('hidden')),
-        kind: dock && dock.dataset ? String(dock.dataset.kind || '') : '',
-        controlsNavFound: Boolean(controlsNav),
       },
     };
     const pass = () => ({ ...base, ok: true, reason: 'passed' });
@@ -2977,23 +2974,14 @@ function stationProbeSource() {
         'renderer',
       );
     }
-    if (probe === 'dock') {
-      if (base.dock.found) {
-        return pass();
-      }
-      return fail('Station dock is missing');
-    }
     if (probe === 'dock-hidden') {
-      if (base.dock.found && base.dock.hidden) {
+      // Name kept for compatibility: it now passes when the legacy dock is
+      // absent (the expected dock-less state) or present-but-hidden, and only
+      // fails when a visible dock is still in the DOM.
+      if (!base.dock.found || base.dock.hidden) {
         return pass();
       }
-      return fail(base.dock.found ? 'Station dock is visible' : 'Station dock is missing');
-    }
-    if (probe === 'dock-controls') {
-      if (base.dock.found && base.dock.controlsNavFound) {
-        return pass();
-      }
-      return fail(base.dock.found ? 'Station dock controls nav is missing' : 'Station dock is missing');
+      return fail('Station dock is visible');
     }
     if (probe === 'webgpu') {
       const active = /^webgpu$/i.test(base.renderer)
@@ -3121,30 +3109,26 @@ function stationHotspotPointSource() {
 
 function stationHotspotActivateSource() {
   return function activateStationHotspot(target) {
-    const stateFor = function collectStationInteractionStateInline(targetText) {
-      const kind = targetText.startsWith('system:') ? targetText.slice('system:'.length) : targetText;
+    const stateFor = function collectStationInteractionStateInline(targetText, settleMs) {
+      const kind = targetText.includes(':') ? targetText.slice(targetText.lastIndexOf(':') + 1) : targetText;
       const status = document.getElementById('station-status');
-      const dock = document.getElementById('station-dock');
       const activeTab = document.getElementById('tab-station')?.classList.contains('active') ? 'station' : '';
       const statusText = String(status?.textContent || '');
-      const dockKind = String(dock?.dataset?.kind || '');
-      const dockHidden = !dock || dock.classList.contains('hidden');
       const statusMatches = kind
         ? new RegExp(`\\b${kind.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i').test(statusText)
         : false;
-      const renderedMatches = statusMatches && /\b(rendered|opening|station)\b/i.test(statusText);
-      const dockMatches = Boolean(kind && dockKind === kind && !dockHidden);
-      const ok = activeTab === 'station' && (dockMatches || renderedMatches);
+      // Hotspot activation drives WASM-side selection; the contract is the
+      // `Opening <kind>` pattern on #station-status, not a dock opening.
+      const activationMatches = statusMatches && /\b(rendered|opening|station)\b/i.test(statusText);
+      const ok = activeTab === 'station' && activationMatches;
       return {
         ok,
         failureKind: ok ? '' : 'interaction',
         target: targetText,
         activeTab,
         statusText,
-        dockKind,
-        dockHidden,
         statusMatches,
-        dockMatches,
+        settleMs: Number(settleMs) || 0,
         reason: ok ? 'passed' : `Station did not activate ${targetText}`,
       };
     };
@@ -3153,7 +3137,7 @@ function stationHotspotActivateSource() {
       failureKind: 'interaction',
       reason,
       target,
-      state: stateFor(String(target || '')),
+      state: stateFor(String(target || ''), 0),
       ...extra,
     });
     const pane = document.getElementById('tab-station');
@@ -3176,8 +3160,8 @@ function stationHotspotActivateSource() {
       view: window,
     });
     const accepted = button.dispatchEvent(event);
-    const state = stateFor(String(target || ''));
-    return {
+    const startedAt = Date.now();
+    const finish = (state) => ({
       ok: Boolean(state.ok),
       target,
       selector,
@@ -3186,7 +3170,26 @@ function stationHotspotActivateSource() {
       defaultPrevented: event.defaultPrevented,
       state,
       reason: state.ok ? 'passed' : state.reason,
-    };
+    });
+    const first = stateFor(String(target || ''), 0);
+    if (first.ok) {
+      return finish(first);
+    }
+    // The renderer repaints on requestAnimationFrame with render-on-change, so
+    // the status text may land a tick after the click. Poll briefly; this is an
+    // upper bound only and resolves as soon as the status reflects activation.
+    return new Promise((resolve) => {
+      const deadlineAt = startedAt + 1000;
+      const recheck = () => {
+        const state = stateFor(String(target || ''), Date.now() - startedAt);
+        if (state.ok || Date.now() >= deadlineAt) {
+          resolve(finish(state));
+          return;
+        }
+        setTimeout(recheck, 50);
+      };
+      setTimeout(recheck, 16);
+    });
   }.toString();
 }
 
@@ -3705,10 +3708,8 @@ function compactStationInteractionState(state) {
     target: String(state.target || ''),
     activeTab: String(state.activeTab || ''),
     statusText: truncateMiddle(state.statusText || '', DIAGNOSTIC_TEXT_LIMIT),
-    dockKind: String(state.dockKind || ''),
-    dockHidden: Boolean(state.dockHidden),
     statusMatches: Boolean(state.statusMatches),
-    dockMatches: Boolean(state.dockMatches),
+    settleMs: Number(state.settleMs) || 0,
     reason: truncateMiddle(state.reason || '', DIAGNOSTIC_TEXT_LIMIT),
   };
 }
@@ -4036,7 +4037,7 @@ function failureDiagnosticSelectors(opts) {
     addDiagnosticSelector(selectors, selector);
   }
   if ((opts.stationProbes || []).length || opts.stationInteractionProbe || opts.requireStationState || opts.requireAiProviderSession || opts.requireExternalAgent || opts.requireManagedContextState) {
-    for (const selector of ['#station-status', '#station-hud-canvas', '#station-dock', '#station-dock-nav [data-station-dock-nav="system:controls"]']) {
+    for (const selector of ['#station-status', '#station-hud-canvas', '[data-station-hotspot]']) {
       addDiagnosticSelector(selectors, selector);
     }
   }
@@ -4054,10 +4055,10 @@ function isStationFocusedCheck(opts) {
     opts.requireExternalAgent ? `station:external-agent:${opts.requireExternalAgent}` : '',
     opts.requireManagedContextState ? 'station:managed-context-state' : '',
   ].join('\n').toLowerCase();
-  return haystack.includes('station-status')
-    || haystack.includes('station-hud-canvas')
-    || haystack.includes('station-dock')
-    || haystack.includes('station');
+  // Any mention of "station" (selectors, wait functions, or the synthetic
+  // station:* tokens above) marks the run as Station-focused; the previous
+  // station-status/station-hud-canvas/station-dock checks were subsumed by it.
+  return haystack.includes('station');
 }
 
 function addDiagnosticSelector(selectors, selector) {
@@ -4359,6 +4360,19 @@ async function runSelfTest() {
     () => parseArgs(['--station-probe', 'everything'], {}),
     /unknown Station probe/,
   );
+  assert.throws(
+    () => parseArgs(['--station-probe', 'dock'], {}),
+    /unknown Station probe/,
+  );
+  assert.throws(
+    () => parseArgs(['--station-probe', 'dock-controls'], {}),
+    /unknown Station probe/,
+  );
+  assert.throws(
+    () => parseArgs(['--station-probe', 'dock-nav'], {}),
+    /unknown Station probe/,
+  );
+  assert.deepStrictEqual(parseArgs(['--station-probe', 'hidden-dock'], {}).stationProbes, ['dock-hidden']);
   const launchParsed = parseArgs(
     [
       '--launch-dashboard',
@@ -4537,20 +4551,13 @@ async function runSelfTest() {
   assert.ok(stationStateSummarySource().includes('buildStationSnapshot'));
   assert.ok(stationHotspotPointSource().includes('stationHotspotBoxes'));
   assert.ok(stationHotspotActivateSource().includes('MouseEvent'));
-  const fakeDock = {
-    classList: { contains: (name) => name === 'hidden' },
-    dataset: { kind: 'controls' },
-  };
-  const fakeDocument = {
-    getElementById: (id) => (id === 'station-dock' ? fakeDock : null),
-    querySelector: (selector) => (
-      selector === '#station-dock-nav [data-station-dock-nav="system:controls"]'
-        ? { dataset: { stationDockNav: 'system:controls' } }
-        : null
-    ),
-  };
+  const stationProbeDocumentFor = (dock) => ({
+    getElementById: (id) => (id === 'station-dock' ? dock : null),
+    querySelector: () => null,
+  });
+  // Dock-less Station is the expected state: no #station-dock in the DOM.
   const stationProbe = vm.runInNewContext(`(${stationProbeSource()})`, {
-    document: fakeDocument,
+    document: stationProbeDocumentFor(null),
     stationRendererLabel: () => 'WebGPU',
     stationWebgpuStatusLabel: () => 'active',
   });
@@ -4571,9 +4578,37 @@ async function runSelfTest() {
       total: 144,
     },
   };
-  assert.strictEqual(stationProbe('dock-hidden', stationProbeDiagnostics).ok, true);
+  const absentDockResult = stationProbe('dock-hidden', stationProbeDiagnostics);
+  assert.strictEqual(absentDockResult.ok, true);
+  assert.strictEqual(absentDockResult.dock.found, false);
   assert.strictEqual(stationProbe('rendered', stationProbeDiagnostics).ok, true);
   assert.strictEqual(stationProbe('webgpu', stationProbeDiagnostics).ok, true);
+  const hiddenDockProbe = vm.runInNewContext(`(${stationProbeSource()})`, {
+    document: stationProbeDocumentFor({ classList: { contains: (name) => name === 'hidden' } }),
+  });
+  assert.strictEqual(hiddenDockProbe('dock-hidden', stationProbeDiagnostics).ok, true);
+  const visibleDockProbe = vm.runInNewContext(`(${stationProbeSource()})`, {
+    document: stationProbeDocumentFor({ classList: { contains: () => false } }),
+  });
+  const visibleDockResult = visibleDockProbe('dock-hidden', stationProbeDiagnostics);
+  assert.strictEqual(visibleDockResult.ok, false);
+  assert.strictEqual(visibleDockResult.reason, 'Station dock is visible');
+  const debugStateWebgpuProbe = vm.runInNewContext(`(${stationProbeSource()})`, {
+    document: stationProbeDocumentFor(null),
+    station: { debug_state: () => 'renderer=webgpu gpu=true' },
+  });
+  assert.strictEqual(
+    debugStateWebgpuProbe('webgpu', { ...stationProbeDiagnostics, statusText: 'station ready' }).ok,
+    true,
+  );
+  const canvasFallbackProbe = vm.runInNewContext(`(${stationProbeSource()})`, {
+    document: stationProbeDocumentFor(null),
+    station: { debug_state: () => 'renderer=canvas2d gpu=false' },
+  });
+  const canvasFallbackResult = canvasFallbackProbe('webgpu', { ...stationProbeDiagnostics, statusText: 'station ready' });
+  assert.strictEqual(canvasFallbackResult.ok, false);
+  assert.strictEqual(canvasFallbackResult.failureKind, 'renderer');
+  assert.ok(canvasFallbackResult.reason.includes('unavailable or in fallback'));
   const unlitProbe = stationProbe('rendered', {
     ...stationProbeDiagnostics,
     pixels: { litCount: 0, total: 144 },
@@ -4604,52 +4639,83 @@ async function runSelfTest() {
   })('system:view');
   assert.strictEqual(hotspotPoint.ok, true);
   assert.strictEqual(Math.round(hotspotPoint.x), 150);
+  class FakeMouseEvent {
+    constructor(_type, init) {
+      this.detail = init.detail;
+      this.defaultPrevented = false;
+    }
+  }
+  const activateDocumentFor = (statusElement, button, hotspot) => ({
+    getElementById: (id) => {
+      if (id === 'tab-station') return { classList: { contains: (name) => name === 'active' } };
+      if (id === 'station-status') return statusElement;
+      return null;
+    },
+    querySelector: (selector) => (selector === `[data-station-hotspot="${hotspot}"]` ? button : null),
+  });
   let dispatchedActivationDetail = null;
+  const syncStatus = { textContent: '' };
   const fakeHotspotButton = {
     disabled: false,
     focus() {},
     dispatchEvent(event) {
       dispatchedActivationDetail = event.detail;
-      fakeActivateDocument.stationStatus.textContent = 'Opening view';
-      fakeActivateDocument.stationDock.dataset.kind = 'view';
-      fakeActivateDocument.stationDock.classList.hidden = false;
+      syncStatus.textContent = 'Opening view';
       return false;
     },
   };
-  const fakeActivateDocument = {
-    stationStatus: { textContent: '' },
-    stationDock: {
-      dataset: { kind: '' },
-      classList: {
-        hidden: true,
-        contains(name) {
-          return name === 'hidden' && this.hidden;
-        },
-      },
-    },
-    getElementById: (id) => (id === 'tab-station' ? { classList: { contains: (name) => name === 'active' } } : null),
-    querySelector: (selector) => (selector === '[data-station-hotspot="system:view"]' ? fakeHotspotButton : null),
-  };
-  fakeActivateDocument.getElementById = (id) => {
-    if (id === 'tab-station') return { classList: { contains: (name) => name === 'active' } };
-    if (id === 'station-status') return fakeActivateDocument.stationStatus;
-    if (id === 'station-dock') return fakeActivateDocument.stationDock;
-    return null;
-  };
-  const hotspotActivation = vm.runInNewContext(`(${stationHotspotActivateSource()})`, {
-    document: fakeActivateDocument,
+  const hotspotActivation = await vm.runInNewContext(`(${stationHotspotActivateSource()})`, {
+    document: activateDocumentFor(syncStatus, fakeHotspotButton, 'system:view'),
     window: {},
-    MouseEvent: class FakeMouseEvent {
-      constructor(_type, init) {
-        this.detail = init.detail;
-        this.defaultPrevented = false;
-      }
-    },
+    MouseEvent: FakeMouseEvent,
     RegExp,
     String,
+    Date,
+    Number,
+    setTimeout,
   })('system:view');
   assert.strictEqual(hotspotActivation.ok, true);
+  assert.strictEqual(hotspotActivation.state.statusMatches, true);
+  assert.strictEqual(hotspotActivation.state.settleMs, 0);
   assert.strictEqual(dispatchedActivationDetail, 0);
+  // Verification without a dock: the status text lands a frame after the
+  // click (requestAnimationFrame render-on-change), inside the settle window.
+  const deferredStatus = { textContent: 'station idle' };
+  const deferredHotspotButton = {
+    disabled: false,
+    focus() {},
+    dispatchEvent() {
+      setTimeout(() => {
+        deferredStatus.textContent = 'Opening context';
+      }, 20);
+      return true;
+    },
+  };
+  const deferredActivation = await vm.runInNewContext(`(${stationHotspotActivateSource()})`, {
+    document: activateDocumentFor(deferredStatus, deferredHotspotButton, 'system:context'),
+    window: {},
+    MouseEvent: FakeMouseEvent,
+    RegExp,
+    String,
+    Date,
+    Number,
+    setTimeout,
+  })('system:context');
+  assert.strictEqual(deferredActivation.ok, true);
+  assert.strictEqual(deferredActivation.state.statusMatches, true);
+  assert.ok(deferredActivation.state.settleMs > 0);
+  const missingHotspotActivation = await vm.runInNewContext(`(${stationHotspotActivateSource()})`, {
+    document: activateDocumentFor({ textContent: '' }, null, 'system:view'),
+    window: {},
+    MouseEvent: FakeMouseEvent,
+    RegExp,
+    String,
+    Date,
+    Number,
+    setTimeout,
+  })('system:peers');
+  assert.strictEqual(missingHotspotActivation.ok, false);
+  assert.ok(missingHotspotActivation.reason.includes('system:peers is missing'));
   const stationStateSummary = vm.runInNewContext(`(${stationStateSummarySource()})`, {
     buildStationSnapshot: () => ({
       hosts: [{ id: 'local' }],
@@ -4966,13 +5032,13 @@ async function runSelfTest() {
   assert.deepStrictEqual(
     stationConsoleWarnings([
       '[console.log] Station ordinary log',
-      '[console.warn] Station WebGPU unavailable; using DOM fallback',
+      '[console.warn] Station WebGPU unavailable; using canvas fallback',
       '[console.warning] Station canvas alpha sample failed',
       '[console.warn] unrelated warning',
       '[log.warning] canvas fallback path selected',
     ]),
     [
-      '[console.warn] Station WebGPU unavailable; using DOM fallback',
+      '[console.warn] Station WebGPU unavailable; using canvas fallback',
       '[console.warning] Station canvas alpha sample failed',
       '[log.warning] canvas fallback path selected',
     ],
@@ -5109,10 +5175,10 @@ async function runSelfTest() {
     failureDiagnosticSelectors({
       selectors: ['#station-status'],
       functions: [
-        '() => document.getElementById("station-dock")?.textContent.includes("Controls") && document.querySelector("[data-station-dock-nav=\'system:controls\']")',
+        '() => document.getElementById("station-hud-canvas") && document.querySelector("[data-station-hotspot=\'system:controls\']")',
       ],
     }),
-    ['#station-status', '#station-dock', '[data-station-dock-nav=\'system:controls\']'],
+    ['#station-status', '#station-hud-canvas', '[data-station-hotspot=\'system:controls\']'],
   );
   assert.deepStrictEqual(
     failureDiagnosticSelectors({
@@ -5128,7 +5194,7 @@ async function runSelfTest() {
       functions: [],
       stationProbes: ['rendered'],
     }),
-    ['#station-status', '#station-hud-canvas', '#station-dock', '#station-dock-nav [data-station-dock-nav="system:controls"]'],
+    ['#station-status', '#station-hud-canvas', '[data-station-hotspot]'],
   );
   assert.deepStrictEqual(
     failureDiagnosticSelectors({
@@ -5137,8 +5203,12 @@ async function runSelfTest() {
       stationProbes: [],
       stationInteractionProbe: true,
     }),
-    ['#station-status', '#station-hud-canvas', '#station-dock', '#station-dock-nav [data-station-dock-nav="system:controls"]'],
+    ['#station-status', '#station-hud-canvas', '[data-station-hotspot]'],
   );
+  assert.strictEqual(isStationFocusedCheck({ selectors: [], functions: [], stationProbes: ['webgpu'] }), true);
+  assert.strictEqual(isStationFocusedCheck({ selectors: [], functions: [], stationProbes: [], stationInteractionProbe: true }), true);
+  assert.strictEqual(isStationFocusedCheck({ selectors: ['#station-status'], functions: [], stationProbes: [] }), true);
+  assert.strictEqual(isStationFocusedCheck({ selectors: ['#root'], functions: ['() => document.title'], stationProbes: [] }), false);
   assert.deepStrictEqual(formatDiagnostics(undefined), []);
   assert.deepStrictEqual(formatDiagnostics({ error: 'boom' }), ['diagnostics error="boom"']);
   assert.ok(
@@ -5190,7 +5260,7 @@ async function runSelfTest() {
         readyState: 'complete',
         title: 'Dashboard',
         location: 'http://127.0.0.1:1234/',
-        selectorMatches: [{ selector: '#station-dock', count: 1, first: 'aside#station-dock.hidden {kind=controls}' }],
+        selectorMatches: [{ selector: '[data-station-hotspot]', count: 11, first: 'button[data-station-hotspot="layout:orbital"]' }],
       },
     },
   );
@@ -5218,11 +5288,9 @@ async function runSelfTest() {
             ok: true,
             target: 'system:view',
             activeTab: 'station',
-            statusText: `Station view ${'detail '.repeat(200)}`,
-            dockKind: 'view',
-            dockHidden: false,
+            statusText: `Opening view ${'detail '.repeat(200)}`,
             statusMatches: true,
-            dockMatches: true,
+            settleMs: 5,
             reason: 'passed',
           },
         }],
@@ -5231,6 +5299,9 @@ async function runSelfTest() {
   );
   assert.strictEqual(compactedInteraction.stationInteraction.count, 3);
   assert.ok(compactedInteraction.stationInteraction.interactions[0].state.statusText.includes('chars omitted'));
+  assert.strictEqual(compactedInteraction.stationInteraction.interactions[0].state.statusMatches, true);
+  assert.strictEqual(compactedInteraction.stationInteraction.interactions[0].state.settleMs, 5);
+  assert.strictEqual('dockMatches' in compactedInteraction.stationInteraction.interactions[0].state, false);
   assert.deepStrictEqual(
     formatArtifactLines({ screenshot: '/tmp/a.png', browserUserDataDir: '/tmp/profile' }),
     ['artifact screenshot="/tmp/a.png"', 'artifact browserUserDataDir="/tmp/profile"'],
@@ -5271,7 +5342,7 @@ async function runSelfTest() {
             total: 144,
             samples: [{ x: 1, y: 2, rgba: [3, 4, 5, 255] }],
           },
-          warnings: ['[console.warn] Station WebGPU unavailable; using DOM fallback'],
+          warnings: ['[console.warn] Station WebGPU unavailable; using canvas fallback'],
         },
       },
     },
