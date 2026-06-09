@@ -107,6 +107,43 @@ fn session_log_id(session_log: &SharedSessionLog) -> Option<String> {
         .filter(|id| !id.is_empty())
 }
 
+fn external_resume_session_for_startup(
+    backend: Option<&external_agent::AgentBackend>,
+    flags: &CliFlags,
+    intendant_session_id: Option<&str>,
+) -> Option<String> {
+    external_resume_session_for_startup_in_home(
+        &platform::home_dir(),
+        backend,
+        flags,
+        intendant_session_id,
+    )
+}
+
+fn external_resume_session_for_startup_in_home(
+    home: &Path,
+    backend: Option<&external_agent::AgentBackend>,
+    flags: &CliFlags,
+    intendant_session_id: Option<&str>,
+) -> Option<String> {
+    let backend = backend?;
+    let intendant_session_id = intendant_session_id
+        .map(str::trim)
+        .filter(|id| !id.is_empty())?;
+    let requested_resume_token = flags
+        .resume_id
+        .as_deref()
+        .or(flags.continue_last.then_some(intendant_session_id))?;
+    let token = session_supervisor::effective_external_resume_token_in_home(
+        home,
+        backend.as_short_str(),
+        intendant_session_id,
+        requested_resume_token,
+        false,
+    );
+    (!token.trim().is_empty()).then_some(token)
+}
+
 fn emit_external_session_identity(
     bus: &EventBus,
     session_id: Option<String>,
@@ -16793,6 +16830,37 @@ Also: {"source": "bare"}"#;
         assert_eq!(task.as_deref(), Some("resume managed harness"));
     }
 
+    #[test]
+    fn external_agent_startup_resume_uses_persisted_wrapper_backend_session() {
+        let home = tempfile::tempdir().unwrap();
+        let wrapper_session_id = "6036429e-54f9-4f93-b74d-04c060c79054";
+        let backend_session_id = "019ea9da-d0d6-7800-acae-a16366f02a92";
+        let wrapper_dir = home
+            .path()
+            .join(".intendant")
+            .join("logs")
+            .join(wrapper_session_id);
+        {
+            let mut log = session_log::SessionLog::open(wrapper_dir).unwrap();
+            log.write_meta(Some(home.path()), Some("old task"));
+            log.session_identity(wrapper_session_id, "codex", backend_session_id);
+        }
+
+        let mut flags = cli_flags_for_tests();
+        flags.agent_backend = Some(external_agent::AgentBackend::Codex);
+        flags.resume_id = Some(wrapper_session_id.to_string());
+        flags.task_file = Some("/tmp/station-managed-resume-task.txt".to_string());
+
+        let resume_session = external_resume_session_for_startup_in_home(
+            home.path(),
+            flags.agent_backend.as_ref(),
+            &flags,
+            Some(wrapper_session_id),
+        );
+
+        assert_eq!(resume_session.as_deref(), Some(backend_session_id));
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn black_frame_detector_rejects_all_zero_rgb() {
@@ -20557,6 +20625,7 @@ async fn run_with_presence(
     shared_codex_config: control_plane::SharedCodexConfig,
     shared_gemini_config: control_plane::SharedGeminiConfig,
     web_port: Option<u16>,
+    resume_session: Option<String>,
 ) -> Result<LoopStats, CallerError> {
     // 1. Try to create presence provider. Degrade to silent mode on failure so
     //    an external-agent-only run (e.g. codex with no API keys configured)
@@ -20751,6 +20820,7 @@ async fn run_with_presence(
     let mut persistent_open_side_threads: HashMap<String, String> = HashMap::new();
     let mut persistent_side_rounds: HashMap<String, usize> = HashMap::new();
     let mut persistent_side_turn_revisions: HashMap<String, UserTurnRevisionState> = HashMap::new();
+    let mut startup_resume_session = resume_session;
     // Track which backend the persistent agent was created for, so we can reset
     // when the web UI changes the selection between tasks.
     let mut persistent_agent_backend: Option<external_agent::AgentBackend> = None;
@@ -21816,7 +21886,7 @@ async fn run_with_presence(
                     &proj,
                     &session_log,
                     web_port,
-                    None,
+                    startup_resume_session.take(),
                     session_log_id(&session_log),
                     None,
                     None,
@@ -26764,6 +26834,11 @@ async fn main() -> Result<(), CallerError> {
         resolve_agent_backend_from_config(flags.agent_backend.clone(), &project);
     let shared_external_agent: Arc<tokio::sync::RwLock<Option<external_agent::AgentBackend>>> =
         Arc::new(tokio::sync::RwLock::new(initial_agent_backend.clone()));
+    let startup_external_resume_session = external_resume_session_for_startup(
+        initial_agent_backend.as_ref(),
+        &flags,
+        session_log_id(&session_log).as_deref(),
+    );
     let runtime_presence_enabled = !flags.no_presence && project.config.presence.enabled;
 
     // Resolve web port via auto-discovery, keeping the listener alive (no TOCTOU).
@@ -28039,6 +28114,7 @@ async fn main() -> Result<(), CallerError> {
                     shared_codex_config_for_presence,
                     shared_gemini_config_for_presence,
                     if use_web { Some(web_port) } else { None },
+                    startup_external_resume_session.clone(),
                 )
                 .await;
 
@@ -28103,7 +28179,7 @@ async fn main() -> Result<(), CallerError> {
                         false, // not headless — TUI handles approval
                         web_port_for_agent,
                         UserAttachments::default(),
-                        None,
+                        startup_external_resume_session.clone(),
                         None,
                         None,
                         None,
@@ -28579,7 +28655,7 @@ async fn main() -> Result<(), CallerError> {
                 true, // headless mode
                 web_port_for_agent,
                 UserAttachments::default(),
-                None,
+                startup_external_resume_session.clone(),
                 None,
                 None,
                 None,

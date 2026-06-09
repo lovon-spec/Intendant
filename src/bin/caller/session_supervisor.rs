@@ -3748,7 +3748,7 @@ fn persisted_external_identity_for_session(session_id: &str) -> Option<(String, 
     persisted_external_identity_for_session_in_home(&home, session_id)
 }
 
-fn effective_external_resume_token(
+pub(crate) fn effective_external_resume_token(
     source: &str,
     session_id: &str,
     requested_resume_token: &str,
@@ -3764,7 +3764,7 @@ fn effective_external_resume_token(
     )
 }
 
-fn effective_external_resume_token_in_home(
+pub(crate) fn effective_external_resume_token_in_home(
     home: &Path,
     source: &str,
     session_id: &str,
