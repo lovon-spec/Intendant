@@ -36,6 +36,16 @@ const DIAGNOSTIC_SOURCE_SELECTOR_LIMIT = 8;
 const FORMATTED_DIAGNOSTIC_LINE_LIMIT = 520;
 const FORMATTED_STATION_STATUS_LINE_LIMIT = 2000;
 const STATION_WARNING_LIMIT = 6;
+const DEFAULT_STATION_MIN_FPS = 24;
+const DEFAULT_STATION_MAX_FRAME_GAP_MS = 40;
+const STATION_SMOOTH_SAMPLE_MS = 2000;
+const STATION_SMOOTH_HARD_GAP_LIMIT_MS = 250;
+const STATION_SMOOTH_EVALUATE_TIMEOUT_BUFFER_MS = 4000;
+const STATION_ACTIVATE_SETTLE_BUDGET_MS = 1000;
+const STATION_PERF_EVAL_SETTLE_MS = 1500;
+const STATION_PERF_EVAL_DEFAULT_TARGETS = ['system:activity', 'system:controls', 'system:view'];
+const STATION_DEBUG_JSON_REQUIRED_KEYS = ['fps', 'renderer', 'hosts'];
+const STATION_DEBUG_JSON_LIST_LIMIT = 16;
 const PROTECTED_DASHBOARD_PORT = 8765;
 const STALE_BINARY_MTIME_SLOP_MS = 1000;
 const DASHBOARD_BINARY_INPUT_FILES = ['Cargo.toml', 'Cargo.lock'];
@@ -85,10 +95,30 @@ Checks:
   --selector CSS              Wait until document.querySelector(CSS) exists
   --wait-for-selector CSS     Alias for --selector
   --wait-for-function JS      Wait until a JS expression/function returns truthy
-  --station-probe NAME        Named Station probe: status, canvas, rendered, dock-hidden, webgpu, fps
-                              (dock-hidden passes when the legacy #station-dock is absent or hidden;
-                              fps reads the renderer's trailing-2s presented-frame rate from debug_state)
-  --station-min-fps N         Minimum fps for the fps probe (default: 24)
+  --station-probe NAME        Named Station probe: status, canvas, rendered, dock-hidden, webgpu,
+                              fps, smooth, debug-json. Repeatable; comma lists are accepted
+                              (e.g. --station-probe rendered,webgpu,fps,smooth).
+                              dock-hidden passes when the legacy #station-dock is absent or hidden.
+                              fps reads the renderer's trailing-2s presented-frame rate from debug_state.
+                              smooth samples page frame pacing via requestAnimationFrame for ~${STATION_SMOOTH_SAMPLE_MS}ms
+                              and fails when the p95 frame gap exceeds --station-max-frame-gap or any
+                              gap exceeds ${STATION_SMOOTH_HARD_GAP_LIMIT_MS}ms; reports fps/p50/p95/worst. Catches main-thread
+                              stalls the Station fps figure can miss.
+                              debug-json passes when station.debug_json() parses and contains
+                              fps/renderer/hosts keys; on builds without the export it soft-passes
+                              as unsupported unless --require-debug-json is set.
+  --station-min-fps N         Minimum fps for the fps probe and --station-perf-eval (default: ${DEFAULT_STATION_MIN_FPS})
+  --station-max-frame-gap MS  p95 frame-gap budget for the smooth probe and --station-perf-eval
+                              (default: ${DEFAULT_STATION_MAX_FRAME_GAP_MS})
+  --require-debug-json        Fail the debug-json probe when station.debug_json() is absent instead
+                              of soft-passing
+  --station-activate NAME     Activate a Station target programmatically via station.activate(NAME)
+                              and verify via debug_json selectedId/status text; repeatable. Faster and
+                              more robust than the click-based interaction probe; requires a build
+                              that exports station.activate
+  --station-perf-eval         Scripted perf sequence: settle, idle smooth sample, activate three
+                              targets (or each --station-activate NAME) timing each, smooth sample
+                              again; emits one JSON report and fails on threshold violations
 
 Options:
   --host HOST                 Host used with --port (default: 127.0.0.1)
@@ -149,7 +179,11 @@ function parseArgs(argv, env = process.env) {
     selectors: [],
     functions: [],
     stationProbes: [],
-    stationMinFps: 24,
+    stationMinFps: DEFAULT_STATION_MIN_FPS,
+    stationMaxFrameGapMs: DEFAULT_STATION_MAX_FRAME_GAP_MS,
+    requireDebugJson: false,
+    stationActivateTargets: [],
+    stationPerfEval: false,
     timeoutMs: DEFAULT_TIMEOUT_MS,
     cdpTimeoutMs: DEFAULT_CDP_TIMEOUT_MS,
     logLines: DEFAULT_LOG_LINES,
@@ -233,10 +267,22 @@ function parseArgs(argv, env = process.env) {
       opts.stationMinFps = parsePositiveInt(readValue(), '--station-min-fps');
     } else if (arg.startsWith('--station-min-fps=')) {
       opts.stationMinFps = parsePositiveInt(arg.slice('--station-min-fps='.length), '--station-min-fps');
+    } else if (arg === '--station-max-frame-gap') {
+      opts.stationMaxFrameGapMs = parsePositiveInt(readValue(), '--station-max-frame-gap');
+    } else if (arg.startsWith('--station-max-frame-gap=')) {
+      opts.stationMaxFrameGapMs = parsePositiveInt(arg.slice('--station-max-frame-gap='.length), '--station-max-frame-gap');
+    } else if (arg === '--require-debug-json') {
+      opts.requireDebugJson = true;
+    } else if (arg === '--station-activate') {
+      opts.stationActivateTargets.push(normalizeStationActivateTarget(readValue()));
+    } else if (arg.startsWith('--station-activate=')) {
+      opts.stationActivateTargets.push(normalizeStationActivateTarget(arg.slice('--station-activate='.length)));
+    } else if (arg === '--station-perf-eval') {
+      opts.stationPerfEval = true;
     } else if (arg === '--station-probe') {
-      opts.stationProbes.push(normalizeStationProbeName(readValue()));
+      opts.stationProbes.push(...parseStationProbeArgument(readValue()));
     } else if (arg.startsWith('--station-probe=')) {
-      opts.stationProbes.push(normalizeStationProbeName(arg.slice('--station-probe='.length)));
+      opts.stationProbes.push(...parseStationProbeArgument(arg.slice('--station-probe='.length)));
     } else if (arg === '--timeout') {
       opts.timeoutMs = readNumber('--timeout');
     } else if (arg.startsWith('--timeout=')) {
@@ -348,13 +394,36 @@ function normalizeStationProbeName(raw) {
     ['hidden-dock', 'dock-hidden'],
     ['gpu', 'webgpu'],
     ['framerate', 'fps'],
+    ['frame-pacing', 'smooth'],
+    ['pacing', 'smooth'],
+    ['debugjson', 'debug-json'],
   ]);
   const normalized = aliases.get(value) || value;
-  const allowed = new Set(['status', 'canvas', 'rendered', 'dock-hidden', 'webgpu', 'fps']);
+  const allowed = new Set(['status', 'canvas', 'rendered', 'dock-hidden', 'webgpu', 'fps', 'smooth', 'debug-json']);
   if (!allowed.has(normalized)) {
     throw new Error(`unknown Station probe '${raw}'; expected one of ${Array.from(allowed).join(', ')}`);
   }
   return normalized;
+}
+
+function parseStationProbeArgument(raw) {
+  const names = String(raw || '')
+    .split(',')
+    .map((name) => name.trim())
+    .filter(Boolean)
+    .map(normalizeStationProbeName);
+  if (!names.length) {
+    throw new Error('--station-probe requires at least one probe name');
+  }
+  return names;
+}
+
+function normalizeStationActivateTarget(raw) {
+  const value = String(raw || '').trim();
+  if (!value) {
+    throw new Error('--station-activate requires a target name');
+  }
+  return value;
 }
 
 function normalizeExternalAgentRequirement(raw) {
@@ -560,8 +629,12 @@ async function main() {
       selectors: opts.selectors.length,
       functions: opts.functions.length,
       stationProbes: opts.stationProbes.length,
+      stationProbeReports: validation.stationProbeReports,
       stationInteraction: validation.stationInteraction,
       stationInteractions: validation.stationInteraction ? validation.stationInteraction.count : 0,
+      stationActivation: validation.stationActivation,
+      stationActivations: validation.stationActivation ? validation.stationActivation.count : 0,
+      stationPerfEval: validation.stationPerfEval,
       stationState: validation.stationState,
       harnessRetries: Object.keys(harnessRetries).length ? harnessRetries : undefined,
       staticIdentity,
@@ -595,6 +668,7 @@ async function main() {
       websocket: harness && harness.websocketKind,
       artifacts: failureArtifacts(opts, harness),
       logs: collectFailureLogs(opts.logLines, dashboard, harness),
+      stationPerfEval: error && error.stationPerfEval,
       diagnostics,
       diagnosticsAuto: Boolean(diagnostics && !opts.diagnostics),
       harnessFallbacks,
@@ -617,6 +691,8 @@ function staticScriptsOnly(opts) {
       && opts.functions.length === 0
       && opts.stationProbes.length === 0
       && !opts.stationInteractionProbe
+      && opts.stationActivateTargets.length === 0
+      && !opts.stationPerfEval
       && !opts.requireStationState
       && !opts.requireAiProviderSession
       && !opts.requireExternalAgent
@@ -729,15 +805,24 @@ function printResult(opts, result) {
   }
   if (displayResult.status === 'pass') {
     console.log(
-      `PASS dashboard-validation url=${quote(displayResult.url)} selectors=${displayResult.selectors} functions=${displayResult.functions} stationProbes=${displayResult.stationProbes || 0} stationInteractions=${displayResult.stationInteractions || 0} ms=${displayResult.ms} websocket=${displayResult.websocket || 'unknown'}`,
+      `PASS dashboard-validation url=${quote(displayResult.url)} selectors=${displayResult.selectors} functions=${displayResult.functions} stationProbes=${displayResult.stationProbes || 0} stationInteractions=${displayResult.stationInteractions || 0} stationActivations=${displayResult.stationActivations || 0} ms=${displayResult.ms} websocket=${displayResult.websocket || 'unknown'}`,
     );
     for (const line of formatArtifactLines(displayResult.artifacts)) {
+      console.log(`  ${line}`);
+    }
+    for (const line of formatStationProbeReportLines(displayResult.stationProbeReports)) {
       console.log(`  ${line}`);
     }
     if (displayResult.stationInteraction) {
       console.log(
         `  station interaction count=${displayResult.stationInteraction.count || 0} warmupLatencyMs=${displayResult.stationInteraction.warmupLatencyMs || 0} subsequentLatencyMs=${displayResult.stationInteraction.subsequentLatencyMs || 0} names=${quote((displayResult.stationInteraction.names || []).join(','))}`,
       );
+    }
+    if (displayResult.stationActivation) {
+      console.log(formatStationActivationPass(displayResult.stationActivation));
+    }
+    if (displayResult.stationPerfEval) {
+      console.log(formatStationPerfEvalLine(displayResult.stationPerfEval));
     }
     if (displayResult.stationState) {
       console.log(formatStationStatePass(displayResult.stationState));
@@ -753,6 +838,9 @@ function printResult(opts, result) {
   console.error(
     `FAIL dashboard-validation url=${quote(displayResult.url)} kind=${quote(displayResult.failureKind || 'unknown')} reason=${quote(displayResult.reason)} ms=${displayResult.ms}`,
   );
+  if (displayResult.stationPerfEval) {
+    console.error(formatStationPerfEvalLine(displayResult.stationPerfEval));
+  }
   for (const line of displayResult.logs || []) {
     console.error(`  ${line}`);
   }
@@ -847,6 +935,48 @@ function formatStationStatePass(result) {
     ? ` managedContext=${quote(result.managedContextState.sessionId || result.managedSessionId || 'active')}`
     : '';
   return `  station state sessions=${counts.sessions || 0} events=${counts.events || 0} managed=${counts.managed || 0} peers=${counts.peers || 0}${live}${external}${managedContext}`;
+}
+
+function formatStationProbeReportLines(reports) {
+  if (!reports || typeof reports !== 'object') {
+    return [];
+  }
+  const lines = [];
+  if (reports.fps) {
+    lines.push(`station probe=fps fps=${Number(reports.fps.fps) || 0} minFps=${Number(reports.fps.minFps) || 0}`);
+  }
+  if (reports.smooth) {
+    const smooth = reports.smooth;
+    lines.push(
+      `station probe=smooth fps=${Number(smooth.fps) || 0} p50=${Number(smooth.p50) || 0} p95=${Number(smooth.p95) || 0} worst=${Number(smooth.worst) || 0} frames=${Number(smooth.frames) || 0} sampleMs=${Number(smooth.sampleMs) || 0}`,
+    );
+  }
+  if (reports['debug-json']) {
+    const report = reports['debug-json'];
+    if (!report.supported) {
+      lines.push(`station probe=debug-json supported=false reason=${quote(report.reason || 'not supported by this build')}`);
+    } else {
+      const data = report.data || {};
+      lines.push(
+        `station probe=debug-json supported=true fps=${Number(data.fps) || 0} renderer=${quote(data.renderer || '')} gpu=${data.gpu === undefined ? 'unknown' : Boolean(data.gpu)} hosts=${Number(data.hosts) || 0} agents=${Number(data.agents) || 0} events=${Number(data.events) || 0} displays=${Number(data.displays) || 0} selectedId=${quote(data.selectedId || '')} layout=${quote(data.layout || '')} hitZones=${Number(data.hitZones) || 0} systemTargets=${quote((data.systemTargets || []).join(','))}`,
+      );
+    }
+  }
+  return lines.map((line) => truncateMiddle(line, FORMATTED_DIAGNOSTIC_LINE_LIMIT));
+}
+
+function formatStationActivationPass(activation) {
+  return `  station activate count=${activation.count || 0} warmupLatencyMs=${activation.warmupLatencyMs || 0} subsequentLatencyMs=${activation.subsequentLatencyMs || 0} names=${quote((activation.names || []).join(','))}`;
+}
+
+function formatStationPerfEvalLine(report) {
+  let json;
+  try {
+    json = JSON.stringify(compactStationPerfEval(report));
+  } catch (_) {
+    json = String(report);
+  }
+  return `  station perf-eval ${truncateMiddle(json, FORMATTED_STATION_STATUS_LINE_LIMIT)}`;
 }
 
 function collectFailureLogs(lineCount, dashboard, harness) {
@@ -1696,14 +1826,24 @@ class BrowserHarness {
       for (const source of opts.functions) {
         await this.waitForFunction(source, opts.timeoutMs);
       }
-      if (opts.stationProbes.length > 0 || opts.stationInteractionProbe || opts.requireStationState || opts.requireAiProviderSession || opts.requireExternalAgent || opts.requireManagedContextState) {
+      if (stationSurfaceRequired(opts)) {
         await this.prepareStationSurface(opts.timeoutMs);
       }
       for (const probe of opts.stationProbes) {
-        await this.waitForStationProbe(probe, opts.timeoutMs);
+        const report = await this.runStationProbe(probe, opts);
+        if (report) {
+          validation.stationProbeReports = validation.stationProbeReports || {};
+          validation.stationProbeReports[probe] = report;
+        }
       }
       if (opts.stationInteractionProbe) {
         validation.stationInteraction = await this.runStationInteractionProbe(opts.timeoutMs);
+      }
+      if (opts.stationActivateTargets.length > 0) {
+        validation.stationActivation = await this.runStationActivateProbe(opts);
+      }
+      if (opts.stationPerfEval) {
+        validation.stationPerfEval = await this.runStationPerfEval(opts);
       }
       if (opts.requireStationState || opts.requireAiProviderSession || opts.requireExternalAgent || opts.requireManagedContextState) {
         validation.stationState = await this.requireStationState(opts);
@@ -1801,24 +1941,190 @@ class BrowserHarness {
     );
   }
 
-  async waitForStationProbe(probe, timeoutMs) {
+  async runStationProbe(probe, opts) {
+    if (probe === 'smooth') {
+      return this.runStationSmoothProbe(opts);
+    }
+    if (probe === 'debug-json') {
+      return this.waitForStationDebugJsonProbe(opts);
+    }
+    const value = await this.waitForStationProbe(probe, opts);
+    if (probe === 'fps' && value && value.fps !== undefined) {
+      return { fps: Number(value.fps) || 0, minFps: Number(value.minFps) || 0 };
+    }
+    return undefined;
+  }
+
+  async waitForStationProbe(probe, opts) {
     let lastError = '';
     let lastValue = '';
+    let passed;
     const expression = stationProbeExpression(probe, { minFps: opts.stationMinFps });
     await waitUntil(
       async () => {
         try {
           const value = await this.evaluate(expression);
           lastValue = summarizeWaitValue(value);
-          return Boolean(value && value.ok);
+          if (value && value.ok) {
+            passed = value;
+            return true;
+          }
+          return false;
         } catch (error) {
           lastError = error.message || String(error);
           return false;
         }
       },
-      timeoutMs,
+      opts.timeoutMs,
       () => `station probe ${probe} did not pass${waitFailureSuffix(lastError, lastValue)}`,
     );
+    return passed;
+  }
+
+  async runStationSmoothProbe(opts) {
+    const value = await this.sampleStationSmooth(opts);
+    if (!value || !value.ok) {
+      throw new Error(`station probe smooth did not pass${waitFailureSuffix('', summarizeWaitValue(value))}`);
+    }
+    return compactStationSmoothReport(value);
+  }
+
+  async sampleStationSmooth(opts) {
+    const options = stationSmoothOptions(opts);
+    return this.evaluate(
+      stationSmoothProbeExpression(options),
+      options.sampleMs + options.stallTimeoutMs + STATION_SMOOTH_EVALUATE_TIMEOUT_BUFFER_MS,
+    );
+  }
+
+  async waitForStationDebugJsonProbe(opts) {
+    let lastError = '';
+    let lastValue = '';
+    let passed;
+    const expression = stationDebugJsonProbeExpression({ require: Boolean(opts.requireDebugJson) });
+    await waitUntil(
+      async () => {
+        try {
+          const value = await this.evaluate(expression);
+          lastValue = summarizeWaitValue(value);
+          if (value && value.ok) {
+            passed = value;
+            return true;
+          }
+          return false;
+        } catch (error) {
+          lastError = error.message || String(error);
+          return false;
+        }
+      },
+      opts.timeoutMs,
+      () => `station probe debug-json did not pass${waitFailureSuffix(lastError, lastValue)}`,
+    );
+    return compactStationDebugJsonReport(passed);
+  }
+
+  async stationActivateSupported() {
+    const value = await this.evaluate(
+      "Boolean(typeof station !== 'undefined' && station && typeof station.activate === 'function')",
+    );
+    return Boolean(value);
+  }
+
+  async activateStationTargetViaWasm(target) {
+    return this.evaluate(
+      `Promise.resolve((${stationActivateWasmSource()})(${JSON.stringify(target)}, ${STATION_ACTIVATE_SETTLE_BUDGET_MS}))`,
+      STATION_ACTIVATE_SETTLE_BUDGET_MS + DEFAULT_CDP_COMMAND_TIMEOUT_MS,
+    );
+  }
+
+  async activateStationTargetAuto(target) {
+    if (await this.stationActivateSupported()) {
+      return this.activateStationTargetViaWasm(target);
+    }
+    return this.activateStationHotspot(target);
+  }
+
+  async runStationActivateProbe(opts) {
+    const activations = [];
+    for (const target of opts.stationActivateTargets) {
+      const started = Date.now();
+      const result = await this.activateStationTargetViaWasm(target);
+      if (!result || !result.ok) {
+        throw new Error(`station activate probe ${target} did not pass (last value: ${summarizeWaitValue(result)})`);
+      }
+      activations.push({
+        name: target,
+        input: result.input || 'wasm-activate',
+        verifiedVia: result.verifiedVia || '',
+        selectedId: result.selectedId || '',
+        latencyMs: Date.now() - started,
+        settleMs: Number(result.settleMs) || 0,
+      });
+    }
+    const latencies = activations.map((item) => item.latencyMs);
+    const subsequent = latencies.slice(1);
+    return {
+      status: 'pass',
+      count: activations.length,
+      names: activations.map((item) => item.name),
+      warmupLatencyMs: latencies[0] || 0,
+      subsequentLatencyMs: subsequent.length
+        ? Math.round(subsequent.reduce((sum, value) => sum + value, 0) / subsequent.length)
+        : 0,
+      activations,
+    };
+  }
+
+  async stationDebugJsonSnapshot() {
+    try {
+      const value = await this.evaluate(stationDebugJsonProbeExpression({ require: false }));
+      return value && value.ok && value.supported ? value.data : undefined;
+    } catch (_) {
+      return undefined;
+    }
+  }
+
+  async runStationPerfEval(opts) {
+    const thresholds = stationPerfEvalThresholds(opts);
+    await delay(STATION_PERF_EVAL_SETTLE_MS);
+    const idle = await this.sampleStationSmooth(opts);
+    const targets = opts.stationActivateTargets.length
+      ? opts.stationActivateTargets
+      : STATION_PERF_EVAL_DEFAULT_TARGETS;
+    const activations = [];
+    for (const target of targets) {
+      const started = Date.now();
+      let result;
+      try {
+        result = await this.activateStationTargetAuto(target);
+      } catch (error) {
+        result = { ok: false, reason: error.message || String(error) };
+      }
+      activations.push({
+        target,
+        ok: Boolean(result && result.ok),
+        input: (result && result.input) || '',
+        latencyMs: Date.now() - started,
+        reason: result && !result.ok
+          ? truncateMiddle((result && result.reason) || 'activation failed', DIAGNOSTIC_TEXT_LIMIT)
+          : undefined,
+      });
+    }
+    const active = await this.sampleStationSmooth(opts);
+    const snapshot = await this.stationDebugJsonSnapshot();
+    const report = buildStationPerfEvalReport({
+      idle,
+      active,
+      activations,
+      thresholds,
+      displays: snapshot ? Number(snapshot.displays) || 0 : undefined,
+    });
+    if (report.verdict !== 'pass') {
+      const error = new Error(`station perf eval did not pass (${report.failures.join('; ')})`);
+      error.stationPerfEval = report;
+      throw error;
+    }
+    return report;
   }
 
   async prepareStationSurface(timeoutMs) {
@@ -2691,6 +2997,456 @@ function stationProbeExpression(probe, options = {}) {
     const stationDiagnostics = (${stationDiagnosticsSource()})();
     return (${stationProbeSource()})(${JSON.stringify(normalized)}, stationDiagnostics, ${JSON.stringify(options)});
   })())`;
+}
+
+function stationSurfaceRequired(opts) {
+  return Boolean(
+    (opts.stationProbes || []).length > 0
+      || opts.stationInteractionProbe
+      || (opts.stationActivateTargets || []).length > 0
+      || opts.stationPerfEval
+      || opts.requireStationState
+      || opts.requireAiProviderSession
+      || opts.requireExternalAgent
+      || opts.requireManagedContextState,
+  );
+}
+
+function stationSmoothOptions(opts = {}) {
+  const sampleMs = STATION_SMOOTH_SAMPLE_MS;
+  return {
+    sampleMs,
+    maxFrameGapMs: Number(opts.stationMaxFrameGapMs) || DEFAULT_STATION_MAX_FRAME_GAP_MS,
+    hardGapLimitMs: STATION_SMOOTH_HARD_GAP_LIMIT_MS,
+    stallTimeoutMs: sampleMs * 2 + 1000,
+  };
+}
+
+function stationSmoothProbeExpression(options = {}) {
+  return `Promise.resolve((${stationSmoothProbeSource()})(${JSON.stringify(options)}))`;
+}
+
+function stationSmoothProbeSource() {
+  return function collectStationSmoothSample(options) {
+    const sampleMs = Math.max(250, Number(options && options.sampleMs) || 2000);
+    const maxFrameGapMs = Number(options && options.maxFrameGapMs) || 40;
+    const hardGapLimitMs = Number(options && options.hardGapLimitMs) || 250;
+    const stallTimeoutMs = Math.max(50, Number(options && options.stallTimeoutMs) || sampleMs * 2 + 1000);
+    return new Promise((resolve) => {
+      const deltas = [];
+      let last = -1;
+      let endAt = 0;
+      let settled = false;
+      const finish = (result) => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        resolve(result);
+      };
+      const quantile = (sorted, q) => {
+        if (!sorted.length) {
+          return 0;
+        }
+        const index = Math.min(sorted.length - 1, Math.max(0, Math.ceil(q * sorted.length) - 1));
+        return sorted[index];
+      };
+      const round1 = (value) => Math.round(value * 10) / 10;
+      const summarize = () => {
+        const sorted = deltas.slice().sort((a, b) => a - b);
+        const total = deltas.reduce((sum, value) => sum + value, 0);
+        return {
+          probe: 'smooth',
+          frames: deltas.length,
+          sampleMs: Math.round(total),
+          fps: total > 0 ? Math.round((deltas.length * 1000) / total) : 0,
+          p50: round1(quantile(sorted, 0.5)),
+          p95: round1(quantile(sorted, 0.95)),
+          worst: round1(sorted.length ? sorted[sorted.length - 1] : 0),
+          maxFrameGapMs,
+          hardGapLimitMs,
+        };
+      };
+      const verdict = () => {
+        const stats = summarize();
+        if (!stats.frames) {
+          return { ...stats, ok: false, stalled: true, failureKind: 'renderer', reason: 'no requestAnimationFrame frames were observed' };
+        }
+        if (stats.worst > hardGapLimitMs) {
+          return { ...stats, ok: false, failureKind: 'renderer', reason: `worst frame gap ${stats.worst}ms exceeds the ${hardGapLimitMs}ms stall limit` };
+        }
+        if (stats.p95 > maxFrameGapMs) {
+          return { ...stats, ok: false, failureKind: 'renderer', reason: `p95 frame gap ${stats.p95}ms exceeds the ${maxFrameGapMs}ms budget` };
+        }
+        return { ...stats, ok: true, reason: 'passed' };
+      };
+      const guard = setTimeout(() => {
+        const stats = summarize();
+        finish({
+          ...stats,
+          ok: false,
+          stalled: true,
+          failureKind: 'renderer',
+          reason: `requestAnimationFrame stalled: ${stats.frames} frame(s) in ${stallTimeoutMs}ms`,
+        });
+      }, stallTimeoutMs);
+      const step = (now) => {
+        if (settled) {
+          return;
+        }
+        if (last < 0) {
+          last = now;
+          endAt = now + sampleMs;
+          requestAnimationFrame(step);
+          return;
+        }
+        deltas.push(now - last);
+        last = now;
+        if (now < endAt) {
+          requestAnimationFrame(step);
+          return;
+        }
+        clearTimeout(guard);
+        finish(verdict());
+      };
+      requestAnimationFrame(step);
+    });
+  }.toString();
+}
+
+function compactStationSmoothReport(sample) {
+  if (!sample || typeof sample !== 'object') {
+    return sample;
+  }
+  return {
+    ok: Boolean(sample.ok),
+    frames: Number(sample.frames) || 0,
+    sampleMs: Number(sample.sampleMs) || 0,
+    fps: Number(sample.fps) || 0,
+    p50: Number(sample.p50) || 0,
+    p95: Number(sample.p95) || 0,
+    worst: Number(sample.worst) || 0,
+    maxFrameGapMs: Number(sample.maxFrameGapMs) || 0,
+    hardGapLimitMs: Number(sample.hardGapLimitMs) || 0,
+  };
+}
+
+function stationDebugJsonProbeExpression(options = {}) {
+  return `Promise.resolve((${stationDebugJsonProbeSource()})(${JSON.stringify({
+    requiredKeys: STATION_DEBUG_JSON_REQUIRED_KEYS,
+    listLimit: STATION_DEBUG_JSON_LIST_LIMIT,
+    ...options,
+  })}))`;
+}
+
+function stationDebugJsonProbeSource() {
+  return function collectStationDebugJson(options) {
+    const requireExport = Boolean(options && options.require);
+    const listLimit = Number(options && options.listLimit) || 16;
+    const requiredKeys = Array.isArray(options && options.requiredKeys) && options.requiredKeys.length
+      ? options.requiredKeys.map(String)
+      : ['fps', 'renderer', 'hosts'];
+    const fail = (reason) => ({ ok: false, probe: 'debug-json', supported: true, failureKind: 'probe', reason });
+    const handle = (typeof station !== 'undefined' && station)
+      || (typeof window !== 'undefined' && window.station)
+      || null;
+    if (!handle) {
+      return { ok: false, probe: 'debug-json', supported: false, failureKind: 'probe', reason: 'Station WASM handle is unavailable' };
+    }
+    if (typeof handle.debug_json !== 'function') {
+      if (requireExport) {
+        return { ok: false, probe: 'debug-json', supported: false, failureKind: 'probe', reason: 'station.debug_json() is not supported by this build' };
+      }
+      return { ok: true, probe: 'debug-json', supported: false, reason: 'station.debug_json() is not supported by this build' };
+    }
+    let raw;
+    try {
+      raw = handle.debug_json();
+    } catch (error) {
+      return fail(`station.debug_json() threw: ${error && error.message ? error.message : error}`);
+    }
+    let data = raw;
+    if (typeof raw === 'string') {
+      try {
+        data = JSON.parse(raw);
+      } catch (error) {
+        return fail(`station.debug_json() did not parse as JSON: ${error && error.message ? error.message : error}`);
+      }
+    }
+    if (!data || typeof data !== 'object' || Array.isArray(data)) {
+      return fail('station.debug_json() returned a non-object payload');
+    }
+    const missing = requiredKeys.filter((key) => !(key in data));
+    if (missing.length) {
+      return fail(`station.debug_json() is missing required key(s): ${missing.join(', ')}`);
+    }
+    const countOf = (value) => {
+      if (Array.isArray(value)) {
+        return value.length;
+      }
+      if (typeof value === 'number') {
+        return value;
+      }
+      if (value && typeof value === 'object') {
+        return Object.keys(value).length;
+      }
+      return 0;
+    };
+    const text = (value, limit) => {
+      const out = String(value === undefined || value === null ? '' : value);
+      return out.length <= limit ? out : `${out.slice(0, limit - 3)}...`;
+    };
+    const names = (value) => {
+      if (!Array.isArray(value)) {
+        return [];
+      }
+      return value
+        .slice(0, listLimit)
+        .map((item) => {
+          if (typeof item === 'string') {
+            return text(item, 48);
+          }
+          if (item && typeof item === 'object') {
+            return text(item.name || item.id || '', 48);
+          }
+          return text(item, 48);
+        })
+        .filter(Boolean);
+    };
+    return {
+      ok: true,
+      probe: 'debug-json',
+      supported: true,
+      reason: 'passed',
+      data: {
+        fps: Number(data.fps) || 0,
+        renderer: text(data.renderer, 48),
+        gpu: data.gpu === undefined ? undefined : Boolean(data.gpu),
+        hosts: countOf(data.hosts),
+        agents: countOf(data.agents),
+        events: countOf(data.events),
+        displays: countOf(data.displays),
+        selectedId: text(data.selectedId, 80),
+        layout: text(data.layout, 48),
+        mood: text(data.mood, 48),
+        motion: text(data.motion, 48),
+        hitZones: countOf(data.hitZones),
+        hitZoneNames: names(data.hitZones),
+        systemTargets: names(data.systemTargets),
+        systemTargetCount: countOf(data.systemTargets),
+      },
+    };
+  }.toString();
+}
+
+function compactStationDebugJsonReport(value) {
+  if (!value || typeof value !== 'object') {
+    return value;
+  }
+  const compact = {
+    ok: Boolean(value.ok),
+    supported: Boolean(value.supported),
+    reason: truncateMiddle(value.reason || '', DIAGNOSTIC_TEXT_LIMIT),
+  };
+  if (value.data && typeof value.data === 'object') {
+    const data = value.data;
+    compact.data = {
+      fps: Number(data.fps) || 0,
+      renderer: truncateMiddle(data.renderer || '', 48),
+      gpu: data.gpu === undefined ? undefined : Boolean(data.gpu),
+      hosts: Number(data.hosts) || 0,
+      agents: Number(data.agents) || 0,
+      events: Number(data.events) || 0,
+      displays: Number(data.displays) || 0,
+      selectedId: truncateMiddle(data.selectedId || '', 80),
+      layout: truncateMiddle(data.layout || '', 48),
+      mood: truncateMiddle(data.mood || '', 48),
+      motion: truncateMiddle(data.motion || '', 48),
+      hitZones: Number(data.hitZones) || 0,
+      hitZoneNames: compactStringArray(data.hitZoneNames, STATION_DEBUG_JSON_LIST_LIMIT, 48).values,
+      systemTargets: compactStringArray(data.systemTargets, STATION_DEBUG_JSON_LIST_LIMIT, 48).values,
+      systemTargetCount: Number(data.systemTargetCount) || 0,
+    };
+  }
+  return compact;
+}
+
+function stationActivateWasmSource() {
+  return function activateStationTargetViaWasm(target, settleBudgetMs) {
+    const budget = Math.max(50, Number(settleBudgetMs) || 1000);
+    const handleFor = () => (typeof station !== 'undefined' && station)
+      || (typeof window !== 'undefined' && window.station)
+      || null;
+    const readState = () => {
+      const state = { selectedId: '', statusText: '' };
+      const handle = handleFor();
+      try {
+        if (handle && typeof handle.debug_json === 'function') {
+          let data = handle.debug_json();
+          if (typeof data === 'string') {
+            data = JSON.parse(data);
+          }
+          if (data && typeof data === 'object') {
+            state.selectedId = String(data.selectedId === undefined || data.selectedId === null ? '' : data.selectedId);
+          }
+        }
+      } catch (_) {}
+      const status = document.getElementById('station-status');
+      state.statusText = String((status && status.textContent) || '');
+      return state;
+    };
+    const targetText = String(target || '');
+    const kind = targetText.includes(':') ? targetText.slice(targetText.lastIndexOf(':') + 1) : targetText;
+    const verify = (state) => {
+      const norm = (value) => String(value || '').trim().toLowerCase();
+      const selected = norm(state.selectedId);
+      if (selected && (selected === norm(targetText) || selected === norm(kind))) {
+        return 'selectedId';
+      }
+      if (kind) {
+        const kindPattern = new RegExp(`\\b${kind.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i');
+        if (kindPattern.test(state.statusText) && /\b(rendered|opening|station)\b/i.test(state.statusText)) {
+          return 'status-text';
+        }
+      }
+      return '';
+    };
+    const fail = (reason, extra = {}) => ({
+      ok: false,
+      failureKind: 'interaction',
+      input: 'wasm-activate',
+      target: targetText,
+      reason,
+      ...extra,
+    });
+    const pane = document.getElementById('tab-station');
+    if (!pane || !pane.classList.contains('active')) {
+      return fail('Station tab is not active');
+    }
+    const handle = handleFor();
+    if (!handle || typeof handle.activate !== 'function') {
+      return fail('station.activate() is not supported by this build');
+    }
+    let accepted;
+    try {
+      accepted = handle.activate(targetText);
+    } catch (error) {
+      return fail(`station.activate(${targetText}) threw: ${error && error.message ? error.message : error}`);
+    }
+    if (accepted === false) {
+      return fail(`station.activate(${targetText}) returned false (unknown target?)`);
+    }
+    const startedAt = Date.now();
+    const finish = (state, verifiedVia, settleMs) => ({
+      ok: Boolean(verifiedVia),
+      input: 'wasm-activate',
+      target: targetText,
+      accepted: accepted !== false,
+      verifiedVia: verifiedVia || '',
+      selectedId: state.selectedId,
+      statusText: state.statusText,
+      settleMs: Number(settleMs) || 0,
+      failureKind: verifiedVia ? '' : 'interaction',
+      reason: verifiedVia
+        ? 'passed'
+        : `Station did not reflect activation of ${targetText} in debug_json selectedId or status text`,
+    });
+    const first = readState();
+    const firstVia = verify(first);
+    if (firstVia) {
+      return finish(first, firstVia, 0);
+    }
+    // Selection lands on the next WASM render/state tick; poll briefly. This
+    // is an upper bound only and resolves as soon as the state reflects it.
+    return new Promise((resolve) => {
+      const deadlineAt = startedAt + budget;
+      const recheck = () => {
+        const state = readState();
+        const via = verify(state);
+        if (via || Date.now() >= deadlineAt) {
+          resolve(finish(state, via, Date.now() - startedAt));
+          return;
+        }
+        setTimeout(recheck, 50);
+      };
+      setTimeout(recheck, 16);
+    });
+  }.toString();
+}
+
+function stationPerfEvalThresholds(opts = {}) {
+  return {
+    minFps: Number(opts.stationMinFps) || DEFAULT_STATION_MIN_FPS,
+    maxFrameGapMs: Number(opts.stationMaxFrameGapMs) || DEFAULT_STATION_MAX_FRAME_GAP_MS,
+    hardGapLimitMs: STATION_SMOOTH_HARD_GAP_LIMIT_MS,
+  };
+}
+
+function buildStationPerfEvalReport({ idle, active, activations, thresholds, displays }) {
+  const failures = [];
+  const checkSample = (label, value) => {
+    if (!value || typeof value !== 'object') {
+      failures.push(`${label} smooth sample is missing`);
+      return { fps: 0, p50: 0, p95: 0, worst: 0, frames: 0 };
+    }
+    const stats = {
+      fps: Number(value.fps) || 0,
+      p50: Number(value.p50) || 0,
+      p95: Number(value.p95) || 0,
+      worst: Number(value.worst) || 0,
+      frames: Number(value.frames) || 0,
+    };
+    if (value.stalled) {
+      failures.push(`${label} sample stalled: ${value.reason || 'requestAnimationFrame stalled'}`);
+      return stats;
+    }
+    if (stats.fps < thresholds.minFps) {
+      failures.push(`${label} fps ${stats.fps} below minimum ${thresholds.minFps}`);
+    }
+    if (stats.p95 > thresholds.maxFrameGapMs) {
+      failures.push(`${label} p95 frame gap ${stats.p95}ms exceeds ${thresholds.maxFrameGapMs}ms`);
+    }
+    if (stats.worst > thresholds.hardGapLimitMs) {
+      failures.push(`${label} worst frame gap ${stats.worst}ms exceeds ${thresholds.hardGapLimitMs}ms`);
+    }
+    return stats;
+  };
+  const idleStats = checkSample('idle', idle);
+  const activeStats = checkSample('active', active);
+  const list = Array.isArray(activations) ? activations : [];
+  for (const activation of list) {
+    if (!activation || !activation.ok) {
+      const target = activation && activation.target ? activation.target : 'unknown';
+      const reason = activation && activation.reason ? `: ${activation.reason}` : '';
+      failures.push(`activation ${target} failed${reason}`);
+    }
+  }
+  const report = {
+    fpsIdle: idleStats.fps,
+    fpsAfterInteraction: activeStats.fps,
+    p50Idle: idleStats.p50,
+    p95Idle: idleStats.p95,
+    worstIdle: idleStats.worst,
+    p50Active: activeStats.p50,
+    p95Active: activeStats.p95,
+    worstActive: activeStats.worst,
+    framesIdle: idleStats.frames,
+    framesActive: activeStats.frames,
+    interactionTargets: list.map((item) => String((item && item.target) || '')),
+    interactionLatencies: list.map((item) => Number(item && item.latencyMs) || 0),
+    interactionInput: list.length ? String((list[0] && list[0].input) || '') : '',
+    thresholds: {
+      minFps: Number(thresholds && thresholds.minFps) || 0,
+      maxFrameGapMs: Number(thresholds && thresholds.maxFrameGapMs) || 0,
+      hardGapLimitMs: Number(thresholds && thresholds.hardGapLimitMs) || 0,
+    },
+    failures,
+    verdict: failures.length ? 'fail' : 'pass',
+  };
+  if (displays !== undefined) {
+    report.displays = Number(displays) || 0;
+  }
+  return report;
 }
 
 function summarizeWaitValue(value) {
@@ -3572,6 +4328,15 @@ function compactResultForOutput(opts, result) {
   if (compact.stationInteraction) {
     compact.stationInteraction = compactStationInteraction(compact.stationInteraction);
   }
+  if (compact.stationProbeReports) {
+    compact.stationProbeReports = compactStationProbeReports(compact.stationProbeReports);
+  }
+  if (compact.stationActivation) {
+    compact.stationActivation = compactStationActivation(compact.stationActivation);
+  }
+  if (compact.stationPerfEval) {
+    compact.stationPerfEval = compactStationPerfEval(compact.stationPerfEval);
+  }
   if (compact.stationState) {
     compact.stationState = compactStationState(compact.stationState);
   }
@@ -3738,6 +4503,89 @@ function compactStationInteractionState(state) {
   };
 }
 
+function compactStationProbeReports(reports) {
+  if (!reports || typeof reports !== 'object') {
+    return reports;
+  }
+  const compact = {};
+  if (reports.fps) {
+    compact.fps = {
+      fps: Number(reports.fps.fps) || 0,
+      minFps: Number(reports.fps.minFps) || 0,
+    };
+  }
+  if (reports.smooth) {
+    compact.smooth = compactStationSmoothReport(reports.smooth);
+  }
+  if (reports['debug-json']) {
+    compact['debug-json'] = compactStationDebugJsonReport(reports['debug-json']);
+  }
+  return compact;
+}
+
+function compactStationActivation(activation) {
+  if (!activation || typeof activation !== 'object') {
+    return activation;
+  }
+  const compact = {
+    status: activation.status || '',
+    count: Number(activation.count) || 0,
+    names: Array.isArray(activation.names) ? activation.names.slice(0, 8).map(String) : [],
+    warmupLatencyMs: Number(activation.warmupLatencyMs) || 0,
+    subsequentLatencyMs: Number(activation.subsequentLatencyMs) || 0,
+  };
+  if (Array.isArray(activation.activations)) {
+    compact.activations = activation.activations.slice(0, 8).map((item) => ({
+      name: String(item.name || ''),
+      input: String(item.input || ''),
+      verifiedVia: String(item.verifiedVia || ''),
+      selectedId: truncateMiddle(item.selectedId || '', DIAGNOSTIC_TEXT_LIMIT),
+      latencyMs: Number(item.latencyMs) || 0,
+      settleMs: Number(item.settleMs) || 0,
+    }));
+    if (activation.activations.length > compact.activations.length) {
+      compact.activationsOmitted = activation.activations.length - compact.activations.length;
+    }
+  }
+  return compact;
+}
+
+function compactStationPerfEval(report) {
+  if (!report || typeof report !== 'object') {
+    return report;
+  }
+  const compact = {
+    fpsIdle: Number(report.fpsIdle) || 0,
+    fpsAfterInteraction: Number(report.fpsAfterInteraction) || 0,
+    p50Idle: Number(report.p50Idle) || 0,
+    p95Idle: Number(report.p95Idle) || 0,
+    worstIdle: Number(report.worstIdle) || 0,
+    p50Active: Number(report.p50Active) || 0,
+    p95Active: Number(report.p95Active) || 0,
+    worstActive: Number(report.worstActive) || 0,
+    framesIdle: Number(report.framesIdle) || 0,
+    framesActive: Number(report.framesActive) || 0,
+    interactionTargets: Array.isArray(report.interactionTargets)
+      ? report.interactionTargets.slice(0, 8).map(String)
+      : [],
+    interactionLatencies: Array.isArray(report.interactionLatencies)
+      ? report.interactionLatencies.slice(0, 8).map((value) => Number(value) || 0)
+      : [],
+    interactionInput: String(report.interactionInput || ''),
+    thresholds: {
+      minFps: Number(report.thresholds && report.thresholds.minFps) || 0,
+      maxFrameGapMs: Number(report.thresholds && report.thresholds.maxFrameGapMs) || 0,
+      hardGapLimitMs: Number(report.thresholds && report.thresholds.hardGapLimitMs) || 0,
+    },
+    failures: compactStringArray(report.failures, DIAGNOSTIC_LIST_LIMIT, DIAGNOSTIC_TEXT_LIMIT).values,
+    verdict: String(report.verdict || ''),
+  };
+  if (report.displays !== undefined) {
+    compact.displays = Number(report.displays) || 0;
+  }
+  return compact;
+}
+
 function validationFailureNextStep(result) {
   if (/headed Linux Chromium could not reach the graphical display|Missing X server or \$DISPLAY|ozone_platform_x11/i.test(result.reason || '')) {
     return 'fix the remote graphical session environment first: on SSH hosts, prepend ~/.cargo/bin to PATH and run from a live GNOME/RDP session or import DISPLAY/WAYLAND_DISPLAY, XDG_RUNTIME_DIR, DBUS_SESSION_BUS_ADDRESS, and XAUTHORITY from systemctl --user show-environment';
@@ -3747,6 +4595,9 @@ function validationFailureNextStep(result) {
   }
   if (result.failureKind === 'interaction') {
     return 'treat as headed interaction validation failure; use the reported hotspot state/latency facts instead of scraping DevToolsActivePort or switching to desktop portal screenshots';
+  }
+  if (result.failureKind === 'perf-eval') {
+    return 'treat as a Station performance regression: compare the emitted perf-eval JSON report against a pre-change baseline run, and bisect renderer/display changes instead of loosening --station-min-fps/--station-max-frame-gap';
   }
   if (result.failureKind === 'station-state') {
     return 'target a populated managed Station controller, or rerun with --allow-empty-station-state only for renderer smoke tests';
@@ -3782,6 +4633,12 @@ function validationFailureKind(reason) {
   const text = String(reason || '');
   if (/^station interaction probe/.test(text) || /station interaction probe impossible/.test(text)) {
     return 'interaction';
+  }
+  if (/^station activate probe/.test(text)) {
+    return 'interaction';
+  }
+  if (/^station perf eval did not pass/.test(text)) {
+    return 'perf-eval';
   }
   if (/^station state check failed/.test(text)) {
     return 'station-state';
@@ -4049,7 +4906,9 @@ function isWaitFailureReason(reason) {
     || /^station probe .* did not pass/.test(String(reason || ''))
     || /^station state check failed/.test(String(reason || ''))
     || /^external agent session check failed/.test(String(reason || ''))
-    || /^station interaction probe/.test(String(reason || ''));
+    || /^station interaction probe/.test(String(reason || ''))
+    || /^station activate probe/.test(String(reason || ''))
+    || /^station perf eval did not pass/.test(String(reason || ''));
 }
 
 function failureDiagnosticSelectors(opts) {
@@ -4060,7 +4919,7 @@ function failureDiagnosticSelectors(opts) {
   for (const selector of diagnosticSelectorsFromWaitFunctions(opts.functions || [])) {
     addDiagnosticSelector(selectors, selector);
   }
-  if ((opts.stationProbes || []).length || opts.stationInteractionProbe || opts.requireStationState || opts.requireAiProviderSession || opts.requireExternalAgent || opts.requireManagedContextState) {
+  if (stationSurfaceRequired(opts)) {
     for (const selector of ['#station-status', '#station-hud-canvas', '[data-station-hotspot]']) {
       addDiagnosticSelector(selectors, selector);
     }
@@ -4074,6 +4933,8 @@ function isStationFocusedCheck(opts) {
     ...(opts.functions || []),
     ...(opts.stationProbes || []).map((probe) => `station:${probe}`),
     opts.stationInteractionProbe ? 'station:interaction' : '',
+    (opts.stationActivateTargets || []).length ? 'station:activate' : '',
+    opts.stationPerfEval ? 'station:perf-eval' : '',
     opts.requireStationState ? 'station:state' : '',
     opts.requireAiProviderSession ? 'station:ai-provider-session' : '',
     opts.requireExternalAgent ? `station:external-agent:${opts.requireExternalAgent}` : '',
@@ -4620,6 +5481,416 @@ async function runSelfTest() {
   assert.strictEqual(stationProbe('fps', fpsDiag, undefined).ok, true);
   assert.deepStrictEqual(parseArgs(['--station-probe', 'framerate'], {}).stationProbes, ['fps']);
   assert.strictEqual(parseArgs(['--station-min-fps', '30'], {}).stationMinFps, 30);
+  assert.strictEqual(parseArgs([], {}).stationMinFps, DEFAULT_STATION_MIN_FPS);
+  assert.strictEqual(parseArgs([], {}).stationMaxFrameGapMs, DEFAULT_STATION_MAX_FRAME_GAP_MS);
+  assert.strictEqual(parseArgs(['--station-max-frame-gap', '25'], {}).stationMaxFrameGapMs, 25);
+  assert.strictEqual(parseArgs(['--station-max-frame-gap=60'], {}).stationMaxFrameGapMs, 60);
+  assert.strictEqual(parseArgs(['--require-debug-json'], {}).requireDebugJson, true);
+  assert.strictEqual(parseArgs([], {}).requireDebugJson, false);
+  assert.strictEqual(parseArgs(['--station-perf-eval'], {}).stationPerfEval, true);
+  assert.deepStrictEqual(
+    parseArgs(['--station-probe', 'rendered,webgpu,fps,smooth'], {}).stationProbes,
+    ['rendered', 'webgpu', 'fps', 'smooth'],
+  );
+  assert.deepStrictEqual(parseArgs(['--station-probe', 'frame-pacing'], {}).stationProbes, ['smooth']);
+  assert.deepStrictEqual(parseArgs(['--station-probe', 'debug_json,smooth,'], {}).stationProbes, ['debug-json', 'smooth']);
+  assert.throws(() => parseArgs(['--station-probe', ','], {}), /requires at least one probe name/);
+  assert.throws(() => parseArgs(['--station-probe', 'rendered,everything'], {}), /unknown Station probe/);
+  assert.deepStrictEqual(
+    parseArgs(['--station-activate', 'system:view', '--station-activate=system:context'], {}).stationActivateTargets,
+    ['system:view', 'system:context'],
+  );
+  assert.throws(() => parseArgs(['--station-activate', '  '], {}), /requires a target name/);
+  assert.strictEqual(stationSurfaceRequired(parseArgs(['--station-perf-eval', '--port', '7777'], {})), true);
+  assert.strictEqual(stationSurfaceRequired(parseArgs(['--station-activate', 'system:view', '--port', '7777'], {})), true);
+  assert.strictEqual(stationSurfaceRequired(parseArgs(['--port', '7777'], {})), false);
+  assert.strictEqual(
+    staticScriptsOnly(parseArgs(['--check-static-scripts', '--station-perf-eval'], {
+      INTENDANT_MCP_URL: 'http://127.0.0.1:7777/mcp',
+    })),
+    false,
+  );
+  assert.strictEqual(
+    staticScriptsOnly(parseArgs(['--check-static-scripts', '--station-activate', 'system:view'], {
+      INTENDANT_MCP_URL: 'http://127.0.0.1:7777/mcp',
+    })),
+    false,
+  );
+
+  // smooth probe: scripted requestAnimationFrame timestamps drive the in-page sampler.
+  const smoothOptionsDefaults = stationSmoothOptions(parseArgs([], {}));
+  assert.strictEqual(smoothOptionsDefaults.sampleMs, STATION_SMOOTH_SAMPLE_MS);
+  assert.strictEqual(smoothOptionsDefaults.maxFrameGapMs, DEFAULT_STATION_MAX_FRAME_GAP_MS);
+  assert.strictEqual(smoothOptionsDefaults.hardGapLimitMs, STATION_SMOOTH_HARD_GAP_LIMIT_MS);
+  assert.strictEqual(stationSmoothOptions(parseArgs(['--station-max-frame-gap', '25'], {})).maxFrameGapMs, 25);
+  assert.ok(stationSmoothProbeExpression({ sampleMs: 100 }).includes('requestAnimationFrame'));
+  const smoothSandboxFor = (timestamps) => {
+    let index = 0;
+    return {
+      requestAnimationFrame: (callback) => {
+        if (index < timestamps.length) {
+          const ts = timestamps[index];
+          index += 1;
+          setImmediate(() => callback(ts));
+        }
+      },
+      setTimeout,
+      clearTimeout,
+    };
+  };
+  const smoothStampsFrom = (deltas) => {
+    const stamps = [0];
+    let acc = 0;
+    for (const delta of deltas) {
+      acc += delta;
+      stamps.push(acc);
+    }
+    return stamps;
+  };
+  const runSmoothSample = async (deltas) => {
+    const stamps = smoothStampsFrom(deltas);
+    const total = stamps[stamps.length - 1];
+    return vm.runInNewContext(`(${stationSmoothProbeSource()})`, smoothSandboxFor(stamps))({
+      sampleMs: total,
+      maxFrameGapMs: 40,
+      hardGapLimitMs: 250,
+      stallTimeoutMs: 5000,
+    });
+  };
+  const smoothPass = await runSmoothSample(Array(20).fill(16));
+  assert.strictEqual(smoothPass.ok, true);
+  assert.strictEqual(smoothPass.frames, 20);
+  assert.strictEqual(smoothPass.sampleMs, 320);
+  assert.strictEqual(smoothPass.fps, 63);
+  assert.strictEqual(smoothPass.p50, 16);
+  assert.strictEqual(smoothPass.p95, 16);
+  assert.strictEqual(smoothPass.worst, 16);
+  assert.deepStrictEqual(compactStationSmoothReport(smoothPass), {
+    ok: true,
+    frames: 20,
+    sampleMs: 320,
+    fps: 63,
+    p50: 16,
+    p95: 16,
+    worst: 16,
+    maxFrameGapMs: 40,
+    hardGapLimitMs: 250,
+  });
+  const smoothP95Fail = await runSmoothSample([...Array(18).fill(16), 60, 60]);
+  assert.strictEqual(smoothP95Fail.ok, false);
+  assert.strictEqual(smoothP95Fail.failureKind, 'renderer');
+  assert.strictEqual(smoothP95Fail.p95, 60);
+  assert.ok(/p95 frame gap 60ms exceeds the 40ms budget/.test(smoothP95Fail.reason));
+  const smoothHardFail = await runSmoothSample([...Array(10).fill(16), 300]);
+  assert.strictEqual(smoothHardFail.ok, false);
+  assert.strictEqual(smoothHardFail.worst, 300);
+  assert.ok(/worst frame gap 300ms exceeds the 250ms stall limit/.test(smoothHardFail.reason));
+  const smoothStalled = await vm.runInNewContext(`(${stationSmoothProbeSource()})`, {
+    requestAnimationFrame: () => {},
+    setTimeout,
+    clearTimeout,
+  })({ sampleMs: 300, stallTimeoutMs: 20 });
+  assert.strictEqual(smoothStalled.ok, false);
+  assert.strictEqual(smoothStalled.stalled, true);
+  assert.strictEqual(smoothStalled.frames, 0);
+  assert.ok(/requestAnimationFrame stalled/.test(smoothStalled.reason));
+  assert.strictEqual(
+    validationFailureKind('station probe smooth did not pass (last value: {"failureKind":"renderer"})'),
+    'renderer',
+  );
+
+  // debug-json probe: station.debug_json() is live-only, so fixtures stub the
+  // station handle directly (statusText/debug_state fixtures stay fps-token only).
+  assert.ok(stationDebugJsonProbeExpression().includes('collectStationDebugJson'));
+  assert.ok(stationDebugJsonProbeExpression({ require: true }).includes('"require":true'));
+  const debugJsonProbeIn = (sandbox, options = {}) => vm.runInNewContext(
+    `(${stationDebugJsonProbeSource()})`,
+    sandbox,
+  )({ requiredKeys: STATION_DEBUG_JSON_REQUIRED_KEYS, listLimit: STATION_DEBUG_JSON_LIST_LIMIT, ...options });
+  const debugJsonFixture = {
+    fps: 58,
+    renderer: 'webgpu',
+    gpu: true,
+    hosts: [{ id: 'local' }],
+    agents: [{ id: 'primary-agent' }, { id: 'peer-1' }],
+    events: 5,
+    displays: [{ id: 'd0' }],
+    selectedId: 'system:view',
+    layout: 'orbital',
+    mood: 'calm',
+    motion: 'normal',
+    hitZones: [
+      { name: 'system:activity', x: 1, y: 2, w: 3, h: 4 },
+      { name: 'system:controls', x: 5, y: 6, w: 7, h: 8 },
+    ],
+    systemTargets: ['system:activity', 'system:controls', 'system:view'],
+  };
+  const debugJsonPass = debugJsonProbeIn({ station: { debug_json: () => debugJsonFixture } });
+  assert.strictEqual(debugJsonPass.ok, true);
+  assert.strictEqual(debugJsonPass.supported, true);
+  assert.strictEqual(debugJsonPass.data.fps, 58);
+  assert.strictEqual(debugJsonPass.data.renderer, 'webgpu');
+  assert.strictEqual(debugJsonPass.data.gpu, true);
+  assert.strictEqual(debugJsonPass.data.hosts, 1);
+  assert.strictEqual(debugJsonPass.data.agents, 2);
+  assert.strictEqual(debugJsonPass.data.events, 5);
+  assert.strictEqual(debugJsonPass.data.displays, 1);
+  assert.strictEqual(debugJsonPass.data.selectedId, 'system:view');
+  assert.strictEqual(debugJsonPass.data.layout, 'orbital');
+  assert.strictEqual(debugJsonPass.data.hitZones, 2);
+  assert.deepStrictEqual(debugJsonPass.data.hitZoneNames, ['system:activity', 'system:controls']);
+  assert.deepStrictEqual(debugJsonPass.data.systemTargets, ['system:activity', 'system:controls', 'system:view']);
+  assert.strictEqual(debugJsonPass.data.systemTargetCount, 3);
+  const debugJsonStringPass = debugJsonProbeIn({
+    station: { debug_json: () => JSON.stringify(debugJsonFixture) },
+  });
+  assert.strictEqual(debugJsonStringPass.ok, true);
+  assert.strictEqual(debugJsonStringPass.data.renderer, 'webgpu');
+  const debugJsonMissingKeys = debugJsonProbeIn({ station: { debug_json: () => ({ fps: 30 }) } });
+  assert.strictEqual(debugJsonMissingKeys.ok, false);
+  assert.ok(/missing required key\(s\): renderer, hosts/.test(debugJsonMissingKeys.reason));
+  const debugJsonBroken = debugJsonProbeIn({ station: { debug_json: () => '{nope' } });
+  assert.strictEqual(debugJsonBroken.ok, false);
+  assert.ok(/did not parse as JSON/.test(debugJsonBroken.reason));
+  const debugJsonThrew = debugJsonProbeIn({
+    station: { debug_json: () => { throw new Error('wasm panic'); } },
+  });
+  assert.strictEqual(debugJsonThrew.ok, false);
+  assert.ok(/threw: .*wasm panic/.test(debugJsonThrew.reason));
+  const debugJsonUnsupported = debugJsonProbeIn({ station: { debug_state: () => 'fps=58' } });
+  assert.strictEqual(debugJsonUnsupported.ok, true);
+  assert.strictEqual(debugJsonUnsupported.supported, false);
+  assert.ok(/not supported by this build/.test(debugJsonUnsupported.reason));
+  const debugJsonRequired = debugJsonProbeIn({ station: { debug_state: () => 'fps=58' } }, { require: true });
+  assert.strictEqual(debugJsonRequired.ok, false);
+  assert.strictEqual(debugJsonRequired.supported, false);
+  assert.ok(/not supported by this build/.test(debugJsonRequired.reason));
+  const debugJsonNoHandle = debugJsonProbeIn({ window: {} });
+  assert.strictEqual(debugJsonNoHandle.ok, false);
+  assert.ok(/Station WASM handle is unavailable/.test(debugJsonNoHandle.reason));
+  const compactDebugJson = compactStationDebugJsonReport(debugJsonPass);
+  assert.strictEqual(compactDebugJson.ok, true);
+  assert.strictEqual(compactDebugJson.data.renderer, 'webgpu');
+  assert.deepStrictEqual(compactDebugJson.data.systemTargets, ['system:activity', 'system:controls', 'system:view']);
+  assert.strictEqual(
+    validationFailureKind('station probe debug-json did not pass (last value: {"supported":true})'),
+    'probe',
+  );
+
+  // station.activate() probe: programmatic activation verified via
+  // debug_json selectedId or the status text.
+  assert.ok(stationActivateWasmSource().includes('station.activate'));
+  const wasmActivateDocFor = (statusElement) => ({
+    getElementById: (id) => {
+      if (id === 'tab-station') {
+        return { classList: { contains: (name) => name === 'active' } };
+      }
+      if (id === 'station-status') {
+        return statusElement;
+      }
+      return null;
+    },
+  });
+  const runWasmActivate = (sandbox, target, budgetMs = 400) => vm.runInNewContext(
+    `(${stationActivateWasmSource()})`,
+    { Date, setTimeout, RegExp, String, Number, Math, JSON, ...sandbox },
+  )(target, budgetMs);
+  const activateImmediate = await runWasmActivate({
+    document: wasmActivateDocFor({ textContent: 'station idle' }),
+    station: {
+      activate: (name) => name === 'system:view',
+      debug_json: () => ({ fps: 60, renderer: 'webgpu', hosts: 1, selectedId: 'system:view' }),
+    },
+  }, 'system:view');
+  assert.strictEqual(activateImmediate.ok, true);
+  assert.strictEqual(activateImmediate.input, 'wasm-activate');
+  assert.strictEqual(activateImmediate.verifiedVia, 'selectedId');
+  assert.strictEqual(activateImmediate.settleMs, 0);
+  const deferredWasmStatus = { textContent: 'station idle' };
+  const activateDeferredWasm = await runWasmActivate({
+    document: wasmActivateDocFor(deferredWasmStatus),
+    station: {
+      activate: () => {
+        setTimeout(() => {
+          deferredWasmStatus.textContent = 'Opening context';
+        }, 20);
+        return true;
+      },
+    },
+  }, 'system:context');
+  assert.strictEqual(activateDeferredWasm.ok, true);
+  assert.strictEqual(activateDeferredWasm.verifiedVia, 'status-text');
+  assert.ok(activateDeferredWasm.settleMs > 0);
+  const activateRejected = await runWasmActivate({
+    document: wasmActivateDocFor({ textContent: '' }),
+    station: { activate: () => false },
+  }, 'system:peers');
+  assert.strictEqual(activateRejected.ok, false);
+  assert.ok(/returned false/.test(activateRejected.reason));
+  const activateUnsupported = await runWasmActivate({
+    document: wasmActivateDocFor({ textContent: '' }),
+    station: { debug_state: () => 'fps=58' },
+  }, 'system:view');
+  assert.strictEqual(activateUnsupported.ok, false);
+  assert.ok(/station\.activate\(\) is not supported by this build/.test(activateUnsupported.reason));
+  const activateUnverified = await runWasmActivate({
+    document: wasmActivateDocFor({ textContent: 'station idle' }),
+    station: { activate: () => true },
+  }, 'system:view', 60);
+  assert.strictEqual(activateUnverified.ok, false);
+  assert.ok(/did not reflect activation/.test(activateUnverified.reason));
+  assert.strictEqual(
+    validationFailureKind('station activate probe system:view did not pass (last value: false)'),
+    'interaction',
+  );
+  assert.strictEqual(isWaitFailureReason('station activate probe system:view did not pass'), true);
+
+  // perf eval: pure report builder drives the verdict.
+  const perfThresholds = stationPerfEvalThresholds(parseArgs([], {}));
+  assert.deepStrictEqual(perfThresholds, {
+    minFps: DEFAULT_STATION_MIN_FPS,
+    maxFrameGapMs: DEFAULT_STATION_MAX_FRAME_GAP_MS,
+    hardGapLimitMs: STATION_SMOOTH_HARD_GAP_LIMIT_MS,
+  });
+  const perfPass = buildStationPerfEvalReport({
+    idle: { ok: true, fps: 60, p50: 16, p95: 17, worst: 30, frames: 120 },
+    active: { ok: true, fps: 58, p50: 16.5, p95: 21, worst: 38, frames: 116 },
+    activations: [
+      { target: 'system:activity', ok: true, input: 'wasm-activate', latencyMs: 38 },
+      { target: 'system:controls', ok: true, input: 'wasm-activate', latencyMs: 12 },
+      { target: 'system:view', ok: true, input: 'wasm-activate', latencyMs: 11 },
+    ],
+    thresholds: perfThresholds,
+    displays: 1,
+  });
+  assert.strictEqual(perfPass.verdict, 'pass');
+  assert.strictEqual(perfPass.fpsIdle, 60);
+  assert.strictEqual(perfPass.fpsAfterInteraction, 58);
+  assert.strictEqual(perfPass.p95Idle, 17);
+  assert.strictEqual(perfPass.p95Active, 21);
+  assert.deepStrictEqual(perfPass.interactionTargets, ['system:activity', 'system:controls', 'system:view']);
+  assert.deepStrictEqual(perfPass.interactionLatencies, [38, 12, 11]);
+  assert.strictEqual(perfPass.interactionInput, 'wasm-activate');
+  assert.strictEqual(perfPass.displays, 1);
+  assert.deepStrictEqual(perfPass.failures, []);
+  const perfFail = buildStationPerfEvalReport({
+    idle: { ok: true, fps: 60, p50: 16, p95: 17, worst: 30, frames: 120 },
+    active: { ok: false, fps: 19, p50: 30, p95: 87, worst: 260, frames: 40 },
+    activations: [
+      { target: 'system:activity', ok: true, input: 'wasm-activate', latencyMs: 41 },
+      { target: 'system:controls', ok: false, input: 'wasm-activate', latencyMs: 1004, reason: 'Station did not reflect activation' },
+    ],
+    thresholds: perfThresholds,
+  });
+  assert.strictEqual(perfFail.verdict, 'fail');
+  assert.ok(perfFail.failures.some((failure) => failure.includes('active fps 19 below minimum 24')));
+  assert.ok(perfFail.failures.some((failure) => failure.includes('active p95 frame gap 87ms exceeds 40ms')));
+  assert.ok(perfFail.failures.some((failure) => failure.includes('active worst frame gap 260ms exceeds 250ms')));
+  assert.ok(perfFail.failures.some((failure) => failure.includes('activation system:controls failed: Station did not reflect activation')));
+  assert.strictEqual('displays' in perfFail, false);
+  const perfStalled = buildStationPerfEvalReport({
+    idle: { ok: false, stalled: true, fps: 0, frames: 0, reason: 'requestAnimationFrame stalled: 0 frame(s) in 5000ms' },
+    active: { ok: true, fps: 60, p50: 16, p95: 17, worst: 30, frames: 120 },
+    activations: [],
+    thresholds: perfThresholds,
+  });
+  assert.strictEqual(perfStalled.verdict, 'fail');
+  assert.ok(perfStalled.failures.some((failure) => failure.includes('idle sample stalled')));
+  assert.strictEqual(
+    validationFailureKind('station perf eval did not pass (active fps 19 below minimum 24)'),
+    'perf-eval',
+  );
+  assert.ok(validationFailureNextStep({ failureKind: 'perf-eval', reason: '' }).includes('perf-eval JSON report'));
+  assert.strictEqual(isWaitFailureReason('station perf eval did not pass (idle sample stalled)'), true);
+
+  // report formatting and output compaction for the new probes.
+  const probeReportLines = formatStationProbeReportLines({
+    fps: { fps: 58, minFps: 24 },
+    smooth: { ok: true, fps: 60, p50: 16.7, p95: 18.2, worst: 33.4, frames: 119, sampleMs: 2001 },
+    'debug-json': {
+      ok: true,
+      supported: true,
+      data: {
+        fps: 58,
+        renderer: 'webgpu',
+        gpu: true,
+        hosts: 1,
+        agents: 2,
+        events: 5,
+        displays: 1,
+        selectedId: '',
+        layout: 'orbital',
+        hitZones: 12,
+        systemTargets: ['system:activity', 'system:view'],
+      },
+    },
+  });
+  assert.strictEqual(probeReportLines.length, 3);
+  assert.ok(probeReportLines.some((line) => line.includes('probe=fps fps=58 minFps=24')));
+  assert.ok(probeReportLines.some((line) => line.includes('probe=smooth fps=60') && line.includes('p95=18.2') && line.includes('worst=33.4')));
+  assert.ok(probeReportLines.some((line) => line.includes('probe=debug-json supported=true')
+    && line.includes('renderer="webgpu"')
+    && line.includes('systemTargets="system:activity,system:view"')));
+  assert.ok(
+    formatStationProbeReportLines({
+      'debug-json': { ok: true, supported: false, reason: 'station.debug_json() is not supported by this build' },
+    })[0].includes('supported=false'),
+  );
+  assert.deepStrictEqual(formatStationProbeReportLines(undefined), []);
+  assert.ok(
+    formatStationActivationPass({
+      count: 2,
+      warmupLatencyMs: 40,
+      subsequentLatencyMs: 12,
+      names: ['system:view', 'system:context'],
+    }).includes('station activate count=2 warmupLatencyMs=40 subsequentLatencyMs=12'),
+  );
+  assert.ok(formatStationPerfEvalLine(perfPass).includes('"verdict":"pass"'));
+  assert.ok(formatStationPerfEvalLine(perfFail).includes('"verdict":"fail"'));
+  const compactedStationExtras = compactResultForOutput({}, {
+    status: 'pass',
+    stationProbeReports: {
+      smooth: { ok: true, frames: 119, sampleMs: 2001, fps: 60, p50: 16.7, p95: 18.2, worst: 33.4, maxFrameGapMs: 40, hardGapLimitMs: 250 },
+      'debug-json': {
+        ok: true,
+        supported: true,
+        reason: 'passed',
+        data: { fps: 58, renderer: 'webgpu', hosts: 1, systemTargets: ['system:view'], hitZoneNames: [] },
+      },
+    },
+    stationActivation: {
+      status: 'pass',
+      count: 1,
+      names: ['system:view'],
+      warmupLatencyMs: 9,
+      subsequentLatencyMs: 0,
+      activations: [{
+        name: 'system:view',
+        input: 'wasm-activate',
+        verifiedVia: 'selectedId',
+        selectedId: 'system:view',
+        latencyMs: 9,
+        settleMs: 0,
+      }],
+    },
+    stationPerfEval: perfPass,
+  });
+  assert.strictEqual(compactedStationExtras.stationProbeReports.smooth.p95, 18.2);
+  assert.strictEqual(compactedStationExtras.stationProbeReports['debug-json'].data.renderer, 'webgpu');
+  assert.strictEqual(compactedStationExtras.stationActivation.activations[0].verifiedVia, 'selectedId');
+  assert.strictEqual(compactedStationExtras.stationPerfEval.verdict, 'pass');
+  assert.deepStrictEqual(
+    failureDiagnosticSelectors({ selectors: [], functions: [], stationProbes: [], stationPerfEval: true }),
+    ['#station-status', '#station-hud-canvas', '[data-station-hotspot]'],
+  );
+  assert.strictEqual(
+    isStationFocusedCheck({ selectors: [], functions: [], stationProbes: [], stationActivateTargets: ['system:view'] }),
+    true,
+  );
+  assert.strictEqual(
+    isStationFocusedCheck({ selectors: [], functions: [], stationProbes: [], stationPerfEval: true }),
+    true,
+  );
   const hiddenDockProbe = vm.runInNewContext(`(${stationProbeSource()})`, {
     document: stationProbeDocumentFor({ classList: { contains: (name) => name === 'hidden' } }),
   });
