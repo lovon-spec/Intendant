@@ -2,11 +2,13 @@ use crate::error::CallerError;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct Worktree {
     pub branch_name: String,
     pub path: PathBuf,
+    /// Base ref the worktree branched from. Only the merge/list flows read
+    /// it; live callers (the fission spawn path) construct-and-drop it.
+    #[allow(dead_code)]
     pub base_branch: String,
 }
 
@@ -17,7 +19,6 @@ pub enum MergeResult {
     Conflict(String),
 }
 
-#[allow(dead_code)]
 pub fn create(project_root: &Path, branch: &str, base: &str) -> Result<Worktree, CallerError> {
     let worktree_path = project_root
         .join(".intendant")
@@ -52,7 +53,6 @@ pub fn create(project_root: &Path, branch: &str, base: &str) -> Result<Worktree,
     })
 }
 
-#[allow(dead_code)]
 pub fn remove(project_root: &Path, wt: &Worktree) -> Result<(), CallerError> {
     let output = Command::new("git")
         .args(["worktree", "remove", &wt.path.to_string_lossy()])

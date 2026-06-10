@@ -4579,6 +4579,24 @@ async fn apply_external_context_rewind(
             None
         }
     };
+    // Fission detach prep, BEFORE the rollback mutates the rollout: snapshot
+    // every anchor's first line plus the cut line of this rewind from the
+    // pre-rewind catalog, so the post-rollback detach pass can decide which
+    // fission spawn anchors were cut out of the effective history.
+    let fission_detach_prep = match scan_context_rewind_anchor_catalog(&source_rollout_path) {
+        Ok(anchors) => {
+            fission_anchor_cut_line(&anchors, &resolved_anchor.item_id, request.position)
+                .map(|cut_line| (fission_anchor_first_lines(&anchors), cut_line))
+        }
+        Err(err) => {
+            slog(config.session_log, |log| {
+                log.warn(&format!(
+                    "Could not snapshot rollout anchors for fission detach before rewind {record_id}: {err}"
+                ))
+            });
+            None
+        }
+    };
     let recovery_rollout_path =
         context_rewind::copy_recovery_rollout(config.log_dir, &record_id, &source_rollout_path)
             .map_err(|e| format!("failed to copy pre-rewind rollout: {}", e))?;
@@ -4617,7 +4635,7 @@ async fn apply_external_context_rewind(
             }
         };
 
-    let record = context_rewind::ContextRewindRecord {
+    let mut record = context_rewind::ContextRewindRecord {
         record_id: record_id.clone(),
         created_at: chrono::Utc::now().to_rfc3339(),
         session_id: request
@@ -4638,6 +4656,7 @@ async fn apply_external_context_rewind(
         fission_snapshot,
         lineage_ledger,
         fission_ledger,
+        detached_fission_group_ids: Vec::new(),
     };
     // Perform the rollback BEFORE persisting the durable record. The recovery
     // rollout was copied above (copy-before-mutation), but the record itself is
@@ -4656,6 +4675,46 @@ async fn apply_external_context_rewind(
             });
         }
         return Err(format!("thread rollback failed: {}", e));
+    }
+
+    // The rollback succeeded: sever every fission group whose spawn anchor
+    // was cut out of the effective history, BEFORE the durable record is
+    // written so the record carries the detached group ids. Skipped (with a
+    // warning above) when the pre-rewind anchor snapshot could not be taken —
+    // without it the predicate would wrongly report every anchor unreachable.
+    if let Some((anchor_first_lines, cut_line)) = fission_detach_prep {
+        let detach_parent_candidates = fission_detach_parent_candidates(thread_id, &record, config);
+        match fission_ledger::detach_groups_with_invalid_anchors(
+            config.log_dir,
+            &detach_parent_candidates,
+            |anchor_item_id| {
+                fission_anchor_reachable_after_rewind(
+                    &anchor_first_lines,
+                    cut_line,
+                    request.position,
+                    anchor_item_id,
+                )
+            },
+        ) {
+            Ok(report) => {
+                if !report.detached_group_ids.is_empty() {
+                    emit_fission_detach_relationships(config, &report);
+                    fission_lifecycle::drop_pending_deliveries(&report.detached_group_ids);
+                    slog(config.session_log, |log| {
+                        log.info(&format!(
+                            "Rewind {record_id} detached fission group(s) [{}]",
+                            report.detached_group_ids.join(", ")
+                        ))
+                    });
+                    record.detached_fission_group_ids = report.detached_group_ids;
+                }
+            }
+            Err(err) => slog(config.session_log, |log| {
+                log.warn(&format!(
+                    "Could not detach fission groups after rewind {record_id}: {err}"
+                ))
+            }),
+        }
     }
 
     context_rewind::persist_record(config.log_dir, &record)
@@ -6492,6 +6551,740 @@ async fn apply_context_rewind_backout_action(
     ))
 }
 
+fn is_fission_spawn_action(op: &str) -> bool {
+    matches!(op, "fission_spawn" | "fission-spawn")
+}
+
+fn is_fission_import_action(op: &str) -> bool {
+    matches!(op, "fission_import" | "fission-import")
+}
+
+/// Most branches a single `fission_spawn` call may launch.
+const FISSION_SPAWN_MAX_BRANCHES: usize = 4;
+
+/// One branch request inside a `fission_spawn` thread action.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FissionSpawnBranchSpec {
+    objective: String,
+    write_scope: Vec<String>,
+    name: Option<String>,
+}
+
+fn fission_spawn_branch_specs_from_params(
+    params: &serde_json::Value,
+) -> Result<Vec<FissionSpawnBranchSpec>, String> {
+    let branches = params
+        .get("branches")
+        .and_then(|value| value.as_array())
+        .ok_or_else(|| "fission_spawn requires a `branches` array".to_string())?;
+    if branches.is_empty() || branches.len() > FISSION_SPAWN_MAX_BRANCHES {
+        return Err(format!(
+            "fission_spawn takes between 1 and {FISSION_SPAWN_MAX_BRANCHES} branches; got {}",
+            branches.len()
+        ));
+    }
+    let mut specs = Vec::new();
+    for (index, branch) in branches.iter().enumerate() {
+        let objective = branch
+            .get("objective")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|objective| !objective.is_empty())
+            .ok_or_else(|| {
+                format!(
+                    "fission_spawn branch {} requires a non-empty `objective`",
+                    index + 1
+                )
+            })?;
+        let write_scope_value = branch
+            .get("write_scope")
+            .or_else(|| branch.get("writeScope"));
+        let write_scope: Vec<String> = match write_scope_value {
+            Some(serde_json::Value::Array(entries)) => entries
+                .iter()
+                .filter_map(|entry| entry.as_str())
+                .map(str::trim)
+                .filter(|entry| !entry.is_empty())
+                .map(str::to_string)
+                .collect(),
+            // Tolerate a bare string scope; the contract shape is an array.
+            Some(serde_json::Value::String(entry)) => Some(entry.trim())
+                .filter(|entry| !entry.is_empty())
+                .map(|entry| vec![entry.to_string()])
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        };
+        let name = branch
+            .get("name")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(str::to_string);
+        specs.push(FissionSpawnBranchSpec {
+            objective: objective.to_string(),
+            write_scope,
+            name,
+        });
+    }
+    Ok(specs)
+}
+
+fn fission_spawn_use_worktree_override(params: &serde_json::Value) -> Option<bool> {
+    params
+        .get("use_worktree")
+        .or_else(|| params.get("useWorktree"))
+        .and_then(|value| value.as_bool())
+}
+
+fn fission_anchor_item_id_from_params(params: &serde_json::Value) -> Option<String> {
+    params
+        .get("anchor_item_id")
+        .or_else(|| params.get("anchorItemId"))
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+}
+
+fn fission_params_with_anchor_item_id(
+    params: serde_json::Value,
+    anchor_item_id: &str,
+) -> serde_json::Value {
+    match params {
+        serde_json::Value::Object(mut obj) => {
+            obj.insert(
+                "anchor_item_id".to_string(),
+                serde_json::Value::String(anchor_item_id.to_string()),
+            );
+            serde_json::Value::Object(obj)
+        }
+        other => other,
+    }
+}
+
+/// Pick the spawn anchor from the in-flight tool items of the active turn:
+/// the most recently started `mcp` tool call whose preview references
+/// `fission_spawn` — i.e. the very tool call that asked for the spawn. The
+/// mid-turn dispatch arm injects the winner into the action params as
+/// `anchor_item_id`.
+fn most_recent_inflight_fission_spawn_tool_item(
+    active_tool_ids: &HashSet<String>,
+    tool_previews: &HashMap<String, String>,
+    tool_start_seq: &HashMap<String, u64>,
+) -> Option<String> {
+    active_tool_ids
+        .iter()
+        .filter(|item_id| {
+            tool_previews.get(item_id.as_str()).is_some_and(|preview| {
+                preview.starts_with("mcp") && preview.contains("fission_spawn")
+            })
+        })
+        .max_by_key(|item_id| tool_start_seq.get(item_id.as_str()).copied().unwrap_or(0))
+        .cloned()
+}
+
+/// A spawn anchor resolved from the parent's rollout catalog when the action
+/// params carried none.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FissionSpawnResolvedAnchor {
+    item_id: String,
+    /// True when no anchor named for `fission_spawn` existed and the catalog
+    /// head (last anchor) was used instead; recorded as tool
+    /// `fission_spawn:head` for honest provenance.
+    head_fallback: bool,
+}
+
+fn fission_spawn_anchor_from_catalog(
+    anchors: &[ContextRewindAnchorCatalogEntry],
+) -> Option<FissionSpawnResolvedAnchor> {
+    if let Some(anchor) = anchors.iter().rev().find(|anchor| {
+        anchor
+            .names
+            .iter()
+            .any(|name| name.contains("fission_spawn"))
+    }) {
+        return Some(FissionSpawnResolvedAnchor {
+            item_id: anchor.item_id.clone(),
+            head_fallback: false,
+        });
+    }
+    anchors.last().map(|anchor| FissionSpawnResolvedAnchor {
+        item_id: anchor.item_id.clone(),
+        head_fallback: true,
+    })
+}
+
+/// Worktree default for a fission branch: an owned write scope in a git
+/// project gets an isolated checkout; an explicit `use_worktree` overrides in
+/// both directions.
+fn fission_branch_uses_worktree(
+    has_write_scope: bool,
+    project_root_is_git_repo: bool,
+    use_worktree_override: Option<bool>,
+) -> bool {
+    use_worktree_override.unwrap_or(has_write_scope && project_root_is_git_repo)
+}
+
+fn fission_project_root_is_git_repo(project_root: &Path) -> bool {
+    // Repo roots have a `.git` directory; linked worktrees a `.git` file.
+    // Either way the root can host `git worktree add`.
+    project_root.join(".git").exists()
+}
+
+/// Git branch name for a fission worktree: `fission/<short-group-hash>-<ordinal>`.
+/// The short hash is the collision-resistant tail segment of the fission
+/// group id, so sibling spawns at different anchors never collide.
+fn fission_branch_git_name(group_id: &str, ordinal: usize) -> String {
+    let hash = group_id.rsplit('-').next().unwrap_or(group_id);
+    let short: String = hash.chars().take(8).collect();
+    format!("fission/{short}-{ordinal}")
+}
+
+/// The `<fission_charter>` developer message injected into a freshly forked
+/// branch: identity (group + branch session), mandate (objective + owned
+/// write scope + worktree), and the report-back contract.
+fn fission_charter_message(
+    group_id: &str,
+    branch_session_id: &str,
+    objective: &str,
+    write_scope: &[String],
+    branch_worktree: Option<&worktree::Worktree>,
+) -> String {
+    let scope = if write_scope.is_empty() {
+        "read-only".to_string()
+    } else {
+        write_scope.join(", ")
+    };
+    let mut out = String::from("<fission_charter>\n");
+    out.push_str(&format!("group_id: {group_id}\n"));
+    out.push_str(&format!("branch_session_id: {branch_session_id}\n"));
+    out.push_str(&format!("objective: {objective}\n"));
+    out.push_str(&format!("owned write scope: {scope}\n"));
+    if let Some(wt) = branch_worktree {
+        out.push_str(&format!(
+            "worktree: {} (git branch {})\n",
+            wt.path.display(),
+            wt.branch_name
+        ));
+    }
+    out.push_str(
+        "Work only within your write scope. When done, end your turn with a concise outcome \
+         summary (it becomes your ledger summary). If your result should become the group's \
+         canonical outcome, call claim_fission_canonical with this group_id. Prefer the fission \
+         ledger in get_status over reading sibling raw logs.\n",
+    );
+    out.push_str("</fission_charter>");
+    out
+}
+
+/// Shared per-spawn facts threaded through the per-branch launcher.
+struct FissionSpawnContext<'a> {
+    parent_thread_id: &'a str,
+    anchor_item_id: &'a str,
+    group_id: &'a str,
+    use_worktree_override: Option<bool>,
+    project_root_is_git: bool,
+    launch: Option<&'a crate::session_config::SessionAgentConfig>,
+}
+
+async fn apply_fission_spawn_action(
+    agent: &mut Box<dyn external_agent::ExternalAgent>,
+    params: &serde_json::Value,
+    config: &DrainConfig<'_>,
+) -> Result<String, String> {
+    let specs = fission_spawn_branch_specs_from_params(params)?;
+    let parent_thread_id = thread_id_from_action_params(params)
+        .or_else(|| config.alias_session_id.clone())
+        .or_else(|| config.session_id.clone())
+        .ok_or_else(|| "fission_spawn requires a parent thread id".to_string())?;
+
+    // Anchor resolution order: explicit `anchor_item_id` (the mid-turn
+    // dispatch arm injects the in-flight fission_spawn tool item) → newest
+    // rollout anchor named for fission_spawn → catalog head with honest
+    // `fission_spawn:head` provenance.
+    let (anchor_item_id, head_fallback) = match fission_anchor_item_id_from_params(params) {
+        Some(item_id) => (item_id, false),
+        None => {
+            let snapshot = agent
+                .read_thread_snapshot(&parent_thread_id)
+                .await
+                .map_err(|e| {
+                    format!("failed to read parent thread metadata for fission spawn: {e}")
+                })?;
+            let rollout_path = snapshot.rollout_path.ok_or_else(|| {
+                "parent thread metadata did not include a rollout path to anchor the fission group"
+                    .to_string()
+            })?;
+            let anchors = scan_context_rewind_anchor_catalog(&rollout_path)
+                .map_err(|e| format!("failed to scan rollout anchors for fission spawn: {e}"))?;
+            let resolved = fission_spawn_anchor_from_catalog(&anchors).ok_or_else(|| {
+                "parent thread rollout has no anchors to attach a fission group to".to_string()
+            })?;
+            (resolved.item_id, resolved.head_fallback)
+        }
+    };
+
+    let group_id = fission_ledger::group_id(&parent_thread_id, &anchor_item_id);
+    let group_tool = if head_fallback {
+        "fission_spawn:head"
+    } else {
+        "fission_spawn"
+    };
+    // Stamp the group's tool provenance before registering branches;
+    // `register_spawned_branch` keys into the same `(parent, anchor)` group
+    // and leaves an existing group's tool untouched.
+    fission_ledger::record_fission_observation(
+        config.log_dir,
+        fission_ledger::FissionObservation {
+            parent_session_id: parent_thread_id.clone(),
+            anchor_item_id: anchor_item_id.clone(),
+            tool: group_tool.to_string(),
+            status: "running".to_string(),
+            prompt: None,
+            model: None,
+            reasoning_effort: None,
+            branches: Vec::new(),
+        },
+    )
+    .map_err(|e| format!("failed to record fission group {group_id}: {e}"))?;
+
+    let launch = crate::session_config::read_log_dir_config(config.log_dir);
+    let ctx = FissionSpawnContext {
+        parent_thread_id: &parent_thread_id,
+        anchor_item_id: &anchor_item_id,
+        group_id: &group_id,
+        use_worktree_override: fission_spawn_use_worktree_override(params),
+        project_root_is_git: fission_project_root_is_git_repo(config.project_root),
+        launch: launch.as_ref(),
+    };
+    let mut results = Vec::new();
+    let mut spawned = 0usize;
+    for (index, spec) in specs.iter().enumerate() {
+        let ordinal = index + 1;
+        match spawn_single_fission_branch(agent, config, &ctx, ordinal, spec).await {
+            Ok(line) => {
+                spawned += 1;
+                results.push(format!("branch {ordinal}: {line}"));
+            }
+            Err(err) => results.push(format!("branch {ordinal}: FAILED — {err}")),
+        }
+    }
+    let message = format!(
+        "fission group {group_id} (anchor {anchor_item_id}): spawned {spawned}/{} branch(es)\n{}",
+        specs.len(),
+        results.join("\n"),
+    );
+    if spawned == 0 {
+        Err(message)
+    } else {
+        Ok(message)
+    }
+}
+
+/// Launch one fission branch: optional worktree → live-thread fork → charter
+/// injection → durable ledger registration → lifecycle route → frontend
+/// wiring (rename + relationship + resume with the kickoff task). Any failed
+/// step removes the worktree this branch created, so a partial spawn leaves
+/// no orphaned checkouts.
+async fn spawn_single_fission_branch(
+    agent: &mut Box<dyn external_agent::ExternalAgent>,
+    config: &DrainConfig<'_>,
+    ctx: &FissionSpawnContext<'_>,
+    ordinal: usize,
+    spec: &FissionSpawnBranchSpec,
+) -> Result<String, String> {
+    let use_worktree = fission_branch_uses_worktree(
+        !spec.write_scope.is_empty(),
+        ctx.project_root_is_git,
+        ctx.use_worktree_override,
+    );
+    let branch_worktree = if use_worktree {
+        Some(
+            worktree::create(
+                config.project_root,
+                &fission_branch_git_name(ctx.group_id, ordinal),
+                "HEAD",
+            )
+            .map_err(|e| format!("worktree creation failed: {e}"))?,
+        )
+    } else {
+        None
+    };
+    let cleanup_worktree = |wt: &Option<worktree::Worktree>| -> String {
+        if let Some(wt) = wt {
+            if let Err(err) = worktree::remove(config.project_root, wt) {
+                return format!(
+                    "; cleanup of worktree {} also failed: {err}",
+                    wt.path.display()
+                );
+            }
+        }
+        String::new()
+    };
+
+    let display_name = spec.name.clone().unwrap_or_else(|| {
+        format!(
+            "Fission {}: {}",
+            ordinal,
+            truncate_string_copy(&spec.objective, 48)
+        )
+    });
+    let child = match agent
+        .fork_thread_with_options(
+            ctx.parent_thread_id,
+            Some(&display_name),
+            branch_worktree.as_ref().map(|wt| wt.path.as_path()),
+        )
+        .await
+    {
+        Ok(child) => child,
+        Err(e) => {
+            let cleanup = cleanup_worktree(&branch_worktree);
+            return Err(format!("live-thread fork failed: {e}{cleanup}"));
+        }
+    };
+
+    let charter = fission_charter_message(
+        ctx.group_id,
+        &child.thread_id,
+        &spec.objective,
+        &spec.write_scope,
+        branch_worktree.as_ref(),
+    );
+    if let Err(e) = agent
+        .inject_thread_developer_message(&child.thread_id, &charter)
+        .await
+    {
+        let cleanup = cleanup_worktree(&branch_worktree);
+        return Err(format!(
+            "charter injection into forked thread {} failed: {e}{cleanup}",
+            child.thread_id
+        ));
+    }
+
+    let kickoff = format!("Begin your fission charter: {}", spec.objective);
+    if let Err(err) = fission_ledger::register_spawned_branch(
+        config.log_dir,
+        ctx.parent_thread_id,
+        ctx.anchor_item_id,
+        fission_ledger::BranchCharter {
+            objective: spec.objective.clone(),
+            write_scope: (!spec.write_scope.is_empty()).then(|| spec.write_scope.join(", ")),
+            worktree_requested: use_worktree,
+        },
+        fission_ledger::NewSpawnedBranch {
+            session_id: child.thread_id.clone(),
+            backend_session_id: Some(child.thread_id.clone()),
+            worktree_path: branch_worktree.as_ref().map(|wt| wt.path.clone()),
+            task: Some(kickoff.clone()),
+            ..Default::default()
+        },
+    ) {
+        let cleanup = cleanup_worktree(&branch_worktree);
+        return Err(format!(
+            "fission ledger registration for forked thread {} failed: {err}{cleanup}",
+            child.thread_id
+        ));
+    }
+    fission_lifecycle::register_branch(&child.thread_id, ctx.group_id, config.log_dir);
+
+    config
+        .bus
+        .send(AppEvent::ControlCommand(event::ControlMsg::RenameSession {
+            source: Some("codex".to_string()),
+            session_id: child.thread_id.clone(),
+            backend_session_id: Some(child.thread_id.clone()),
+            name: display_name,
+        }));
+    emit_session_relationship(
+        config.bus,
+        Some(ctx.parent_thread_id),
+        &child.thread_id,
+        "fission-branch",
+        false,
+    );
+    let branch_project_root = branch_worktree
+        .as_ref()
+        .map(|wt| wt.path.as_path())
+        .unwrap_or(config.project_root);
+    config
+        .bus
+        .send(AppEvent::ControlCommand(event::ControlMsg::ResumeSession {
+            source: "codex".to_string(),
+            session_id: child.thread_id.clone(),
+            resume_id: Some(child.thread_id.clone()),
+            project_root: Some(branch_project_root.to_string_lossy().to_string()),
+            task: Some(kickoff),
+            direct: Some(true),
+            attachments: Vec::new(),
+            agent_command: ctx.launch.and_then(|cfg| cfg.agent_command.clone()),
+            codex_sandbox: ctx.launch.and_then(|cfg| cfg.codex_sandbox.clone()),
+            codex_approval_policy: ctx.launch.and_then(|cfg| cfg.codex_approval_policy.clone()),
+            codex_managed_context: ctx.launch.and_then(|cfg| cfg.codex_managed_context.clone()),
+            codex_context_archive: ctx.launch.and_then(|cfg| cfg.codex_context_archive.clone()),
+        }));
+
+    let location = branch_worktree
+        .as_ref()
+        .map(|wt| {
+            format!(
+                " in worktree {} (git branch {})",
+                wt.path.display(),
+                wt.branch_name
+            )
+        })
+        .unwrap_or_default();
+    Ok(format!(
+        "spawned thread {}{} — {}",
+        child.thread_id, location, spec.objective
+    ))
+}
+
+/// Compact developer-message payload for `fission_import`: everything the
+/// parent needs to fold a branch's outcome into its continuation without
+/// reading the sibling's raw log.
+fn fission_import_payload(
+    group: &fission_ledger::FissionGroup,
+    branch: &fission_ledger::FissionBranch,
+    branch_ext: Option<&fission_ledger::FissionBranchExt>,
+) -> String {
+    let objective = branch_ext
+        .and_then(|ext| ext.charter.as_ref())
+        .map(|charter| charter.objective.clone())
+        .or_else(|| branch.task.clone())
+        .or_else(|| group.objective.clone())
+        .unwrap_or_else(|| "(none recorded)".to_string());
+    let mut out = String::from("<fission_import>\n");
+    out.push_str(&format!("group_id: {}\n", group.group_id));
+    out.push_str(&format!("branch_session_id: {}\n", branch.session_id));
+    out.push_str(&format!("objective: {objective}\n"));
+    out.push_str(&format!(
+        "status: {}\n",
+        fission_ledger::normalize_branch_status(&branch.status)
+    ));
+    if let Some(summary) = branch.summary.as_deref() {
+        out.push_str(&format!("summary: {summary}\n"));
+    }
+    if let Some(ext) = branch_ext {
+        if !ext.changed_files.is_empty() {
+            out.push_str(&format!(
+                "changed_files: {}\n",
+                ext.changed_files.join(", ")
+            ));
+        }
+        if !ext.tests_run.is_empty() {
+            out.push_str(&format!("tests_run: {}\n", ext.tests_run.join(", ")));
+        }
+    }
+    if let Some(worktree_path) = branch.worktree_path.as_deref() {
+        out.push_str(&format!("worktree: {}\n", worktree_path.display()));
+    }
+    out.push_str(&format!("raw_log: {}\n", branch.raw_log));
+    out.push_str("</fission_import>");
+    out
+}
+
+async fn apply_fission_import_action(
+    agent: &mut Box<dyn external_agent::ExternalAgent>,
+    params: &serde_json::Value,
+    config: &DrainConfig<'_>,
+) -> Result<String, String> {
+    let group_id = params
+        .get("group_id")
+        .or_else(|| params.get("groupId"))
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| "fission_import requires `group_id`".to_string())?
+        .to_string();
+    let branch_session_id = params
+        .get("branch_session_id")
+        .or_else(|| params.get("branchSessionId"))
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| "fission_import requires `branch_session_id`".to_string())?
+        .to_string();
+
+    let document = fission_ledger::read_fission_ledger_document(config.log_dir)
+        .map_err(|e| format!("failed to read fission ledger: {e}"))?
+        .ok_or_else(|| {
+            format!("fission group `{group_id}` was not found (no fission ledger exists yet)")
+        })?;
+    let Some(group) = document
+        .groups
+        .iter()
+        .find(|group| group.group_id == group_id)
+    else {
+        return Err(format!("fission group `{group_id}` was not found"));
+    };
+    if document.group_is_detached(&group_id) {
+        return Err(format!(
+            "fission group `{group_id}` is detached: a context rewind cut its spawn anchor out of the effective history, so its results cannot be auto-imported into the live lineage. Inspect the branch raw logs directly (see the fission ledger's raw_log pointers), or use rewind_backout on the covering rewind record to revisit the pre-rewind lineage."
+        ));
+    }
+    let Some(branch) = group
+        .branches
+        .iter()
+        .find(|branch| branch.session_id == branch_session_id)
+    else {
+        return Err(format!(
+            "branch `{branch_session_id}` is not part of fission group `{group_id}`"
+        ));
+    };
+    let payload = fission_import_payload(group, branch, document.branch_ext(&group_id, &branch_session_id));
+
+    // Inject into the thread the action targets (the caller's continuation);
+    // default to the group's recorded parent.
+    let parent_thread_id = thread_id_from_action_params(params)
+        .unwrap_or_else(|| group.parent_session_id.clone());
+    agent
+        .inject_thread_developer_message(&parent_thread_id, &payload)
+        .await
+        .map_err(|e| {
+            format!("failed to inject fission import into thread {parent_thread_id}: {e}")
+        })?;
+    fission_ledger::mark_branch_imported(config.log_dir, &group_id, &branch_session_id, None)
+        .map_err(|e| format!("failed to mark branch `{branch_session_id}` imported: {e}"))?;
+    emit_session_relationship(
+        config.bus,
+        Some(group.parent_session_id.as_str()),
+        &branch_session_id,
+        "fission-imported",
+        false,
+    );
+    Ok(payload)
+}
+
+/// First line of every anchor in a pre-rewind rollout catalog, keyed by item
+/// id. Snapshotted BEFORE a rollback so the post-rollback fission detach pass
+/// can decide anchor reachability against the pre-rewind line numbers.
+fn fission_anchor_first_lines(
+    anchors: &[ContextRewindAnchorCatalogEntry],
+) -> HashMap<String, usize> {
+    anchors
+        .iter()
+        .map(|anchor| (anchor.item_id.clone(), anchor.first_line))
+        .collect()
+}
+
+/// The rollout line where a rewind cuts history: everything at/after the cut
+/// is pruned for `position=before` (cut = the anchor's first line), and
+/// everything strictly after it for `position=after` (cut = the anchor's
+/// last line) — matching the rollback semantics in
+/// `context_rewind_pruned_prior_primer_facts`.
+fn fission_anchor_cut_line(
+    anchors: &[ContextRewindAnchorCatalogEntry],
+    item_id: &str,
+    position: external_agent::RollbackAnchorPosition,
+) -> Option<usize> {
+    let entry = anchors.iter().find(|anchor| anchor.item_id == item_id)?;
+    Some(match position {
+        external_agent::RollbackAnchorPosition::Before => entry.first_line,
+        external_agent::RollbackAnchorPosition::After => entry.last_line,
+    })
+}
+
+/// Whether a fission group's spawn anchor survives a rewind that cut the
+/// rollout at `cut_line`: it must exist in the pre-rewind catalog AND start
+/// on the kept side of the cut — strictly before the cut for
+/// `position=before` (the cut line itself is pruned), at-or-before it for
+/// `position=after` (the cut line is the last kept line).
+fn fission_anchor_reachable_after_rewind(
+    anchor_first_lines: &HashMap<String, usize>,
+    cut_line: usize,
+    position: external_agent::RollbackAnchorPosition,
+    anchor_item_id: &str,
+) -> bool {
+    let Some(first_line) = anchor_first_lines.get(anchor_item_id) else {
+        return false;
+    };
+    match position {
+        external_agent::RollbackAnchorPosition::Before => *first_line < cut_line,
+        external_agent::RollbackAnchorPosition::After => *first_line <= cut_line,
+    }
+}
+
+/// Every id the rewound parent is known by — the live thread id, the
+/// snapshot/record ids, and the Intendant session id/alias — because the
+/// fission recording paths differ in which id they store as
+/// `parent_session_id`.
+fn fission_detach_parent_candidates(
+    thread_id: &str,
+    record: &context_rewind::ContextRewindRecord,
+    config: &DrainConfig<'_>,
+) -> Vec<String> {
+    let mut candidates: Vec<String> = Vec::new();
+    for id in [
+        Some(thread_id),
+        Some(record.thread_id.as_str()),
+        record.session_id.as_deref(),
+        config.session_id.as_deref(),
+        config.alias_session_id.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .map(str::trim)
+    .filter(|id| !id.is_empty())
+    {
+        if !candidates.iter().any(|existing| existing == id) {
+            candidates.push(id.to_string());
+        }
+    }
+    candidates
+}
+
+/// Emit the `fission-detached` lineage markers (parent→branch) for every
+/// branch a detach report flipped, so lineage views fold the marker into the
+/// spawn row. Branches that kept a terminal status are deliberately not
+/// marked — their recorded results stay real even though the join point is
+/// gone.
+fn emit_fission_detach_relationships(
+    config: &DrainConfig<'_>,
+    report: &fission_ledger::DetachReport,
+) {
+    if report.detached_group_ids.is_empty() {
+        return;
+    }
+    let document = match fission_ledger::read_fission_ledger_document(config.log_dir) {
+        Ok(Some(document)) => document,
+        Ok(None) => return,
+        Err(err) => {
+            slog(config.session_log, |log| {
+                log.warn(&format!(
+                    "Could not read fission ledger to emit detach relationships: {err}"
+                ))
+            });
+            return;
+        }
+    };
+    let flipped: HashSet<&str> = report
+        .detached_branch_session_ids
+        .iter()
+        .map(String::as_str)
+        .collect();
+    for group_id in &report.detached_group_ids {
+        let Some(group) = document
+            .groups
+            .iter()
+            .find(|group| &group.group_id == group_id)
+        else {
+            continue;
+        };
+        for branch in &group.branches {
+            if flipped.contains(branch.session_id.as_str()) {
+                emit_session_relationship(
+                    config.bus,
+                    Some(group.parent_session_id.as_str()),
+                    &branch.session_id,
+                    "fission-detached",
+                    false,
+                );
+            }
+        }
+    }
+}
+
 async fn apply_context_rewind_anchor_list_action(
     agent: &mut Box<dyn external_agent::ExternalAgent>,
     params: &serde_json::Value,
@@ -6558,6 +7351,10 @@ async fn handle_external_thread_action(
         apply_context_rewind_anchor_inspect_action(agent, &params).await
     } else if is_context_rewind_backout_action(&op) {
         apply_context_rewind_backout_action(agent, &op, &params, config).await
+    } else if is_fission_spawn_action(&op) {
+        apply_fission_spawn_action(agent, &params, config).await
+    } else if is_fission_import_action(&op) {
+        apply_fission_import_action(agent, &params, config).await
     } else {
         agent
             .thread_action(&op, &params)
@@ -7948,6 +8745,11 @@ async fn drain_external_agent_events(
     let mut tool_previews: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
     let mut active_tool_ids: HashSet<String> = HashSet::new();
+    // Start order of in-flight tool items, so the fission spawn dispatch can
+    // pick the MOST RECENT in-flight `fission_spawn` MCP call as its anchor.
+    let mut tool_start_seq: std::collections::HashMap<String, u64> =
+        std::collections::HashMap::new();
+    let mut tool_start_counter: u64 = 0;
     let mut context_snapshot_tick = tokio::time::interval_at(
         tokio::time::Instant::now() + EXTERNAL_CONTEXT_SNAPSHOT_INTERVAL,
         EXTERNAL_CONTEXT_SNAPSHOT_INTERVAL,
@@ -8559,6 +9361,25 @@ async fn drain_external_agent_events(
                             }
                             continue;
                         }
+                        // Mid-turn fission spawn: anchor the group at the very
+                        // tool call that asked for it — the most recent
+                        // in-flight `fission_spawn` MCP item of this turn.
+                        let params = if is_fission_spawn_action(&action)
+                            && fission_anchor_item_id_from_params(&params).is_none()
+                        {
+                            match most_recent_inflight_fission_spawn_tool_item(
+                                &active_tool_ids,
+                                &tool_previews,
+                                &tool_start_seq,
+                            ) {
+                                Some(anchor_item_id) => {
+                                    fission_params_with_anchor_item_id(params, &anchor_item_id)
+                                }
+                                None => params,
+                            }
+                        } else {
+                            params
+                        };
                         let effect =
                             handle_external_thread_action(agent, action, params, session_id, config)
                                 .await;
@@ -9280,6 +10101,8 @@ async fn drain_external_agent_events(
                 turns_in_round += 1;
                 if !item_id.is_empty() {
                     active_tool_ids.insert(item_id.clone());
+                    tool_start_counter += 1;
+                    tool_start_seq.insert(item_id.clone(), tool_start_counter);
                     pending_context_rewind_turn_stop.record_tool_started(&item_id);
                 }
                 let preview_text = external_tool_preview_text(&tool_name, &preview);
@@ -9330,6 +10153,7 @@ async fn drain_external_agent_events(
                     continue;
                 }
                 active_tool_ids.remove(&item_id);
+                tool_start_seq.remove(&item_id);
                 pending_context_rewind_turn_stop.record_tool_completed(&item_id, &status);
                 if let Some(stdout) = tool_output_limiter.complete(&item_id) {
                     emit_external_tool_output(config, config.session_id.as_deref(), stdout);
@@ -16550,6 +17374,7 @@ mod tests {
                 fission_snapshot: None,
                 lineage_ledger: None,
                 fission_ledger: None,
+                detached_fission_group_ids: Vec::new(),
             },
         )
         .unwrap();
@@ -19838,6 +20663,1344 @@ Also: {"source": "bare"}"#;
             }
         }
         assert_eq!(ids, vec!["steer-1".to_string(), "steer-2".to_string()]);
+    }
+
+    // ---- fission supervisor core ----
+
+    fn fission_test_drain_config<'a>(
+        bus: &'a EventBus,
+        session_log: &'a SharedSessionLog,
+        approval_registry: &'a event::ApprovalRegistry,
+        context_injection: &'a event::ContextInjectionQueue,
+        project_root: &'a Path,
+        log_dir: &'a Path,
+        session_id: &str,
+    ) -> DrainConfig<'a> {
+        DrainConfig {
+            bus,
+            web_port: None,
+            session_id: Some(session_id.to_string()),
+            alias_session_id: None,
+            autonomy: autonomy::shared_autonomy(AutonomyState::default()),
+            session_log,
+            project_root,
+            log_dir,
+            approval_registry,
+            json_approval: None,
+            agent_source: Some("Codex".to_string()),
+            suppress_agent_started: true,
+            persist_model_responses_inline: false,
+            headless: true,
+            context_injection,
+        }
+    }
+
+    /// Write a synthetic Codex rollout: one `function_call` response item per
+    /// `(call_id, name)` pair, one rollout line each.
+    fn write_fission_test_rollout(path: &Path, items: &[(&str, &str)]) {
+        let mut out = String::new();
+        for (call_id, name) in items {
+            out.push_str(
+                &serde_json::json!({
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call",
+                        "call_id": call_id,
+                        "name": name,
+                        "arguments": "{}",
+                    }
+                })
+                .to_string(),
+            );
+            out.push('\n');
+        }
+        std::fs::write(path, out).unwrap();
+    }
+
+    fn init_fission_test_git_repo(root: &Path) {
+        let run = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        run(&["init"]);
+        run(&["config", "user.email", "test@test.com"]);
+        run(&["config", "user.name", "Test"]);
+        std::fs::write(root.join("README.md"), "# fission test\n").unwrap();
+        run(&["add", "README.md"]);
+        run(&["commit", "-m", "initial"]);
+    }
+
+    #[test]
+    fn fission_action_routing_helpers_match_contract_ops() {
+        assert!(is_fission_spawn_action("fission_spawn"));
+        assert!(is_fission_spawn_action("fission-spawn"));
+        assert!(!is_fission_spawn_action("fission_import"));
+        assert!(is_fission_import_action("fission_import"));
+        assert!(is_fission_import_action("fission-import"));
+        assert!(!is_fission_import_action("fission_spawn"));
+        assert!(!is_fission_spawn_action("fork"));
+    }
+
+    #[test]
+    fn fission_spawn_branch_specs_validate_count_and_objectives() {
+        let specs = fission_spawn_branch_specs_from_params(&serde_json::json!({
+            "branches": [
+                { "objective": "fix the parser", "write_scope": ["src/parser.rs", " "], "name": "Parser fix" },
+                { "objective": "  survey docs  ", "write_scope": "docs/" },
+                { "objective": "third" },
+            ]
+        }))
+        .unwrap();
+        assert_eq!(specs.len(), 3);
+        assert_eq!(specs[0].objective, "fix the parser");
+        assert_eq!(specs[0].write_scope, vec!["src/parser.rs".to_string()]);
+        assert_eq!(specs[0].name.as_deref(), Some("Parser fix"));
+        assert_eq!(specs[1].objective, "survey docs");
+        assert_eq!(specs[1].write_scope, vec!["docs/".to_string()]);
+        assert!(specs[2].write_scope.is_empty());
+        assert_eq!(specs[2].name, None);
+
+        assert!(fission_spawn_branch_specs_from_params(&serde_json::json!({})).is_err());
+        assert!(
+            fission_spawn_branch_specs_from_params(&serde_json::json!({ "branches": [] }))
+                .is_err()
+        );
+        assert!(fission_spawn_branch_specs_from_params(&serde_json::json!({
+            "branches": [{}, {}, {}, {}, {}]
+        }))
+        .is_err());
+        assert!(fission_spawn_branch_specs_from_params(&serde_json::json!({
+            "branches": [{ "objective": "   " }]
+        }))
+        .is_err());
+    }
+
+    #[test]
+    fn fission_worktree_default_matrix() {
+        // Default: write scope AND git repo.
+        assert!(fission_branch_uses_worktree(true, true, None));
+        assert!(!fission_branch_uses_worktree(true, false, None));
+        assert!(!fission_branch_uses_worktree(false, true, None));
+        assert!(!fission_branch_uses_worktree(false, false, None));
+        // use_worktree overrides both ways.
+        assert!(!fission_branch_uses_worktree(true, true, Some(false)));
+        assert!(fission_branch_uses_worktree(false, false, Some(true)));
+        assert!(fission_branch_uses_worktree(false, true, Some(true)));
+        assert!(!fission_branch_uses_worktree(false, true, Some(false)));
+    }
+
+    #[test]
+    fn fission_branch_git_name_uses_group_hash_tail() {
+        let group_id = fission_ledger::group_id("parent-thread", "call-7");
+        let hash_tail = group_id.rsplit('-').next().unwrap();
+        let name = fission_branch_git_name(&group_id, 2);
+        assert_eq!(
+            name,
+            format!("fission/{}-2", &hash_tail[..8.min(hash_tail.len())])
+        );
+        assert!(name.starts_with("fission/"));
+    }
+
+    #[test]
+    fn fission_mid_turn_anchor_prefers_most_recent_inflight_spawn_item() {
+        let mut active = HashSet::new();
+        let mut previews = HashMap::new();
+        let mut seq = HashMap::new();
+        let mut add = |id: &str, preview: &str, order: u64,
+                       active: &mut HashSet<String>,
+                       previews: &mut HashMap<String, String>,
+                       seq: &mut HashMap<String, u64>| {
+            active.insert(id.to_string());
+            previews.insert(id.to_string(), preview.to_string());
+            seq.insert(id.to_string(), order);
+        };
+        // No matching item: nothing captured.
+        add(
+            "item_shell",
+            "command: git status",
+            1,
+            &mut active,
+            &mut previews,
+            &mut seq,
+        );
+        assert_eq!(
+            most_recent_inflight_fission_spawn_tool_item(&active, &previews, &seq),
+            None
+        );
+        // Two in-flight fission_spawn MCP calls: the most recently started wins.
+        add(
+            "item_spawn_old",
+            "mcp: intendant:fission_spawn {\"branches\":[…]}",
+            2,
+            &mut active,
+            &mut previews,
+            &mut seq,
+        );
+        add(
+            "item_spawn_new",
+            "mcp: intendant:fission_spawn {\"branches\":[…]}",
+            3,
+            &mut active,
+            &mut previews,
+            &mut seq,
+        );
+        // A non-mcp tool mentioning fission_spawn must not match.
+        add(
+            "item_grep",
+            "command: rg fission_spawn src/",
+            4,
+            &mut active,
+            &mut previews,
+            &mut seq,
+        );
+        assert_eq!(
+            most_recent_inflight_fission_spawn_tool_item(&active, &previews, &seq).as_deref(),
+            Some("item_spawn_new")
+        );
+        // A completed item (no longer active) is not considered.
+        active.remove("item_spawn_new");
+        previews.remove("item_spawn_new");
+        seq.remove("item_spawn_new");
+        assert_eq!(
+            most_recent_inflight_fission_spawn_tool_item(&active, &previews, &seq).as_deref(),
+            Some("item_spawn_old")
+        );
+
+        // Param injection only fills a missing anchor.
+        let injected = fission_params_with_anchor_item_id(
+            serde_json::json!({ "branches": [] }),
+            "item_spawn_old",
+        );
+        assert_eq!(
+            fission_anchor_item_id_from_params(&injected).as_deref(),
+            Some("item_spawn_old")
+        );
+    }
+
+    #[test]
+    fn fission_catalog_anchor_prefers_named_spawn_then_head_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let rollout = dir.path().join("rollout.jsonl");
+        write_fission_test_rollout(
+            &rollout,
+            &[
+                ("call_1", "shell"),
+                ("call_2", "intendant.fission_spawn"),
+                ("call_3", "intendant.fission_spawn"),
+                ("call_4", "shell"),
+            ],
+        );
+        let anchors = scan_context_rewind_anchor_catalog(&rollout).unwrap();
+        let resolved = fission_spawn_anchor_from_catalog(&anchors).unwrap();
+        // Newest fission_spawn-named anchor wins, not the head.
+        assert_eq!(resolved.item_id, "call_3");
+        assert!(!resolved.head_fallback);
+
+        // No fission_spawn names anywhere: head fallback with honest flag.
+        write_fission_test_rollout(&rollout, &[("call_1", "shell"), ("call_2", "shell")]);
+        let anchors = scan_context_rewind_anchor_catalog(&rollout).unwrap();
+        let resolved = fission_spawn_anchor_from_catalog(&anchors).unwrap();
+        assert_eq!(resolved.item_id, "call_2");
+        assert!(resolved.head_fallback);
+
+        // Empty catalog: nothing to anchor to.
+        assert!(fission_spawn_anchor_from_catalog(&[]).is_none());
+    }
+
+    #[test]
+    fn fission_detach_predicate_math_on_synthetic_rollout() {
+        let dir = tempfile::tempdir().unwrap();
+        let rollout = dir.path().join("rollout.jsonl");
+        write_fission_test_rollout(
+            &rollout,
+            &[
+                ("call_early", "shell"),
+                ("call_mid", "shell"),
+                ("call_late", "shell"),
+            ],
+        );
+        let anchors = scan_context_rewind_anchor_catalog(&rollout).unwrap();
+        let first_lines = fission_anchor_first_lines(&anchors);
+        assert_eq!(first_lines.get("call_early"), Some(&1));
+        assert_eq!(first_lines.get("call_mid"), Some(&2));
+        assert_eq!(first_lines.get("call_late"), Some(&3));
+
+        // position=after on call_mid: the cut keeps lines 1..=2.
+        let cut_after = fission_anchor_cut_line(
+            &anchors,
+            "call_mid",
+            external_agent::RollbackAnchorPosition::After,
+        )
+        .unwrap();
+        assert_eq!(cut_after, 2);
+        let after = external_agent::RollbackAnchorPosition::After;
+        assert!(fission_anchor_reachable_after_rewind(
+            &first_lines,
+            cut_after,
+            after,
+            "call_early"
+        ));
+        assert!(fission_anchor_reachable_after_rewind(
+            &first_lines,
+            cut_after,
+            after,
+            "call_mid"
+        ));
+        assert!(!fission_anchor_reachable_after_rewind(
+            &first_lines,
+            cut_after,
+            after,
+            "call_late"
+        ));
+
+        // position=before on call_mid: the cut prunes line 2 and beyond.
+        let cut_before = fission_anchor_cut_line(
+            &anchors,
+            "call_mid",
+            external_agent::RollbackAnchorPosition::Before,
+        )
+        .unwrap();
+        assert_eq!(cut_before, 2);
+        let before = external_agent::RollbackAnchorPosition::Before;
+        assert!(fission_anchor_reachable_after_rewind(
+            &first_lines,
+            cut_before,
+            before,
+            "call_early"
+        ));
+        assert!(!fission_anchor_reachable_after_rewind(
+            &first_lines,
+            cut_before,
+            before,
+            "call_mid"
+        ));
+        assert!(!fission_anchor_reachable_after_rewind(
+            &first_lines,
+            cut_before,
+            before,
+            "call_late"
+        ));
+
+        // Absent anchors are unreachable in either direction.
+        assert!(!fission_anchor_reachable_after_rewind(
+            &first_lines,
+            cut_after,
+            after,
+            "call_unknown"
+        ));
+        assert!(!fission_anchor_reachable_after_rewind(
+            &first_lines,
+            cut_before,
+            before,
+            "call_unknown"
+        ));
+
+        // Unknown cut anchor yields no cut line at all.
+        assert!(fission_anchor_cut_line(
+            &anchors,
+            "call_unknown",
+            external_agent::RollbackAnchorPosition::After
+        )
+        .is_none());
+    }
+
+    /// External-agent mock for the fission flows: records live-thread forks,
+    /// developer-message injections, and anchored rollbacks; serves a fixed
+    /// rollout path as the thread snapshot.
+    struct FissionTestAgent {
+        rollout_path: Option<PathBuf>,
+        child_id_prefix: String,
+        forks: Arc<Mutex<Vec<(String, Option<String>, Option<PathBuf>)>>>,
+        injected: Arc<Mutex<Vec<(String, String)>>>,
+        rollbacks: Arc<Mutex<Vec<(String, String, &'static str)>>>,
+        fail_fork_for_name_containing: Option<String>,
+        fail_rollback: bool,
+    }
+
+    impl FissionTestAgent {
+        fn new(rollout_path: Option<PathBuf>, child_id_prefix: &str) -> Self {
+            Self {
+                rollout_path,
+                child_id_prefix: child_id_prefix.to_string(),
+                forks: Arc::new(Mutex::new(Vec::new())),
+                injected: Arc::new(Mutex::new(Vec::new())),
+                rollbacks: Arc::new(Mutex::new(Vec::new())),
+                fail_fork_for_name_containing: None,
+                fail_rollback: false,
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl external_agent::ExternalAgent for FissionTestAgent {
+        fn name(&self) -> &str {
+            "codex"
+        }
+
+        async fn initialize(
+            &mut self,
+            _config: external_agent::AgentConfig,
+        ) -> Result<tokio::sync::mpsc::UnboundedReceiver<external_agent::AgentEvent>, CallerError>
+        {
+            let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            Ok(rx)
+        }
+
+        async fn start_thread(&mut self) -> Result<external_agent::AgentThread, CallerError> {
+            Ok(external_agent::AgentThread {
+                thread_id: "thread-1".to_string(),
+            })
+        }
+
+        async fn send_message(
+            &mut self,
+            _thread: &external_agent::AgentThread,
+            _message: &str,
+        ) -> Result<(), CallerError> {
+            Ok(())
+        }
+
+        async fn resolve_approval(
+            &mut self,
+            _request_id: &str,
+            _decision: external_agent::ApprovalDecision,
+        ) -> Result<(), CallerError> {
+            Ok(())
+        }
+
+        async fn shutdown(&mut self) -> Result<(), CallerError> {
+            Ok(())
+        }
+
+        fn supports_item_anchor_rewind(&self) -> bool {
+            true
+        }
+
+        async fn read_thread_snapshot(
+            &mut self,
+            thread_id: &str,
+        ) -> Result<external_agent::AgentThreadSnapshot, CallerError> {
+            Ok(external_agent::AgentThreadSnapshot {
+                thread_id: thread_id.to_string(),
+                rollout_path: self.rollout_path.clone(),
+            })
+        }
+
+        async fn fork_thread_with_options(
+            &mut self,
+            thread_id: &str,
+            name: Option<&str>,
+            cwd: Option<&Path>,
+        ) -> Result<external_agent::AgentThread, CallerError> {
+            if let Some(needle) = self.fail_fork_for_name_containing.as_deref() {
+                if name.is_some_and(|name| name.contains(needle)) {
+                    return Err(CallerError::ExternalAgent(
+                        "thread/fork refused by test".to_string(),
+                    ));
+                }
+            }
+            let mut forks = self.forks.lock().unwrap();
+            forks.push((
+                thread_id.to_string(),
+                name.map(str::to_string),
+                cwd.map(Path::to_path_buf),
+            ));
+            Ok(external_agent::AgentThread {
+                thread_id: format!("{}-{}", self.child_id_prefix, forks.len()),
+            })
+        }
+
+        async fn rollback_thread_to_item_anchor(
+            &mut self,
+            thread_id: &str,
+            item_id: &str,
+            position: external_agent::RollbackAnchorPosition,
+        ) -> Result<(), CallerError> {
+            if self.fail_rollback {
+                return Err(CallerError::ExternalAgent(
+                    "thread/rollback refused by test".to_string(),
+                ));
+            }
+            self.rollbacks.lock().unwrap().push((
+                thread_id.to_string(),
+                item_id.to_string(),
+                position.as_str(),
+            ));
+            Ok(())
+        }
+
+        async fn inject_thread_developer_message(
+            &mut self,
+            thread_id: &str,
+            message: &str,
+        ) -> Result<(), CallerError> {
+            self.injected
+                .lock()
+                .unwrap()
+                .push((thread_id.to_string(), message.to_string()));
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn apply_fission_spawn_action_spawns_branches_with_worktree_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let project_root = dir.path().join("project");
+        std::fs::create_dir_all(&project_root).unwrap();
+        init_fission_test_git_repo(&project_root);
+        let log_dir = dir.path().join("logs");
+        std::fs::create_dir_all(&log_dir).unwrap();
+
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        let session_log: SharedSessionLog = Arc::new(Mutex::new(
+            session_log::SessionLog::open(log_dir.clone()).unwrap(),
+        ));
+        let approval_registry: event::ApprovalRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let context_injection: event::ContextInjectionQueue = Arc::new(Mutex::new(Vec::new()));
+        let config = fission_test_drain_config(
+            &bus,
+            &session_log,
+            &approval_registry,
+            &context_injection,
+            &project_root,
+            &log_dir,
+            "spawn-parent-a",
+        );
+
+        let test_agent = FissionTestAgent::new(None, "spawnA-child");
+        let forks = test_agent.forks.clone();
+        let injected = test_agent.injected.clone();
+        let mut agent: Box<dyn external_agent::ExternalAgent> = Box::new(test_agent);
+
+        let params = serde_json::json!({
+            "threadId": "spawn-parent-a",
+            "anchor_item_id": "call_anchor_a",
+            "branches": [
+                { "objective": "fix the parser", "write_scope": ["src/parser.rs"] },
+                { "objective": "survey the docs", "name": "Docs survey" },
+            ],
+        });
+        let message = apply_fission_spawn_action(&mut agent, &params, &config)
+            .await
+            .expect("spawn succeeds");
+        assert!(message.contains("spawned 2/2"), "message: {message}");
+
+        let group_id = fission_ledger::group_id("spawn-parent-a", "call_anchor_a");
+
+        // Fork calls: branch 1 in a worktree (write scope + git repo), branch
+        // 2 sharing the parent checkout.
+        let forks = forks.lock().unwrap();
+        assert_eq!(forks.len(), 2);
+        assert_eq!(forks[0].0, "spawn-parent-a");
+        let worktree_path = forks[0].2.clone().expect("branch 1 forked into worktree");
+        assert!(worktree_path.exists());
+        assert!(worktree_path
+            .to_string_lossy()
+            .contains(&fission_branch_git_name(&group_id, 1)));
+        assert_eq!(forks[1].2, None, "branch 2 must not get a worktree");
+        assert_eq!(forks[1].1.as_deref(), Some("Docs survey"));
+
+        // Charters: injected into each child as developer messages.
+        let injected = injected.lock().unwrap();
+        assert_eq!(injected.len(), 2);
+        assert_eq!(injected[0].0, "spawnA-child-1");
+        assert!(injected[0].1.starts_with("<fission_charter>"));
+        assert!(injected[0].1.contains(&format!("group_id: {group_id}")));
+        assert!(injected[0].1.contains("branch_session_id: spawnA-child-1"));
+        assert!(injected[0].1.contains("objective: fix the parser"));
+        assert!(injected[0].1.contains("owned write scope: src/parser.rs"));
+        assert!(injected[0].1.contains("worktree: "));
+        assert!(injected[0].1.contains("claim_fission_canonical"));
+        assert!(injected[0].1.contains("end your turn with a concise outcome summary"));
+        assert!(injected[1].1.contains("owned write scope: read-only"));
+        assert!(!injected[1].1.contains("worktree: "));
+
+        // Ledger: group with fission_spawn provenance, both branches running,
+        // per-branch charters with the joined write scope.
+        let document = fission_ledger::read_fission_ledger_document(&log_dir)
+            .unwrap()
+            .expect("ledger document");
+        let group = document
+            .groups
+            .iter()
+            .find(|group| group.group_id == group_id)
+            .expect("group registered");
+        assert_eq!(group.tool, "fission_spawn");
+        assert_eq!(group.branches.len(), 2);
+        let branch_1 = group
+            .branches
+            .iter()
+            .find(|branch| branch.session_id == "spawnA-child-1")
+            .expect("branch 1");
+        assert_eq!(branch_1.status, "running");
+        assert_eq!(branch_1.worktree_path.as_deref(), Some(worktree_path.as_path()));
+        assert_eq!(
+            branch_1.task.as_deref(),
+            Some("Begin your fission charter: fix the parser")
+        );
+        let charter_1 = document
+            .branch_ext(&group_id, "spawnA-child-1")
+            .and_then(|ext| ext.charter.as_ref())
+            .expect("branch 1 charter");
+        assert_eq!(charter_1.objective, "fix the parser");
+        assert_eq!(charter_1.write_scope.as_deref(), Some("src/parser.rs"));
+        assert!(charter_1.worktree_requested);
+        let charter_2 = document
+            .branch_ext(&group_id, "spawnA-child-2")
+            .and_then(|ext| ext.charter.as_ref())
+            .expect("branch 2 charter");
+        assert_eq!(charter_2.write_scope, None);
+        assert!(!charter_2.worktree_requested);
+
+        // Lifecycle routes registered for both branches.
+        let route = fission_lifecycle::branch_route("spawnA-child-1").expect("route 1");
+        assert_eq!(route.group_id, group_id);
+        assert_eq!(route.log_dir, log_dir);
+        assert!(fission_lifecycle::branch_route("spawnA-child-2").is_some());
+
+        // Frontend wiring: rename + fission-branch relationship + resumed
+        // kickoff turn per branch, with the worktree as branch 1's root.
+        let mut renames = Vec::new();
+        let mut relationships = Vec::new();
+        let mut resumes = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            match event {
+                AppEvent::ControlCommand(event::ControlMsg::RenameSession {
+                    session_id,
+                    name,
+                    ..
+                }) => renames.push((session_id, name)),
+                AppEvent::SessionRelationship {
+                    parent_session_id,
+                    child_session_id,
+                    relationship,
+                    ..
+                } => relationships.push((parent_session_id, child_session_id, relationship)),
+                AppEvent::ControlCommand(event::ControlMsg::ResumeSession {
+                    session_id,
+                    project_root,
+                    task,
+                    direct,
+                    ..
+                }) => resumes.push((session_id, project_root, task, direct)),
+                _ => {}
+            }
+        }
+        assert_eq!(renames.len(), 2);
+        assert!(renames
+            .iter()
+            .any(|(id, name)| id == "spawnA-child-2" && name == "Docs survey"));
+        assert_eq!(
+            relationships
+                .iter()
+                .filter(|(parent, _, relationship)| parent == "spawn-parent-a"
+                    && relationship == "fission-branch")
+                .count(),
+            2
+        );
+        assert_eq!(resumes.len(), 2);
+        let resume_1 = resumes
+            .iter()
+            .find(|(id, ..)| id == "spawnA-child-1")
+            .expect("resume for branch 1");
+        assert_eq!(
+            resume_1.1.as_deref(),
+            Some(worktree_path.to_string_lossy().to_string().as_str())
+        );
+        assert_eq!(
+            resume_1.2.as_deref(),
+            Some("Begin your fission charter: fix the parser")
+        );
+        assert_eq!(resume_1.3, Some(true));
+        let resume_2 = resumes
+            .iter()
+            .find(|(id, ..)| id == "spawnA-child-2")
+            .expect("resume for branch 2");
+        assert_eq!(
+            resume_2.1.as_deref(),
+            Some(project_root.to_string_lossy().to_string().as_str())
+        );
+
+        fission_lifecycle::drop_pending_deliveries(&[group_id]);
+    }
+
+    #[tokio::test]
+    async fn apply_fission_spawn_action_honors_worktree_override_and_reports_failures() {
+        // Non-git project root: the default would skip worktrees, but the
+        // explicit override forces the attempt, which fails honestly and
+        // counts as a failed branch.
+        let dir = tempfile::tempdir().unwrap();
+        let project_root = dir.path().join("plain");
+        std::fs::create_dir_all(&project_root).unwrap();
+        let log_dir = dir.path().join("logs");
+        std::fs::create_dir_all(&log_dir).unwrap();
+
+        let bus = EventBus::new();
+        let session_log: SharedSessionLog = Arc::new(Mutex::new(
+            session_log::SessionLog::open(log_dir.clone()).unwrap(),
+        ));
+        let approval_registry: event::ApprovalRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let context_injection: event::ContextInjectionQueue = Arc::new(Mutex::new(Vec::new()));
+        let config = fission_test_drain_config(
+            &bus,
+            &session_log,
+            &approval_registry,
+            &context_injection,
+            &project_root,
+            &log_dir,
+            "spawn-parent-b",
+        );
+
+        let test_agent = FissionTestAgent::new(None, "spawnB-child");
+        let forks = test_agent.forks.clone();
+        let mut agent: Box<dyn external_agent::ExternalAgent> = Box::new(test_agent);
+
+        let params = serde_json::json!({
+            "threadId": "spawn-parent-b",
+            "anchor_item_id": "call_anchor_b",
+            "use_worktree": true,
+            "branches": [{ "objective": "doomed worktree branch" }],
+        });
+        let err = apply_fission_spawn_action(&mut agent, &params, &config)
+            .await
+            .expect_err("all branches failed");
+        assert!(err.contains("spawned 0/1"), "error: {err}");
+        assert!(err.contains("worktree creation failed"), "error: {err}");
+        assert!(forks.lock().unwrap().is_empty(), "no fork without worktree");
+
+        // Git repo + write scope, but use_worktree=false suppresses isolation.
+        init_fission_test_git_repo(&project_root);
+        let params = serde_json::json!({
+            "threadId": "spawn-parent-b",
+            "anchor_item_id": "call_anchor_b2",
+            "use_worktree": false,
+            "branches": [{ "objective": "shared checkout branch", "write_scope": ["src/"] }],
+        });
+        let message = apply_fission_spawn_action(&mut agent, &params, &config)
+            .await
+            .expect("spawn succeeds");
+        assert!(message.contains("spawned 1/1"));
+        assert_eq!(forks.lock().unwrap().last().unwrap().2, None);
+
+        let group_b2 = fission_ledger::group_id("spawn-parent-b", "call_anchor_b2");
+        fission_lifecycle::drop_pending_deliveries(&[group_b2]);
+    }
+
+    #[tokio::test]
+    async fn apply_fission_spawn_action_partial_failure_removes_failed_branch_worktree() {
+        let dir = tempfile::tempdir().unwrap();
+        let project_root = dir.path().join("project");
+        std::fs::create_dir_all(&project_root).unwrap();
+        init_fission_test_git_repo(&project_root);
+        let log_dir = dir.path().join("logs");
+        std::fs::create_dir_all(&log_dir).unwrap();
+
+        let bus = EventBus::new();
+        let session_log: SharedSessionLog = Arc::new(Mutex::new(
+            session_log::SessionLog::open(log_dir.clone()).unwrap(),
+        ));
+        let approval_registry: event::ApprovalRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let context_injection: event::ContextInjectionQueue = Arc::new(Mutex::new(Vec::new()));
+        let config = fission_test_drain_config(
+            &bus,
+            &session_log,
+            &approval_registry,
+            &context_injection,
+            &project_root,
+            &log_dir,
+            "spawn-parent-c",
+        );
+
+        let mut test_agent = FissionTestAgent::new(None, "spawnC-child");
+        test_agent.fail_fork_for_name_containing = Some("doomed".to_string());
+        let mut agent: Box<dyn external_agent::ExternalAgent> = Box::new(test_agent);
+
+        let params = serde_json::json!({
+            "threadId": "spawn-parent-c",
+            "anchor_item_id": "call_anchor_c",
+            "branches": [
+                { "objective": "healthy branch", "write_scope": ["src/a.rs"] },
+                { "objective": "doomed branch", "write_scope": ["src/b.rs"], "name": "doomed fork" },
+            ],
+        });
+        let message = apply_fission_spawn_action(&mut agent, &params, &config)
+            .await
+            .expect("partial success is Ok");
+        assert!(message.contains("spawned 1/2"), "message: {message}");
+        assert!(message.contains("branch 1: spawned thread spawnC-child-1"));
+        assert!(message.contains("branch 2: FAILED"));
+        assert!(message.contains("live-thread fork failed"));
+
+        let group_id = fission_ledger::group_id("spawn-parent-c", "call_anchor_c");
+        // The failed branch's worktree was removed; the healthy one remains.
+        let worktrees_root = project_root.join(".intendant").join("worktrees");
+        assert!(worktrees_root
+            .join(fission_branch_git_name(&group_id, 1))
+            .exists());
+        assert!(!worktrees_root
+            .join(fission_branch_git_name(&group_id, 2))
+            .exists());
+
+        // Only the healthy branch made it into the ledger and the registry.
+        let document = fission_ledger::read_fission_ledger_document(&log_dir)
+            .unwrap()
+            .expect("ledger document");
+        let group = document
+            .groups
+            .iter()
+            .find(|group| group.group_id == group_id)
+            .expect("group");
+        assert_eq!(group.branches.len(), 1);
+        assert_eq!(group.branches[0].session_id, "spawnC-child-1");
+        assert!(fission_lifecycle::branch_route("spawnC-child-2").is_none());
+
+        fission_lifecycle::drop_pending_deliveries(&[group_id]);
+    }
+
+    #[tokio::test]
+    async fn apply_fission_spawn_action_falls_back_to_catalog_anchor() {
+        let dir = tempfile::tempdir().unwrap();
+        let project_root = dir.path().join("plain");
+        std::fs::create_dir_all(&project_root).unwrap();
+        let log_dir = dir.path().join("logs");
+        std::fs::create_dir_all(&log_dir).unwrap();
+        let rollout = dir.path().join("rollout.jsonl");
+        write_fission_test_rollout(
+            &rollout,
+            &[
+                ("call_1", "shell"),
+                ("call_spawn", "intendant.fission_spawn"),
+                ("call_tail", "shell"),
+            ],
+        );
+
+        let bus = EventBus::new();
+        let session_log: SharedSessionLog = Arc::new(Mutex::new(
+            session_log::SessionLog::open(log_dir.clone()).unwrap(),
+        ));
+        let approval_registry: event::ApprovalRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let context_injection: event::ContextInjectionQueue = Arc::new(Mutex::new(Vec::new()));
+        let config = fission_test_drain_config(
+            &bus,
+            &session_log,
+            &approval_registry,
+            &context_injection,
+            &project_root,
+            &log_dir,
+            "spawn-parent-d",
+        );
+
+        // Preference 2: the newest anchor named for fission_spawn.
+        let test_agent = FissionTestAgent::new(Some(rollout.clone()), "spawnD-child");
+        let mut agent: Box<dyn external_agent::ExternalAgent> = Box::new(test_agent);
+        let params = serde_json::json!({
+            "threadId": "spawn-parent-d",
+            "branches": [{ "objective": "anchor by name" }],
+        });
+        apply_fission_spawn_action(&mut agent, &params, &config)
+            .await
+            .expect("spawn succeeds");
+        let named_group = fission_ledger::group_id("spawn-parent-d", "call_spawn");
+        let document = fission_ledger::read_fission_ledger_document(&log_dir)
+            .unwrap()
+            .expect("document");
+        let group = document
+            .groups
+            .iter()
+            .find(|group| group.group_id == named_group)
+            .expect("group anchored at the fission_spawn call");
+        assert_eq!(group.anchor_item_id, "call_spawn");
+        assert_eq!(group.tool, "fission_spawn");
+
+        // Preference 3: no fission_spawn-named anchor anywhere → catalog head
+        // with `fission_spawn:head` provenance.
+        write_fission_test_rollout(&rollout, &[("call_1", "shell"), ("call_head", "shell")]);
+        let params = serde_json::json!({
+            "threadId": "spawn-parent-d2",
+            "branches": [{ "objective": "anchor at head" }],
+        });
+        let test_agent = FissionTestAgent::new(Some(rollout.clone()), "spawnD2-child");
+        let mut agent: Box<dyn external_agent::ExternalAgent> = Box::new(test_agent);
+        apply_fission_spawn_action(&mut agent, &params, &config)
+            .await
+            .expect("spawn succeeds");
+        let head_group = fission_ledger::group_id("spawn-parent-d2", "call_head");
+        let document = fission_ledger::read_fission_ledger_document(&log_dir)
+            .unwrap()
+            .expect("document");
+        let group = document
+            .groups
+            .iter()
+            .find(|group| group.group_id == head_group)
+            .expect("group anchored at the catalog head");
+        assert_eq!(group.anchor_item_id, "call_head");
+        assert_eq!(group.tool, "fission_spawn:head");
+
+        fission_lifecycle::drop_pending_deliveries(&[named_group, head_group]);
+    }
+
+    #[tokio::test]
+    async fn apply_fission_import_action_injects_payload_and_marks_imported() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("logs");
+        std::fs::create_dir_all(&log_dir).unwrap();
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        let session_log: SharedSessionLog = Arc::new(Mutex::new(
+            session_log::SessionLog::open(log_dir.clone()).unwrap(),
+        ));
+        let approval_registry: event::ApprovalRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let context_injection: event::ContextInjectionQueue = Arc::new(Mutex::new(Vec::new()));
+        let config = fission_test_drain_config(
+            &bus,
+            &session_log,
+            &approval_registry,
+            &context_injection,
+            dir.path(),
+            &log_dir,
+            "import-parent",
+        );
+
+        let group = fission_ledger::register_spawned_branch(
+            &log_dir,
+            "import-parent",
+            "call_import",
+            fission_ledger::BranchCharter {
+                objective: "trace the regression".to_string(),
+                write_scope: Some("src/decoder.rs".to_string()),
+                worktree_requested: true,
+            },
+            fission_ledger::NewSpawnedBranch {
+                session_id: "import-child".to_string(),
+                backend_session_id: Some("import-child".to_string()),
+                worktree_path: Some(PathBuf::from("/tmp/fission-import-wt")),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let group_id = group.group_id;
+        fission_ledger::update_branch_work(
+            &log_dir,
+            &group_id,
+            "import-child",
+            &["src/decoder.rs".to_string()],
+            &["cargo test --bins".to_string()],
+            Some("found the off-by-one in frame reorder"),
+        )
+        .unwrap();
+
+        let test_agent = FissionTestAgent::new(None, "import-unused");
+        let injected = test_agent.injected.clone();
+        let mut agent: Box<dyn external_agent::ExternalAgent> = Box::new(test_agent);
+        let params = serde_json::json!({
+            "threadId": "import-parent",
+            "group_id": group_id,
+            "branch_session_id": "import-child",
+        });
+        let payload = apply_fission_import_action(&mut agent, &params, &config)
+            .await
+            .expect("import succeeds");
+
+        // Payload shape: identity + objective + status + work metadata +
+        // worktree + raw-log pointer, returned AND injected verbatim.
+        assert!(payload.starts_with("<fission_import>"));
+        assert!(payload.contains(&format!("group_id: {group_id}")));
+        assert!(payload.contains("branch_session_id: import-child"));
+        assert!(payload.contains("objective: trace the regression"));
+        assert!(payload.contains("status: running"));
+        assert!(payload.contains("summary: found the off-by-one in frame reorder"));
+        assert!(payload.contains("changed_files: src/decoder.rs"));
+        assert!(payload.contains("tests_run: cargo test --bins"));
+        assert!(payload.contains("worktree: /tmp/fission-import-wt"));
+        assert!(payload.contains("raw_log: session.jsonl#session_id=import-child"));
+        assert!(payload.ends_with("</fission_import>"));
+        let injected = injected.lock().unwrap();
+        assert_eq!(injected.len(), 1);
+        assert_eq!(injected[0].0, "import-parent");
+        assert_eq!(injected[0].1, payload);
+
+        // Imported marker stamped; status untouched by import.
+        let document = fission_ledger::read_fission_ledger_document(&log_dir)
+            .unwrap()
+            .expect("document");
+        assert!(document
+            .branch_ext(&group_id, "import-child")
+            .and_then(|ext| ext.imported_at.as_ref())
+            .is_some());
+
+        // fission-imported relationship parent→branch.
+        let mut saw_imported = false;
+        while let Ok(event) = rx.try_recv() {
+            if let AppEvent::SessionRelationship {
+                parent_session_id,
+                child_session_id,
+                relationship,
+                ..
+            } = event
+            {
+                if relationship == "fission-imported" {
+                    assert_eq!(parent_session_id, "import-parent");
+                    assert_eq!(child_session_id, "import-child");
+                    saw_imported = true;
+                }
+            }
+        }
+        assert!(saw_imported, "expected fission-imported relationship");
+    }
+
+    #[tokio::test]
+    async fn apply_fission_import_action_refuses_detached_and_unknown_groups() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("logs");
+        std::fs::create_dir_all(&log_dir).unwrap();
+        let bus = EventBus::new();
+        let session_log: SharedSessionLog = Arc::new(Mutex::new(
+            session_log::SessionLog::open(log_dir.clone()).unwrap(),
+        ));
+        let approval_registry: event::ApprovalRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let context_injection: event::ContextInjectionQueue = Arc::new(Mutex::new(Vec::new()));
+        let config = fission_test_drain_config(
+            &bus,
+            &session_log,
+            &approval_registry,
+            &context_injection,
+            dir.path(),
+            &log_dir,
+            "import-parent-2",
+        );
+
+        let test_agent = FissionTestAgent::new(None, "import2-unused");
+        let injected = test_agent.injected.clone();
+        let mut agent: Box<dyn external_agent::ExternalAgent> = Box::new(test_agent);
+
+        // Unknown group.
+        let err = apply_fission_import_action(
+            &mut agent,
+            &serde_json::json!({ "group_id": "missing", "branch_session_id": "x" }),
+            &config,
+        )
+        .await
+        .expect_err("unknown group refused");
+        assert!(err.contains("was not found"), "error: {err}");
+
+        // Detached group: refusal explains the recovery paths.
+        let group = fission_ledger::register_spawned_branch(
+            &log_dir,
+            "import-parent-2",
+            "call_detached",
+            fission_ledger::BranchCharter {
+                objective: "orphaned work".to_string(),
+                write_scope: None,
+                worktree_requested: false,
+            },
+            fission_ledger::NewSpawnedBranch {
+                session_id: "import2-child".to_string(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        fission_ledger::detach_group(&log_dir, &group.group_id, "rewind crossed anchor").unwrap();
+        let err = apply_fission_import_action(
+            &mut agent,
+            &serde_json::json!({
+                "group_id": group.group_id,
+                "branch_session_id": "import2-child",
+            }),
+            &config,
+        )
+        .await
+        .expect_err("detached group refused");
+        assert!(err.contains("detached"), "error: {err}");
+        assert!(err.contains("rewind_backout"), "error: {err}");
+        assert!(err.contains("raw log"), "error: {err}");
+        assert!(injected.lock().unwrap().is_empty(), "nothing injected");
+
+        // Missing branch in a live group.
+        let err = apply_fission_import_action(
+            &mut agent,
+            &serde_json::json!({
+                "group_id": fission_ledger::register_spawned_branch(
+                    &log_dir,
+                    "import-parent-2",
+                    "call_live",
+                    fission_ledger::BranchCharter {
+                        objective: "live".to_string(),
+                        write_scope: None,
+                        worktree_requested: false,
+                    },
+                    fission_ledger::NewSpawnedBranch {
+                        session_id: "import2-live-child".to_string(),
+                        ..Default::default()
+                    },
+                )
+                .unwrap()
+                .group_id,
+                "branch_session_id": "no-such-branch",
+            }),
+            &config,
+        )
+        .await
+        .expect_err("missing branch refused");
+        assert!(err.contains("is not part of fission group"), "error: {err}");
+    }
+
+    #[tokio::test]
+    async fn apply_external_context_rewind_detaches_groups_cut_by_the_rewind() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("logs");
+        std::fs::create_dir_all(&log_dir).unwrap();
+        let rollout = dir.path().join("rollout.jsonl");
+        write_fission_test_rollout(
+            &rollout,
+            &[
+                ("call_early", "shell"),
+                ("call_mid", "shell"),
+                ("call_late", "intendant.fission_spawn"),
+            ],
+        );
+
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        let session_log: SharedSessionLog = Arc::new(Mutex::new(
+            session_log::SessionLog::open(log_dir.clone()).unwrap(),
+        ));
+        let approval_registry: event::ApprovalRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let context_injection: event::ContextInjectionQueue = Arc::new(Mutex::new(Vec::new()));
+        let config = fission_test_drain_config(
+            &bus,
+            &session_log,
+            &approval_registry,
+            &context_injection,
+            dir.path(),
+            &log_dir,
+            "rewind-thread",
+        );
+
+        // Two groups for the same parent: one anchored before the cut, one
+        // after it.
+        let surviving_group = fission_ledger::register_spawned_branch(
+            &log_dir,
+            "rewind-thread",
+            "call_early",
+            fission_ledger::BranchCharter {
+                objective: "early work".to_string(),
+                write_scope: None,
+                worktree_requested: false,
+            },
+            fission_ledger::NewSpawnedBranch {
+                session_id: "rewindA-child-early".to_string(),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .group_id;
+        let doomed_group = fission_ledger::register_spawned_branch(
+            &log_dir,
+            "rewind-thread",
+            "call_late",
+            fission_ledger::BranchCharter {
+                objective: "late work".to_string(),
+                write_scope: None,
+                worktree_requested: false,
+            },
+            fission_ledger::NewSpawnedBranch {
+                session_id: "rewindA-child-late".to_string(),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .group_id;
+        fission_lifecycle::register_branch("rewindA-child-early", &surviving_group, &log_dir);
+        fission_lifecycle::register_branch("rewindA-child-late", &doomed_group, &log_dir);
+
+        let test_agent = FissionTestAgent::new(Some(rollout.clone()), "rewindA-unused");
+        let rollbacks = test_agent.rollbacks.clone();
+        let mut agent: Box<dyn external_agent::ExternalAgent> = Box::new(test_agent);
+        let request = ExternalContextRewindRequest {
+            session_id: Some("rewind-thread".to_string()),
+            item_id: "call_mid".to_string(),
+            position: external_agent::RollbackAnchorPosition::After,
+            reason: Some("trim the tail".to_string()),
+            primer: None,
+            preserve: Vec::new(),
+            discard: Vec::new(),
+            artifacts: Vec::new(),
+            next_steps: Vec::new(),
+            auto_resume: false,
+            require_density_improvement: false,
+        };
+        apply_external_context_rewind(&mut agent, "rewind-thread", &request, &config)
+            .await
+            .expect("rewind succeeds");
+
+        // Rollback happened, and detach ran after it (the ledger flip is
+        // observable only post-rollback by construction of the mock).
+        assert_eq!(
+            rollbacks.lock().unwrap().as_slice(),
+            &[(
+                "rewind-thread".to_string(),
+                "call_mid".to_string(),
+                "after"
+            )]
+        );
+
+        // Ledger: the late-anchored group is detached, the early one is not.
+        let document = fission_ledger::read_fission_ledger_document(&log_dir)
+            .unwrap()
+            .expect("document");
+        assert!(document.group_is_detached(&doomed_group));
+        assert!(!document.group_is_detached(&surviving_group));
+        let doomed_branch = document
+            .groups
+            .iter()
+            .find(|group| group.group_id == doomed_group)
+            .unwrap()
+            .branches
+            .iter()
+            .find(|branch| branch.session_id == "rewindA-child-late")
+            .unwrap();
+        assert_eq!(doomed_branch.status, "detached");
+
+        // Rewind record carries the detached group ids.
+        let records = context_rewind::list_records(&log_dir).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].detached_fission_group_ids,
+            vec![doomed_group.clone()]
+        );
+
+        // Pending deliveries dropped for the detached group only.
+        assert!(fission_lifecycle::branch_route("rewindA-child-late").is_none());
+        assert!(fission_lifecycle::branch_route("rewindA-child-early").is_some());
+
+        // fission-detached relationship emitted parent→detached branch only.
+        let mut detached_edges = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if let AppEvent::SessionRelationship {
+                parent_session_id,
+                child_session_id,
+                relationship,
+                ..
+            } = event
+            {
+                if relationship == "fission-detached" {
+                    detached_edges.push((parent_session_id, child_session_id));
+                }
+            }
+        }
+        assert_eq!(
+            detached_edges,
+            vec![(
+                "rewind-thread".to_string(),
+                "rewindA-child-late".to_string()
+            )]
+        );
+
+        fission_lifecycle::drop_pending_deliveries(&[surviving_group]);
+    }
+
+    #[tokio::test]
+    async fn apply_external_context_rewind_failed_rollback_leaves_fission_ledger_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("logs");
+        std::fs::create_dir_all(&log_dir).unwrap();
+        let rollout = dir.path().join("rollout.jsonl");
+        write_fission_test_rollout(
+            &rollout,
+            &[("call_mid", "shell"), ("call_late", "shell")],
+        );
+
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        let session_log: SharedSessionLog = Arc::new(Mutex::new(
+            session_log::SessionLog::open(log_dir.clone()).unwrap(),
+        ));
+        let approval_registry: event::ApprovalRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let context_injection: event::ContextInjectionQueue = Arc::new(Mutex::new(Vec::new()));
+        let config = fission_test_drain_config(
+            &bus,
+            &session_log,
+            &approval_registry,
+            &context_injection,
+            dir.path(),
+            &log_dir,
+            "rewind-thread-fail",
+        );
+
+        let doomed_group = fission_ledger::register_spawned_branch(
+            &log_dir,
+            "rewind-thread-fail",
+            "call_late",
+            fission_ledger::BranchCharter {
+                objective: "late work".to_string(),
+                write_scope: None,
+                worktree_requested: false,
+            },
+            fission_ledger::NewSpawnedBranch {
+                session_id: "rewindB-child-late".to_string(),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .group_id;
+        fission_lifecycle::register_branch("rewindB-child-late", &doomed_group, &log_dir);
+
+        let mut test_agent = FissionTestAgent::new(Some(rollout.clone()), "rewindB-unused");
+        test_agent.fail_rollback = true;
+        let mut agent: Box<dyn external_agent::ExternalAgent> = Box::new(test_agent);
+        let request = ExternalContextRewindRequest {
+            session_id: Some("rewind-thread-fail".to_string()),
+            item_id: "call_mid".to_string(),
+            position: external_agent::RollbackAnchorPosition::After,
+            reason: Some("trim the tail".to_string()),
+            primer: None,
+            preserve: Vec::new(),
+            discard: Vec::new(),
+            artifacts: Vec::new(),
+            next_steps: Vec::new(),
+            auto_resume: false,
+            require_density_improvement: false,
+        };
+        let err = apply_external_context_rewind(&mut agent, "rewind-thread-fail", &request, &config)
+            .await
+            .expect_err("rollback failure surfaces");
+        assert!(err.contains("thread rollback failed"), "error: {err}");
+
+        // Detach never ran: ledger untouched, route intact, no record, no
+        // relationship markers.
+        let document = fission_ledger::read_fission_ledger_document(&log_dir)
+            .unwrap()
+            .expect("document");
+        assert!(!document.group_is_detached(&doomed_group));
+        let branch = document
+            .groups
+            .iter()
+            .find(|group| group.group_id == doomed_group)
+            .unwrap()
+            .branches
+            .iter()
+            .find(|branch| branch.session_id == "rewindB-child-late")
+            .unwrap();
+        assert_eq!(branch.status, "running");
+        assert!(fission_lifecycle::branch_route("rewindB-child-late").is_some());
+        assert!(context_rewind::list_records(&log_dir).unwrap().is_empty());
+        while let Ok(event) = rx.try_recv() {
+            if let AppEvent::SessionRelationship { relationship, .. } = event {
+                assert_ne!(relationship, "fission-detached");
+            }
+        }
+
+        fission_lifecycle::drop_pending_deliveries(&[doomed_group]);
     }
 }
 

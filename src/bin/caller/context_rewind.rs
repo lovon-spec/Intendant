@@ -25,6 +25,12 @@ pub struct ContextRewindRecord {
     pub lineage_ledger: Option<crate::lineage_ledger::LineageLedger>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fission_ledger: Option<crate::fission_ledger::FissionLedger>,
+    /// Fission groups whose spawn anchors this rewind cut out of the
+    /// effective history (severed by `detach_groups_with_invalid_anchors`
+    /// right after the rollback). Backward compatible: records written before
+    /// the field existed deserialize as empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub detached_fission_group_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -230,6 +236,7 @@ mod tests {
             fission_snapshot: None,
             lineage_ledger: None,
             fission_ledger: None,
+            detached_fission_group_ids: Vec::new(),
         }
     }
 
@@ -309,10 +316,53 @@ mod tests {
                     }],
                 }],
             }),
+            detached_fission_group_ids: vec!["fission-thread-1-call-1".to_string()],
         };
 
         persist_record(dir.path(), &record).unwrap();
         assert_eq!(read_record(dir.path(), "rewind-1").unwrap(), record);
+    }
+
+    #[test]
+    fn record_without_detached_fission_groups_round_trips_compactly() {
+        // Old records (and new records that detached nothing) carry no
+        // `detached_fission_group_ids` key at all; they must deserialize as
+        // an empty list and serialize back without the key.
+        let dir = tempdir().unwrap();
+        let record = minimal_record("rewind-2", "2026-05-25T00:00:00Z", None, "thread-2");
+        assert!(record.detached_fission_group_ids.is_empty());
+
+        persist_record(dir.path(), &record).unwrap();
+        let raw = fs::read_to_string(record_path(dir.path(), "rewind-2")).unwrap();
+        assert!(!raw.contains("detached_fission_group_ids"));
+
+        let read = read_record(dir.path(), "rewind-2").unwrap();
+        assert_eq!(read, record);
+        assert!(read.detached_fission_group_ids.is_empty());
+    }
+
+    #[test]
+    fn legacy_record_json_without_detach_field_deserializes() {
+        // A record persisted by a pre-fission build: no
+        // `detached_fission_group_ids` key anywhere.
+        let legacy = serde_json::json!({
+            "record_id": "rewind-legacy",
+            "created_at": "2026-05-25T00:00:00Z",
+            "session_id": "session-1",
+            "thread_id": "thread-1",
+            "item_id": "call-1",
+            "position": "after",
+            "reason": "trim noisy output",
+            "primer": "keep this",
+            "preserve": [],
+            "discard": [],
+            "artifacts": [],
+            "next_steps": [],
+            "source_rollout_path": null,
+            "recovery_rollout_path": null,
+        });
+        let record: ContextRewindRecord = serde_json::from_value(legacy).unwrap();
+        assert!(record.detached_fission_group_ids.is_empty());
     }
 
     #[test]

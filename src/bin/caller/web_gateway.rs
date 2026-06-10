@@ -21954,6 +21954,7 @@ mod tests {
             fission_snapshot: None,
             lineage_ledger: None,
             fission_ledger: None,
+            detached_fission_group_ids: Vec::new(),
         }
     }
 
