@@ -67,6 +67,13 @@ impl StationInner {
                 let mut s = move_inner.borrow_mut();
                 let (x, y) = s.event_xy(e.client_x() as f64, e.client_y() as f64);
                 s.hover_xy = Some((x, y));
+                // Hover visuals only change when the pointer crosses a hit
+                // zone boundary; mark the HUD dirty exactly then.
+                let zone = s.hover_zone_rect_at(x, y);
+                if zone != s.hover_zone_rect {
+                    s.hover_zone_rect = zone;
+                    s.hud_dirty = true;
+                }
                 if s.active_pointers.contains_key(&e.pointer_id()) {
                     s.active_pointers.insert(e.pointer_id(), Vec2::new(x, y));
                 }
@@ -123,6 +130,7 @@ impl StationInner {
                         s.dispatch_hit(action)
                     } else if !drag.moved {
                         s.selected_id = s.pick_node(x, y);
+                        s.hud_dirty = true;
                         None
                     } else {
                         None
@@ -150,6 +158,8 @@ impl StationInner {
                 if s.hover_xy.take().is_none() {
                     return;
                 }
+                s.hover_zone_rect = None;
+                s.hud_dirty = true;
                 s.mark_input();
             }
             StationInner::schedule_frame(&leave_inner);
@@ -277,10 +287,12 @@ impl StationInner {
             }
             HitAction::ClosePanel => {
                 self.selected_id = None;
+                self.hud_dirty = true;
                 None
             }
             HitAction::Select(id) => {
                 self.selected_id = Some(id);
+                self.hud_dirty = true;
                 None
             }
             HitAction::Noop => None,
@@ -354,11 +366,21 @@ impl StationInner {
     }
 
     pub(crate) fn hit_action_at(&self, x: f32, y: f32) -> Option<HitAction> {
+        self.zone_at(x, y).map(|z| z.action.clone())
+    }
+
+    /// Rect of the top-most hit zone under the pointer (the one a click
+    /// would dispatch to); used to detect hover transitions cheaply.
+    pub(crate) fn hover_zone_rect_at(&self, x: f32, y: f32) -> Option<(f32, f32, f32, f32)> {
+        self.zone_at(x, y).map(|z| (z.x, z.y, z.w, z.h))
+    }
+
+    /// Top-most (= last drawn, matching draw order) hit zone at a point.
+    fn zone_at(&self, x: f32, y: f32) -> Option<&HitZone> {
         self.hit_zones
             .iter()
             .rev()
             .find(|z| x >= z.x && x <= z.x + z.w && y >= z.y && y <= z.y + z.h)
-            .map(|z| z.action.clone())
     }
 
     /// Map client coordinates into canvas CSS coordinates, reusing a cached

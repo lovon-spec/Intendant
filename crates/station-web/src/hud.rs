@@ -198,24 +198,73 @@ impl StationInner {
         (x, y, tw, th)
     }
 
-    pub(crate) fn draw_display_thumbnails(&self) {
-        if self.display_sources.is_empty() {
-            return;
-        }
-        let by_host: HashMap<&str, &ProjectedNode> = self
-            .frame
+    /// Projected host nodes by bare host id, for anchoring display
+    /// thumbnails to their hosts.
+    fn host_nodes(&self) -> HashMap<&str, &ProjectedNode> {
+        self.frame
             .projected_nodes
             .iter()
             .filter(|n| n.kind == NodeKind::Host)
             .map(|n| (n.id.strip_prefix("host:").unwrap_or(n.id.as_str()), n))
-            .collect();
+            .collect()
+    }
 
+    /// CSS-px center of a projected node.
+    fn node_css_center(&self, node: &ProjectedNode) -> Vec2 {
+        let center = ndc_to_screen([node.ndc.x, node.ndc.y], self.width, self.height);
+        Vec2::new(center.x / self.dpr as f32, center.y / self.dpr as f32)
+    }
+
+    /// Partial HUD repaint: refresh only the live video pixels inside the
+    /// already-painted thumbnail frames. Valid whenever nothing else on
+    /// the HUD changed since the last full paint (`render` guarantees the
+    /// camera is unchanged, so the cached frame geometry still matches):
+    /// the glass frame, label, and every other panel stay as previously
+    /// rasterized, and the opaque video pixels overwrite themselves in
+    /// place — no clearing, no translucent-fill accumulation.
+    pub(crate) fn paint_display_videos(&self) {
+        if self.display_sources.is_empty() {
+            return;
+        }
+        self.hud
+            .ctx
+            .set_transform(self.dpr, 0.0, 0.0, self.dpr, 0.0, 0.0)
+            .ok();
+        let by_host = self.host_nodes();
         for source in self.display_sources.values() {
             let Some(node) = by_host.get(source.host_id.as_str()) else {
                 continue;
             };
-            let center = ndc_to_screen([node.ndc.x, node.ndc.y], self.width, self.height);
-            let css = Vec2::new(center.x / self.dpr as f32, center.y / self.dpr as f32);
+            // Sources still waiting for pixels keep their painted
+            // placeholder; the first ready frame simply draws over it.
+            if source.video.video_width() == 0 || source.video.video_height() == 0 {
+                continue;
+            }
+            let css = self.node_css_center(node);
+            let (x, y, tw, th) = Self::thumbnail_rect(css, self.css_width());
+            let _ = self
+                .hud
+                .ctx
+                .draw_image_with_html_video_element_and_dw_and_dh(
+                    &source.video,
+                    (x + 3.0) as f64,
+                    (y + 3.0) as f64,
+                    (tw - 6.0) as f64,
+                    (th - 6.0) as f64,
+                );
+        }
+    }
+
+    pub(crate) fn draw_display_thumbnails(&self) {
+        if self.display_sources.is_empty() {
+            return;
+        }
+        let by_host = self.host_nodes();
+        for source in self.display_sources.values() {
+            let Some(node) = by_host.get(source.host_id.as_str()) else {
+                continue;
+            };
+            let css = self.node_css_center(node);
             let (x, y, tw, th) = Self::thumbnail_rect(css, self.css_width());
             self.glass_panel(x, y, tw, th, 6.0, C_PEACH, 1.2, 1.15);
             let video_ready = source.video.video_width() > 0 && source.video.video_height() > 0;

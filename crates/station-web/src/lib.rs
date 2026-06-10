@@ -78,6 +78,7 @@ impl StationWeb {
             inner.active = active;
             // The pane may have moved or resized while the tab was hidden.
             inner.canvas_origin = None;
+            inner.hud_dirty = true;
         }
         if active {
             StationInner::schedule_frame(&self.inner);
@@ -120,6 +121,7 @@ impl StationWeb {
                 },
             );
             inner.targets_dirty = true;
+            inner.hud_dirty = true;
         }
         StationInner::schedule_frame(&self.inner);
     }
@@ -129,6 +131,7 @@ impl StationWeb {
             let mut inner = self.inner.borrow_mut();
             inner.display_sources.remove(&source_id);
             inner.targets_dirty = true;
+            inner.hud_dirty = true;
         }
         StationInner::schedule_frame(&self.inner);
     }
@@ -157,17 +160,28 @@ impl StationWeb {
             inner.ar_strength = ar_strength.clamp(0.0, 1.0);
             inner.density = density.clamp(0.5, 1.8);
             inner.targets_dirty = true;
+            inner.hud_dirty = true;
         }
         StationInner::schedule_frame(&self.inner);
     }
 
+    /// Select a node (or clear the selection with `null`); the scene halo
+    /// and HUD focus panel follow `selected_id` on the next paint.
     pub fn select_by_id(&self, id: Option<String>) {
-        self.inner.borrow_mut().selected_id = id;
+        {
+            let mut inner = self.inner.borrow_mut();
+            inner.selected_id = id;
+            inner.hud_dirty = true;
+        }
         StationInner::schedule_frame(&self.inner);
     }
 
     pub fn focus_on(&self, id: String) {
-        self.inner.borrow_mut().focus_id = Some(id);
+        {
+            let mut inner = self.inner.borrow_mut();
+            inner.focus_id = Some(id);
+            inner.hud_dirty = true;
+        }
         StationInner::schedule_frame(&self.inner);
     }
 
@@ -225,6 +239,17 @@ struct StationInner {
     /// Last pointer position in CSS px; drives the pills' / tiles'
     /// lit-from-within hover state. Cleared when the pointer leaves.
     hover_xy: Option<(f32, f32)>,
+    /// Rect of the hit zone currently under the pointer; hover repaints
+    /// are only forced when this changes (crossing a zone boundary).
+    hover_zone_rect: Option<(f32, f32, f32, f32)>,
+    /// Set by anything that changes what the HUD shows (snapshot, layout,
+    /// visuals, selection, hover zone, sources, resize); cleared after a
+    /// full HUD repaint. See `render` for the full/partial decision.
+    hud_dirty: bool,
+    /// Camera signature at the last full HUD paint; thumbnails, the
+    /// compass needle, and node-anchored chrome all track the camera, so
+    /// any change forces a full repaint. None until first paint.
+    hud_camera_sig: Option<(f32, f32, f32, f32, f32)>,
     hit_zones: Vec<HitZone>,
     action_callback: Option<js_sys::Function>,
     /// World positions per node id, rebuilt when the snapshot or layout
@@ -306,6 +331,9 @@ impl StationInner {
             ar_x: 0.0,
             ar_y: 0.0,
             hover_xy: None,
+            hover_zone_rect: None,
+            hud_dirty: true,
+            hud_camera_sig: None,
             hit_zones: Vec::new(),
             action_callback: None,
             layout_cache: HashMap::new(),
@@ -330,6 +358,7 @@ impl StationInner {
             self.layout = layout;
             self.rebuild_layout_cache();
             self.targets_dirty = true;
+            self.hud_dirty = true;
         }
     }
 
@@ -520,6 +549,7 @@ impl StationInner {
         self.snapshot = snapshot;
         self.rebuild_layout_cache();
         self.targets_dirty = true;
+        self.hud_dirty = true;
         if self
             .selected_id
             .as_ref()
@@ -575,8 +605,9 @@ impl StationInner {
         self.scene_canvas.set_height(height);
         self.hud_canvas.set_width(width);
         self.hud_canvas.set_height(height);
-        // Setting a canvas size resets its 2D context state.
+        // Setting a canvas size resets its 2D context state and clears it.
         self.hud.invalidate();
+        self.hud_dirty = true;
         if let Some(gpu) = self.gpu.as_mut() {
             gpu.resize(width, height);
         }
@@ -636,7 +667,32 @@ impl StationInner {
         } else if let Some(scene_ctx) = self.scene_ctx.as_ref() {
             self.draw_scene_lines(scene_ctx);
         }
-        self.draw_hud(anim_ms);
+
+        // HUD repaint split: the full HUD (vignette, panels, text, chrome)
+        // is rasterized only when something it shows could have changed —
+        // explicit state (`hud_dirty`), the interactive input window (drag /
+        // hover feedback), ambient animation (`motion > 0` drives breathing
+        // chrome and orbit drift), or a camera move (thumbnails, compass,
+        // and node-anchored chrome track it). When only live video
+        // thumbnails are animating, just their pixels are refreshed over
+        // the previously drawn HUD — that turns the steady-state
+        // "monitoring a display" cost from a full-canvas repaint into N
+        // small drawImage calls. The WebGPU-failed underlay mode paints the
+        // scene on the HUD canvas, so it always repaints fully.
+        let camera_sig = (self.yaw, self.pitch, self.distance, self.ar_x, self.ar_y);
+        let scene_on_hud = self.gpu.is_none() && self.scene_ctx.is_none();
+        let full_hud = self.hud_dirty
+            || self.motion > 0.0
+            || idle_ms < 150.0
+            || self.hud_camera_sig != Some(camera_sig)
+            || scene_on_hud;
+        if full_hud {
+            self.draw_hud(anim_ms);
+            self.hud_dirty = false;
+            self.hud_camera_sig = Some(camera_sig);
+        } else {
+            self.paint_display_videos();
+        }
     }
 
     fn activity_event(&self, event_id: &str) -> Option<StationEvent> {
