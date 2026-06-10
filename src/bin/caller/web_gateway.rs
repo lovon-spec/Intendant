@@ -119,6 +119,8 @@ const SESSION_LOG_SEARCH_SNIPPET_CHARS: usize = 220;
 const DELETED_EXTERNAL_SESSIONS_FILE: &str = "deleted_external_sessions.json";
 const MANAGED_CONTEXT_ANCHOR_TRACE_LIMIT: usize = 64;
 const MANAGED_CONTEXT_ANCHOR_LIMIT: usize = 40;
+const MANAGED_CONTEXT_FISSION_GROUP_LIMIT: usize = 50;
+const MANAGED_CONTEXT_FISSION_BRANCH_LIMIT: usize = 50;
 const EXTERNAL_CONTEXT_REPLAY_LOG_SCAN_LIMIT: usize = 16;
 const CONTEXT_REPLAY_RAW_SUMMARY_MAX_BYTES: u64 = 128 * 1024;
 const FS_LIST_LIMIT: usize = 500;
@@ -11337,6 +11339,227 @@ fn managed_context_records_response(request_line: &str, log_dir: &Path) -> Strin
     )
 }
 
+/// Merged dashboard view of one fission group: the wire ledger fields from
+/// [`crate::fission_ledger::FissionGroup`] plus the group-level extension
+/// state (detach markers) from the same
+/// [`crate::fission_ledger::FissionLedgerDocument`]. Served by
+/// `GET /api/managed-context/fission`.
+#[derive(Clone, Debug, Serialize)]
+struct ManagedContextFissionGroup {
+    group_id: String,
+    parent_session_id: String,
+    anchor_item_id: String,
+    tool: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    objective: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prompt: Option<String>,
+    created_at: String,
+    updated_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    canonical_session_id: Option<String>,
+    detached: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    detached_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    detach_reason: Option<String>,
+    branches: Vec<ManagedContextFissionBranch>,
+}
+
+/// One branch inside [`ManagedContextFissionGroup`]: the flattened wire
+/// branch plus its per-branch extension state (charter, import marker, work
+/// metadata).
+#[derive(Clone, Debug, Serialize)]
+struct ManagedContextFissionBranch {
+    #[serde(flatten)]
+    branch: crate::fission_ledger::FissionBranch,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    charter: Option<crate::fission_ledger::BranchCharter>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    imported_at: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    changed_files: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    tests_run: Vec<String>,
+}
+
+fn managed_context_fission_group_view(
+    document: &crate::fission_ledger::FissionLedgerDocument,
+    group: &crate::fission_ledger::FissionGroup,
+) -> ManagedContextFissionGroup {
+    let group_ext = document.group_ext(&group.group_id);
+    let branches = group
+        .branches
+        .iter()
+        .take(MANAGED_CONTEXT_FISSION_BRANCH_LIMIT)
+        .map(|branch| {
+            let branch_ext = group_ext.and_then(|ext| ext.branch(&branch.session_id));
+            ManagedContextFissionBranch {
+                branch: branch.clone(),
+                charter: branch_ext.and_then(|ext| ext.charter.clone()),
+                imported_at: branch_ext.and_then(|ext| ext.imported_at.clone()),
+                changed_files: branch_ext
+                    .map(|ext| ext.changed_files.clone())
+                    .unwrap_or_default(),
+                tests_run: branch_ext
+                    .map(|ext| ext.tests_run.clone())
+                    .unwrap_or_default(),
+            }
+        })
+        .collect();
+    ManagedContextFissionGroup {
+        group_id: group.group_id.clone(),
+        parent_session_id: group.parent_session_id.clone(),
+        anchor_item_id: group.anchor_item_id.clone(),
+        tool: group.tool.clone(),
+        objective: group.objective.clone(),
+        prompt: group.prompt.clone(),
+        created_at: group.created_at.clone(),
+        updated_at: group.updated_at.clone(),
+        canonical_session_id: group.canonical_session_id.clone(),
+        detached: group_ext.is_some_and(crate::fission_ledger::FissionGroupExt::is_detached),
+        detached_at: group_ext.and_then(|ext| ext.detached_at.clone()),
+        detach_reason: group_ext.and_then(|ext| ext.detach_reason.clone()),
+        branches,
+    }
+}
+
+fn append_managed_context_fission_groups_from_dir(
+    groups: &mut Vec<ManagedContextFissionGroup>,
+    seen_dirs: &mut std::collections::HashSet<String>,
+    log_dir: &Path,
+    session_ids: &[String],
+) -> std::io::Result<()> {
+    let key = std::fs::canonicalize(log_dir)
+        .unwrap_or_else(|_| log_dir.to_path_buf())
+        .to_string_lossy()
+        .to_string();
+    if !seen_dirs.insert(key) {
+        return Ok(());
+    }
+    // The session-filtered document reader applies the ledger's own
+    // connected-component rule per session id; duplicate groups produced by
+    // overlapping filter ids are deduplicated by `group_id` after the final
+    // newest-first sort.
+    let mut documents = Vec::new();
+    if session_ids.is_empty() {
+        if let Some(document) = crate::fission_ledger::read_fission_ledger_document(log_dir)? {
+            documents.push(document);
+        }
+    } else {
+        for session_id in session_ids {
+            if let Some(document) =
+                crate::fission_ledger::read_fission_ledger_document_for_session(
+                    log_dir, session_id,
+                )?
+            {
+                documents.push(document);
+            }
+        }
+    }
+    for document in &documents {
+        for group in &document.groups {
+            groups.push(managed_context_fission_group_view(document, group));
+        }
+    }
+    Ok(())
+}
+
+fn managed_context_fission_response_from_home(
+    request_line: &str,
+    active_log_dir: Option<&Path>,
+    home: &Path,
+) -> String {
+    let session_id = managed_context_query_session_id(request_line);
+    let wrapper_session_id = managed_context_query_wrapper_session_id(request_line);
+    let mut filter_session_ids = Vec::new();
+    managed_context_push_filter_session_id(&mut filter_session_ids, session_id.as_deref());
+    managed_context_push_filter_session_id(&mut filter_session_ids, wrapper_session_id.as_deref());
+    let mut groups: Vec<ManagedContextFissionGroup> = Vec::new();
+    let mut seen_dirs = std::collections::HashSet::new();
+
+    let mut dirs = managed_context_candidate_log_dirs(
+        home,
+        active_log_dir,
+        session_id.as_deref(),
+        wrapper_session_id.as_deref(),
+    );
+    let mut query_log_ids = Vec::new();
+    managed_context_push_filter_session_id(&mut query_log_ids, wrapper_session_id.as_deref());
+    managed_context_push_filter_session_id(&mut query_log_ids, session_id.as_deref());
+    for query_log_id in query_log_ids {
+        let Some(log_dir) = managed_context_named_log_dir(home, &query_log_id) else {
+            continue;
+        };
+        let Some(backend_session_id) = managed_context_backend_session_id_from_log_dir(&log_dir)
+        else {
+            continue;
+        };
+        if filter_session_ids
+            .iter()
+            .any(|existing| existing == &backend_session_id)
+        {
+            continue;
+        }
+        managed_context_push_filter_session_id(
+            &mut filter_session_ids,
+            Some(backend_session_id.as_str()),
+        );
+        managed_context_extend_candidate_log_dirs(
+            &mut dirs,
+            managed_context_candidate_log_dirs(
+                home,
+                active_log_dir,
+                Some(backend_session_id.as_str()),
+                Some(query_log_id.as_str()),
+            ),
+        );
+    }
+    if !dirs.is_empty() {
+        for log_dir in dirs {
+            if let Err(err) = append_managed_context_fission_groups_from_dir(
+                &mut groups,
+                &mut seen_dirs,
+                &log_dir,
+                &filter_session_ids,
+            ) {
+                return json_error(
+                    "500 Internal Server Error",
+                    format!("failed to read managed-context fission groups: {err}"),
+                );
+            }
+        }
+    } else if active_log_dir.is_some() {
+        return json_ok(serde_json::json!({ "groups": [] }));
+    } else if session_id.is_none() && wrapper_session_id.is_none() {
+        return json_error(
+            "404 Not Found",
+            "managed-context fission groups need an active session log",
+        );
+    } else {
+        let Some(log_dir) = active_log_dir else {
+            return json_ok(serde_json::json!({ "groups": groups }));
+        };
+        if let Err(err) = append_managed_context_fission_groups_from_dir(
+            &mut groups,
+            &mut seen_dirs,
+            log_dir,
+            &filter_session_ids,
+        ) {
+            return json_error(
+                "500 Internal Server Error",
+                format!("failed to read managed-context fission groups: {err}"),
+            );
+        }
+    }
+
+    groups.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    let mut seen_groups = HashSet::new();
+    groups.retain(|group| seen_groups.insert(group.group_id.clone()));
+    groups.truncate(MANAGED_CONTEXT_FISSION_GROUP_LIMIT);
+    json_ok(serde_json::json!({ "groups": groups }))
+}
+
 fn effective_upload_destination(
     requested: crate::upload_store::UploadDestination,
     _has_active_session: bool,
@@ -17811,6 +18034,32 @@ pub fn spawn_web_gateway(
                         };
                         let _ = stream.write_all(response.as_bytes()).await;
                     } else if request_line.starts_with("GET")
+                        && request_line.contains(" /api/managed-context/fission")
+                    {
+                        use tokio::io::AsyncWriteExt;
+                        let response = match session_log.as_ref() {
+                            Some(log) => match log.lock() {
+                                Ok(log) => {
+                                    let active_log_dir = log.dir().to_path_buf();
+                                    managed_context_fission_response_from_home(
+                                        request_line,
+                                        Some(active_log_dir.as_path()),
+                                        &crate::platform::home_dir(),
+                                    )
+                                }
+                                Err(_) => json_error(
+                                    "500 Internal Server Error",
+                                    "session log lock poisoned",
+                                ),
+                            },
+                            None => managed_context_fission_response_from_home(
+                                request_line,
+                                None,
+                                &crate::platform::home_dir(),
+                            ),
+                        };
+                        let _ = stream.write_all(response.as_bytes()).await;
+                    } else if request_line.starts_with("GET")
                         && request_line.contains("/api/session/current/changes")
                     {
                         // File change tracking endpoints:
@@ -22125,6 +22374,124 @@ mod tests {
             .map(|record| record["record_id"].as_str().unwrap())
             .collect();
         assert_eq!(ids, vec!["historical-by-thread"]);
+    }
+
+    #[test]
+    fn managed_context_fission_response_merges_ledger_and_ext_state() {
+        use crate::fission_ledger::{BranchCharter, NewSpawnedBranch};
+
+        let home = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+
+        // Group 1: a chartered spawn that reported work and was imported.
+        let chartered = crate::fission_ledger::register_spawned_branch(
+            dir.path(),
+            "fission-web-parent",
+            "anchor-chartered",
+            BranchCharter {
+                objective: "polish the docs".to_string(),
+                write_scope: Some("docs/**".to_string()),
+                worktree_requested: true,
+            },
+            NewSpawnedBranch {
+                session_id: "branch-chartered".to_string(),
+                worktree_path: Some(std::path::PathBuf::from("/tmp/wt-chartered")),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        crate::fission_ledger::update_branch_work(
+            dir.path(),
+            &chartered.group_id,
+            "branch-chartered",
+            &["docs/src/a.md".to_string(), "docs/src/b.md".to_string()],
+            &["cargo test --bins".to_string()],
+            Some("docs polished"),
+        )
+        .unwrap();
+        crate::fission_ledger::mark_branch_imported(
+            dir.path(),
+            &chartered.group_id,
+            "branch-chartered",
+            None,
+        )
+        .unwrap();
+
+        // Group 2: registered later, then detached (newest by updated_at).
+        let detached = crate::fission_ledger::register_spawned_branch(
+            dir.path(),
+            "fission-web-parent",
+            "anchor-detached",
+            BranchCharter {
+                objective: "explore the alternative".to_string(),
+                write_scope: None,
+                worktree_requested: false,
+            },
+            NewSpawnedBranch {
+                session_id: "branch-detached".to_string(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        crate::fission_ledger::detach_group(
+            dir.path(),
+            &detached.group_id,
+            "anchor rewound away",
+        )
+        .unwrap();
+
+        let response = managed_context_fission_response_from_home(
+            "GET /api/managed-context/fission?session_id=fission-web-parent HTTP/1.1",
+            Some(dir.path()),
+            home.path(),
+        );
+        let body = response_json_body(&response);
+        let groups = body["groups"].as_array().unwrap();
+        assert_eq!(groups.len(), 2);
+
+        // Newest first by updated_at: the detach bumped group 2 last.
+        let first = &groups[0];
+        assert_eq!(first["group_id"], detached.group_id.as_str());
+        assert_eq!(first["parent_session_id"], "fission-web-parent");
+        assert_eq!(first["anchor_item_id"], "anchor-detached");
+        assert_eq!(first["tool"], "spawn_agent");
+        assert_eq!(first["detached"], true);
+        assert!(first["detached_at"].is_string());
+        assert_eq!(first["detach_reason"], "anchor rewound away");
+        assert_eq!(first["branches"][0]["session_id"], "branch-detached");
+        assert_eq!(first["branches"][0]["status"], "detached");
+        assert_eq!(
+            first["branches"][0]["charter"]["objective"],
+            "explore the alternative"
+        );
+
+        let second = &groups[1];
+        assert_eq!(second["group_id"], chartered.group_id.as_str());
+        assert_eq!(second["detached"], false);
+        assert!(second["detached_at"].is_null());
+        let branch = &second["branches"][0];
+        assert_eq!(branch["session_id"], "branch-chartered");
+        assert_eq!(branch["status"], "running");
+        assert_eq!(branch["worktree_path"], "/tmp/wt-chartered");
+        assert_eq!(branch["summary"], "docs polished");
+        assert_eq!(branch["charter"]["objective"], "polish the docs");
+        assert_eq!(branch["charter"]["write_scope"], "docs/**");
+        assert_eq!(branch["charter"]["worktree_requested"], true);
+        assert!(branch["imported_at"].is_string());
+        assert_eq!(
+            branch["changed_files"],
+            serde_json::json!(["docs/src/a.md", "docs/src/b.md"])
+        );
+        assert_eq!(branch["tests_run"], serde_json::json!(["cargo test --bins"]));
+
+        // A session id outside the connected component sees no groups.
+        let unrelated = managed_context_fission_response_from_home(
+            "GET /api/managed-context/fission?session_id=unrelated-session HTTP/1.1",
+            Some(dir.path()),
+            home.path(),
+        );
+        let unrelated_body = response_json_body(&unrelated);
+        assert_eq!(unrelated_body["groups"].as_array().unwrap().len(), 0);
     }
 
     #[test]
