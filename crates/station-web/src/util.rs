@@ -108,6 +108,22 @@ pub(crate) fn css_rgba(color: [f32; 4]) -> String {
     )
 }
 
+/// Parse a `#rrggbb` CSS color into a [`Color`]; the glass chrome uses this
+/// to derive alpha/glow variants from the same palette constants the flat
+/// HUD text uses, so accents stay in one place.
+pub(crate) fn hex_color(css: &str) -> Option<Color> {
+    let hex = css.strip_prefix('#')?;
+    if hex.len() != 6 {
+        return None;
+    }
+    let channel = |range: std::ops::Range<usize>| u8::from_str_radix(hex.get(range)?, 16).ok();
+    Some(Color::rgb(
+        channel(0..2)?,
+        channel(2..4)?,
+        channel(4..6)?,
+    ))
+}
+
 pub(crate) fn percent(value: f32, max: f32) -> f32 {
     if max <= 0.0 {
         0.0
@@ -264,6 +280,18 @@ mod tests {
     #[test]
     fn css_rgba_formats_components() {
         assert_eq!(css_rgba([1.0, 0.0, 0.5, 0.25]), "rgba(255,0,128,0.250)");
+    }
+
+    #[test]
+    fn hex_color_parses_palette_and_rejects_garbage() {
+        let blue = hex_color(C_BLUE_CSS).expect("palette constant parses");
+        let reference: [f32; 4] = C_BLUE.into();
+        let parsed: [f32; 4] = blue.into();
+        assert_eq!(parsed, reference);
+        assert!(hex_color("#fff").is_none());
+        assert!(hex_color("89b4fa").is_none());
+        assert!(hex_color("#89b4fg").is_none());
+        assert!(hex_color("").is_none());
     }
 
     #[test]

@@ -10,9 +10,10 @@ use crate::input::{HitAction, HitZone};
 use crate::model::activity_retained_count;
 use crate::scene::{ndc_to_screen, LayoutName, Mood, NodeKind, ProjectedNode, Vec2};
 use crate::util::{
-    level_color_css, nonempty, pct_label, percent, pressure_color, truncate, C_BLUE_CSS,
-    C_GREEN_CSS, C_LAVENDER_CSS, C_MAUVE_CSS, C_OVERLAY1_CSS, C_PEACH_CSS, C_RED_CSS,
-    C_SUBTEXT0_CSS, C_TEAL_CSS, C_TEXT_CSS, C_YELLOW_CSS,
+    css_rgba, hex_color, level_color_css, nonempty, pct_label, percent, pressure_color, truncate,
+    Color, C_BLUE, C_BLUE_CSS, C_GREEN_CSS, C_LAVENDER, C_LAVENDER_CSS, C_MAUVE_CSS, C_OVERLAY1,
+    C_OVERLAY1_CSS, C_PEACH, C_PEACH_CSS, C_RED_CSS, C_SUBTEXT0_CSS, C_TEAL, C_TEAL_CSS,
+    C_TEXT_CSS, C_YELLOW_CSS,
 };
 use crate::StationInner;
 
@@ -186,6 +187,17 @@ impl StationInner {
         }
     }
 
+    /// Thumbnail frame rect (CSS px) for a display source anchored at the
+    /// projected host position. Shared by the full HUD paint and the
+    /// video-only partial repaint so the two can never drift apart.
+    pub(crate) fn thumbnail_rect(css: Vec2, css_width: f32) -> (f32, f32, f32, f32) {
+        let tw = 164.0_f32.min(css_width * 0.28).max(98.0);
+        let th = tw * 0.5625;
+        let x = css.x - tw / 2.0;
+        let y = css.y - 118.0 - th * 0.2;
+        (x, y, tw, th)
+    }
+
     pub(crate) fn draw_display_thumbnails(&self) {
         if self.display_sources.is_empty() {
             return;
@@ -204,19 +216,8 @@ impl StationInner {
             };
             let center = ndc_to_screen([node.ndc.x, node.ndc.y], self.width, self.height);
             let css = Vec2::new(center.x / self.dpr as f32, center.y / self.dpr as f32);
-            let tw = 164.0_f32.min(self.css_width() * 0.28).max(98.0);
-            let th = tw * 0.5625;
-            let x = css.x - tw / 2.0;
-            let y = css.y - 118.0 - th * 0.2;
-            self.round_rect(
-                x,
-                y,
-                tw,
-                th,
-                5.0,
-                "rgba(17,17,27,0.86)",
-                "rgba(250,179,135,0.82)",
-            );
+            let (x, y, tw, th) = Self::thumbnail_rect(css, self.css_width());
+            self.glass_panel(x, y, tw, th, 6.0, C_PEACH, 1.2, 1.15);
             let video_ready = source.video.video_width() > 0 && source.video.video_height() > 0;
             if video_ready {
                 let _ = self
@@ -258,9 +259,20 @@ impl StationInner {
     }
 
     pub(crate) fn draw_station_header(&mut self, w: f32) {
-        self.hud.set_fill("rgba(11,11,19,0.78)");
-        self.hud.ctx.fill_rect(0.0, 0.0, w as f64, 42.0);
-        self.hud.set_stroke("rgba(49,50,68,0.82)");
+        let ctx = &self.hud.ctx;
+        let a = self.mood.glass();
+        // Full-bleed glass strip: translucent gradient body, top sheen,
+        // luminous bottom edge.
+        let body = ctx.create_linear_gradient(0.0, 0.0, 0.0, 42.0);
+        let _ = body.add_color_stop(0.0, "rgba(16,17,28,0.92)");
+        let _ = body.add_color_stop(1.0, "rgba(11,11,19,0.62)");
+        ctx.set_fill_style_canvas_gradient(&body);
+        self.hud.note_fill_unknown();
+        ctx.fill_rect(0.0, 0.0, w as f64, 42.0);
+        self.hud.set_stroke(&css_rgba([0.93, 0.95, 1.0, 0.06 * a]));
+        self.line(0.0, 1.0, w, 1.0);
+        self.hud
+            .set_stroke(&css_rgba(C_BLUE.with_alpha(0.30 * a).into()));
         self.line(0.0, 42.0, w, 42.0);
         self.text("STATION", 24.0, 26.0, 11.0, C_TEXT_CSS, "bold");
         self.pill_button(
@@ -347,8 +359,7 @@ impl StationInner {
     }
 
     pub(crate) fn draw_station_command_deck(&mut self, x: f32, y: f32, w: f32, h: f32) {
-        self.hud.set_stroke("rgba(137,180,250,0.32)");
-        self.line(x, y + h - 1.0, x + w, y + h - 1.0);
+        self.glass_panel(x - 6.0, y - 8.0, w + 12.0, h + 14.0, 12.0, C_BLUE, 0.9, 0.9);
         self.hud.set_fill(C_BLUE_CSS);
         self.hud
             .ctx
@@ -476,7 +487,7 @@ impl StationInner {
             if ax < x + w * 0.48 {
                 break;
             }
-            self.pill_at(ax, ay, action.width, 23.0, action.label, action.color);
+            self.pill_at(ax, ay, action.width, 23.0, action.label, action.color, false);
             self.hit_zones
                 .push(HitZone::new(ax, ay, action.width, 23.0, action.hit));
             ax -= 8.0;
@@ -488,15 +499,7 @@ impl StationInner {
         let y = 64.0;
         let panel_w = w - 36.0;
         let panel_h = (h - 92.0).max(180.0);
-        self.round_rect(
-            x,
-            y,
-            panel_w,
-            panel_h,
-            6.0,
-            "rgba(17,17,27,0.78)",
-            "rgba(137,180,250,0.58)",
-        );
+        self.glass_panel(x, y, panel_w, panel_h, 10.0, C_BLUE, 1.0, 1.0);
         self.text(
             "CONTROL CENTER",
             x + 16.0,
@@ -534,15 +537,8 @@ impl StationInner {
         if core_h < 150.0 {
             return;
         }
-        self.round_rect(
-            x,
-            y,
-            w,
-            core_h,
-            7.0,
-            "rgba(11,11,19,0.24)",
-            "rgba(69,71,90,0.24)",
-        );
+        // Clear glass: low tint so the 3D scene stays visible through it.
+        self.glass_panel(x, y, w, core_h, 12.0, C_LAVENDER, 0.5, 0.28);
         let cx = x + w * 0.5;
         let cy = y + core_h * 0.52;
         let ring_scale = (core_h * 0.42).clamp(132.0, 230.0);
@@ -693,6 +689,9 @@ impl StationInner {
         target: &SystemTarget,
     ) {
         let selected = self.selected_id.as_deref() == Some(target.id);
+        let hovered = self.hover_xy.is_some_and(|(hx, hy)| {
+            hx >= x - 8.0 && hx <= x + w + 8.0 && hy >= y - 8.0 && hy <= y + h + 8.0
+        });
         let is_display = target.id == "system:peers";
         let anchor_x = if x + w * 0.5 < cx { x + w } else { x };
         let anchor_y = y + h * 0.5;
@@ -722,6 +721,23 @@ impl StationInner {
             std::f64::consts::TAU,
         );
         self.hud.ctx.stroke();
+        // Light glass chip behind the node text so it reads over the scene.
+        self.glass_panel(
+            x - 12.0,
+            y - 4.0,
+            w + 18.0,
+            h + 8.0,
+            9.0,
+            hex_color(target.color).unwrap_or(C_BLUE),
+            if selected {
+                1.6
+            } else if hovered {
+                1.1
+            } else {
+                0.55
+            },
+            if selected { 0.95 } else { 0.62 },
+        );
         if is_display {
             self.hud.set_stroke("rgba(250,179,135,0.58)");
             let aperture_w = (w * 0.34).max(92.0);
@@ -806,8 +822,7 @@ impl StationInner {
     pub(crate) fn draw_station_activity_lane(&mut self, x: f32, h: f32, w: f32) {
         let lane_h = 78.0;
         let y = (h - lane_h - 24.0).max(282.0);
-        self.hud.set_stroke("rgba(148,226,213,0.34)");
-        self.line(x, y, x + w, y);
+        self.glass_panel(x - 6.0, y, w + 12.0, lane_h + 10.0, 12.0, C_TEAL, 0.9, 0.9);
         self.hud.set_fill(C_TEAL_CSS);
         self.hud
             .ctx
@@ -878,7 +893,15 @@ impl StationInner {
         let mut ax = x + w - 18.0;
         for action in actions.into_iter().rev() {
             ax -= action.width;
-            self.pill_at(ax, y + 13.0, action.width, 22.0, action.label, action.color);
+            self.pill_at(
+                ax,
+                y + 13.0,
+                action.width,
+                22.0,
+                action.label,
+                action.color,
+                false,
+            );
             self.hit_zones
                 .push(HitZone::new(ax, y + 13.0, action.width, 22.0, action.hit));
             ax -= 8.0;
@@ -909,14 +932,15 @@ impl StationInner {
                     C_BLUE_CSS,
                 ),
             };
-        self.round_rect(
+        self.glass_panel(
             x,
             y,
             panel_w,
             panel_h,
-            7.0,
-            "rgba(17,17,27,0.86)",
-            "rgba(137,180,250,0.62)",
+            10.0,
+            hex_color(color).unwrap_or(C_BLUE),
+            1.5,
+            1.1,
         );
         self.hit_zones
             .push(HitZone::new(x, y, panel_w, panel_h, HitAction::Noop));
@@ -931,6 +955,7 @@ impl StationInner {
             23.0,
             "close",
             C_OVERLAY1_CSS,
+            false,
         );
         self.hit_zones.push(HitZone::new(
             x + panel_w - 70.0,
@@ -959,22 +984,24 @@ impl StationInner {
         let value = &target.value;
         let detail = &target.detail;
         let selected = self.selected_id.as_deref() == Some(id);
-        self.round_rect(
+        let hovered = self
+            .hover_xy
+            .is_some_and(|(hx, hy)| hx >= x && hx <= x + w && hy >= y && hy <= y + h);
+        self.glass_panel(
             x,
             y,
             w,
             h,
-            6.0,
+            8.0,
+            hex_color(color).unwrap_or(C_OVERLAY1),
             if selected {
-                "rgba(30,30,46,0.90)"
+                1.7
+            } else if hovered {
+                1.2
             } else {
-                "rgba(17,17,27,0.68)"
+                0.7
             },
-            if selected {
-                color
-            } else {
-                "rgba(69,71,90,0.70)"
-            },
+            if selected { 1.1 } else { 0.85 },
         );
         self.hud.set_fill(color);
         self.hud
@@ -1295,8 +1322,9 @@ impl StationInner {
     }
 
     pub(crate) fn draw_corners(&self, w: f32, h: f32) {
-        let c = "rgba(69,71,90,0.8)";
-        self.hud.set_stroke(c);
+        let a = self.mood.glass();
+        self.hud
+            .set_stroke(&css_rgba(C_LAVENDER.with_alpha(0.34 * a).into()));
         let len = 26.0;
         for (x, y, sx, sy) in [
             (11.0, 50.0, 1.0, 1.0),
@@ -1312,12 +1340,19 @@ impl StationInner {
     pub(crate) fn draw_compass(&self, w: f32, h: f32) {
         let cx = w - 71.0;
         let cy = h - 33.0;
-        self.hud.set_stroke("rgba(69,71,90,0.9)");
+        // Small glass disc so the dial reads over any scene behind it.
         self.hud.ctx.begin_path();
         let _ = self
             .hud
             .ctx
             .arc(cx as f64, cy as f64, 18.0, 0.0, std::f64::consts::TAU);
+        self.hud.set_fill("rgba(13,14,24,0.55)");
+        self.hud.ctx.fill();
+        self.hud.set_stroke(&css_rgba(
+            C_LAVENDER
+                .with_alpha(0.40 * self.mood.glass())
+                .into(),
+        ));
         self.hud.ctx.stroke();
         let angle = -self.yaw as f64;
         self.hud.set_stroke(C_BLUE_CSS);
@@ -1365,27 +1400,69 @@ impl StationInner {
             h,
             label,
             if active { C_BLUE_CSS } else { C_OVERLAY1_CSS },
+            active,
         );
         self.hit_zones.push(HitZone::new(x, y, w, h, action));
     }
 
-    pub(crate) fn pill_at(&self, x: f32, y: f32, w: f32, h: f32, label: &str, color: &str) {
-        self.round_rect(x, y, w, h, 4.0, "rgba(49,50,68,0.45)", color);
-        self.text(label, x + 8.0, y + h * 0.65, 10.0, color, "bold");
-    }
-
+    /// Capsule pill with the glass treatment. `active` (selected) and
+    /// hovered pills are lit from within: an accent gradient swelling from
+    /// the capsule's middle plus a brighter luminous border.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn round_rect(
+    pub(crate) fn pill_at(
         &self,
         x: f32,
         y: f32,
         w: f32,
         h: f32,
-        r: f32,
-        fill: &str,
-        stroke: &str,
+        label: &str,
+        color: &str,
+        active: bool,
     ) {
         let ctx = &self.hud.ctx;
+        let a = self.mood.glass();
+        let accent = hex_color(color).unwrap_or(C_OVERLAY1);
+        let hovered = self
+            .hover_xy
+            .is_some_and(|(hx, hy)| hx >= x && hx <= x + w && hy >= y && hy <= y + h);
+        let r = (h * 0.5).min(11.0);
+        // Dark translucent capsule base.
+        self.rounded_path(x, y, w, h, r);
+        let base = ctx.create_linear_gradient(x as f64, y as f64, x as f64, (y + h) as f64);
+        let _ = base.add_color_stop(0.0, &css_rgba(Color::rgb(42, 44, 66).with_alpha(0.52).into()));
+        let _ = base.add_color_stop(1.0, &css_rgba(Color::rgb(13, 14, 24).with_alpha(0.68).into()));
+        ctx.set_fill_style_canvas_gradient(&base);
+        self.hud.note_fill_unknown();
+        ctx.fill();
+        if active || hovered {
+            let lit = (if active { 0.30 } else { 0.20 }) * a;
+            let inner = ctx.create_linear_gradient(x as f64, y as f64, x as f64, (y + h) as f64);
+            let _ = inner.add_color_stop(0.0, &css_rgba(accent.with_alpha(lit * 0.35).into()));
+            let _ = inner.add_color_stop(0.5, &css_rgba(accent.with_alpha(lit).into()));
+            let _ = inner.add_color_stop(1.0, &css_rgba(accent.with_alpha(lit * 0.45).into()));
+            ctx.set_fill_style_canvas_gradient(&inner);
+            ctx.fill();
+        }
+        // Gentle top highlight, then the luminous border.
+        self.hud.set_stroke(&css_rgba([0.93, 0.95, 1.0, 0.07 * a]));
+        self.line(x + r, y + 1.0, x + w - r, y + 1.0);
+        let border = if active {
+            0.85
+        } else if hovered {
+            0.62
+        } else {
+            0.38
+        } * a;
+        self.rounded_path(x, y, w, h, r);
+        self.hud.set_stroke(&css_rgba(accent.with_alpha(border).into()));
+        ctx.stroke();
+        self.text(label, x + 8.0, y + h * 0.65, 10.0, color, "bold");
+    }
+
+    /// Trace a rounded-rect path on the HUD context (no fill/stroke).
+    pub(crate) fn rounded_path(&self, x: f32, y: f32, w: f32, h: f32, r: f32) {
+        let ctx = &self.hud.ctx;
+        let r = r.min(w * 0.5).min(h * 0.5).max(0.0);
         ctx.begin_path();
         ctx.move_to((x + r) as f64, y as f64);
         ctx.line_to((x + w - r) as f64, y as f64);
@@ -1402,10 +1479,84 @@ impl StationInner {
         ctx.line_to(x as f64, (y + r) as f64);
         ctx.quadratic_curve_to(x as f64, y as f64, (x + r) as f64, y as f64);
         ctx.close_path();
-        self.hud.set_fill(fill);
+    }
+
+    /// Frosted-glass panel, canvas-native: a soft outer shadow, layered
+    /// translucent body gradient, a top-edge specular sheen, a faint inner
+    /// highlight, and a 1px luminous border with corner glow. Everything is
+    /// plain gradient/alpha layering — no `ctx.filter` blur, which would be
+    /// far too slow to repaint per frame.
+    ///
+    /// `emphasis` scales the accent (border/corner) luminosity — ~1.0 for
+    /// resting panels, higher for selected/featured ones. `tint` scales the
+    /// body opacity — 1.0 for solid panels, low values for see-through
+    /// surfaces that must not hide the 3D scene behind them. The calm mood
+    /// additionally dims all accents via [`Mood::glass`].
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn glass_panel(
+        &self,
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        r: f32,
+        accent: Color,
+        emphasis: f32,
+        tint: f32,
+    ) {
+        let ctx = &self.hud.ctx;
+        let a = self.mood.glass();
+        // Soft outer shadow: one slightly enlarged, downward-biased dark
+        // fill fakes a blurred drop shadow.
+        self.rounded_path(x - 2.0, y - 1.0, w + 4.0, h + 5.0, r + 3.0);
+        self.hud.set_fill("rgba(2,3,9,0.30)");
         ctx.fill();
-        self.hud.set_stroke(stroke);
+        // Body: deep dark vertical gradient (lighter up top, denser below).
+        self.rounded_path(x, y, w, h, r);
+        let body = ctx.create_linear_gradient(x as f64, y as f64, x as f64, (y + h) as f64);
+        let _ = body.add_color_stop(0.0, &css_rgba(Color::rgb(38, 40, 60).with_alpha(0.62 * tint).into()));
+        let _ = body.add_color_stop(0.45, &css_rgba(Color::rgb(21, 22, 34).with_alpha(0.74 * tint).into()));
+        let _ = body.add_color_stop(1.0, &css_rgba(Color::rgb(12, 12, 20).with_alpha(0.85 * tint).into()));
+        ctx.set_fill_style_canvas_gradient(&body);
+        self.hud.note_fill_unknown();
+        ctx.fill();
+        // Top-edge specular sheen; the body path is still current.
+        let sheen_h = (h * 0.42).clamp(8.0, 30.0);
+        let sheen = ctx.create_linear_gradient(x as f64, y as f64, x as f64, (y + sheen_h) as f64);
+        let _ = sheen.add_color_stop(0.0, &css_rgba([0.92, 0.95, 1.0, 0.10 * a]));
+        let _ = sheen.add_color_stop(1.0, "rgba(235,242,255,0)");
+        ctx.set_fill_style_canvas_gradient(&sheen);
+        ctx.fill();
+        // Gentle inner highlight stroke, inset 1px.
+        self.rounded_path(
+            x + 1.0,
+            y + 1.0,
+            (w - 2.0).max(1.0),
+            (h - 2.0).max(1.0),
+            (r - 1.0).max(1.5),
+        );
+        self.hud.set_stroke(&css_rgba([0.93, 0.95, 1.0, 0.05 * a]));
         ctx.stroke();
+        // 1px luminous border.
+        let border = ((0.26 + 0.26 * emphasis) * a).min(0.92);
+        self.rounded_path(x, y, w, h, r);
+        self.hud.set_stroke(&css_rgba(accent.with_alpha(border).into()));
+        ctx.stroke();
+        // Corner glow: brighter quarter-arcs hugging each rounded corner.
+        let glow = (0.55 * emphasis * a).min(0.95);
+        self.hud.set_stroke(&css_rgba(accent.with_alpha(glow).into()));
+        let cr = r.max(2.0).min(w * 0.5).min(h * 0.5) as f64;
+        let half_pi = std::f64::consts::FRAC_PI_2;
+        for (cx, cy, start) in [
+            (x + cr as f32, y + cr as f32, std::f64::consts::PI),
+            (x + w - cr as f32, y + cr as f32, 1.5 * std::f64::consts::PI),
+            (x + w - cr as f32, y + h - cr as f32, 0.0),
+            (x + cr as f32, y + h - cr as f32, half_pi),
+        ] {
+            ctx.begin_path();
+            let _ = ctx.arc(cx as f64, cy as f64, cr, start, start + half_pi);
+            ctx.stroke();
+        }
     }
 
     pub(crate) fn text(&self, text: &str, x: f32, y: f32, px: f32, color: &str, weight: &str) {

@@ -25,14 +25,27 @@ impl StationInner {
         let aspect = self.width as f32 / self.height.max(1) as f32;
         let fov_deg = self.fov_deg;
         let density = self.density;
+        let camera_distance = self.distance;
 
-        let mut project = move |p: Vec3| camera.project(p, aspect, fov_deg);
+        // Projector used by every scene element: NDC position plus a
+        // depth-cued brightness multiplier (nearer geometry draws brighter).
+        let mut project = move |p: Vec3| {
+            camera
+                .project_depth(p, aspect, fov_deg)
+                .map(|(ndc, z)| (ndc, depth_alpha(z, camera_distance)))
+        };
 
         let star_alpha = self.mood.starfield_alpha();
-        for star in self.starfield.iter().step_by(self.mood.starfield_stride()) {
-            if let Some(p) = project(*star) {
+        for (idx, star) in self
+            .starfield
+            .iter()
+            .enumerate()
+            .step_by(self.mood.starfield_stride())
+        {
+            if let Some((p, cue)) = project(*star) {
                 let s = 0.0045 * density;
-                frame.add_quad_ndc(p.x, p.y, s, [0.35, 0.36, 0.44, star_alpha]);
+                let alpha = star_alpha * cue.min(1.0) * star_twinkle(anim_ms, idx);
+                frame.add_quad_ndc(p.x, p.y, s, [0.35, 0.36, 0.44, alpha]);
             }
         }
 
@@ -91,13 +104,16 @@ impl StationInner {
             }
             let lifted =
                 particle.start.lerp(particle.end, t) + Vec3::new(0.0, (t * PI).sin() * 0.6, 0.0);
-            if let Some(p) = project(lifted) {
+            if let Some((p, cue)) = project(lifted) {
                 let size = (0.026 * (1.0 - t) + 0.006) * density;
                 frame.add_quad_ndc(
                     p.x,
                     p.y,
                     size,
-                    particle.color.with_alpha(0.88 * (1.0 - t)).into(),
+                    particle
+                        .color
+                        .with_alpha((0.88 * (1.0 - t) * cue).min(1.0))
+                        .into(),
                 );
             }
             true
@@ -109,7 +125,7 @@ impl StationInner {
     pub(crate) fn add_grid(
         &self,
         frame: &mut GpuFrame,
-        project: &mut impl FnMut(Vec3) -> Option<Vec2>,
+        project: &mut impl FnMut(Vec3) -> Option<(Vec2, f32)>,
     ) {
         let grid = 9;
         for i in -grid..=grid {
@@ -133,19 +149,22 @@ impl StationInner {
     pub(crate) fn add_operator(
         &self,
         frame: &mut GpuFrame,
-        project: &mut impl FnMut(Vec3) -> Option<Vec2>,
+        project: &mut impl FnMut(Vec3) -> Option<(Vec2, f32)>,
         time_ms: f64,
     ) {
         let pos = self.layout_cache.get("op").copied().unwrap_or(Vec3::ZERO);
         let spin = time_ms as f32 * 0.00032 * self.motion;
         let glow = self.mood.glow();
         frame.add_wire_octa(project, pos, 0.48, spin, C_BLUE.with_alpha(0.95));
-        frame.add_ring(
+        // The operator core is the scene's anchor: give its inner ring the
+        // cheap two-pass glow (thick faint quad under a thin bright line).
+        frame.add_glow_ring(
             project,
             pos,
             0.82,
             C_SAPPHIRE.with_alpha(0.55 * glow),
             Plane::XZ,
+            GLOW_WIDTH,
         );
         frame.add_ring(
             project,
@@ -154,7 +173,10 @@ impl StationInner {
             C_BLUE.with_alpha(0.18 * glow),
             Plane::XZ,
         );
-        if let Some(p) = project(pos) {
+        if self.selected_id.as_deref() == Some("op") {
+            self.add_selection_halo(frame, project, pos, 1.32);
+        }
+        if let Some((p, _)) = project(pos) {
             frame.projected_nodes.push(ProjectedNode::new(
                 "op",
                 NodeKind::Operator,
@@ -164,12 +186,32 @@ impl StationInner {
         }
     }
 
+    /// Selection halo: a glowing ring around whichever node is selected.
+    /// Drawn from `selected_id` every frame, so `select_by_id(None)` (or
+    /// Escape / close) clears it on the next present.
+    pub(crate) fn add_selection_halo(
+        &self,
+        frame: &mut GpuFrame,
+        project: &mut impl FnMut(Vec3) -> Option<(Vec2, f32)>,
+        pos: Vec3,
+        radius: f32,
+    ) {
+        frame.add_glow_ring(
+            project,
+            pos,
+            radius,
+            C_BLUE.with_alpha(0.88),
+            Plane::XY,
+            GLOW_WIDTH * 1.4,
+        );
+    }
+
     pub(crate) fn add_host(
         &self,
         frame: &mut GpuFrame,
         host: &StationHost,
         pos: Vec3,
-        project: &mut impl FnMut(Vec3) -> Option<Vec2>,
+        project: &mut impl FnMut(Vec3) -> Option<(Vec2, f32)>,
         time_ms: f64,
     ) {
         let id = format!("host:{}", host.id);
@@ -189,7 +231,10 @@ impl StationInner {
             C_PEACH.with_alpha(0.28 * self.mood.glow()),
             Plane::XZ,
         );
-        if let Some(p) = project(pos) {
+        if self.selected_id.as_deref() == Some(&id) {
+            self.add_selection_halo(frame, project, pos, 0.94);
+        }
+        if let Some((p, _)) = project(pos) {
             frame.projected_nodes.push(ProjectedNode::new(
                 &id,
                 NodeKind::Host,
@@ -204,7 +249,7 @@ impl StationInner {
         frame: &mut GpuFrame,
         agent: &StationAgent,
         pos: Vec3,
-        project: &mut impl FnMut(Vec3) -> Option<Vec2>,
+        project: &mut impl FnMut(Vec3) -> Option<(Vec2, f32)>,
         time_ms: f64,
     ) {
         let role = role_color(&agent.role);
@@ -239,23 +284,25 @@ impl StationInner {
             );
         }
         if agent.needs_approval {
-            frame.add_ring(
+            // Approval requests must read from across the room: glow pass.
+            frame.add_glow_ring(
                 project,
                 pos,
                 0.84 + (time_ms as f32 * 0.006).sin() * 0.07 * self.mood.pulse(),
                 C_YELLOW.with_alpha(0.58),
                 Plane::XY,
+                GLOW_WIDTH,
             );
         }
         if self.selected_id.as_deref() == Some(&agent.id) {
-            frame.add_ring(project, pos, 0.96, C_BLUE.with_alpha(0.84), Plane::XY);
+            self.add_selection_halo(frame, project, pos, 0.96);
         }
         if let Some(parent_id) = agent.parent_id.as_ref().filter(|s| !s.is_empty()) {
             if let Some(parent) = self.layout_cache.get(parent_id).copied() {
                 frame.add_line_projected(project, parent, pos, C_MAUVE.with_alpha(0.5));
             }
         }
-        if let Some(p) = project(pos) {
+        if let Some((p, _)) = project(pos) {
             frame.projected_nodes.push(ProjectedNode::new(
                 &agent.id,
                 NodeKind::Agent,
@@ -383,6 +430,15 @@ impl Mood {
         match self {
             Self::Cockpit => 1.0,
             Self::Calm => 0.65,
+        }
+    }
+
+    /// Alpha scale for the HUD glass chrome (borders, sheen, corner glow);
+    /// calm dims the accents along with the scene.
+    pub(crate) fn glass(self) -> f32 {
+        match self {
+            Self::Cockpit => 1.0,
+            Self::Calm => 0.6,
         }
     }
 
@@ -550,7 +606,15 @@ impl Camera {
         }
     }
 
-    pub(crate) fn project(&self, world: Vec3, aspect: f32, fov_deg: f32) -> Option<Vec2> {
+    /// Project a world position to NDC, also returning the view-space depth
+    /// so callers can depth-cue brightness. Culls behind-camera and
+    /// far-outside-frustum points.
+    pub(crate) fn project_depth(
+        &self,
+        world: Vec3,
+        aspect: f32,
+        fov_deg: f32,
+    ) -> Option<(Vec2, f32)> {
         let p = world - self.eye;
         let z = p.dot(self.forward);
         if z <= 0.12 {
@@ -564,8 +628,27 @@ impl Camera {
         if ndc_x.abs() > 2.2 || ndc_y.abs() > 2.2 {
             return None;
         }
-        Some(Vec2::new(ndc_x, ndc_y))
+        Some((Vec2::new(ndc_x, ndc_y), z))
     }
+}
+
+/// Half-width (in NDC) of the faint thick pass behind glowing lines.
+pub(crate) const GLOW_WIDTH: f32 = 0.007;
+
+/// Depth-cued brightness: geometry nearer than the orbit center draws a
+/// little brighter, farther a little dimmer. `z` is view-space depth and
+/// `camera_distance` the orbit radius, so the scene center sits at 1.0.
+pub(crate) fn depth_alpha(z: f32, camera_distance: f32) -> f32 {
+    (1.0 + (camera_distance - z) * 0.04).clamp(0.6, 1.18)
+}
+
+/// Gentle per-star twinkle, frozen (1.0) whenever ambient motion is off —
+/// `anim_ms` is already zeroed at motion 0, so a parked scene stays still.
+pub(crate) fn star_twinkle(anim_ms: f64, idx: usize) -> f32 {
+    if anim_ms == 0.0 {
+        return 1.0;
+    }
+    0.84 + 0.16 * (anim_ms as f32 * 0.0011 + idx as f32 * 2.39).sin()
 }
 
 pub(crate) fn rotate_y(v: Vec3, a: f32) -> Vec3 {
@@ -754,12 +837,36 @@ mod tests {
     fn camera_projects_target_near_center_and_culls_behind() {
         let eye = Vec3::new(0.0, 0.0, 10.0);
         let camera = Camera::look_at(eye, Vec3::ZERO, Vec3::Y);
-        let center = camera.project(Vec3::ZERO, 16.0 / 9.0, 55.0).unwrap();
+        let (center, z) = camera.project_depth(Vec3::ZERO, 16.0 / 9.0, 55.0).unwrap();
         assert!(center.x.abs() < 1e-5 && center.y.abs() < 1e-5);
+        // View-space depth along the forward axis.
+        assert!((z - 10.0).abs() < 1e-5);
         // A point behind the camera must be culled.
         assert!(camera
-            .project(Vec3::new(0.0, 0.0, 20.0), 16.0 / 9.0, 55.0)
+            .project_depth(Vec3::new(0.0, 0.0, 20.0), 16.0 / 9.0, 55.0)
             .is_none());
+    }
+
+    #[test]
+    fn depth_alpha_brightens_near_and_dims_far() {
+        let center = depth_alpha(11.0, 11.0);
+        assert!((center - 1.0).abs() < 1e-6);
+        assert!(depth_alpha(5.0, 11.0) > center);
+        assert!(depth_alpha(17.0, 11.0) < center);
+        // Extremes clamp instead of inverting or blowing out.
+        assert_eq!(depth_alpha(0.2, 11.0), 1.18);
+        assert_eq!(depth_alpha(40.0, 11.0), 0.6);
+    }
+
+    #[test]
+    fn star_twinkle_freezes_without_motion_and_stays_subtle() {
+        assert_eq!(star_twinkle(0.0, 7), 1.0);
+        for idx in 0..32 {
+            let t = star_twinkle(1234.5, idx);
+            assert!((0.68..=1.0).contains(&t), "idx {idx} -> {t}");
+        }
+        // Different stars twinkle out of phase.
+        assert_ne!(star_twinkle(1234.5, 0), star_twinkle(1234.5, 1));
     }
 
     #[test]
@@ -799,6 +906,8 @@ mod tests {
         assert!(Mood::Calm.starfield_alpha() < Mood::Cockpit.starfield_alpha());
         assert!(Mood::Calm.pulse() < Mood::Cockpit.pulse());
         assert!(Mood::Calm.glow() < Mood::Cockpit.glow());
+        // Calm also dims the HUD glass chrome, not just the scene.
+        assert!(Mood::Calm.glass() < Mood::Cockpit.glass());
         assert_eq!(Mood::Calm.starfield_stride(), 2);
         assert_eq!(
             LayoutName::from_str("constellation"),

@@ -222,6 +222,9 @@ struct StationInner {
     pinch_zoom: Option<PinchZoom>,
     ar_x: f32,
     ar_y: f32,
+    /// Last pointer position in CSS px; drives the pills' / tiles'
+    /// lit-from-within hover state. Cleared when the pointer leaves.
+    hover_xy: Option<(f32, f32)>,
     hit_zones: Vec<HitZone>,
     action_callback: Option<js_sys::Function>,
     /// World positions per node id, rebuilt when the snapshot or layout
@@ -302,6 +305,7 @@ impl StationInner {
             pinch_zoom: None,
             ar_x: 0.0,
             ar_y: 0.0,
+            hover_xy: None,
             hit_zones: Vec::new(),
             action_callback: None,
             layout_cache: HashMap::new(),

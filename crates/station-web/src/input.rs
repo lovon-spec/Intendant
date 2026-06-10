@@ -66,6 +66,7 @@ impl StationInner {
             {
                 let mut s = move_inner.borrow_mut();
                 let (x, y) = s.event_xy(e.client_x() as f64, e.client_y() as f64);
+                s.hover_xy = Some((x, y));
                 if s.active_pointers.contains_key(&e.pointer_id()) {
                     s.active_pointers.insert(e.pointer_id(), Vec2::new(x, y));
                 }
@@ -140,6 +141,21 @@ impl StationInner {
         target.add_event_listener_with_callback("pointerup", up.as_ref().unchecked_ref())?;
         target.add_event_listener_with_callback("pointercancel", up.as_ref().unchecked_ref())?;
         inner.borrow_mut()._events.push(up);
+
+        // Leaving the canvas must drop the hover-lit state on pills/tiles.
+        let leave_inner = inner.clone();
+        let leave = Closure::wrap(Box::new(move |_event: Event| {
+            {
+                let mut s = leave_inner.borrow_mut();
+                if s.hover_xy.take().is_none() {
+                    return;
+                }
+                s.mark_input();
+            }
+            StationInner::schedule_frame(&leave_inner);
+        }) as Box<dyn FnMut(_)>);
+        target.add_event_listener_with_callback("pointerleave", leave.as_ref().unchecked_ref())?;
+        inner.borrow_mut()._events.push(leave);
 
         let wheel_inner = inner.clone();
         let wheel = Closure::wrap(Box::new(move |event: Event| {

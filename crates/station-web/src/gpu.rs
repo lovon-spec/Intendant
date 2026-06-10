@@ -368,16 +368,46 @@ impl GpuFrame {
         });
     }
 
+    /// Project and append one line segment. The projector returns the NDC
+    /// position plus a depth-cue brightness multiplier; the segment's alpha
+    /// is scaled by the endpoints' mean so nearer edges draw brighter.
     pub(crate) fn add_line_projected(
         &mut self,
-        project: &mut impl FnMut(Vec3) -> Option<Vec2>,
+        project: &mut impl FnMut(Vec3) -> Option<(Vec2, f32)>,
         a: Vec3,
         b: Vec3,
         color: Color,
     ) {
-        if let (Some(pa), Some(pb)) = (project(a), project(b)) {
-            self.add_line_ndc(pa, pb, color);
+        if let (Some((pa, ca)), Some((pb, cb))) = (project(a), project(b)) {
+            let cue = (ca + cb) * 0.5;
+            self.add_line_ndc(pa, pb, color.with_alpha((color.a * cue).min(1.0)));
         }
+    }
+
+    /// Two-pass glow segment: a thick low-alpha quad under a thin bright
+    /// line. Same pipelines, just extra vertices — far cheaper than any
+    /// post-process blur. `width` is the quad half-width in NDC.
+    pub(crate) fn add_glow_line_ndc(&mut self, a: Vec2, b: Vec2, color: Color, width: f32) {
+        let dx = b.x - a.x;
+        let dy = b.y - a.y;
+        let len = (dx * dx + dy * dy).sqrt();
+        if len > 1e-6 {
+            let px = -dy / len * width;
+            let py = dx / len * width;
+            let halo: [f32; 4] = color.with_alpha(color.a * 0.17).into();
+            let quad = [
+                [a.x - px, a.y - py],
+                [b.x - px, b.y - py],
+                [b.x + px, b.y + py],
+                [a.x - px, a.y - py],
+                [b.x + px, b.y + py],
+                [a.x + px, a.y + py],
+            ];
+            for pos in quad {
+                self.tri_vertices.push(GpuVertex { pos, color: halo });
+            }
+        }
+        self.add_line_ndc(a, b, color);
     }
 
     pub(crate) fn add_quad_ndc(&mut self, x: f32, y: f32, size: f32, color: [f32; 4]) {
@@ -397,11 +427,38 @@ impl GpuFrame {
 
     pub(crate) fn add_ring(
         &mut self,
-        project: &mut impl FnMut(Vec3) -> Option<Vec2>,
+        project: &mut impl FnMut(Vec3) -> Option<(Vec2, f32)>,
         center: Vec3,
         radius: f32,
         color: Color,
         plane: Plane,
+    ) {
+        self.ring_inner(project, center, radius, color, plane, None);
+    }
+
+    /// Ring with the two-pass glow treatment on every segment.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn add_glow_ring(
+        &mut self,
+        project: &mut impl FnMut(Vec3) -> Option<(Vec2, f32)>,
+        center: Vec3,
+        radius: f32,
+        color: Color,
+        plane: Plane,
+        width: f32,
+    ) {
+        self.ring_inner(project, center, radius, color, plane, Some(width));
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn ring_inner(
+        &mut self,
+        project: &mut impl FnMut(Vec3) -> Option<(Vec2, f32)>,
+        center: Vec3,
+        radius: f32,
+        color: Color,
+        plane: Plane,
+        glow_width: Option<f32>,
     ) {
         let seg = 64;
         let mut prev = None;
@@ -414,7 +471,20 @@ impl GpuFrame {
             };
             let p = center + local;
             if let Some(prev_p) = prev {
-                self.add_line_projected(project, prev_p, p, color);
+                match glow_width {
+                    Some(width) => {
+                        if let (Some((pa, ca)), Some((pb, cb))) = (project(prev_p), project(p)) {
+                            let cue = (ca + cb) * 0.5;
+                            self.add_glow_line_ndc(
+                                pa,
+                                pb,
+                                color.with_alpha((color.a * cue).min(1.0)),
+                                width,
+                            );
+                        }
+                    }
+                    None => self.add_line_projected(project, prev_p, p, color),
+                }
             }
             prev = Some(p);
         }
@@ -422,7 +492,7 @@ impl GpuFrame {
 
     pub(crate) fn add_wire_octa(
         &mut self,
-        project: &mut impl FnMut(Vec3) -> Option<Vec2>,
+        project: &mut impl FnMut(Vec3) -> Option<(Vec2, f32)>,
         center: Vec3,
         scale: f32,
         spin: f32,
@@ -455,7 +525,7 @@ impl GpuFrame {
 
     pub(crate) fn add_wire_tetra(
         &mut self,
-        project: &mut impl FnMut(Vec3) -> Option<Vec2>,
+        project: &mut impl FnMut(Vec3) -> Option<(Vec2, f32)>,
         center: Vec3,
         scale: f32,
         spin: f32,
@@ -473,7 +543,7 @@ impl GpuFrame {
 
     pub(crate) fn add_wire_icosa(
         &mut self,
-        project: &mut impl FnMut(Vec3) -> Option<Vec2>,
+        project: &mut impl FnMut(Vec3) -> Option<(Vec2, f32)>,
         center: Vec3,
         scale: f32,
         spin: f32,
@@ -531,7 +601,7 @@ impl GpuFrame {
 
     pub(crate) fn add_wire_hex(
         &mut self,
-        project: &mut impl FnMut(Vec3) -> Option<Vec2>,
+        project: &mut impl FnMut(Vec3) -> Option<(Vec2, f32)>,
         center: Vec3,
         radius: f32,
         height: f32,
@@ -561,7 +631,7 @@ impl GpuFrame {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn add_edges(
         &mut self,
-        project: &mut impl FnMut(Vec3) -> Option<Vec2>,
+        project: &mut impl FnMut(Vec3) -> Option<(Vec2, f32)>,
         center: Vec3,
         scale: f32,
         spin: f32,
@@ -599,15 +669,27 @@ mod tests {
         frame.add_line_ndc(Vec2::new(0.0, 0.0), Vec2::new(1.0, 1.0), color);
         assert_eq!(frame.line_vertices.len(), 2);
         // A projector that culls everything adds nothing.
-        let mut cull = |_: Vec3| -> Option<Vec2> { None };
+        let mut cull = |_: Vec3| -> Option<(Vec2, f32)> { None };
         frame.add_line_projected(&mut cull, Vec3::ZERO, Vec3::Y, color);
         assert_eq!(frame.line_vertices.len(), 2);
     }
 
     #[test]
+    fn projected_lines_apply_depth_cue_to_alpha() {
+        let mut frame = GpuFrame::default();
+        let mut dim = |v: Vec3| Some((Vec2::new(v.x, v.y), 0.5));
+        frame.add_line_projected(&mut dim, Vec3::ZERO, Vec3::Y, Color::rgb(255, 0, 0));
+        assert!((frame.line_vertices[0].color[3] - 0.5).abs() < 1e-6);
+        // A cue above 1.0 brightens but never exceeds full alpha.
+        let mut hot = |v: Vec3| Some((Vec2::new(v.x, v.y), 1.5));
+        frame.add_line_projected(&mut hot, Vec3::ZERO, Vec3::Y, Color::rgb(255, 0, 0));
+        assert_eq!(frame.line_vertices[2].color[3], 1.0);
+    }
+
+    #[test]
     fn ring_segments_share_endpoints() {
         let mut frame = GpuFrame::default();
-        let mut identity = |v: Vec3| Some(Vec2::new(v.x, v.y));
+        let mut identity = |v: Vec3| Some((Vec2::new(v.x, v.y), 1.0));
         frame.add_ring(
             &mut identity,
             Vec3::ZERO,
@@ -617,6 +699,33 @@ mod tests {
         );
         // 64 segments, two vertices each.
         assert_eq!(frame.line_vertices.len(), 128);
+    }
+
+    #[test]
+    fn glow_lines_add_quad_plus_bright_core() {
+        let mut frame = GpuFrame::default();
+        let color = Color::rgb(0, 0, 255);
+        frame.add_glow_line_ndc(Vec2::new(0.0, 0.0), Vec2::new(1.0, 0.0), color, 0.01);
+        assert_eq!(frame.tri_vertices.len(), 6, "thick halo quad");
+        assert_eq!(frame.line_vertices.len(), 2, "thin bright core");
+        assert!(frame.tri_vertices[0].color[3] < frame.line_vertices[0].color[3]);
+        // Degenerate (zero-length) glow segments skip the quad, not crash.
+        frame.add_glow_line_ndc(Vec2::new(0.5, 0.5), Vec2::new(0.5, 0.5), color, 0.01);
+        assert_eq!(frame.tri_vertices.len(), 6);
+        assert_eq!(frame.line_vertices.len(), 4);
+
+        let mut glow_ring = GpuFrame::default();
+        let mut identity = |v: Vec3| Some((Vec2::new(v.x, v.y), 1.0));
+        glow_ring.add_glow_ring(
+            &mut identity,
+            Vec3::ZERO,
+            1.0,
+            color,
+            Plane::XY,
+            0.01,
+        );
+        assert_eq!(glow_ring.line_vertices.len(), 128);
+        assert_eq!(glow_ring.tri_vertices.len(), 64 * 6);
     }
 
     #[test]
