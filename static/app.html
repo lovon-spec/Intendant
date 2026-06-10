@@ -11454,6 +11454,12 @@ function handleStationAction(action) {
     stationHandleActivityAction(action);
   } else if (action.type === 'controls_action') {
     stationHandleControlsAction(action);
+  } else if (action.type === 'view_set') {
+    // Canvas View-panel control (mood pill or slider release): persist the
+    // draft and re-apply through set_visuals. The renderer already shows
+    // the scrubbed value; this round-trip makes it durable.
+    stationViewSet(String(action.key || ''), action.value);
+    return;
   } else if (action.type === 'changes_action') {
     stationHandleChangesAction(action);
   } else if (action.type === 'navigate') {

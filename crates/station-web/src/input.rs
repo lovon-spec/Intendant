@@ -37,20 +37,39 @@ impl StationInner {
                     s.pointer_down = None;
                     s.set_cursor("drag");
                 } else {
-                    let pending_action = s.hit_action_at(x, y);
-                    s.set_cursor(if pending_action.is_some() {
-                        "pointer"
+                    // A press on a slider track starts a scrub: jump the
+                    // value to the press point and keep tracking the
+                    // pointer; the final value is emitted on pointer-up.
+                    let slider = s.slider_at(x, y);
+                    if let Some(slider) = slider {
+                        s.apply_slider(slider, x);
+                        s.set_cursor("pointer");
+                        s.pointer_down = Some(PointerDrag {
+                            x,
+                            y,
+                            last_x: x,
+                            last_y: y,
+                            moved: false,
+                            pending_action: None,
+                            slider: Some(slider),
+                        });
                     } else {
-                        "drag"
-                    });
-                    s.pointer_down = Some(PointerDrag {
-                        x,
-                        y,
-                        last_x: x,
-                        last_y: y,
-                        moved: false,
-                        pending_action,
-                    });
+                        let pending_action = s.hit_action_at(x, y);
+                        s.set_cursor(if pending_action.is_some() {
+                            "pointer"
+                        } else {
+                            "drag"
+                        });
+                        s.pointer_down = Some(PointerDrag {
+                            x,
+                            y,
+                            last_x: x,
+                            last_y: y,
+                            moved: false,
+                            pending_action,
+                            slider: None,
+                        });
+                    }
                 }
             }
             StationInner::schedule_frame(&down_inner);
@@ -77,10 +96,25 @@ impl StationInner {
                 if s.active_pointers.contains_key(&e.pointer_id()) {
                     s.active_pointers.insert(e.pointer_id(), Vec2::new(x, y));
                 }
+                // Pointer-tilt parallax: without a real device-orientation
+                // source, the pointer position substitutes for tilt so the
+                // AR-strength setting does something on desktops. Gated on
+                // ar_strength so 0 keeps the camera (and repaints) still.
+                if !s.has_device_orientation && s.ar_strength > 0.0 {
+                    let cw = s.css_width().max(1.0);
+                    let ch = s.css_height().max(1.0);
+                    s.ar_x = ((x / cw) * 2.0 - 1.0).clamp(-1.0, 1.0) * 0.6;
+                    s.ar_y = ((y / ch) * 2.0 - 1.0).clamp(-1.0, 1.0) * 0.6;
+                }
+                let active_slider = s.pointer_down.as_ref().and_then(|drag| drag.slider);
                 if s.active_pointers.len() >= 2 {
                     s.apply_pinch();
                     s.mark_input();
                     s.set_cursor("drag");
+                } else if let Some(slider) = active_slider {
+                    s.apply_slider(slider, x);
+                    s.mark_input();
+                    s.set_cursor("pointer");
                 } else if let Some(drag) = s.pointer_down.as_mut() {
                     let dx = x - drag.last_x;
                     let dy = y - drag.last_y;
@@ -126,7 +160,16 @@ impl StationInner {
                     s.pinch_zoom = None;
                 }
                 if let Some(drag) = s.pointer_down.take() {
-                    if let Some(action) = drag.pending_action {
+                    if let Some(slider) = drag.slider {
+                        // Final scrub position, then hand the value to the
+                        // dashboard for persistence + set_visuals re-apply.
+                        s.apply_slider(slider, x);
+                        Some(serde_json::json!({
+                            "type": "view_set",
+                            "key": slider.key.name(),
+                            "value": s.view_slider_value(slider.key),
+                        }))
+                    } else if let Some(action) = drag.pending_action {
                         s.dispatch_hit(action)
                     } else if !drag.moved {
                         s.selected_id = s.pick_node(x, y);
@@ -150,13 +193,18 @@ impl StationInner {
         target.add_event_listener_with_callback("pointercancel", up.as_ref().unchecked_ref())?;
         inner.borrow_mut()._events.push(up);
 
-        // Leaving the canvas must drop the hover-lit state on pills/tiles.
+        // Leaving the canvas must drop the hover-lit state on pills/tiles
+        // (and recentre the pointer-tilt parallax).
         let leave_inner = inner.clone();
         let leave = Closure::wrap(Box::new(move |_event: Event| {
             {
                 let mut s = leave_inner.borrow_mut();
                 if s.hover_xy.take().is_none() {
                     return;
+                }
+                if !s.has_device_orientation {
+                    s.ar_x = 0.0;
+                    s.ar_y = 0.0;
                 }
                 s.hover_zone_rect = None;
                 s.hud_dirty = true;
@@ -225,11 +273,16 @@ impl StationInner {
                 return;
             };
             {
+                // Desktop browsers can fire one all-null event; only a real
+                // reading claims the AR channel (and silences the
+                // pointer-tilt fallback).
+                let (Some(gamma), Some(beta)) = (e.gamma(), e.beta()) else {
+                    return;
+                };
                 let mut s = orientation_inner.borrow_mut();
-                let gamma = e.gamma().unwrap_or(0.0) as f32;
-                let beta = e.beta().unwrap_or(0.0) as f32;
-                s.ar_x = (gamma / 45.0).clamp(-1.0, 1.0);
-                s.ar_y = (beta / 60.0).clamp(-1.0, 1.0);
+                s.has_device_orientation = true;
+                s.ar_x = (gamma as f32 / 45.0).clamp(-1.0, 1.0);
+                s.ar_y = (beta as f32 / 60.0).clamp(-1.0, 1.0);
             }
             StationInner::schedule_frame(&orientation_inner);
         }) as Box<dyn FnMut(_)>);
@@ -315,7 +368,61 @@ impl StationInner {
                     "approval_id": approval_id,
                     "decision": decision,
             })),
+            HitAction::ViewSet { key, value } => {
+                // Instant local feedback; the emitted action persists the
+                // draft and re-applies the same value through set_visuals.
+                if key == "mood" {
+                    self.mood = crate::scene::Mood::from_str(value);
+                    self.targets_dirty = true;
+                    self.hud_dirty = true;
+                }
+                Some(serde_json::json!({
+                        "type": "view_set",
+                        "key": key,
+                        "value": value,
+                }))
+            }
+            // Activating a slider by name (no drag geometry) re-emits its
+            // current value — an idempotent persist, and the way the E2E
+            // driver confirms the wiring without synthesizing a drag.
+            HitAction::ViewSlider { key } => Some(serde_json::json!({
+                    "type": "view_set",
+                    "key": key.name(),
+                    "value": self.view_slider_value(key),
+            })),
         }
+    }
+
+    /// Current value backing a view slider.
+    pub(crate) fn view_slider_value(&self, key: ViewSliderKey) -> f32 {
+        match key {
+            ViewSliderKey::Fov => self.fov_deg,
+            ViewSliderKey::Motion => self.motion,
+            ViewSliderKey::Ar => self.ar_strength,
+            ViewSliderKey::Density => self.density,
+        }
+    }
+
+    /// Apply a scrubbed slider value locally (clamped to the key's range).
+    /// fov/density/mood feed the View target's summary text, so those mark
+    /// the cached system targets dirty too.
+    pub(crate) fn set_view_slider_value(&mut self, key: ViewSliderKey, value: f32) {
+        let (min, max) = key.range();
+        let value = value.clamp(min, max);
+        match key {
+            ViewSliderKey::Fov => self.fov_deg = value,
+            ViewSliderKey::Motion => self.motion = value,
+            ViewSliderKey::Ar => self.ar_strength = value,
+            ViewSliderKey::Density => self.density = value,
+        }
+        self.targets_dirty = true;
+        self.hud_dirty = true;
+    }
+
+    /// Begin or continue a slider scrub at pointer x.
+    pub(crate) fn apply_slider(&mut self, slider: ActiveSlider, x: f32) {
+        let value = slider.key.value_at(x, slider.track_x, slider.track_w);
+        self.set_view_slider_value(slider.key, value);
     }
 
     pub(crate) fn emit_action(callback: Option<js_sys::Function>, action: serde_json::Value) {
@@ -393,6 +500,19 @@ impl StationInner {
             .find(|z| x >= z.x && x <= z.x + z.w && y >= z.y && y <= z.y + z.h)
     }
 
+    /// Slider scrub descriptor when the point sits on a slider track zone.
+    pub(crate) fn slider_at(&self, x: f32, y: f32) -> Option<ActiveSlider> {
+        let zone = self.zone_at(x, y)?;
+        match zone.action {
+            HitAction::ViewSlider { key } => Some(ActiveSlider {
+                key,
+                track_x: zone.x,
+                track_w: zone.w,
+            }),
+            _ => None,
+        }
+    }
+
     /// Map client coordinates into canvas CSS coordinates, reusing a cached
     /// canvas origin so pointermove storms do not force layout. The cache is
     /// dropped on resize, scroll, and tab activation.
@@ -431,6 +551,73 @@ pub(crate) enum HitAction {
         approval_id: String,
         decision: &'static str,
     },
+    /// Discrete view-settings toggle (mood pills). Applied locally for
+    /// instant feedback, then emitted as `{type:'view_set', key, value}` so
+    /// the dashboard persists the draft and re-applies via `set_visuals`.
+    ViewSet {
+        key: &'static str,
+        value: &'static str,
+    },
+    /// Drag-aware view-settings slider track. The owning `HitZone`'s rect
+    /// is the track geometry; pointer x within it maps onto the key's
+    /// range. Scrubbing applies locally per move; the final value is
+    /// emitted as `{type:'view_set', ...}` on pointer-up.
+    ViewSlider { key: ViewSliderKey },
+}
+
+/// The continuously adjustable view settings exposed as slider tracks in
+/// the View focus panel.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum ViewSliderKey {
+    Fov,
+    Motion,
+    Ar,
+    Density,
+}
+
+impl ViewSliderKey {
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::Fov => "fov",
+            Self::Motion => "motion",
+            Self::Ar => "ar",
+            Self::Density => "density",
+        }
+    }
+
+    /// Inclusive value range, matching the clamps in `set_visuals` and the
+    /// dashboard's `stationViewSet`.
+    pub(crate) fn range(self) -> (f32, f32) {
+        match self {
+            Self::Fov => (35.0, 85.0),
+            Self::Motion => (0.0, 2.0),
+            Self::Ar => (0.0, 1.0),
+            Self::Density => (0.5, 1.8),
+        }
+    }
+
+    /// Map a pointer x within a track rect onto the key's value range.
+    pub(crate) fn value_at(self, x: f32, track_x: f32, track_w: f32) -> f32 {
+        let (min, max) = self.range();
+        let t = ((x - track_x) / track_w.max(1.0)).clamp(0.0, 1.0);
+        min + (max - min) * t
+    }
+
+    /// Normalized [0,1] position of a value within the range.
+    pub(crate) fn t_of(self, value: f32) -> f32 {
+        let (min, max) = self.range();
+        ((value - min) / (max - min).max(0.0001)).clamp(0.0, 1.0)
+    }
+}
+
+/// In-flight slider scrub: the track geometry captured at pointer-down so
+/// every subsequent move maps x consistently even when the pointer leaves
+/// the track rect.
+#[derive(Clone, Copy)]
+pub(crate) struct ActiveSlider {
+    pub(crate) key: ViewSliderKey,
+    pub(crate) track_x: f32,
+    pub(crate) track_w: f32,
 }
 
 /// Stable name for a hit zone, used by the agentic introspection API
@@ -462,6 +649,8 @@ pub(crate) fn zone_name(action: &HitAction) -> Option<String> {
                 approval_id
             }
         )),
+        HitAction::ViewSet { key, value } => Some(format!("view:{key}:{value}")),
+        HitAction::ViewSlider { key } => Some(format!("view:{}", key.name())),
         HitAction::Noop => None,
     }
 }
@@ -475,6 +664,8 @@ pub(crate) fn zone_kind(action: &HitAction) -> &'static str {
         HitAction::ActivityAction { .. } => "activity",
         HitAction::ControlsAction { .. } => "controls",
         HitAction::Approval { .. } => "approval",
+        HitAction::ViewSet { .. } => "view-set",
+        HitAction::ViewSlider { .. } => "slider",
         HitAction::Noop => "panel",
     }
 }
@@ -537,6 +728,9 @@ pub(crate) struct PointerDrag {
     pub(crate) last_y: f32,
     pub(crate) moved: bool,
     pub(crate) pending_action: Option<HitAction>,
+    /// Set when the press landed on a slider track: the drag scrubs the
+    /// slider instead of orbiting the camera or arming a click.
+    pub(crate) slider: Option<ActiveSlider>,
 }
 
 #[derive(Clone, Copy)]
@@ -616,6 +810,55 @@ mod tests {
             zone_action_by_name(&zones, "approval:approve:ap-42"),
             Some(HitAction::Approval { decision: "approve", .. })
         ));
+    }
+
+    #[test]
+    fn view_zones_name_sliders_and_toggles() {
+        let slider = HitAction::ViewSlider {
+            key: ViewSliderKey::Fov,
+        };
+        assert_eq!(zone_name(&slider).as_deref(), Some("view:fov"));
+        assert_eq!(zone_kind(&slider), "slider");
+        let toggle = HitAction::ViewSet {
+            key: "mood",
+            value: "calm",
+        };
+        assert_eq!(zone_name(&toggle).as_deref(), Some("view:mood:calm"));
+        assert_eq!(zone_kind(&toggle), "view-set");
+        // View controls live in the focus panel, not the hotspot overlay.
+        let zones = vec![
+            HitZone::new(0.0, 0.0, 100.0, 10.0, slider),
+            HitZone::new(0.0, 20.0, 60.0, 10.0, toggle),
+        ];
+        assert!(hotspot_rects_from_zones(&zones).is_empty());
+        assert!(matches!(
+            zone_action_by_name(&zones, "view:fov"),
+            Some(HitAction::ViewSlider { key: ViewSliderKey::Fov })
+        ));
+    }
+
+    #[test]
+    fn view_slider_keys_map_pointer_x_onto_their_ranges() {
+        for key in [
+            ViewSliderKey::Fov,
+            ViewSliderKey::Motion,
+            ViewSliderKey::Ar,
+            ViewSliderKey::Density,
+        ] {
+            let (min, max) = key.range();
+            assert_eq!(key.value_at(100.0, 100.0, 200.0), min, "{key:?} left edge");
+            assert_eq!(key.value_at(300.0, 100.0, 200.0), max, "{key:?} right edge");
+            let mid = key.value_at(200.0, 100.0, 200.0);
+            assert!(
+                (mid - (min + max) / 2.0).abs() < 1e-4,
+                "{key:?} midpoint: {mid}"
+            );
+            // Out-of-track presses clamp to the range.
+            assert_eq!(key.value_at(0.0, 100.0, 200.0), min);
+            assert_eq!(key.value_at(900.0, 100.0, 200.0), max);
+            // t_of inverts value_at across the range.
+            assert!((key.t_of(mid) - 0.5).abs() < 1e-4);
+        }
     }
 
     #[test]

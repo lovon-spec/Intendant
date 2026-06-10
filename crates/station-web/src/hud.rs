@@ -6,7 +6,7 @@ use std::collections::HashMap;
 
 use web_sys::CanvasRenderingContext2d;
 
-use crate::input::{HitAction, HitZone};
+use crate::input::{HitAction, HitZone, ViewSliderKey};
 use crate::model::activity_retained_count;
 use crate::scene::{ndc_to_screen, LayoutName, Mood, NodeKind, ProjectedNode, Vec2};
 use crate::util::{
@@ -982,6 +982,10 @@ impl StationInner {
             self.draw_host_focus(&host, x, panel_w, activity_lane_y);
             return;
         }
+        if id == "system:view" {
+            self.draw_view_focus(x, panel_w, activity_lane_y);
+            return;
+        }
         if id.starts_with("system:") {
             return;
         }
@@ -1206,6 +1210,126 @@ impl StationInner {
                 },
             ));
         }
+    }
+
+    /// View-settings panel for the system:view node: mood toggle pills plus
+    /// drag-aware fov/motion/AR/density sliders. Scrubs apply live in the
+    /// renderer; the released value is emitted as a `view_set` action that
+    /// the dashboard persists and re-applies through `set_visuals`.
+    fn draw_view_focus(&mut self, x: f32, panel_w: f32, activity_lane_y: f32) {
+        let panel_h = 74.0 + 30.0 + 4.0 * 26.0 + 12.0;
+        let y = (activity_lane_y - panel_h - 12.0).max(58.0);
+        self.focus_panel_frame(x, y, panel_w, panel_h, "View", C_LAVENDER_CSS);
+        self.text(
+            &format!("{} layout", self.layout.label()),
+            x + 96.0,
+            y + 23.0,
+            9.0,
+            C_SUBTEXT0_CSS,
+            "normal",
+        );
+
+        let mut row_y = y + 72.0;
+        self.text("mood", x + 16.0, row_y, 9.0, C_LAVENDER_CSS, "bold");
+        for (idx, mood) in [Mood::Cockpit, Mood::Calm].into_iter().enumerate() {
+            let px = x + 96.0 + idx as f32 * 86.0;
+            let label = mood.label();
+            self.pill_at(
+                px,
+                row_y - 16.0,
+                78.0,
+                23.0,
+                label,
+                if self.mood == mood {
+                    C_LAVENDER_CSS
+                } else {
+                    C_OVERLAY1_CSS
+                },
+                self.mood == mood,
+            );
+            self.hit_zones.push(HitZone::new(
+                px,
+                row_y - 16.0,
+                78.0,
+                23.0,
+                HitAction::ViewSet {
+                    key: "mood",
+                    value: label,
+                },
+            ));
+        }
+        row_y += 30.0;
+
+        let sliders = [
+            (
+                ViewSliderKey::Fov,
+                "fov",
+                format!("{}°", self.fov_deg.round() as i32),
+            ),
+            (ViewSliderKey::Motion, "motion", format!("{:.1}x", self.motion)),
+            (
+                ViewSliderKey::Ar,
+                "ar tilt",
+                format!("{}%", (self.ar_strength * 100.0).round() as i32),
+            ),
+            (
+                ViewSliderKey::Density,
+                "density",
+                format!("{:.1}", self.density),
+            ),
+        ];
+        for (key, label, value_label) in sliders {
+            row_y = self.focus_slider(x, row_y, panel_w, key, label, &value_label);
+        }
+    }
+
+    /// One slider row: label, scrubbable track with fill + knob, value
+    /// readout. The hit zone is exactly the track rect (taller for touch),
+    /// which is also the geometry pointer x maps through.
+    fn focus_slider(
+        &mut self,
+        x: f32,
+        row_y: f32,
+        w: f32,
+        key: ViewSliderKey,
+        label: &str,
+        value_label: &str,
+    ) -> f32 {
+        self.text(label, x + 16.0, row_y, 9.0, C_LAVENDER_CSS, "bold");
+        let track_x = x + 96.0;
+        let track_w = w - 96.0 - 72.0;
+        let t = key.t_of(self.view_slider_value(key));
+        self.hud.set_fill("rgba(49,50,68,0.92)");
+        self.hud
+            .ctx
+            .fill_rect(track_x as f64, (row_y - 7.0) as f64, track_w as f64, 4.0);
+        self.hud.set_fill(C_LAVENDER_CSS);
+        self.hud.ctx.fill_rect(
+            track_x as f64,
+            (row_y - 7.0) as f64,
+            (track_w * t) as f64,
+            4.0,
+        );
+        self.hud.ctx.begin_path();
+        let _ = self.hud.ctx.arc(
+            (track_x + track_w * t) as f64,
+            (row_y - 5.0) as f64,
+            5.5,
+            0.0,
+            std::f64::consts::TAU,
+        );
+        self.hud.ctx.fill();
+        self.hud.set_stroke("rgba(17,17,27,0.9)");
+        self.hud.ctx.stroke();
+        self.text(value_label, x + w - 62.0, row_y, 9.0, C_TEXT_CSS, "normal");
+        self.hit_zones.push(HitZone::new(
+            track_x,
+            row_y - 16.0,
+            track_w,
+            22.0,
+            HitAction::ViewSlider { key },
+        ));
+        row_y + 26.0
     }
 
     /// Real detail panel for a selected host node: platform, link state,
