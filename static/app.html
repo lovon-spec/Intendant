@@ -23485,18 +23485,35 @@ function saveSessionRenameModal() {
   });
 }
 
+// Index over _cachedSessions for O(1) any-id lookups. Every mutation site
+// reassigns the array (never splices in place), so the array's reference
+// identity doubles as the invalidation key. Station snapshot builds call
+// this hundreds of times per pass; the previous linear scan made each
+// build O(sessions²) — multi-second stalls at a few hundred sessions.
+let _cachedSessionIndex = null;
+let _cachedSessionIndexFor = null;
+
 function findCachedSessionByAnyId(sessionId) {
   const sid = String(sessionId || '').trim();
   if (!sid) return null;
-  return (_cachedSessions || []).find(session => {
-    if (!session) return false;
-    return [
-      session.session_id,
-      session.resume_id,
-      session.backend_session_id,
-      session.intendant_session_id,
-    ].some(id => String(id || '').trim() === sid);
-  }) || null;
+  if (_cachedSessionIndexFor !== _cachedSessions) {
+    _cachedSessionIndex = new Map();
+    for (const session of _cachedSessions || []) {
+      if (!session) continue;
+      for (const id of [
+        session.session_id,
+        session.resume_id,
+        session.backend_session_id,
+        session.intendant_session_id,
+      ]) {
+        const key = String(id || '').trim();
+        // First match wins, matching the old Array.find semantics.
+        if (key && !_cachedSessionIndex.has(key)) _cachedSessionIndex.set(key, session);
+      }
+    }
+    _cachedSessionIndexFor = _cachedSessions;
+  }
+  return _cachedSessionIndex.get(sid) || null;
 }
 
 function sessionConfigSource(meta = {}) {
@@ -28444,23 +28461,10 @@ class DisplaySlot {
     // Handle incoming video track
     this.pc.ontrack = (e) => {
       this.videoEl.srcObject = e.streams[0];
-      this.videoEl.play().catch(() => {});
       this.connected = true;
       const res = this.width > 0 ? ` ${this.width}x${this.height}` : '';
       this.statusEl.textContent = `Connected (view-only)${res}`;
       this.statusEl.className = 'display-status connected';
-      // The slot was registered with the Station at creation, before this
-      // track existed (srcObject was null, so the play-kick was a no-op and
-      // the Station held a frameless element). Re-register now that the
-      // stream is live so the local pane shows without a manual toggle.
-      stationRegisterVideoSource(
-        `local:${this.displayId}`,
-        selfPeerId,
-        String(this.displayId),
-        `${selfHostLabel || 'local'} :${this.displayId}`,
-        'local',
-        this.videoEl,
-      );
     };
 
     // ICE candidates — send to server via WASM app
