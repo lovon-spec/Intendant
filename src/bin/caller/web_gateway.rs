@@ -21136,17 +21136,22 @@ fn resolve_peer_connection_identity_from_cert_dir(
     header_text: &str,
     tls_client_cert_fingerprint: Option<&str>,
 ) -> Result<Option<PeerConnectionIdentity>, (u16, String)> {
-    let peer_mode = peer_client_header_present(header_text);
+    // No TLS client certificate → resolve as anonymous. Peer relationship
+    // policy is a property of a paired mTLS identity, so without a
+    // certificate there is no identity to police. Whether a certless
+    // connection may proceed at all is the transport-auth layer's decision,
+    // not this resolver's: when mTLS is required, the
+    // `tls_client_cert_required` gates reject certless connections (modulo
+    // the public pairing doorbell), and the documented certless federation
+    // modes (`AuthRequirements::none()` on trusted networks, legacy bearer
+    // tokens, plaintext `--no-tls` local/debug) must keep working even
+    // though the peer transport always sends `x-intendant-peer`. Rejecting
+    // on that client-controlled header alone adds no security — a hostile
+    // client simply omits it.
     let Some(fingerprint) = tls_client_cert_fingerprint else {
-        return if peer_mode {
-            Err((
-                401,
-                serde_json::json!({"error": "peer client certificate required"}).to_string(),
-            ))
-        } else {
-            Ok(None)
-        };
+        return Ok(None);
     };
+    let peer_mode = peer_client_header_present(header_text);
 
     let record = crate::peer::access_policy::lookup_identity(&cert_dir, fingerprint)
         .map_err(|e| (500, serde_json::json!({"error": e.to_string()}).to_string()))?;
@@ -29976,6 +29981,37 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.0, 403);
         assert!(err.1.contains("peer identity revoked"));
+    }
+
+    /// Connections without a TLS client certificate resolve as anonymous,
+    /// even when the peer transport's `x-intendant-peer` header is present.
+    /// Certless federation modes (`AuthRequirements::none()` on trusted
+    /// networks, plaintext `--no-tls` local/debug, legacy bearer tokens) are
+    /// documented and supported; when mTLS is required, certless connections
+    /// are rejected by the dedicated `tls_client_cert_required` gates, not by
+    /// the identity resolver.
+    #[test]
+    fn peer_connection_identity_resolves_anonymous_without_client_cert() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let header_with_peer_mode = concat!(
+            "GET /.well-known/agent-card.json HTTP/1.1\r\n",
+            "Host: x\r\n",
+            "x-intendant-peer: 1\r\n\r\n"
+        );
+        let header_plain = "GET /ws HTTP/1.1\r\nHost: x\r\n\r\n";
+
+        assert!(resolve_peer_connection_identity_from_cert_dir(
+            tmp.path(),
+            header_with_peer_mode,
+            None
+        )
+        .unwrap()
+        .is_none());
+        assert!(
+            resolve_peer_connection_identity_from_cert_dir(tmp.path(), header_plain, None)
+                .unwrap()
+                .is_none()
+        );
     }
 
     // -----------------------------------------------------------------
