@@ -6,7 +6,7 @@ description: >
   then verifies managed Codex avoids hidden compaction, blocks ordinary tools
   under pressure, rewinds to an exact tool-call anchor, and returns to a safe
   context-pressure state.
-compatibility: Requires OpenAI Codex auth in ~/.codex/auth.json, installed vanilla Codex at /opt/homebrew/bin/codex, and a built patched Codex + Intendant worktree.
+compatibility: Requires OpenAI Codex auth in ~/.codex/auth.json, installed vanilla Codex at /opt/homebrew/bin/codex, and the patched Codex fork checkout at /Users/vm/projects/codex-minimal-lineage.
 allowed-tools: Bash Read
 disable-model-invocation: false
 ---
@@ -41,15 +41,28 @@ The test compares:
 
 ## Run
 
-From the Intendant worktree:
+The feature is on `main` in both repos. Build the patched Codex fork, then
+build and run from the Intendant repo root:
 
 ```bash
-cargo build --bin intendant
-cd /Users/vm/projects/codex/.worktrees/minimal-lineage-upstream/codex-rs
+# 1. Patched Codex (minimal-lineage fork)
+cd /Users/vm/projects/codex-minimal-lineage/codex-rs
 cargo build -p codex-cli --bin codex
-cd /Users/vm/projects/intendant/.worktrees/codex-lineage-port
-scripts/codex_context_stress_e2e.py
+
+# 2. Intendant (debug build matches the harness's --intendant-bin default)
+cd /Users/vm/projects/intendant
+cargo build --bin intendant
+
+# 3. Harness
+scripts/codex_context_stress_e2e.py \
+  --managed-codex-bin /Users/vm/projects/codex-minimal-lineage/codex-rs/target/debug/codex
 ```
+
+Binary selection is flags-only (no env vars): `--vanilla-codex-bin` defaults to
+`/opt/homebrew/bin/codex`, `--intendant-bin` defaults to
+`target/debug/intendant` relative to the repo containing the script, and
+`--managed-codex-bin` has a stale built-in default pointing at a retired
+worktree — always pass it explicitly as above.
 
 The script refuses to use port `8765`; it starts Intendant on a random isolated
 port and terminates that process at the end of the run.

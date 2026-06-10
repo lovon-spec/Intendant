@@ -227,10 +227,12 @@ Routes coding tasks to an external CLI agent instead of the native loop (see
 | `approval_policy` | string | `on-request` | `untrusted`, `on-request`, or `never` (UI set; `on-failure` is deprecated upstream) |
 | `sandbox` | string | `workspace-write` | `read-only`, `workspace-write`, or `danger-full-access` |
 | `reasoning_effort` | string | unset (model default) | `minimal`, `low`, `medium`, `high`, `xhigh` |
+| `service_tier` | string | unset (inherit Codex default) | `priority` enables Fast, `flex` requests Flex, `standard` is a sentinel that sends an explicit `serviceTier: null` to opt managed sessions out of Fast |
 | `web_search` | bool | `false` | Enable the Responses-API `web_search` tool (`codex --search`) |
 | `network_access` | bool | `false` | Allow outbound network in `workspace-write` sandbox (ignored for `read-only` / `danger-full-access`) |
 | `writable_roots` | array | `[]` | Extra writable roots, each passed as `--add-dir` (absolute, or resolved against project root) |
 | `managed_context` | string | `vanilla` | `vanilla` for upstream/original-fork Codex; `managed` enables proactive Intendant context densification, rewind/backout tools, disables Codex auto-compaction, and requires the patched Codex app-server protocol with lineage prompt-cache-key support |
+| `context_archive` | string | `summary` | Context snapshot archive mode ("Context replay" in the UI): `summary` records compact per-request visualization data with temporary provider traces, `exact` persists full provider request payloads for raw replay, `off` disables capture |
 
 Codex `app-server` launches in `managed_context = "managed"` suppress inherited
 user-global Codex MCP/plugin/app servers by default and inject Intendant's MCP

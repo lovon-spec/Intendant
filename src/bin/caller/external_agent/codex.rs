@@ -57,10 +57,9 @@ Intendant, not Codex automatic compaction, owns long-task context density. This 
 Keep the live transcript informationally dense:
 - Prefer targeted reads and searches over dumping large files, logs, or generated artifacts.
 - For GUI inspection in Intendant-managed sessions, use Intendant MCP `take_screenshot` and `execute_cu_actions` directly. Do not enumerate desktop apps or read bulky browser/computer-use plugin manuals when those direct tools are available; use Browser/Chrome/plugin CU only when their specialized capabilities are actually required. Do not use shell-driven GUI fallbacks such as `open`, `cliclick`, `osascript`, accessibility queries, or app binary inspection for GUI interaction.
-- For browser/dashboard/Station validation, use `node scripts/validate-dashboard.cjs` and prefer its named probes such as `--station-probe rendered` over ad-hoc Chromium/CDP scripts or giant inline `--wait-for-function` expressions; its `--help` is the authoritative flag reference, and docs/src/external-agent-orchestration.md has the full Station QA recipes. For a temporary dashboard, use the helper's owned lifecycle: `--launch-dashboard --port <throwaway_port>` for a one-shot smoke, or `--hold-dashboard` kept in the foreground while separate CU/browser steps run against the printed URL, then interrupted for helper-owned cleanup. Do not start a separate foreground/nohup/setsid dashboard just so another tool can connect.
-- Do not use broad argv-pattern process cleanup such as `pkill -f validate-dashboard`, `pkill -f intendant`, or similar. Managed controller argv can contain the task prompt, and prompts often include command examples, so `pkill -f` can match and kill the controller supervising you. Prefer helper-owned cleanup, tracked child PIDs, process groups created by the command you launched, temporary workspace/profile directories, or exact PIDs you verified with `ps`.
-- Browser validation retry discipline: run one primary helper smoke. If it fails or times out, run at most one compact diagnostic retry with `--diagnostics --json` and a targeted selector/function. Then either make a targeted code fix from those facts, or report a clear partial-validation conclusion with the helper reason/logs/diagnostics. Do not cycle through raw CDP, Node, Python, Browser, Chrome, and plugin automation stacks unless the user explicitly asks for deeper manual investigation or the helper itself is the suspected broken component.
-- After a successful build, run dev servers through already-built binaries or quiet commands when possible. Avoid repeating `cargo run` or other build commands that stream known warnings only to launch a server; if a noisy command is unavoidable, preserve only the durable result and compact immediately.
+- Do not use broad argv-pattern process cleanup such as `pkill -f intendant` or `pkill -f <script-name>`. Managed controller argv can contain the task prompt, and prompts often include command examples, so `pkill -f` can match and kill the controller supervising you. Prefer helper-owned cleanup, tracked child PIDs, process groups created by the command you launched, temporary workspace/profile directories, or exact PIDs you verified with `ps`.
+- Browser/GUI validation retry discipline: run one primary validation attempt. If it fails or times out, run at most one compact diagnostic retry. Then either make a targeted code fix from those facts, or report a clear partial-validation conclusion with the failure reason and relevant logs/diagnostics. Do not cycle through multiple automation stacks unless the user explicitly asks for deeper manual investigation or the validation tool itself is the suspected broken component.
+- After a successful build, run dev servers through already-built binaries or quiet commands when possible. Avoid re-running build commands that stream known warnings only to launch a server; if a noisy command is unavoidable, preserve only the durable result and compact immediately.
 - While a long-running command/tool is still active, do not emit assistant status messages that only say you are still waiting/building/running and have no new output or errors, such as "No output yet", "Still active", or "Polling". Wait silently for material output, completion, an approval need, or a real decision; Intendant surfaces tool lifecycle separately.
 - A rewind can cancel the active long-running command. If the chosen anchor is before a server launch, assume the server may be gone; verify it with a small health check and relaunch tersely instead of preserving the old PID as if it survived.
 - After genuinely noisy or unexpectedly large tool output, failed exploration that added substantial low-value context, backend context status `watch`/`rewind_only`, or finishing a coherent subtask while near the density threshold, crystallize durable facts and consider exact-anchor managed-context maintenance before continuing broad ordinary-tool work.
@@ -70,6 +69,20 @@ Keep the live transcript informationally dense:
 - Do not use recovery_candidates_only=false to look for newer rewind targets. Non-recovery rows require include_non_recovery=true, are diagnostic-only, and must not be passed to rewind_context when recovery_eligible=false or the requested position is not present in the default row's positions.
 - The primer must preserve user constraints, current objective, completed work, changed files, important command results, remaining decisions, and the substance of any prior managed primer that would otherwise be overwritten.
 - Never synthesize anchor ids, never use anchors from failed examples, and never target managed-context maintenance calls unless explicitly auditing those internals."#;
+
+/// Per-project extension of `MANAGED_CONTEXT_DEVELOPER_INSTRUCTIONS`: when
+/// `<working_dir>/.intendant/codex-managed-instructions.md` exists, its
+/// contents are appended to the generic block under
+/// `MANAGED_CONTEXT_PROJECT_INSTRUCTIONS_HEADING`. This keeps repo-specific
+/// guidance (validation helpers, QA recipes) out of the generic constant that
+/// every managed session in every project would otherwise pay a token tax for.
+const MANAGED_CONTEXT_PROJECT_INSTRUCTIONS_FILE: &str = "codex-managed-instructions.md";
+const MANAGED_CONTEXT_PROJECT_INSTRUCTIONS_DIR: &str = ".intendant";
+const MANAGED_CONTEXT_PROJECT_INSTRUCTIONS_HEADING: &str =
+    "Project managed-context instructions (.intendant/codex-managed-instructions.md):";
+const MANAGED_CONTEXT_PROJECT_INSTRUCTIONS_MAX_BYTES: usize = 16 * 1024;
+const MANAGED_CONTEXT_PROJECT_INSTRUCTIONS_TRUNCATION_MARKER: &str =
+    "[project managed-context instructions truncated at 16 KiB]";
 
 const GENERATION_STARVATION_HINT: &str = "The previous Codex response appears to have been cut off near the backend context limit. Avoid regenerating the same long output; rewind context first or produce a much shorter recovery response.";
 const CODEX_INITIALIZE_TIMEOUT_SECS: u64 = 60;
@@ -366,12 +379,15 @@ impl CodexAgent {
         if !self.managed_context {
             return None;
         }
-        Some(match self.current_codex_developer_instructions().await {
-            Ok(existing_instructions) => {
-                managed_context_developer_instructions(existing_instructions.as_deref())
-            }
-            Err(_) => managed_context_developer_instructions(None),
-        })
+        let existing_instructions = self
+            .current_codex_developer_instructions()
+            .await
+            .ok()
+            .flatten();
+        Some(managed_context_developer_instructions_for_project(
+            existing_instructions.as_deref(),
+            self.working_dir.as_deref(),
+        ))
     }
 
     async fn current_codex_developer_instructions(
@@ -839,6 +855,68 @@ fn managed_context_developer_instructions(existing_instructions: Option<&str>) -
             format!("{existing_instructions}\n\n{MANAGED_CONTEXT_DEVELOPER_INSTRUCTIONS}")
         }
         _ => MANAGED_CONTEXT_DEVELOPER_INSTRUCTIONS.to_string(),
+    }
+}
+
+fn project_managed_context_instructions_path(working_dir: &Path) -> PathBuf {
+    working_dir
+        .join(MANAGED_CONTEXT_PROJECT_INSTRUCTIONS_DIR)
+        .join(MANAGED_CONTEXT_PROJECT_INSTRUCTIONS_FILE)
+}
+
+/// Read the project's managed-context instructions extension, if any.
+/// Returns `None` when the file is absent, empty, or unreadable — read
+/// failures are logged and non-fatal so a bad project file can never block a
+/// managed launch. Contents beyond
+/// `MANAGED_CONTEXT_PROJECT_INSTRUCTIONS_MAX_BYTES` are truncated (on a char
+/// boundary) with an explicit marker.
+fn project_managed_context_instructions(working_dir: Option<&Path>) -> Option<String> {
+    let path = project_managed_context_instructions_path(working_dir?);
+    let contents = match std::fs::read_to_string(&path) {
+        Ok(contents) => contents,
+        Err(e) => {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                eprintln!(
+                    "[codex] Warning: failed to read project managed-context instructions {}: {}",
+                    path.display(),
+                    e
+                );
+            }
+            return None;
+        }
+    };
+    let trimmed = contents.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.len() <= MANAGED_CONTEXT_PROJECT_INSTRUCTIONS_MAX_BYTES {
+        return Some(trimmed.to_string());
+    }
+    let mut end = MANAGED_CONTEXT_PROJECT_INSTRUCTIONS_MAX_BYTES;
+    while end > 0 && !trimmed.is_char_boundary(end) {
+        end -= 1;
+    }
+    Some(format!(
+        "{}\n{}",
+        trimmed[..end].trim_end(),
+        MANAGED_CONTEXT_PROJECT_INSTRUCTIONS_TRUNCATION_MARKER
+    ))
+}
+
+/// Full managed-context developer instructions for one project: any existing
+/// Codex developer instructions, then the generic managed-context block, then
+/// the optional per-project extension from
+/// `<working_dir>/.intendant/codex-managed-instructions.md`.
+fn managed_context_developer_instructions_for_project(
+    existing_instructions: Option<&str>,
+    working_dir: Option<&Path>,
+) -> String {
+    let base = managed_context_developer_instructions(existing_instructions);
+    match project_managed_context_instructions(working_dir) {
+        Some(project_instructions) => format!(
+            "{base}\n\n{MANAGED_CONTEXT_PROJECT_INSTRUCTIONS_HEADING}\n\n{project_instructions}"
+        ),
+        None => base,
     }
 }
 
@@ -10896,16 +10974,10 @@ error: build failed
         assert!(developer_instructions.contains("Keep the live transcript informationally dense"));
         assert!(developer_instructions.contains("take_screenshot"));
         assert!(developer_instructions.contains("execute_cu_actions"));
-        assert!(developer_instructions.contains("scripts/validate-dashboard.cjs"));
-        assert!(developer_instructions.contains("--station-probe"));
-        assert!(developer_instructions.contains("--launch-dashboard"));
-        assert!(developer_instructions.contains("--hold-dashboard"));
-        assert!(developer_instructions.contains("docs/src/external-agent-orchestration.md"));
-        assert!(developer_instructions
-            .contains("Do not start a separate foreground/nohup/setsid dashboard"));
-        assert!(developer_instructions.contains("--diagnostics --json"));
-        assert!(developer_instructions.contains("one primary helper smoke"));
-        assert!(developer_instructions.contains("Do not cycle through raw CDP"));
+        assert!(developer_instructions.contains("pkill -f intendant"));
+        assert!(developer_instructions.contains("one primary validation attempt"));
+        assert!(developer_instructions.contains("one compact diagnostic retry"));
+        assert!(developer_instructions.contains("Do not cycle through multiple automation stacks"));
         assert!(developer_instructions.contains("cliclick"));
         assert!(developer_instructions.contains("osascript"));
         assert!(developer_instructions.contains("already-built binaries"));
@@ -10924,6 +10996,118 @@ error: build failed
         assert!(developer_instructions.contains("list_rewind_anchors"));
         assert!(developer_instructions.contains("inspect_rewind_anchor"));
         assert!(developer_instructions.contains("rewind_context"));
+    }
+
+    #[test]
+    fn managed_context_generic_instructions_omit_repo_specific_guidance() {
+        // Intendant-repo-specific guidance lives in
+        // .intendant/codex-managed-instructions.md, not in the generic
+        // constant injected into every managed session in every project.
+        for marker in [
+            "validate-dashboard.cjs",
+            "--station-probe",
+            "--launch-dashboard",
+            "--hold-dashboard",
+            "--diagnostics --json",
+            "docs/src/external-agent-orchestration.md",
+            "Station",
+            "cargo run",
+        ] {
+            assert!(
+                !MANAGED_CONTEXT_DEVELOPER_INSTRUCTIONS.contains(marker),
+                "generic managed-context instructions must not contain {marker:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn managed_context_instructions_append_project_file_when_present() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join(MANAGED_CONTEXT_PROJECT_INSTRUCTIONS_DIR);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(MANAGED_CONTEXT_PROJECT_INSTRUCTIONS_FILE),
+            "Use `node scripts/validate-dashboard.cjs` for dashboard QA.\n",
+        )
+        .unwrap();
+
+        let instructions = managed_context_developer_instructions_for_project(
+            Some("Existing developer policy."),
+            Some(tmp.path()),
+        );
+
+        assert!(instructions.contains("Existing developer policy."));
+        assert!(instructions.contains("managed_context=managed"));
+        assert!(instructions.contains(MANAGED_CONTEXT_PROJECT_INSTRUCTIONS_HEADING));
+        assert!(instructions.contains("validate-dashboard.cjs"));
+        // Project extension comes after the generic block, under the heading.
+        let heading_at = instructions
+            .find(MANAGED_CONTEXT_PROJECT_INSTRUCTIONS_HEADING)
+            .unwrap();
+        let generic_at = instructions.find("managed_context=managed").unwrap();
+        let project_at = instructions.find("validate-dashboard.cjs").unwrap();
+        assert!(generic_at < heading_at && heading_at < project_at);
+        assert!(!instructions.contains(MANAGED_CONTEXT_PROJECT_INSTRUCTIONS_TRUNCATION_MARKER));
+    }
+
+    #[test]
+    fn managed_context_instructions_cap_project_file_size() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join(MANAGED_CONTEXT_PROJECT_INSTRUCTIONS_DIR);
+        std::fs::create_dir_all(&dir).unwrap();
+        let oversized = "project guidance line\n"
+            .repeat(MANAGED_CONTEXT_PROJECT_INSTRUCTIONS_MAX_BYTES / 8)
+            + "UNREACHABLE-TAIL-MARKER";
+        std::fs::write(dir.join(MANAGED_CONTEXT_PROJECT_INSTRUCTIONS_FILE), &oversized).unwrap();
+
+        let instructions =
+            managed_context_developer_instructions_for_project(None, Some(tmp.path()));
+
+        assert!(instructions.contains(MANAGED_CONTEXT_PROJECT_INSTRUCTIONS_HEADING));
+        assert!(instructions.contains(MANAGED_CONTEXT_PROJECT_INSTRUCTIONS_TRUNCATION_MARKER));
+        assert!(!instructions.contains("UNREACHABLE-TAIL-MARKER"));
+        let project_part = instructions
+            .split(MANAGED_CONTEXT_PROJECT_INSTRUCTIONS_HEADING)
+            .nth(1)
+            .unwrap();
+        assert!(
+            project_part.len()
+                <= MANAGED_CONTEXT_PROJECT_INSTRUCTIONS_MAX_BYTES
+                    + MANAGED_CONTEXT_PROJECT_INSTRUCTIONS_TRUNCATION_MARKER.len()
+                    + 8
+        );
+    }
+
+    #[test]
+    fn managed_context_instructions_without_project_file_are_generic_only() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        let with_missing_file =
+            managed_context_developer_instructions_for_project(None, Some(tmp.path()));
+        assert_eq!(
+            with_missing_file,
+            managed_context_developer_instructions(None)
+        );
+
+        let without_working_dir = managed_context_developer_instructions_for_project(None, None);
+        assert_eq!(
+            without_working_dir,
+            managed_context_developer_instructions(None)
+        );
+
+        // Unreadable file (a directory at the file path) is non-fatal and
+        // also falls back to the generic block.
+        let dir = tmp
+            .path()
+            .join(MANAGED_CONTEXT_PROJECT_INSTRUCTIONS_DIR)
+            .join(MANAGED_CONTEXT_PROJECT_INSTRUCTIONS_FILE);
+        std::fs::create_dir_all(&dir).unwrap();
+        let with_unreadable_file =
+            managed_context_developer_instructions_for_project(None, Some(tmp.path()));
+        assert_eq!(
+            with_unreadable_file,
+            managed_context_developer_instructions(None)
+        );
     }
 
     #[test]

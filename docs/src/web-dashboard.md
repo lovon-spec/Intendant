@@ -97,11 +97,50 @@ The default tab. Five subtabs:
   / Deny) and a follow-up text input for sending a message after a round
   completes.
 - **Context** — the agent's current working context (what it is operating on).
-- **Managed** — managed-context anchors, rewind records, and recovery actions for
-  managed Codex sessions.
+- **Managed** — operator console for managed-Codex context maintenance (see
+  below).
 - **Changes** — file changes / diffs produced during the session (with its own
   badge when new changes land).
 - **Control** — direct controls for steering the run.
+
+#### Managed (Activity → Managed)
+
+The manual counterpart to the model-driven managed-context tools. A session
+picker lists Codex-like sessions — live windows plus historical sessions from
+the session store — sorted prompt-target first, then managed-mode, live, and
+most recently updated (labels show name, short id, source, and `via <id>` when
+the Codex thread is reached through an Intendant wrapper session). **Use
+target** snaps back to the current prompt target.
+
+For a live session the pane calls the per-session MCP `get_status` and renders
+a density card: managed/vanilla mode, pressure status, effective and hard-limit
+token usage with a colored pressure bar, the soft rewind-at threshold, and
+whether rewind-only gating is active. Historical sessions show `historical`
+status — records and anchors stay readable, but live actions are disabled.
+Alerts flag non-Codex selections, sessions without managed mode, an
+insufficient last rewind, and a configured Codex command that doesn't look like
+the patched managed build.
+
+- **Rewind** — manual `rewind_context` dispatch with an exact item anchor
+  (`call_id` or response item id) plus anchor side (`before`/`after`), a
+  required reason and carry-forward primer, and optional preserve / discard /
+  artifacts / next-steps lists (one entry per line). **Inspect anchor** runs
+  `inspect_rewind_anchor` to show a small window around the candidate before
+  committing.
+- **Recent anchors** — harvested from the live activity log and the
+  `/api/managed-context/anchors` history, each with a one-click **Use** that
+  fills the anchor field (switching the picker to the anchor's session if
+  needed).
+- **Records / Backout** — the session's rewind records from
+  `/api/managed-context/records`; clicking one shows its JSON and fills the
+  backout form, which runs `rewind_backout` in `inspect`, `restore`, `fork`,
+  or `backout` mode with an optional fork name.
+- **Lineage and fission** — ledger groups from `get_status` with the canonical
+  session and its branches; fission branches offer a **Claim** canonical
+  action. **Copy status JSON** copies the raw status payload.
+
+Rewind, backout, and inspect stay disabled unless the selected session is live
+and effectively managed.
 
 ### Stats
 

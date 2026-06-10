@@ -285,6 +285,17 @@ features they lack.
   the child with the replacement message. The original compacted thread is not
   mutated silently.
 
+  Managed launches inject a generic managed-context developer-instructions
+  block (transcript density, GUI via Intendant MCP, rewind discipline) into
+  `thread/start` / `thread/resume`. Projects can extend it: when
+  `<working_dir>/.intendant/codex-managed-instructions.md` exists, its contents
+  are appended under a "Project managed-context instructions" delimiter for
+  every managed Codex session launched in that project, capped at 16 KiB with
+  an explicit truncation marker; read failures are logged and non-fatal. Keep
+  repo-specific validation/QA guidance there rather than in the generic block
+  that every project pays a token tax for — this repository's own file carries
+  the `validate-dashboard.cjs` usage and helper retry discipline above.
+
 - **Rich `thread_action` ops** (`codex.rs`): `compact`, `fast`, `fork`,
   `side`/`btw` (open a side conversation) and `side-close`, `review`,
   `goal`/`goal-set`/`goal-clear`/`goal-pause`/`goal-resume`/`goal-complete`, and
@@ -385,10 +396,12 @@ model            = "gpt-5-codex"      # optional; omit to use Codex's default
 approval_policy  = "on-request"       # untrusted | on-request | never
 sandbox          = "workspace-write"  # read-only | workspace-write | danger-full-access
 reasoning_effort = "medium"           # ""(default) | minimal | low | medium | high | xhigh
+service_tier     = ""                 # ""(inherit Codex default) | priority (Fast) | flex | standard (explicit opt-out sentinel)
 web_search       = false              # enable the Responses web_search tool
 network_access   = false              # outbound net inside workspace-write only
 writable_roots   = []                 # extra writable dirs (absolute), each → -c writable_roots
 managed_context = "vanilla"          # vanilla | managed
+context_archive = "summary"          # summary | exact | off — context snapshot archive mode ("Context replay" in the UI)
 
 [agent.claude_code]
 command         = "claude"
@@ -409,10 +422,12 @@ debug                = false          # --debug (Gemini DevTools console)
 
 Values are normalized at dispatch (`normalize_sandbox_mode`,
 `normalize_approval_policy`, `normalize_reasoning_effort`,
+`normalize_codex_managed_context`, `normalize_codex_context_archive`,
 `normalize_gemini_approval_mode`): unknown or empty values fall back to the safe
 default rather than silently escalating privileges (e.g. a typo'd Codex sandbox
-becomes `workspace-write`, not `danger-full-access`; a bad Gemini approval mode
-becomes `default`, not `yolo`).
+becomes `workspace-write`, not `danger-full-access`; an unknown
+`managed_context` becomes `vanilla`; an unknown `context_archive` becomes
+`summary`; a bad Gemini approval mode becomes `default`, not `yolo`).
 
 ### Selecting the backend with `--agent`
 
@@ -452,10 +467,12 @@ shared state (when driven over MCP) → config default → native.
   runs do not silently display a requested root as if Codex had accepted it.
 - **Per-session launch config beats global defaults.** Dashboard-created and
   dashboard-configured external sessions persist their binary command and, for
-  Codex, `managed_context` mode. Resume/attach first applies explicit dashboard
-  overrides, then the persisted per-session config, then the global Settings
-  pane. This keeps old sessions from silently adopting a new global Codex binary
-  or managed-context mode after a daemon restart.
+  Codex, `managed_context` mode. Both resume paths — daemon resume/attach and
+  CLI `--resume` — rehydrate that persisted per-session config with the same
+  precedence: explicit overrides (dashboard launch options or CLI flags), then
+  the persisted per-session config, then the global Settings pane /
+  `intendant.toml`. This keeps old sessions from silently adopting a new global
+  Codex binary or managed-context mode after a daemon restart.
 - **Managed historical edits are branches.** Once a managed rewind has replaced
   old rollout context with a dense primer, the old user-turn number may no longer
   exist in the active Codex thread. Editing or jumping to that overwritten message

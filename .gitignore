@@ -2,7 +2,10 @@
 target/
 __pycache__/
 *.py[cod]
-.intendant/
+# Ignore runtime state in any .intendant/ dir, but track the repo's
+# managed-context instructions extension (read by external_agent/codex.rs).
+**/.intendant/*
+!/.intendant/codex-managed-instructions.md
 .env
 .env.*
 !.env.example
