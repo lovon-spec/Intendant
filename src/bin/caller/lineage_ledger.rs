@@ -9,12 +9,17 @@ use std::path::Path;
 /// as a model-authored branch summary.
 const DONE_SIGNAL_DEFAULT_MESSAGE: &str = "Agent signalled done";
 
+/// Parent/child session relationships for one session's connected component,
+/// derived from `session.jsonl` (never persisted as its own file). Consumed
+/// by the MCP `get_status` surface (`mcp.rs`) and embedded into rewind-record
+/// snapshots (`main.rs` / `context_rewind.rs`).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LineageLedger {
     pub source_session_id: String,
     pub groups: Vec<LineageGroup>,
 }
 
+/// All recorded child edges of one parent session.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LineageGroup {
     pub group_id: String,
@@ -24,6 +29,8 @@ pub struct LineageGroup {
     pub branches: Vec<LineageBranch>,
 }
 
+/// One parent→child relationship row (see [`lineage_ledger_from_jsonl`] for
+/// the recognized relationship kinds and their status conventions).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LineageBranch {
     pub session_id: String,
@@ -59,8 +66,19 @@ struct SessionFacts {
     /// selection can pick the *latest* rewind-restore rather than relying on the
     /// `BTreeSet`'s lexicographic ordering of (random) child session ids.
     relationship_order: HashMap<RelationshipKey, usize>,
+    /// `(parent, child)` pairs severed by a `fission-detached` relationship:
+    /// the branch's spawn anchor left the effective history (rewound past) or
+    /// the group was explicitly severed.
+    fission_detached: BTreeSet<(String, String)>,
+    /// `(parent, child)` pairs whose result a `fission-imported` relationship
+    /// marked as explicitly imported into the parent's continuation.
+    fission_imported: BTreeSet<(String, String)>,
 }
 
+/// Read `session.jsonl` from `log_dir` and derive the lineage ledger for
+/// `source_session_id` (see [`lineage_ledger_from_jsonl`]). Called by the MCP
+/// `get_status` surface (`mcp.rs`) and the rewind-record snapshot path
+/// (`main.rs`). `Ok(None)` when no session log exists.
 pub fn read_lineage_ledger(
     log_dir: &Path,
     source_session_id: &str,
@@ -74,9 +92,30 @@ pub fn read_lineage_ledger(
     Ok(lineage_ledger_from_jsonl(&contents, source_session_id))
 }
 
+/// Derive the lineage ledger for `source_session_id`'s connected component
+/// from raw `session.jsonl` contents. Called by [`read_lineage_ledger`] (the
+/// dashboard Managed tab / MCP `get_status` read side and the rewind path's
+/// lineage snapshot in `main.rs`).
+///
+/// Branch rows come from `session_relationship` events. Specially handled
+/// relationship kinds:
+/// - `rewind-restore` — row status `restored`; the latest one becomes the
+///   group's canonical head;
+/// - `rewind-backout` — row status `inspection`;
+/// - `fission-branch` — a fission spawn edge (written by the
+///   `register_spawned_branch` / observation wiring); status follows the
+///   child's observed lifecycle unless a fission marker overrides it;
+/// - `fission-detached` / `fission-imported` — markers that update the spawn
+///   row's status (`detached` / `imported`) instead of duplicating the row;
+///   they only become rows of their own when the log carries no matching
+///   spawn row (see [`fission_status_override`] for the precedence rules).
+///
+/// Everything else (`subagent`, `managed-edit-branch`, …) renders generically
+/// with the child's observed status.
 pub fn lineage_ledger_from_jsonl(contents: &str, source_session_id: &str) -> Option<LineageLedger> {
     let mut facts = SessionFacts::default();
     let mut relationship_seq = 0usize;
+    let mut pending_fission_marks: Vec<RelationshipKey> = Vec::new();
     for line in contents.lines() {
         let Ok(entry) = serde_json::from_str::<serde_json::Value>(line) else {
             continue;
@@ -119,7 +158,26 @@ pub fn lineage_ledger_from_jsonl(contents: &str, source_session_id: &str) -> Opt
                         .relationship_order
                         .insert(rel.clone(), relationship_seq);
                     relationship_seq += 1;
-                    facts.relationships.insert(rel);
+                    match rel.relationship.as_str() {
+                        // Fission detach/import markers prefer updating their
+                        // spawn row over becoming rows of their own; whether a
+                        // spawn row exists is only known once the whole log
+                        // has been scanned, so they are resolved after the
+                        // loop (event order does not matter).
+                        "fission-detached" | "fission-imported" => {
+                            let pair =
+                                (rel.parent_session_id.clone(), rel.child_session_id.clone());
+                            if rel.relationship == "fission-detached" {
+                                facts.fission_detached.insert(pair);
+                            } else {
+                                facts.fission_imported.insert(pair);
+                            }
+                            pending_fission_marks.push(rel);
+                        }
+                        _ => {
+                            facts.relationships.insert(rel);
+                        }
+                    }
                 }
             }
             "done_signal" => {
@@ -177,6 +235,21 @@ pub fn lineage_ledger_from_jsonl(contents: &str, source_session_id: &str) -> Opt
         }
     }
 
+    // A detach/import marker dedups into its spawn row (`fission-branch`)
+    // when one exists — the marker then only drives that row's status — and
+    // becomes a standalone row otherwise (e.g. a truncated log that no longer
+    // carries the spawn event), so the fact stays visible either way.
+    for rel in pending_fission_marks {
+        let has_spawn_row = facts.relationships.iter().any(|existing| {
+            existing.relationship == "fission-branch"
+                && existing.parent_session_id == rel.parent_session_id
+                && existing.child_session_id == rel.child_session_id
+        });
+        if !has_spawn_row {
+            facts.relationships.insert(rel);
+        }
+    }
+
     if facts.relationships.is_empty() {
         return None;
     }
@@ -209,6 +282,10 @@ pub fn lineage_ledger_from_jsonl(contents: &str, source_session_id: &str) -> Opt
                     "restored".to_string()
                 } else if rel.relationship == "rewind-backout" {
                     "inspection".to_string()
+                } else if let Some(status) =
+                    fission_status_override(&facts.fission_detached, &facts.fission_imported, &rel)
+                {
+                    status
                 } else {
                     facts
                         .statuses
@@ -239,6 +316,40 @@ pub fn lineage_ledger_from_jsonl(contents: &str, source_session_id: &str) -> Opt
         source_session_id: source_session_id.to_string(),
         groups,
     })
+}
+
+/// Status override for fission relationship rows (`fission-branch` /
+/// `fission-detached` / `fission-imported`). Precedence mirrors the fission
+/// ledger's stickiness rules — `detached` beats `imported` beats the child's
+/// observed lifecycle status — so a detach survives both stray completion
+/// events from a still-running child and artifact-level imports, and an
+/// import is not downgraded by a later generic teardown event. Returns `None`
+/// for non-fission rows (markers are scoped to fission edges; a `subagent`
+/// edge for the same pair keeps its own lifecycle) and for plain spawn rows
+/// without marks, which fall through to the observed status.
+fn fission_status_override(
+    fission_detached: &BTreeSet<(String, String)>,
+    fission_imported: &BTreeSet<(String, String)>,
+    rel: &RelationshipKey,
+) -> Option<String> {
+    if !matches!(
+        rel.relationship.as_str(),
+        "fission-branch" | "fission-detached" | "fission-imported"
+    ) {
+        return None;
+    }
+    let marked = |marks: &BTreeSet<(String, String)>| {
+        marks.iter().any(|(parent, child)| {
+            parent == &rel.parent_session_id && child == &rel.child_session_id
+        })
+    };
+    if rel.relationship == "fission-detached" || marked(fission_detached) {
+        return Some("detached".to_string());
+    }
+    if rel.relationship == "fission-imported" || marked(fission_imported) {
+        return Some("imported".to_string());
+    }
+    None
 }
 
 fn related_relationships(
@@ -384,5 +495,163 @@ mod tests {
         assert_eq!(ledger.groups.len(), 1);
         assert_eq!(ledger.groups[0].parent_session_id, "parent");
         assert_eq!(ledger.groups[0].branches[0].session_id, "child");
+    }
+
+    #[test]
+    fn lineage_ledger_parses_fission_branch_relationship() {
+        let jsonl = concat!(
+            r#"{"event":"session_started","data":{"session_id":"branch","task":"trace the bug"}}"#,
+            "\n",
+            r#"{"event":"session_relationship","data":{"parent_session_id":"parent","child_session_id":"branch","relationship":"fission-branch","ephemeral":false}}"#,
+            "\n",
+        );
+        let ledger = lineage_ledger_from_jsonl(jsonl, "parent").expect("ledger");
+        let branch = &ledger.groups[0].branches[0];
+        assert_eq!(branch.relationship, "fission-branch");
+        assert_eq!(branch.status, "running");
+        assert_eq!(branch.task.as_deref(), Some("trace the bug"));
+
+        // Without markers, a spawn row follows the child's observed lifecycle
+        // — and the edge connects the component when sourcing from the child.
+        let jsonl = concat!(
+            r#"{"event":"session_relationship","data":{"parent_session_id":"parent","child_session_id":"branch","relationship":"fission-branch","ephemeral":false}}"#,
+            "\n",
+            r#"{"event":"task_complete","data":{"session_id":"branch","summary":"traced"}}"#,
+            "\n",
+        );
+        let ledger = lineage_ledger_from_jsonl(jsonl, "branch").expect("ledger");
+        let branch = &ledger.groups[0].branches[0];
+        assert_eq!(branch.status, "completed");
+        assert_eq!(branch.summary.as_deref(), Some("traced"));
+    }
+
+    #[test]
+    fn lineage_ledger_fission_detached_updates_spawn_row_without_duplicate() {
+        // Detach marker plus a stray later completion: one row, sticky
+        // detached — mirrors the fission ledger's rule that a detach must
+        // survive completion events from a still-running child.
+        let jsonl = concat!(
+            r#"{"event":"session_relationship","data":{"parent_session_id":"parent","child_session_id":"branch","relationship":"fission-branch","ephemeral":false}}"#,
+            "\n",
+            r#"{"event":"session_relationship","data":{"parent_session_id":"parent","child_session_id":"branch","relationship":"fission-detached","ephemeral":false}}"#,
+            "\n",
+            r#"{"event":"task_complete","data":{"session_id":"branch","summary":"finished anyway"}}"#,
+            "\n",
+        );
+        let ledger = lineage_ledger_from_jsonl(jsonl, "parent").expect("ledger");
+        assert_eq!(ledger.groups.len(), 1);
+        let branches = &ledger.groups[0].branches;
+        assert_eq!(branches.len(), 1);
+        assert_eq!(branches[0].relationship, "fission-branch");
+        assert_eq!(branches[0].status, "detached");
+        // Artifact-level facts (the summary) still render.
+        assert_eq!(branches[0].summary.as_deref(), Some("finished anyway"));
+    }
+
+    #[test]
+    fn lineage_ledger_fission_detached_dedups_regardless_of_event_order() {
+        let jsonl = concat!(
+            r#"{"event":"session_relationship","data":{"parent_session_id":"parent","child_session_id":"branch","relationship":"fission-detached","ephemeral":false}}"#,
+            "\n",
+            r#"{"event":"session_relationship","data":{"parent_session_id":"parent","child_session_id":"branch","relationship":"fission-branch","ephemeral":false}}"#,
+            "\n",
+        );
+        let ledger = lineage_ledger_from_jsonl(jsonl, "parent").expect("ledger");
+        let branches = &ledger.groups[0].branches;
+        assert_eq!(branches.len(), 1);
+        assert_eq!(branches[0].relationship, "fission-branch");
+        assert_eq!(branches[0].status, "detached");
+    }
+
+    #[test]
+    fn lineage_ledger_fission_detached_without_spawn_row_gets_own_row() {
+        // A truncated log may carry the detach marker but not the spawn
+        // event; the fact must stay visible as a standalone row.
+        let jsonl = concat!(
+            r#"{"event":"session_relationship","data":{"parent_session_id":"parent","child_session_id":"branch","relationship":"fission-detached","ephemeral":false}}"#,
+            "\n",
+        );
+        let ledger = lineage_ledger_from_jsonl(jsonl, "parent").expect("ledger");
+        let branches = &ledger.groups[0].branches;
+        assert_eq!(branches.len(), 1);
+        assert_eq!(branches[0].relationship, "fission-detached");
+        assert_eq!(branches[0].status, "detached");
+    }
+
+    #[test]
+    fn lineage_ledger_fission_imported_marks_spawn_row_status() {
+        let jsonl = concat!(
+            r#"{"event":"session_relationship","data":{"parent_session_id":"parent","child_session_id":"branch","relationship":"fission-branch","ephemeral":false}}"#,
+            "\n",
+            r#"{"event":"task_complete","data":{"session_id":"branch","summary":"useful diff"}}"#,
+            "\n",
+            r#"{"event":"session_relationship","data":{"parent_session_id":"parent","child_session_id":"branch","relationship":"fission-imported","ephemeral":false}}"#,
+            "\n",
+        );
+        let ledger = lineage_ledger_from_jsonl(jsonl, "parent").expect("ledger");
+        let branches = &ledger.groups[0].branches;
+        assert_eq!(branches.len(), 1);
+        assert_eq!(branches[0].relationship, "fission-branch");
+        assert_eq!(branches[0].status, "imported");
+        assert_eq!(branches[0].summary.as_deref(), Some("useful diff"));
+    }
+
+    #[test]
+    fn lineage_ledger_import_does_not_resurrect_detached_fission_branch() {
+        // Import is artifact-level: a detached branch whose result was
+        // salvaged stays detached, mirroring the fission ledger.
+        let jsonl = concat!(
+            r#"{"event":"session_relationship","data":{"parent_session_id":"parent","child_session_id":"branch","relationship":"fission-branch","ephemeral":false}}"#,
+            "\n",
+            r#"{"event":"session_relationship","data":{"parent_session_id":"parent","child_session_id":"branch","relationship":"fission-detached","ephemeral":false}}"#,
+            "\n",
+            r#"{"event":"session_relationship","data":{"parent_session_id":"parent","child_session_id":"branch","relationship":"fission-imported","ephemeral":false}}"#,
+            "\n",
+        );
+        let ledger = lineage_ledger_from_jsonl(jsonl, "parent").expect("ledger");
+        let branches = &ledger.groups[0].branches;
+        assert_eq!(branches.len(), 1);
+        assert_eq!(branches[0].status, "detached");
+    }
+
+    #[test]
+    fn lineage_ledger_fission_imported_without_spawn_row_gets_own_row() {
+        let jsonl = concat!(
+            r#"{"event":"session_relationship","data":{"parent_session_id":"parent","child_session_id":"branch","relationship":"fission-imported","ephemeral":false}}"#,
+            "\n",
+        );
+        let ledger = lineage_ledger_from_jsonl(jsonl, "branch").expect("ledger");
+        let branches = &ledger.groups[0].branches;
+        assert_eq!(branches.len(), 1);
+        assert_eq!(branches[0].relationship, "fission-imported");
+        assert_eq!(branches[0].status, "imported");
+    }
+
+    #[test]
+    fn lineage_ledger_fission_marks_do_not_touch_non_fission_rows() {
+        // Markers are scoped to fission edges: a subagent edge for the same
+        // (parent, child) keeps its own lifecycle status, while the marker —
+        // having no spawn row to fold into — renders standalone.
+        let jsonl = concat!(
+            r#"{"event":"session_relationship","data":{"parent_session_id":"parent","child_session_id":"branch","relationship":"subagent","ephemeral":false}}"#,
+            "\n",
+            r#"{"event":"session_relationship","data":{"parent_session_id":"parent","child_session_id":"branch","relationship":"fission-detached","ephemeral":false}}"#,
+            "\n",
+            r#"{"event":"task_complete","data":{"session_id":"branch","summary":"done"}}"#,
+            "\n",
+        );
+        let ledger = lineage_ledger_from_jsonl(jsonl, "parent").expect("ledger");
+        let branches = &ledger.groups[0].branches;
+        assert_eq!(branches.len(), 2);
+        let subagent = branches
+            .iter()
+            .find(|branch| branch.relationship == "subagent")
+            .unwrap();
+        let detached = branches
+            .iter()
+            .find(|branch| branch.relationship == "fission-detached")
+            .unwrap();
+        assert_eq!(subagent.status, "completed");
+        assert_eq!(detached.status, "detached");
     }
 }
