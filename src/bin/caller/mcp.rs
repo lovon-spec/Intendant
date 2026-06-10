@@ -1337,6 +1337,19 @@ fn managed_context_tool(name: &str) -> bool {
     )
 }
 
+/// Fission MCP surface: spawning sibling branches, managing their lifecycle,
+/// and claiming canonical continuation. Like the managed rewind tools these
+/// only make sense for a managed Codex session, so they share the
+/// managed-context exposure gate — but they are deliberately NOT part of
+/// [`rewind_only_allowed_tool`]: under rewind-only context pressure the
+/// recovery gate must block fission work like any other ordinary tool.
+fn fission_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "fission_spawn" | "fission_control" | "claim_fission_canonical"
+    )
+}
+
 fn with_default_mcp_session_id(
     mut args: serde_json::Value,
     session_id: Option<&str>,
@@ -1363,7 +1376,7 @@ fn with_default_mcp_session_id(
 }
 
 fn tool_allowed_for_profile(name: &str, managed_context: bool, profile: Option<&str>) -> bool {
-    if !managed_context && managed_context_tool(name) {
+    if !managed_context && (managed_context_tool(name) || fission_tool(name)) {
         return false;
     }
     let Some(profile) = profile
@@ -1388,10 +1401,11 @@ fn tool_allowed_for_profile(name: &str, managed_context: bool, profile: Option<&
                     | "capture_shared_view_frame"
                     | "hide_shared_view"
             ) || (managed_context
-                // Keep managed rewind tools reachable from Codex's small MCP
-                // profile; descriptions and status decide when normal turns
-                // should use them.
+                // Keep managed rewind + fission tools reachable from Codex's
+                // small MCP profile; descriptions and status decide when
+                // normal turns should use them.
                 && (managed_context_tool(name)
+                    || fission_tool(name)
                     || matches!(
                         name,
                         "list_displays"
@@ -1423,10 +1437,11 @@ fn tool_allowed_for_profile(name: &str, managed_context: bool, profile: Option<&
                     | "request_shared_view_input"
                     | "capture_shared_view_frame"
                     | "hide_shared_view"
-            ) || (managed_context && managed_context_tool(name))
+            ) || (managed_context && (managed_context_tool(name) || fission_tool(name)))
         }
         "managed" | "managed-context" => {
-            matches!(name, "get_status") || (managed_context && managed_context_tool(name))
+            matches!(name, "get_status")
+                || (managed_context && (managed_context_tool(name) || fission_tool(name)))
         }
         // Unknown profiles fail open so typoed third-party URLs do not silently
         // hide tools. Intendant-generated URLs use known profile names.
@@ -1491,6 +1506,30 @@ fn append_manual_http_tool_definitions(
             "rewind_backout",
             "Inspect or restore a previous managed-context rewind/backout record. Restore mutates the active Codex thread in place; fork/backout create a lineage branch when the patched Codex binary is used.",
             RewindBackoutParams
+        ),
+    );
+    push(
+        "fission_spawn",
+        manual_http_tool_definition!(
+            "fission_spawn",
+            "Fork this Codex thread into 1-4 full-context sibling branches that run in parallel as real sessions. Each branch needs a self-contained charter (objective + optional owned write_scope); branches fork from the last completed turn and do not see the current turn. Branches with a write_scope get an isolated git worktree by default. Returns group_id, branch session ids, and worktree paths; track progress via get_status fission_ledger.",
+            FissionSpawnParams
+        ),
+    );
+    push(
+        "fission_control",
+        manual_http_tool_definition!(
+            "fission_control",
+            "Manage a fission branch. op=wait blocks (capped timeout_s, default 60, max 300) until the branch is terminal and returns the group snapshot — still_running on timeout is normal. op=import returns the branch outcome (summary, changed files, raw-log pointer) into this context and marks it imported. op=cancel stops the branch session. op=detach abandons it without stopping. Detached branches cannot be waited on or imported.",
+            FissionControlParams
+        ),
+    );
+    push(
+        "claim_fission_canonical",
+        manual_http_tool_definition!(
+            "claim_fission_canonical",
+            "Claim a fission group's canonical branch. Omit expected_canonical_session_id for first-writer-wins; provide it to deliberately compare-and-swap from the current canonical branch.",
+            ClaimFissionCanonicalParams
         ),
     );
     push(
@@ -6685,6 +6724,50 @@ pub struct ClaimFissionCanonicalParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct FissionSpawnParams {
+    /// Optional Intendant or backend session id. Omit for the active Codex session.
+    #[serde(default, alias = "sessionId")]
+    pub session_id: Option<String>,
+    /// 1-4 branch charters; one sibling branch session is spawned per entry.
+    pub branches: Vec<FissionBranchSpec>,
+    /// Override worktree isolation for all branches. Omit for the default:
+    /// branches that declare a write_scope get an isolated git worktree.
+    #[serde(default, alias = "useWorktree")]
+    pub use_worktree: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct FissionBranchSpec {
+    /// Self-contained charter for the branch: what it exists to accomplish.
+    /// Branches fork from the last completed turn and do not see the current turn.
+    pub objective: String,
+    /// Optional owned write scope (paths the branch may edit).
+    #[serde(default, alias = "writeScope")]
+    pub write_scope: Option<Vec<String>>,
+    /// Optional display name for the branch session.
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct FissionControlParams {
+    /// Optional Intendant or backend session id. Omit for the active Codex session.
+    #[serde(default, alias = "sessionId")]
+    pub session_id: Option<String>,
+    /// Fission group id from fission_spawn or get_status().fission_ledger.groups[].group_id.
+    pub group_id: String,
+    /// Branch session id. Required for op=import/cancel/detach; optional for
+    /// op=wait (omit to wait for ANY branch of the group to become terminal).
+    #[serde(default, alias = "branchSessionId")]
+    pub branch_session_id: Option<String>,
+    /// Operation: "wait", "import", "cancel", or "detach".
+    pub op: String,
+    /// op=wait timeout in seconds, clamped to [5, 300]. Default 60.
+    #[serde(default, alias = "timeoutS")]
+    pub timeout_s: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct TakeDisplayParams {
     /// Display ID to claim (e.g. 99 for virtual display 99).
     pub display_id: u32,
@@ -7385,7 +7468,7 @@ impl IntendantServer {
         ) {
             return Ok(text_tool_error(message));
         }
-        if managed_context_tool(name)
+        if (managed_context_tool(name) || fission_tool(name))
             && !self
                 .state
                 .read()
@@ -7393,7 +7476,7 @@ impl IntendantServer {
                 .exposed_codex_managed_context_enabled_for(session_id, managed_context_override)
         {
             return Ok(text_tool_error(
-                "Codex managed context is disabled for this session. Set `[agent.codex] managed_context = \"managed\"` before starting the task, or choose Managed context = managed in the dashboard, to enable list_rewind_anchors/inspect_rewind_anchor/rewind_context/rewind_backout.".to_string(),
+                "Codex managed context is disabled for this session. Set `[agent.codex] managed_context = \"managed\"` before starting the task, or choose Managed context = managed in the dashboard, to enable list_rewind_anchors/inspect_rewind_anchor/rewind_context/rewind_backout and the fission tools fission_spawn/fission_control/claim_fission_canonical.".to_string(),
             ));
         }
 
@@ -7474,6 +7557,18 @@ impl IntendantServer {
             "claim_fission_canonical" => {
                 let params = parse_params::<ClaimFissionCanonicalParams>(args)?;
                 Ok(text_tool_result(self.claim_fission_canonical(params).await))
+            }
+            "fission_spawn" => {
+                let params = parse_params::<FissionSpawnParams>(with_default_mcp_session_id(
+                    args, session_id,
+                ))?;
+                Ok(text_tool_result(self.fission_spawn(params).await))
+            }
+            "fission_control" => {
+                let params = parse_params::<FissionControlParams>(with_default_mcp_session_id(
+                    args, session_id,
+                ))?;
+                Ok(text_tool_result(self.fission_control(params).await))
             }
             "schedule_controller_restart" => {
                 let params = parse_params::<ScheduleControllerRestartParams>(args)?;
@@ -8665,6 +8760,144 @@ fn clean_external_resume_id(value: &str) -> Option<String> {
     (!value.is_empty()).then(|| value.to_string())
 }
 
+/// Most branches a single `fission_spawn` call may fork.
+const FISSION_SPAWN_MAX_BRANCHES: usize = 4;
+/// `fission_control(op="wait")` timeout window: requests are clamped to
+/// [`FISSION_WAIT_MIN_TIMEOUT_S`, `FISSION_WAIT_MAX_TIMEOUT_S`] with
+/// [`FISSION_WAIT_DEFAULT_TIMEOUT_S`] when omitted.
+const FISSION_WAIT_DEFAULT_TIMEOUT_S: u64 = 60;
+const FISSION_WAIT_MIN_TIMEOUT_S: u64 = 5;
+const FISSION_WAIT_MAX_TIMEOUT_S: u64 = 300;
+
+/// Reason recorded on the ledger when `fission_control(op="detach")` severs a
+/// group on the operator's behalf.
+const FISSION_CONTROL_DETACH_REASON: &str = "operator detach via fission_control";
+
+fn clamp_fission_wait_timeout_s(requested: Option<u64>) -> u64 {
+    requested
+        .unwrap_or(FISSION_WAIT_DEFAULT_TIMEOUT_S)
+        .clamp(FISSION_WAIT_MIN_TIMEOUT_S, FISSION_WAIT_MAX_TIMEOUT_S)
+}
+
+/// Render a [`crate::fission_lifecycle::WaitOutcome`] as the
+/// `fission_control(op="wait")` tool result. `Terminal`/`StillRunning` are
+/// compact JSON group snapshots tagged with an `outcome` field —
+/// `still_running` is a NORMAL result (the wait window simply elapsed), not
+/// an error. `Detached` explains why the wait was refused and points at the
+/// salvage paths; the not-found variants render as plain errors.
+fn render_fission_wait_outcome(
+    outcome: crate::fission_lifecycle::WaitOutcome,
+    group_id: &str,
+    branch_session_id: Option<&str>,
+    timeout_s: u64,
+) -> String {
+    use crate::fission_lifecycle::WaitOutcome;
+    let watched = branch_session_id.unwrap_or("any branch");
+    let snapshot = |outcome: &str, group: &crate::fission_ledger::FissionGroup, message: String| {
+        serde_json::to_string_pretty(&serde_json::json!({
+            "op": "wait",
+            "outcome": outcome,
+            "group_id": group_id,
+            "watched": watched,
+            "message": message,
+            "group": group,
+        }))
+        .unwrap_or_else(|_| format!("fission_control wait outcome: {outcome}"))
+    };
+    match outcome {
+        WaitOutcome::Terminal(group) => snapshot(
+            "terminal",
+            &group,
+            format!("{watched} reached a terminal status; use fission_control op=import to pull a branch outcome into this context"),
+        ),
+        WaitOutcome::StillRunning(group) => snapshot(
+            "still_running",
+            &group,
+            format!("{watched} is still running after the {timeout_s}s wait window; this is a normal result, not an error — re-issue fission_control op=wait to keep waiting, or continue other work and check get_status fission_ledger later"),
+        ),
+        WaitOutcome::Detached(group) => snapshot(
+            "detached",
+            &group,
+            format!("fission group `{group_id}` is detached (its spawn anchor left the effective history or it was explicitly severed), so it cannot be waited on or imported; salvage results manually via each branch's raw_log pointer in the group snapshot, or revisit the parent's pre-rewind state with rewind_backout"),
+        ),
+        WaitOutcome::GroupNotFound => format!(
+            "fission_control wait failed: fission group `{group_id}` was not found in any candidate ledger; check get_status fission_ledger for known groups"
+        ),
+        WaitOutcome::BranchNotFound(group) => {
+            let known: Vec<&str> = group
+                .branches
+                .iter()
+                .map(|branch| branch.session_id.as_str())
+                .collect();
+            format!(
+                "fission_control wait failed: branch `{watched}` is not part of fission group `{group_id}`; known branches: [{}]",
+                known.join(", ")
+            )
+        }
+    }
+}
+
+/// Flip a fission branch to the sticky `cancelled` status for
+/// `fission_control(op="cancel")`. Verified against the ledger's setter rules
+/// (`record_fission_observation`): an observation never *overwrites* a sticky
+/// `detached`/`cancelled` status and never downgrades a terminal one, but
+/// recording `cancelled` on a still-running branch is an allowed terminal
+/// upgrade — so this explicit cancel intent can ride the observation path
+/// instead of needing a dedicated ledger setter. Branches that already
+/// reached a terminal status are left untouched (their recorded result stays
+/// real); the terminal guard here is what prevents the one overwrite the
+/// observation path WOULD permit (terminal-over-terminal, e.g. `completed`
+/// -> `cancelled`).
+fn mark_fission_branch_cancelled(
+    log_dir: &std::path::Path,
+    group_id: &str,
+    branch_session_id: &str,
+) -> Result<(String, crate::fission_ledger::FissionGroup), String> {
+    let document = crate::fission_ledger::read_fission_ledger_document(log_dir)
+        .map_err(|err| format!("failed to read fission ledger: {err}"))?
+        .ok_or_else(|| format!("no fission ledger at {}", log_dir.display()))?;
+    let group = document
+        .groups
+        .iter()
+        .find(|group| group.group_id == group_id)
+        .ok_or_else(|| format!("fission group `{group_id}` was not found"))?;
+    let branch = group
+        .branches
+        .iter()
+        .find(|branch| branch.session_id == branch_session_id)
+        .ok_or_else(|| {
+            format!("branch `{branch_session_id}` is not part of fission group `{group_id}`")
+        })?;
+    if crate::fission_ledger::branch_status_is_terminal(&branch.status) {
+        return Ok((
+            format!(
+                "branch already has terminal status `{}`; ledger unchanged",
+                branch.status
+            ),
+            group.clone(),
+        ));
+    }
+    let observation = crate::fission_ledger::FissionObservation {
+        parent_session_id: group.parent_session_id.clone(),
+        anchor_item_id: group.anchor_item_id.clone(),
+        tool: group.tool.clone(),
+        status: "cancelled".to_string(),
+        prompt: None,
+        model: None,
+        reasoning_effort: None,
+        branches: vec![crate::fission_ledger::FissionBranchObservation {
+            session_id: branch_session_id.to_string(),
+            status: "cancelled".to_string(),
+            summary: None,
+        }],
+    };
+    match crate::fission_ledger::record_fission_observation(log_dir, observation) {
+        Ok(Some(group)) => Ok(("branch marked cancelled".to_string(), group)),
+        Ok(None) => Err("ledger observation was dropped (missing ids)".to_string()),
+        Err(err) => Err(format!("failed to record cancellation: {err}")),
+    }
+}
+
 impl IntendantServer {
     #[tool(
         description = "Schedule a Codex context rewind to an exact item/tool-call anchor. Use only after managed-context recovery/density handoff guidance, rewind-only context pressure, a watch-pressure density decision, or genuinely noisy/unexpectedly large recent output makes a rewind necessary; do not use for ordinary low-pressure startup/search work. First call list_rewind_anchors and choose one returned item_id; call inspect_rewind_anchor when the compact row is ambiguous. Do not synthesize anchor ids from prior failed tool calls. The current turn will finish, Intendant will roll back Codex to the anchor, inject the primer as developer context, and resume the branch."
@@ -8908,16 +9141,326 @@ impl IntendantServer {
             .as_deref()
             .map(str::trim)
             .filter(|value| !value.is_empty());
-        let log_dir = self.state.read().await.log_dir.clone();
-        match crate::fission_ledger::claim_canonical(
+        let log_dir = self
+            .resolve_fission_ledger_log_dir(group_id, Some(branch_session_id), None)
+            .await;
+        // v1 anchor-reachability semantics: the MCP layer has no independent
+        // view of the parent's effective (post-rewind) history, so the
+        // ledger's own detached flag IS the reachability proxy — the rewind
+        // path detaches every group whose anchor left the effective history
+        // (`detach_groups_with_invalid_anchors`), and a still-attached group's
+        // anchor is presumed reachable. `claim_canonical_checked` re-checks
+        // the same flag internally; evaluating it here as the explicit
+        // predicate keeps that v1 choice visible (and replaceable) at the
+        // call site.
+        let group_is_detached = crate::fission_ledger::read_fission_ledger_document(&log_dir)
+            .ok()
+            .flatten()
+            .is_some_and(|document| document.group_is_detached(group_id));
+        match crate::fission_ledger::claim_canonical_checked(
             &log_dir,
             group_id,
             branch_session_id,
             expected,
+            |_anchor_item_id| !group_is_detached,
         ) {
             Ok(group) => serde_json::to_string_pretty(&group)
                 .unwrap_or_else(|_| "ok (canonical branch claimed)".to_string()),
             Err(err) => format!("claim_fission_canonical failed: {err}"),
+        }
+    }
+
+    /// Resolve the log dir whose `fission_ledger.json` carries `group_id`.
+    /// Tries the in-process branch route registered at spawn time first, then
+    /// the server's primary log dir, then every dir the calling session is
+    /// known by (supervised parents log under `~/.intendant/logs/<id>/`) —
+    /// the same candidate resolution the managed log/status handlers use. The
+    /// first candidate whose ledger document knows the group wins; when none
+    /// does, the first candidate is returned so the caller surfaces a clean
+    /// group-not-found against the most authoritative dir.
+    async fn resolve_fission_ledger_log_dir(
+        &self,
+        group_id: &str,
+        branch_session_id: Option<&str>,
+        session_id: Option<&str>,
+    ) -> std::path::PathBuf {
+        let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+        let push = |dir: std::path::PathBuf, candidates: &mut Vec<std::path::PathBuf>| {
+            if !candidates.contains(&dir) {
+                candidates.push(dir);
+            }
+        };
+        if let Some(route) = branch_session_id
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .and_then(crate::fission_lifecycle::branch_route)
+        {
+            push(route.log_dir, &mut candidates);
+        }
+        let (primary, session_id) = {
+            let state = self.state.read().await;
+            let session_id = session_id
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+                .map(str::to_string)
+                .or_else(|| {
+                    let active = state.session_id.trim();
+                    (!active.is_empty()).then(|| active.to_string())
+                });
+            (state.log_dir.clone(), session_id)
+        };
+        push(primary.clone(), &mut candidates);
+        if let Some(session_id) = session_id {
+            for dir in requested_session_log_dirs(&primary, &session_id) {
+                push(dir, &mut candidates);
+            }
+        }
+        for dir in &candidates {
+            if let Ok(Some(document)) = crate::fission_ledger::read_fission_ledger_document(dir) {
+                if document
+                    .groups
+                    .iter()
+                    .any(|group| group.group_id == group_id)
+                {
+                    return dir.clone();
+                }
+            }
+        }
+        candidates.into_iter().next().unwrap_or(primary)
+    }
+
+    #[tool(
+        description = "Fork this Codex thread into 1-4 full-context sibling branches that run in parallel as real sessions. Each branch needs a self-contained charter (objective + optional owned write_scope); branches fork from the last completed turn and do not see the current turn. Branches with a write_scope get an isolated git worktree by default. Returns group_id, branch session ids, and worktree paths; track progress via get_status fission_ledger."
+    )]
+    async fn fission_spawn(&self, Parameters(params): Parameters<FissionSpawnParams>) -> String {
+        if params.branches.is_empty() || params.branches.len() > FISSION_SPAWN_MAX_BRANCHES {
+            return format!(
+                "fission_spawn requires between 1 and {FISSION_SPAWN_MAX_BRANCHES} branches; got {}",
+                params.branches.len()
+            );
+        }
+        let mut branches = Vec::with_capacity(params.branches.len());
+        for (idx, branch) in params.branches.iter().enumerate() {
+            let objective = branch.objective.trim();
+            if objective.is_empty() {
+                return format!(
+                    "fission_spawn branches[{idx}] requires a non-empty self-contained objective"
+                );
+            }
+            let mut spec = serde_json::json!({ "objective": objective });
+            if let Some(write_scope) = &branch.write_scope {
+                spec["write_scope"] = serde_json::json!(write_scope
+                    .iter()
+                    .map(|path| path.trim())
+                    .filter(|path| !path.is_empty())
+                    .collect::<Vec<_>>());
+            }
+            if let Some(name) = branch
+                .name
+                .as_deref()
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+            {
+                spec["name"] = serde_json::Value::String(name.to_string());
+            }
+            branches.push(spec);
+        }
+        let mut payload = serde_json::json!({ "branches": branches });
+        if let Some(use_worktree) = params.use_worktree {
+            if let Some(obj) = payload.as_object_mut() {
+                obj.insert(
+                    "use_worktree".to_string(),
+                    serde_json::Value::Bool(use_worktree),
+                );
+            }
+        }
+        self.dispatch_codex_thread_action_and_wait(
+            params.session_id.clone(),
+            "fission_spawn".to_string(),
+            payload,
+            "fission_spawn dispatched but no spawn result was observed".to_string(),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Manage a fission branch. op=wait blocks (capped timeout_s, default 60, max 300) until the branch is terminal and returns the group snapshot — still_running on timeout is normal. op=import returns the branch outcome (summary, changed files, raw-log pointer) into this context and marks it imported. op=cancel stops the branch session. op=detach abandons it without stopping. Detached branches cannot be waited on or imported."
+    )]
+    async fn fission_control(
+        &self,
+        Parameters(params): Parameters<FissionControlParams>,
+    ) -> String {
+        let group_id = params.group_id.trim();
+        if group_id.is_empty() {
+            return "fission_control requires a non-empty group_id".to_string();
+        }
+        let op = params.op.trim().to_ascii_lowercase();
+        if !matches!(op.as_str(), "wait" | "import" | "cancel" | "detach") {
+            return format!(
+                "fission_control op must be `wait`, `import`, `cancel`, or `detach`; got `{}`",
+                params.op.trim()
+            );
+        }
+        let branch_session_id = params
+            .branch_session_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|id| !id.is_empty());
+        let Some(branch_session_id) = branch_session_id else {
+            if op == "wait" {
+                // Waiting without a branch watches for ANY branch of the
+                // group to become terminal.
+                return self
+                    .fission_control_wait(group_id, None, params.timeout_s, params.session_id.as_deref())
+                    .await;
+            }
+            return format!("fission_control op={op} requires branch_session_id");
+        };
+        match op.as_str() {
+            "wait" => {
+                self.fission_control_wait(
+                    group_id,
+                    Some(branch_session_id),
+                    params.timeout_s,
+                    params.session_id.as_deref(),
+                )
+                .await
+            }
+            "import" => {
+                // Stage A's `fission_import` thread-action handler injects the
+                // branch outcome into the parent thread and returns it as the
+                // action result message; this tool just relays that message.
+                self.dispatch_codex_thread_action_and_wait(
+                    params.session_id.clone(),
+                    "fission_import".to_string(),
+                    serde_json::json!({
+                        "group_id": group_id,
+                        "branch_session_id": branch_session_id,
+                    }),
+                    "fission_import dispatched but no import result was observed".to_string(),
+                )
+                .await
+            }
+            "cancel" => {
+                self.fission_control_cancel(
+                    group_id,
+                    branch_session_id,
+                    params.session_id.as_deref(),
+                )
+                .await
+            }
+            "detach" => {
+                self.fission_control_detach(
+                    group_id,
+                    branch_session_id,
+                    params.session_id.as_deref(),
+                )
+                .await
+            }
+            _ => unreachable!("op validated above"),
+        }
+    }
+
+    async fn fission_control_wait(
+        &self,
+        group_id: &str,
+        branch_session_id: Option<&str>,
+        timeout_s: Option<u64>,
+        session_id: Option<&str>,
+    ) -> String {
+        let log_dir = self
+            .resolve_fission_ledger_log_dir(group_id, branch_session_id, session_id)
+            .await;
+        let timeout_s = clamp_fission_wait_timeout_s(timeout_s);
+        match crate::fission_lifecycle::wait_for_branch_terminal(
+            &log_dir,
+            group_id,
+            branch_session_id,
+            std::time::Duration::from_secs(timeout_s),
+        )
+        .await
+        {
+            Ok(outcome) => {
+                render_fission_wait_outcome(outcome, group_id, branch_session_id, timeout_s)
+            }
+            Err(err) => format!(
+                "fission_control wait failed reading the fission ledger at {}: {err}",
+                log_dir.display()
+            ),
+        }
+    }
+
+    async fn fission_control_cancel(
+        &self,
+        group_id: &str,
+        branch_session_id: &str,
+        session_id: Option<&str>,
+    ) -> String {
+        // Stop the live branch session through the same control-plane intent
+        // as the dashboard's stop button (`ControlMsg::StopSession`); the
+        // session supervisor owns the actual backend shutdown.
+        self.bus
+            .send(AppEvent::ControlCommand(ControlMsg::StopSession {
+                session_id: branch_session_id.to_string(),
+            }));
+        let stop_note = format!("stop requested for branch session `{branch_session_id}`");
+
+        let log_dir = self
+            .resolve_fission_ledger_log_dir(group_id, Some(branch_session_id), session_id)
+            .await;
+        let (ledger_note, group) =
+            match mark_fission_branch_cancelled(&log_dir, group_id, branch_session_id) {
+                Ok((note, group)) => (note, Some(group)),
+                Err(err) => (format!("ledger not updated: {err}"), None),
+            };
+        let mut result = serde_json::json!({
+            "op": "cancel",
+            "group_id": group_id,
+            "branch_session_id": branch_session_id,
+            "stop": stop_note,
+            "ledger": ledger_note,
+        });
+        if let (Some(obj), Some(group)) = (result.as_object_mut(), group) {
+            obj.insert(
+                "group".to_string(),
+                serde_json::to_value(group).unwrap_or_else(|_| serde_json::json!({})),
+            );
+        }
+        serde_json::to_string_pretty(&result)
+            .unwrap_or_else(|_| "ok (fission branch cancel dispatched)".to_string())
+    }
+
+    async fn fission_control_detach(
+        &self,
+        group_id: &str,
+        branch_session_id: &str,
+        session_id: Option<&str>,
+    ) -> String {
+        let log_dir = self
+            .resolve_fission_ledger_log_dir(group_id, Some(branch_session_id), session_id)
+            .await;
+        match crate::fission_ledger::detach_group(&log_dir, group_id, FISSION_CONTROL_DETACH_REASON)
+        {
+            Ok(group) => {
+                // Let frontends draw the severed edge: same relationship kind
+                // the lineage ledger folds into a `detached` branch row.
+                self.bus.send(AppEvent::SessionRelationship {
+                    parent_session_id: group.parent_session_id.clone(),
+                    child_session_id: branch_session_id.to_string(),
+                    relationship: "fission-detached".to_string(),
+                    ephemeral: false,
+                });
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "op": "detach",
+                    "group_id": group_id,
+                    "branch_session_id": branch_session_id,
+                    "detach_reason": FISSION_CONTROL_DETACH_REASON,
+                    "message": "group detached without stopping its sessions; detached branches cannot be waited on or imported",
+                    "group": group,
+                }))
+                .unwrap_or_else(|_| "ok (fission group detached)".to_string())
+            }
+            Err(err) => format!("fission_control detach failed: {err}"),
         }
     }
 
@@ -10730,6 +11273,7 @@ mod tests {
             }
         })
     }
+
 
     #[test]
     fn mcp_state_initial_values() {

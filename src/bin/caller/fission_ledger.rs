@@ -689,12 +689,14 @@ pub fn record_fission_observation(
     Ok(Some(updated))
 }
 
-/// First-writer-wins / compare-and-swap canonical claim. Kept for existing
-/// call sites (the `claim_fission_canonical` MCP tool); it skips the
-/// anchor-reachability check but still refuses detached groups and
-/// detached/cancelled branches — a detached branch can never own canonical
-/// continuation, no matter which surface the claim arrives through. New
-/// wiring should prefer [`claim_canonical_checked`] with a real predicate.
+/// First-writer-wins / compare-and-swap canonical claim. Retained compat
+/// surface: the `claim_fission_canonical` MCP tool moved to
+/// [`claim_canonical_checked`] with an explicit reachability predicate. This
+/// wrapper skips the anchor-reachability check but still refuses detached
+/// groups and detached/cancelled branches — a detached branch can never own
+/// canonical continuation, no matter which surface the claim arrives through.
+/// New wiring should prefer [`claim_canonical_checked`] with a real predicate.
+#[allow(dead_code)] // retained compat surface; live callers use claim_canonical_checked
 pub fn claim_canonical(
     log_dir: &Path,
     group_id: &str,
