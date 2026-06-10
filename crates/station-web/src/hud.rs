@@ -6,14 +6,14 @@ use std::collections::HashMap;
 
 use web_sys::CanvasRenderingContext2d;
 
-use crate::input::{HitAction, HitZone};
+use crate::input::{HitAction, HitZone, ViewSliderKey};
 use crate::model::activity_retained_count;
 use crate::scene::{ndc_to_screen, LayoutName, Mood, NodeKind, ProjectedNode, Vec2};
 use crate::util::{
-    css_rgba, hex_color, level_color_css, nonempty, pct_label, percent, pressure_color, truncate,
-    Color, C_BLUE, C_BLUE_CSS, C_GREEN_CSS, C_LAVENDER, C_LAVENDER_CSS, C_MAUVE_CSS, C_OVERLAY1,
-    C_OVERLAY1_CSS, C_PEACH, C_PEACH_CSS, C_RED_CSS, C_SUBTEXT0_CSS, C_TEAL, C_TEAL_CSS,
-    C_TEXT_CSS, C_YELLOW_CSS,
+    attention_level_color_css, css_rgba, fmt_compact, hex_color, level_color_css, nonempty,
+    pct_label, percent, phase_color_css, pressure_color, tone_color_css, truncate, Color, C_BLUE,
+    C_BLUE_CSS, C_GREEN_CSS, C_LAVENDER, C_LAVENDER_CSS, C_MAUVE_CSS, C_OVERLAY1, C_OVERLAY1_CSS,
+    C_PEACH, C_PEACH_CSS, C_RED_CSS, C_SUBTEXT0_CSS, C_TEAL, C_TEAL_CSS, C_TEXT_CSS, C_YELLOW_CSS,
 };
 use crate::StationInner;
 
@@ -187,13 +187,21 @@ impl StationInner {
         }
     }
 
-    /// Thumbnail frame rect (CSS px) for a display source anchored at the
-    /// projected host position. Shared by the full HUD paint and the
-    /// video-only partial repaint so the two can never drift apart.
-    pub(crate) fn thumbnail_rect(css: Vec2, css_width: f32) -> (f32, f32, f32, f32) {
+    /// Thumbnail frame rect (CSS px) for the `index`-th of `count` display
+    /// sources anchored at the projected host position. Multi-display
+    /// hosts fan out horizontally around the anchor instead of stacking
+    /// every thumbnail on the same rect. Shared by the full HUD paint and
+    /// the video-only partial repaint so the two can never drift apart.
+    pub(crate) fn thumbnail_rect(
+        css: Vec2,
+        css_width: f32,
+        index: usize,
+        count: usize,
+    ) -> ThumbRect {
         let tw = 164.0_f32.min(css_width * 0.28).max(98.0);
         let th = tw * 0.5625;
-        let x = css.x - tw / 2.0;
+        let fan = (index as f32 - count.saturating_sub(1) as f32 * 0.5) * (tw + 10.0);
+        let x = css.x - tw / 2.0 + fan;
         let y = css.y - 118.0 - th * 0.2;
         (x, y, tw, th)
     }
@@ -215,6 +223,41 @@ impl StationInner {
         Vec2::new(center.x / self.dpr as f32, center.y / self.dpr as f32)
     }
 
+    /// Every display source with its placed thumbnail rect. Sources are
+    /// sorted by id (HashMap order would make multi-display fans jitter
+    /// between paints) and indexed per host for the fan-out.
+    fn placed_display_thumbnails(&self) -> Vec<(&crate::DisplaySource, ThumbRect)> {
+        if self.display_sources.is_empty() {
+            return Vec::new();
+        }
+        let by_host = self.host_nodes();
+        let mut sources: Vec<(&String, &crate::DisplaySource)> =
+            self.display_sources.iter().collect();
+        sources.sort_by(|a, b| a.0.cmp(b.0));
+        let mut per_host_count: HashMap<&str, usize> = HashMap::new();
+        for (_, source) in &sources {
+            *per_host_count.entry(source.host_id.as_str()).or_default() += 1;
+        }
+        let css_w = self.css_width();
+        let mut per_host_seen: HashMap<&str, usize> = HashMap::new();
+        let mut placed = Vec::with_capacity(sources.len());
+        for (_, source) in sources {
+            let Some(node) = by_host.get(source.host_id.as_str()) else {
+                continue;
+            };
+            let count = per_host_count
+                .get(source.host_id.as_str())
+                .copied()
+                .unwrap_or(1);
+            let seen = per_host_seen.entry(source.host_id.as_str()).or_default();
+            let index = *seen;
+            *seen += 1;
+            let css = self.node_css_center(node);
+            placed.push((source, Self::thumbnail_rect(css, css_w, index, count)));
+        }
+        placed
+    }
+
     /// Partial HUD repaint: refresh only the live video pixels inside the
     /// already-painted thumbnail frames. Valid whenever nothing else on
     /// the HUD changed since the last full paint (`render` guarantees the
@@ -230,18 +273,12 @@ impl StationInner {
             .ctx
             .set_transform(self.dpr, 0.0, 0.0, self.dpr, 0.0, 0.0)
             .ok();
-        let by_host = self.host_nodes();
-        for source in self.display_sources.values() {
-            let Some(node) = by_host.get(source.host_id.as_str()) else {
-                continue;
-            };
+        for (source, (x, y, tw, th)) in self.placed_display_thumbnails() {
             // Sources still waiting for pixels keep their painted
             // placeholder; the first ready frame simply draws over it.
             if source.video.video_width() == 0 || source.video.video_height() == 0 {
                 continue;
             }
-            let css = self.node_css_center(node);
-            let (x, y, tw, th) = Self::thumbnail_rect(css, self.css_width());
             let _ = self
                 .hud
                 .ctx
@@ -256,16 +293,7 @@ impl StationInner {
     }
 
     pub(crate) fn draw_display_thumbnails(&self) {
-        if self.display_sources.is_empty() {
-            return;
-        }
-        let by_host = self.host_nodes();
-        for source in self.display_sources.values() {
-            let Some(node) = by_host.get(source.host_id.as_str()) else {
-                continue;
-            };
-            let css = self.node_css_center(node);
-            let (x, y, tw, th) = Self::thumbnail_rect(css, self.css_width());
+        for (source, (x, y, tw, th)) in self.placed_display_thumbnails() {
             self.glass_panel(x, y, tw, th, 6.0, C_PEACH, 1.2, 1.15);
             let video_ready = source.video.video_width() > 0 && source.video.video_height() > 0;
             if video_ready {
@@ -343,6 +371,39 @@ impl StationInner {
             HitAction::Layout(LayoutName::Constellation),
         );
 
+        // Attention alert strip: the snapshot's attention queue surfaces in
+        // the header so blocked work is visible from any layout. Click
+        // selects system:controls, whose focus panel lists the items.
+        let mut status_x = 318.0;
+        let queue = &self.snapshot.attention_queue;
+        if queue.count > 0 {
+            let color = if queue.blocked > 0 {
+                C_RED_CSS
+            } else {
+                C_YELLOW_CSS
+            };
+            let top = queue
+                .items
+                .first()
+                .map(|item| truncate(&item.title, 22))
+                .unwrap_or_default();
+            let label = if top.is_empty() {
+                format!("{} attention", queue.count)
+            } else {
+                format!("{} attention / {top}", queue.count)
+            };
+            let pill_w = (label.chars().count() as f32 * 6.1 + 18.0).min(w * 0.34);
+            self.pill_at(status_x, 10.0, pill_w, 23.0, &label, color, true);
+            self.hit_zones.push(HitZone::new(
+                status_x,
+                10.0,
+                pill_w,
+                23.0,
+                HitAction::Select("system:controls".to_string()),
+            ));
+            status_x += pill_w + 12.0;
+        }
+
         let active_agents = self
             .snapshot
             .agents
@@ -367,8 +428,8 @@ impl StationInner {
             },
         );
         self.text(
-            &truncate(&right, ((w - 330.0) / 7.0).max(22.0) as usize),
-            318.0,
+            &truncate(&right, ((w - status_x - 12.0) / 7.0).max(22.0) as usize),
+            status_x,
             26.0,
             10.0,
             if pending > 0 {
@@ -571,19 +632,16 @@ impl StationInner {
         );
 
         let targets = std::mem::take(&mut self.system_targets);
+        let (count, pitch, tile_h) = compact_grid(self.density, panel_h);
         let tile_w = (panel_w - 44.0) * 0.5;
         let mut tx = x + 14.0;
         let mut ty = y + 66.0;
-        for (idx, target) in targets
-            .iter()
-            .take(compact_tile_count(self.density))
-            .enumerate()
-        {
+        for (idx, target) in targets.iter().take(count).enumerate() {
             if idx > 0 && idx % 2 == 0 {
                 tx = x + 14.0;
-                ty += 58.0;
+                ty += pitch;
             }
-            self.station_focus_button(tx, ty, tile_w, 48.0, target);
+            self.station_focus_button(tx, ty, tile_w, tile_h, target);
             tx += tile_w + 16.0;
         }
         self.system_targets = targets;
@@ -966,62 +1024,640 @@ impl StationInner {
     }
 
     pub(crate) fn draw_station_focus_detail(&mut self, id: &str, w: f32, h: f32) {
-        if id.starts_with("system:") {
-            return;
-        }
         let panel_w = 370.0_f32.min(w - 48.0).max(280.0);
-        let panel_h = 112.0;
         let x = (w - panel_w - 24.0).max(24.0);
         // Sit just above the activity lane, wherever density placed it.
         let activity_lane_y = (h - lane_metrics(self.density, h).2 - 24.0).max(282.0);
-        let y = (activity_lane_y - panel_h - 12.0).max(58.0);
-        let (title, value, detail, color) =
-            match self.system_targets.iter().find(|target| target.id == id) {
-                Some(target) => (
-                    target.title,
-                    truncate(&target.value, 52),
-                    truncate(&target.detail, 58),
-                    target.color,
-                ),
-                None => (
-                    "Selection",
-                    truncate(id, 42),
-                    "scene node selected".to_string(),
-                    C_BLUE_CSS,
-                ),
+        if let Some(agent) = self.snapshot.agents.iter().find(|a| a.id == id).cloned() {
+            self.draw_agent_focus(&agent, x, panel_w, activity_lane_y);
+            return;
+        }
+        if let Some(host) = id
+            .strip_prefix("host:")
+            .and_then(|hid| self.snapshot.hosts.iter().find(|h| h.id == hid))
+            .cloned()
+        {
+            self.draw_host_focus(&host, x, panel_w, activity_lane_y);
+            return;
+        }
+        if id == "system:view" {
+            self.draw_view_focus(x, panel_w, activity_lane_y);
+            return;
+        }
+        if id == "system:activity" {
+            // The activity runway below IS the detail surface for this one.
+            return;
+        }
+        if id.starts_with("system:") {
+            let rows = self.system_focus_rows(id);
+            let Some((title, value, detail, color)) = self
+                .system_targets
+                .iter()
+                .find(|target| target.id == id)
+                .map(|target| {
+                    (
+                        target.title.to_string(),
+                        truncate(&target.value, 52),
+                        truncate(&target.detail, 58),
+                        target.color,
+                    )
+                })
+            else {
+                return;
             };
-        self.glass_panel(
-            x,
-            y,
-            panel_w,
-            panel_h,
+            let panel_h = 112.0 + rows.len() as f32 * 17.0;
+            let y = (activity_lane_y - panel_h - 12.0).max(58.0);
+            self.focus_panel_frame(x, y, panel_w, panel_h, &title, color);
+            self.text(&value, x + 16.0, y + 68.0, 11.0, C_TEXT_CSS, "normal");
+            self.text(&detail, x + 16.0, y + 88.0, 10.0, C_SUBTEXT0_CSS, "normal");
+            let mut row_y = y + 110.0;
+            for (label, value, color) in &rows {
+                row_y = self.focus_row(x, row_y, panel_w, label, value, color);
+            }
+            return;
+        }
+        let panel_h = 112.0;
+        let y = (activity_lane_y - panel_h - 12.0).max(58.0);
+        self.focus_panel_frame(x, y, panel_w, panel_h, "Selection", C_BLUE_CSS);
+        self.text(&truncate(id, 52), x + 16.0, y + 68.0, 11.0, C_TEXT_CSS, "normal");
+        self.text(
+            "scene node selected",
+            x + 16.0,
+            y + 88.0,
             10.0,
-            hex_color(color).unwrap_or(C_BLUE),
-            1.5,
-            1.1,
+            C_SUBTEXT0_CSS,
+            "normal",
         );
+    }
+
+    /// Detail rows for a system target's focus panel — this is where the
+    /// snapshot's per-domain arrays (context items, managed records, recent
+    /// sessions/worktrees/changes, display lanes, attention items) become
+    /// visible pixels. Returns `(label, value, label_color)` triplets.
+    fn system_focus_rows(&self, id: &str) -> Vec<(String, String, &'static str)> {
+        let mut rows: Vec<(String, String, &'static str)> = Vec::new();
+        match id {
+            "system:context" => {
+                for cat in self.snapshot.context.top_categories.iter().take(3) {
+                    rows.push((
+                        cat.label.clone(),
+                        format!("{} tok / {} / {}", fmt_compact(cat.value), cat.count, cat.detail),
+                        C_BLUE_CSS,
+                    ));
+                }
+                for item in self.snapshot.context.top_items.iter().take(4) {
+                    rows.push((
+                        item.label.clone(),
+                        format!("{} / {}", item.value, item.detail),
+                        tone_color_css(&item.tone),
+                    ));
+                }
+            }
+            "system:managed" => {
+                for record in self.snapshot.managed.recent_records.iter().take(4) {
+                    rows.push((
+                        record.label.clone(),
+                        format!("{} / {}", record.value, record.detail),
+                        tone_color_css(&record.tone),
+                    ));
+                }
+                if rows.is_empty() {
+                    rows.push((
+                        "records".to_string(),
+                        "no managed rewind records yet".to_string(),
+                        C_OVERLAY1_CSS,
+                    ));
+                }
+            }
+            "system:sessions" => {
+                for session in self.snapshot.sessions.recent.iter().take(4) {
+                    rows.push((
+                        session.value.clone(),
+                        format!("{} / {}", session.label, session.detail),
+                        tone_color_css(&session.tone),
+                    ));
+                }
+            }
+            "system:worktrees" => {
+                for worktree in self.snapshot.sessions.recent_worktrees.iter().take(4) {
+                    rows.push((
+                        worktree.value.clone(),
+                        format!("{} / {}", worktree.label, worktree.detail),
+                        tone_color_css(&worktree.tone),
+                    ));
+                }
+            }
+            "system:changes" => {
+                for change in self.snapshot.changes.recent.iter().take(5) {
+                    rows.push((
+                        change.value.clone(),
+                        format!("{} / {}", change.label, change.detail),
+                        tone_color_css(&change.tone),
+                    ));
+                }
+            }
+            "system:peers" => {
+                let runway = &self.snapshot.display_runway;
+                rows.push((
+                    "peers".to_string(),
+                    format!(
+                        "{}/{} connected / {} display-capable",
+                        runway.connected_peers, runway.peer_count, runway.display_peers
+                    ),
+                    C_PEACH_CSS,
+                ));
+                rows.push((
+                    "streams".to_string(),
+                    format!(
+                        "{} local / {} remote",
+                        runway.local_streams, runway.remote_streams
+                    ),
+                    C_TEAL_CSS,
+                ));
+                if !runway.selected_peer_id.is_empty() {
+                    rows.push((
+                        "target".to_string(),
+                        format!(
+                            "{} :{}",
+                            nonempty(&runway.selected_peer_label, &runway.selected_peer_id),
+                            runway.selected_display_id
+                        ),
+                        C_BLUE_CSS,
+                    ));
+                }
+                if !runway.peer_status.trim().is_empty() {
+                    rows.push((
+                        "status".to_string(),
+                        runway.peer_status.trim().to_string(),
+                        C_OVERLAY1_CSS,
+                    ));
+                }
+                for lane in runway.lanes.iter().take(3) {
+                    let tag = match lane.kind.as_str() {
+                        "local_stream" => "local",
+                        "remote_stream" => "remote",
+                        "peer_target" => "target",
+                        "operator_target" => "operator",
+                        "shared_view" => "shared",
+                        other => other,
+                    };
+                    rows.push((
+                        tag.to_string(),
+                        format!("{} / {} / {}", lane.title, lane.meta, lane.detail),
+                        if lane.selected { C_BLUE_CSS } else { C_PEACH_CSS },
+                    ));
+                }
+            }
+            "system:controls" => {
+                let queue = &self.snapshot.attention_queue;
+                rows.push((
+                    "attention".to_string(),
+                    format!(
+                        "{} blocked / {} warn / {} ready",
+                        queue.blocked, queue.warn, queue.ready
+                    ),
+                    if queue.blocked > 0 {
+                        C_RED_CSS
+                    } else if queue.warn > 0 {
+                        C_YELLOW_CSS
+                    } else {
+                        C_GREEN_CSS
+                    },
+                ));
+                for item in queue.items.iter().take(4) {
+                    rows.push((
+                        item.level.clone(),
+                        format!("{} / {} / {}", item.title, item.meta, item.detail),
+                        attention_level_color_css(&item.level),
+                    ));
+                }
+            }
+            _ => {}
+        }
+        rows
+    }
+
+    /// Shared focus-panel chrome: glass body, FOCUS kicker, title, and the
+    /// close pill (with its hit zones). Body content is the caller's.
+    pub(crate) fn focus_panel_frame(
+        &mut self,
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        title: &str,
+        color: &str,
+    ) {
+        self.glass_panel(x, y, w, h, 10.0, hex_color(color).unwrap_or(C_BLUE), 1.5, 1.1);
         self.hit_zones
-            .push(HitZone::new(x, y, panel_w, panel_h, HitAction::Noop));
+            .push(HitZone::new(x, y, w, h, HitAction::Noop));
         self.text("FOCUS", x + 16.0, y + 23.0, 10.0, C_OVERLAY1_CSS, "bold");
-        self.text(title, x + 16.0, y + 47.0, 14.0, color, "bold");
-        self.text(&value, x + 16.0, y + 68.0, 11.0, C_TEXT_CSS, "normal");
-        self.text(&detail, x + 16.0, y + 88.0, 10.0, C_SUBTEXT0_CSS, "normal");
-        self.pill_at(
-            x + panel_w - 70.0,
-            y + 13.0,
-            50.0,
-            23.0,
-            "close",
-            C_OVERLAY1_CSS,
-            false,
-        );
+        self.text(&truncate(title, 34), x + 16.0, y + 47.0, 14.0, color, "bold");
+        self.pill_at(x + w - 70.0, y + 13.0, 50.0, 23.0, "close", C_OVERLAY1_CSS, false);
         self.hit_zones.push(HitZone::new(
-            x + panel_w - 70.0,
+            x + w - 70.0,
             y + 13.0,
             50.0,
             23.0,
             HitAction::ClosePanel,
         ));
+    }
+
+    /// One labeled row inside a focus panel: colored label column, value
+    /// text beside it. Returns the next row baseline.
+    fn focus_row(&self, x: f32, row_y: f32, w: f32, label: &str, value: &str, color: &str) -> f32 {
+        self.text(&truncate(label, 11), x + 16.0, row_y, 9.0, color, "bold");
+        self.text(
+            &truncate(value, ((w - 116.0) / 5.6).max(18.0) as usize),
+            x + 96.0,
+            row_y,
+            9.5,
+            C_TEXT_CSS,
+            "normal",
+        );
+        row_y + 17.0
+    }
+
+    /// Real detail panel for a selected agent node: identity, model, phase,
+    /// task, budget/usage, and — when an approval is pending — the approval
+    /// command plus actionable approve/deny pills.
+    fn draw_agent_focus(
+        &mut self,
+        agent: &crate::model::StationAgent,
+        x: f32,
+        panel_w: f32,
+        activity_lane_y: f32,
+    ) {
+        let approval = agent.needs_approval
+            && (agent.host_id == "local"
+                || self
+                    .snapshot
+                    .hosts
+                    .first()
+                    .is_some_and(|h| h.id == agent.host_id)
+                || agent.approval_id.as_deref().is_some_and(|id| !id.is_empty()));
+        let rows = 5
+            + usize::from(!agent.worktree.trim().is_empty())
+            + if approval { 2 } else { 0 };
+        let panel_h = 74.0 + rows as f32 * 17.0 + if approval { 30.0 } else { 6.0 };
+        let y = (activity_lane_y - panel_h - 12.0).max(58.0);
+        let phase = phase_color_css(&agent.phase);
+        self.focus_panel_frame(x, y, panel_w, panel_h, &agent.id, phase);
+        self.text(
+            &truncate(&format!("{} agent", nonempty(&agent.role, "agent")), 30),
+            x + 96.0,
+            y + 23.0,
+            9.0,
+            C_SUBTEXT0_CSS,
+            "normal",
+        );
+
+        let mut row_y = y + 70.0;
+        row_y = self.focus_row(
+            x,
+            row_y,
+            panel_w,
+            "source",
+            &format!(
+                "{} / {}",
+                nonempty(&agent.provider, "provider"),
+                nonempty(&agent.model, "model")
+            ),
+            C_BLUE_CSS,
+        );
+        row_y = self.focus_row(
+            x,
+            row_y,
+            panel_w,
+            "phase",
+            &format!(
+                "{} / {}{}",
+                nonempty(&agent.phase, "idle"),
+                nonempty(&agent.status, "idle"),
+                if agent.autonomy.trim().is_empty() {
+                    String::new()
+                } else {
+                    format!(" / {} autonomy", agent.autonomy.trim())
+                }
+            ),
+            phase,
+        );
+        row_y = self.focus_row(
+            x,
+            row_y,
+            panel_w,
+            "task",
+            &nonempty(&agent.task, "idle"),
+            C_TEAL_CSS,
+        );
+        let budget_pct = percent(agent.tokens, agent.token_cap);
+        row_y = self.focus_row(
+            x,
+            row_y,
+            panel_w,
+            "tokens",
+            &format!(
+                "{} / {} ({})",
+                fmt_compact(agent.tokens),
+                fmt_compact(agent.token_cap),
+                pct_label(budget_pct)
+            ),
+            pressure_color(budget_pct),
+        );
+        self.meter(
+            x + 96.0,
+            row_y - 12.0,
+            panel_w - 116.0,
+            budget_pct,
+            pressure_color(budget_pct),
+        );
+        row_y += 6.0;
+        let mut usage = format!(
+            "p {} / c {} / cached {}",
+            fmt_compact(agent.prompt),
+            fmt_compact(agent.completion),
+            fmt_compact(agent.cached)
+        );
+        if agent.cost > 0.0 {
+            usage.push_str(&format!(" / ${:.2}", agent.cost));
+        }
+        if agent.turn_cap > 0 {
+            usage.push_str(&format!(" / turn {}/{}", agent.turns, agent.turn_cap));
+        } else if agent.turns > 0 {
+            usage.push_str(&format!(" / turn {}", agent.turns));
+        }
+        row_y = self.focus_row(x, row_y, panel_w, "usage", &usage, C_LAVENDER_CSS);
+        if !agent.worktree.trim().is_empty() {
+            row_y = self.focus_row(x, row_y, panel_w, "worktree", agent.worktree.trim(), C_MAUVE_CSS);
+        }
+
+        if approval {
+            row_y = self.focus_row(
+                x,
+                row_y,
+                panel_w,
+                "approval",
+                &format!(
+                    "{}{}",
+                    nonempty(&agent.approval_command, "approval required"),
+                    if agent.approval_category.trim().is_empty() {
+                        String::new()
+                    } else {
+                        format!(" ({})", agent.approval_category.trim())
+                    }
+                ),
+                C_YELLOW_CSS,
+            );
+            let host_id = agent.host_id.clone();
+            let approval_id = agent.approval_id.clone().unwrap_or_default();
+            let py = row_y - 6.0;
+            self.pill_at(x + 96.0, py, 78.0, 23.0, "approve", C_GREEN_CSS, false);
+            self.hit_zones.push(HitZone::new(
+                x + 96.0,
+                py,
+                78.0,
+                23.0,
+                HitAction::Approval {
+                    host_id: host_id.clone(),
+                    approval_id: approval_id.clone(),
+                    decision: "approve",
+                },
+            ));
+            self.pill_at(x + 182.0, py, 58.0, 23.0, "deny", C_RED_CSS, false);
+            self.hit_zones.push(HitZone::new(
+                x + 182.0,
+                py,
+                58.0,
+                23.0,
+                HitAction::Approval {
+                    host_id,
+                    approval_id,
+                    decision: "deny",
+                },
+            ));
+        }
+    }
+
+    /// View-settings panel for the system:view node: mood toggle pills plus
+    /// drag-aware fov/motion/AR/density sliders. Scrubs apply live in the
+    /// renderer; the released value is emitted as a `view_set` action that
+    /// the dashboard persists and re-applies through `set_visuals`.
+    fn draw_view_focus(&mut self, x: f32, panel_w: f32, activity_lane_y: f32) {
+        let panel_h = 74.0 + 30.0 + 4.0 * 26.0 + 12.0;
+        let y = (activity_lane_y - panel_h - 12.0).max(58.0);
+        self.focus_panel_frame(x, y, panel_w, panel_h, "View", C_LAVENDER_CSS);
+        self.text(
+            &format!("{} layout", self.layout.label()),
+            x + 96.0,
+            y + 23.0,
+            9.0,
+            C_SUBTEXT0_CSS,
+            "normal",
+        );
+
+        let mut row_y = y + 72.0;
+        self.text("mood", x + 16.0, row_y, 9.0, C_LAVENDER_CSS, "bold");
+        for (idx, mood) in [Mood::Cockpit, Mood::Calm].into_iter().enumerate() {
+            let px = x + 96.0 + idx as f32 * 86.0;
+            let label = mood.label();
+            self.pill_at(
+                px,
+                row_y - 16.0,
+                78.0,
+                23.0,
+                label,
+                if self.mood == mood {
+                    C_LAVENDER_CSS
+                } else {
+                    C_OVERLAY1_CSS
+                },
+                self.mood == mood,
+            );
+            self.hit_zones.push(HitZone::new(
+                px,
+                row_y - 16.0,
+                78.0,
+                23.0,
+                HitAction::ViewSet {
+                    key: "mood",
+                    value: label,
+                },
+            ));
+        }
+        row_y += 30.0;
+
+        let sliders = [
+            (
+                ViewSliderKey::Fov,
+                "fov",
+                format!("{}°", self.fov_deg.round() as i32),
+            ),
+            (ViewSliderKey::Motion, "motion", format!("{:.1}x", self.motion)),
+            (
+                ViewSliderKey::Ar,
+                "ar tilt",
+                format!("{}%", (self.ar_strength * 100.0).round() as i32),
+            ),
+            (
+                ViewSliderKey::Density,
+                "density",
+                format!("{:.1}", self.density),
+            ),
+        ];
+        for (key, label, value_label) in sliders {
+            row_y = self.focus_slider(x, row_y, panel_w, key, label, &value_label);
+        }
+    }
+
+    /// One slider row: label, scrubbable track with fill + knob, value
+    /// readout. The hit zone is exactly the track rect (taller for touch),
+    /// which is also the geometry pointer x maps through.
+    fn focus_slider(
+        &mut self,
+        x: f32,
+        row_y: f32,
+        w: f32,
+        key: ViewSliderKey,
+        label: &str,
+        value_label: &str,
+    ) -> f32 {
+        self.text(label, x + 16.0, row_y, 9.0, C_LAVENDER_CSS, "bold");
+        let track_x = x + 96.0;
+        let track_w = w - 96.0 - 72.0;
+        let t = key.t_of(self.view_slider_value(key));
+        self.hud.set_fill("rgba(49,50,68,0.92)");
+        self.hud
+            .ctx
+            .fill_rect(track_x as f64, (row_y - 7.0) as f64, track_w as f64, 4.0);
+        self.hud.set_fill(C_LAVENDER_CSS);
+        self.hud.ctx.fill_rect(
+            track_x as f64,
+            (row_y - 7.0) as f64,
+            (track_w * t) as f64,
+            4.0,
+        );
+        self.hud.ctx.begin_path();
+        let _ = self.hud.ctx.arc(
+            (track_x + track_w * t) as f64,
+            (row_y - 5.0) as f64,
+            5.5,
+            0.0,
+            std::f64::consts::TAU,
+        );
+        self.hud.ctx.fill();
+        self.hud.set_stroke("rgba(17,17,27,0.9)");
+        self.hud.ctx.stroke();
+        self.text(value_label, x + w - 62.0, row_y, 9.0, C_TEXT_CSS, "normal");
+        self.hit_zones.push(HitZone::new(
+            track_x,
+            row_y - 16.0,
+            track_w,
+            22.0,
+            HitAction::ViewSlider { key },
+        ));
+        row_y + 26.0
+    }
+
+    /// Real detail panel for a selected host node: platform, link state,
+    /// load meters, and what is running / streaming on it.
+    fn draw_host_focus(
+        &mut self,
+        host: &crate::model::StationHost,
+        x: f32,
+        panel_w: f32,
+        activity_lane_y: f32,
+    ) {
+        let panel_h = 74.0 + 4.0 * 17.0 + 6.0;
+        let y = (activity_lane_y - panel_h - 12.0).max(58.0);
+        let color = if host.connected { C_PEACH_CSS } else { C_RED_CSS };
+        self.focus_panel_frame(x, y, panel_w, panel_h, &host.name, color);
+        self.text(
+            if host.connected { "connected" } else { "offline" },
+            x + 96.0,
+            y + 23.0,
+            9.0,
+            if host.connected { C_GREEN_CSS } else { C_RED_CSS },
+            "bold",
+        );
+        let mut row_y = y + 70.0;
+        row_y = self.focus_row(
+            x,
+            row_y,
+            panel_w,
+            "platform",
+            &format!(
+                "{} / {}",
+                nonempty(&host.platform, "unknown"),
+                nonempty(&host.region, "local")
+            ),
+            C_BLUE_CSS,
+        );
+        let cpu_pct = (host.cpu / 100.0).clamp(0.0, 1.0);
+        row_y = self.focus_row(
+            x,
+            row_y,
+            panel_w,
+            "cpu",
+            &pct_label(cpu_pct),
+            pressure_color(cpu_pct),
+        );
+        self.meter(
+            x + 156.0,
+            row_y - 12.0,
+            panel_w - 176.0,
+            cpu_pct,
+            pressure_color(cpu_pct),
+        );
+        let mem_pct = (host.mem / 100.0).clamp(0.0, 1.0);
+        row_y = self.focus_row(
+            x,
+            row_y,
+            panel_w,
+            "memory",
+            &pct_label(mem_pct),
+            pressure_color(mem_pct),
+        );
+        self.meter(
+            x + 156.0,
+            row_y - 12.0,
+            panel_w - 176.0,
+            mem_pct,
+            pressure_color(mem_pct),
+        );
+        let agents = self
+            .snapshot
+            .agents
+            .iter()
+            .filter(|a| a.host_id == host.id)
+            .count();
+        let waiting = self
+            .snapshot
+            .agents
+            .iter()
+            .filter(|a| a.host_id == host.id && a.needs_approval)
+            .count();
+        let streams = self
+            .display_sources
+            .values()
+            .filter(|s| s.host_id == host.id)
+            .count();
+        self.focus_row(
+            x,
+            row_y,
+            panel_w,
+            "running",
+            &format!(
+                "{agents} agent{} / {streams} stream{}{}",
+                if agents == 1 { "" } else { "s" },
+                if streams == 1 { "" } else { "s" },
+                if waiting > 0 {
+                    format!(" / {waiting} awaiting approval")
+                } else {
+                    String::new()
+                }
+            ),
+            C_TEAL_CSS,
+        );
     }
 
     pub(crate) fn station_focus_button(
@@ -1639,6 +2275,9 @@ impl StationInner {
     }
 }
 
+/// Thumbnail placement rect in CSS px: `(x, y, w, h)`.
+pub(crate) type ThumbRect = (f32, f32, f32, f32);
+
 /// Activity-lane metrics for a density setting: `(rows, row_pitch,
 /// lane_height)`. Density meaningfully packs the HUD: 0.5 shows 2 event
 /// rows, 1.0 the classic 3, 1.8 up to 5 (with a tighter pitch). Short
@@ -1655,10 +2294,17 @@ pub(crate) fn lane_metrics(density: f32, h: f32) -> (usize, f32, f32) {
     (rows, pitch, base + (rows as f32 - 3.0) * pitch)
 }
 
-/// How many summary tiles the compact (narrow) surface shows; density
-/// scales it between 4 and all 9, with 8 (the legacy count) at 1.0.
-pub(crate) fn compact_tile_count(density: f32) -> usize {
-    ((8.0 * density).round() as i32).clamp(4, 9) as usize
+/// Compact (narrow) surface tile grid for a density setting and panel
+/// height: `(tile_count, row_pitch, tile_height)`. The strip previously
+/// hard-dropped the 9th system target; now all nine fit whenever the
+/// panel has the rows for them, wrapping two per row. Density shrinks the
+/// pitch (more rows fit) and scales how many tiles are wanted — sparse
+/// 0.5 shows ~5, the default 1.0 all nine at the legacy 58px pitch.
+pub(crate) fn compact_grid(density: f32, panel_h: f32) -> (usize, f32, f32) {
+    let pitch = (58.0 / density.max(0.5)).clamp(40.0, 72.0);
+    let rows = (((panel_h - 66.0) / pitch).floor() as i32).max(1) as usize;
+    let preferred = ((9.0 * density).round() as i32).clamp(4, 9) as usize;
+    (preferred.min(rows * 2), pitch, pitch - 10.0)
 }
 
 pub(crate) struct LaneAction {
@@ -1759,11 +2405,21 @@ mod tests {
     }
 
     #[test]
-    fn compact_tile_count_scales_and_clamps() {
-        assert_eq!(compact_tile_count(1.0), 8);
-        assert_eq!(compact_tile_count(0.5), 4);
-        assert_eq!(compact_tile_count(1.8), 9);
-        // There are only nine system targets to show.
-        assert!(compact_tile_count(5.0) <= 9);
+    fn compact_grid_fits_all_nine_targets_by_default() {
+        // Tall pane at default density: every system target is reachable,
+        // at the legacy 58px pitch / 48px tile.
+        let (count, pitch, tile_h) = compact_grid(1.0, 700.0);
+        assert_eq!((count, pitch, tile_h), (9, 58.0, 48.0));
+        // Sparse density prefers fewer tiles; dense packs tighter rows.
+        assert!(compact_grid(0.5, 700.0).0 < 9);
+        let (count, pitch, _) = compact_grid(1.8, 700.0);
+        assert_eq!(count, 9);
+        assert!(pitch < 58.0);
+        // Short panes cap at what actually fits instead of overflowing.
+        let (count, pitch, _) = compact_grid(1.0, 200.0);
+        assert!(count <= ((200.0 - 66.0) / pitch) as usize * 2);
+        assert!(count >= 2);
+        // Never more than the nine system targets.
+        assert!(compact_grid(5.0, 2000.0).0 <= 9);
     }
 }

@@ -29,6 +29,7 @@ features = [
   "Event",
   "EventTarget",
   "HtmlCanvasElement",
+  "HtmlElement",
   "HtmlVideoElement",
   "KeyboardEvent",
   "Performance",

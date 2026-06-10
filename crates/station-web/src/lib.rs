@@ -325,6 +325,10 @@ struct StationInner {
     pinch_zoom: Option<PinchZoom>,
     ar_x: f32,
     ar_y: f32,
+    /// True once a real (non-null) deviceorientation reading arrived;
+    /// until then pointer position drives the AR parallax instead, so
+    /// `ar_strength` is meaningful on desktops.
+    has_device_orientation: bool,
     /// Last pointer position in CSS px; drives the pills' / tiles'
     /// lit-from-within hover state. Cleared when the pointer leaves.
     hover_xy: Option<(f32, f32)>,
@@ -421,6 +425,7 @@ impl StationInner {
             pinch_zoom: None,
             ar_x: 0.0,
             ar_y: 0.0,
+            has_device_orientation: false,
             hover_xy: None,
             hover_zone_rect: None,
             hud_dirty: true,

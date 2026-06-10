@@ -11141,7 +11141,11 @@ async function ensureStation() {
     return station;
   })().catch(err => {
     stationInitPromise = null;
-    stationWasmReady = false;
+    // stationWasmReady is deliberately NOT reset here: it only becomes
+    // true after stationInit resolves, and re-running wasm-bindgen init
+    // on an already-loaded module (because StationWeb construction or a
+    // later setup step threw) would double-initialize the module on
+    // retry. A load failure leaves it false on its own.
     throw err;
   });
   return stationInitPromise;
@@ -11222,6 +11226,8 @@ function stationScheduleUpdate(opts = {}) {
   }, STATION_SNAPSHOT_COALESCE_MS);
 }
 
+let stationLastSnapshotError = '';
+
 function stationUpdateSnapshot() {
   if (!station) return;
   if (!stationSnapshotVisible()) return;
@@ -11237,8 +11243,17 @@ function stationUpdateSnapshot() {
       stationSyncHotspots();
       stationUpdateHotspotAria(snapshot);
     }
+    stationLastSnapshotError = '';
     stationStatus(station.debug_state());
   } catch (e) {
+    // Surface rejections where the operator looks (#station-status) —
+    // once per distinct error, not per coalesced tick; success clears the
+    // latch so a recurrence shows again.
+    const message = e && e.message ? e.message : String(e || 'unknown error');
+    if (message !== stationLastSnapshotError) {
+      stationLastSnapshotError = message;
+      stationStatus(`snapshot rejected: ${message}`);
+    }
     console.warn('station snapshot failed:', e);
   }
 }
@@ -11465,6 +11480,12 @@ function handleStationAction(action) {
     stationHandleActivityAction(action);
   } else if (action.type === 'controls_action') {
     stationHandleControlsAction(action);
+  } else if (action.type === 'view_set') {
+    // Canvas View-panel control (mood pill or slider release): persist the
+    // draft and re-apply through set_visuals. The renderer already shows
+    // the scrubbed value; this round-trip makes it durable.
+    stationViewSet(String(action.key || ''), action.value);
+    return;
   } else if (action.type === 'changes_action') {
     stationHandleChangesAction(action);
   } else if (action.type === 'navigate') {
@@ -11637,8 +11658,6 @@ const STATION_HUD_GEOMETRY = Object.freeze({
   compactX: 18,
   compactY: 130,
   compactGapX: 16,
-  compactGapY: 58,
-  compactTileH: 48,
 });
 
 function stationHotspotBoxes(cssW, cssH) {
@@ -11649,16 +11668,25 @@ function stationHotspotBoxes(cssW, cssH) {
   }
   const g = STATION_HUD_GEOMETRY;
   if (cssW < g.renderedDesktopMin) {
+    // Mirrors hud.rs compact_grid: all nine targets wrap two per row when
+    // the panel has the rows, with a density-scaled pitch (58px / 9 tiles
+    // at the 1.0 default). The old slice(0, 8) dropped system:view.
     const tileW = ((cssW - 36) - 44) * 0.5;
-    STATION_SYSTEM_TARGETS.slice(0, 8).forEach(([name], idx) => {
+    const density = Number.isFinite(Number(stationViewDraft?.density)) ? Number(stationViewDraft.density) : 1;
+    const panelH = Math.max(180, cssH - 92);
+    const pitch = Math.min(72, Math.max(40, 58 / Math.max(0.5, density)));
+    const rows = Math.max(1, Math.floor((panelH - 66) / pitch));
+    const preferred = Math.min(9, Math.max(4, Math.round(9 * density)));
+    const count = Math.min(preferred, rows * 2);
+    STATION_SYSTEM_TARGETS.slice(0, count).forEach(([name], idx) => {
       const col = idx % 2;
       const row = Math.floor(idx / 2);
       add(
         name,
         g.compactX + 14 + col * (tileW + g.compactGapX),
-        g.compactY + row * g.compactGapY,
+        g.compactY + row * pitch,
         tileW,
-        g.compactTileH,
+        pitch - 10,
       );
     });
     return boxes;
@@ -11763,7 +11791,10 @@ function stationUpdateHotspotAria(snapshot) {
   const context = s.context || {};
   const peerHosts = (Array.isArray(s.hosts) ? s.hosts : []).filter(h => h && h.region !== 'primary');
   const peersConnected = peerHosts.filter(h => h.connected).length;
-  const attention = Array.isArray(s.attentionQueue) ? s.attentionQueue.length : 0;
+  // attentionQueue is a summary object ({count, blocked, ...}), not an
+  // array — the old Array.isArray read meant this label never showed a
+  // count.
+  const attention = stationNum(s.attentionQueue?.count);
   const layout = stationViewDraft.layout === 'constellation' ? 'constellation' : 'orbital';
   const n = stationNum;
   stationSetHotspotLabel('layout:orbital', `Orbital layout${layout === 'orbital' ? ' (active)' : ''}`);
@@ -12457,8 +12488,8 @@ async function stationRefreshDisplayTelemetry(key, pc) {
   stationScheduleUpdate();
 }
 
-function stationDisplayRunwayPayload() {
-  const controls = stationBuildControlsSummary();
+function stationDisplayRunwayPayload(controlsSummary = null) {
+  const controls = controlsSummary || stationBuildControlsSummary();
   const selectedPeer = stationSelectedPeer();
   const selectedHostId = selectedPeer?.host_id || stationPeerDraft.selectedHostId || stationSelectedPeerHost || '';
   const selectedDisplayId = selectedHostId
@@ -13193,9 +13224,9 @@ function stationManagedStatusExportPayload(managed, contextSummary) {
       branches: managed.branches || 0,
     },
     recent: {
-      anchors: managed.recentAnchors || [],
+      // Anchor/branch row arrays no longer ride on the summary (snapshot
+      // diet); raw_status below still carries the full ledgers.
       records: managed.recentRecords || [],
-      branches: managed.recentBranches || [],
     },
     raw_status: managedContextStatus || {},
   };
@@ -14251,7 +14282,15 @@ function stationBuildAttentionQueue(controls) {
     blocked: items.filter(item => item.level === 'blocked').length,
     warn: items.filter(item => item.level === 'warn').length,
     ready: items.filter(item => item.level === 'ready').length,
-    items,
+    // Slim wire rows: the header alert strip and the controls focus panel
+    // render level/title/meta/detail for the top items; the counts above
+    // cover the rest.
+    items: items.slice(0, 4).map(item => ({
+      level: String(item.level || ''),
+      title: String(item.title || ''),
+      meta: String(item.meta || ''),
+      detail: String(item.detail || ''),
+    })),
   };
 }
 
@@ -14980,6 +15019,10 @@ function stationOpenDisplay(hostId, displayId = 0) {
     }
     return;
   }
+  // Unknown peer id (stale snapshot, peer removed mid-click): tell the
+  // operator instead of silently doing nothing.
+  showControlToast?.('error', `Unknown peer ${hostId}; cannot open its display`);
+  stationStatus(`Display open failed: unknown peer ${hostId}`);
 }
 
 function stationSnapshotForContext() {
@@ -15048,6 +15091,8 @@ function stationBuildContextSummary() {
   const hardWindow = Number(snapshot.hard_context_window || snapshot.hardContextWindow || analysis.hardWindow || effectiveWindow || 0);
   const sessionId = contextSessionKey(snapshot) === CONTEXT_GLOBAL_SESSION ? '' : contextSessionKey(snapshot);
   const identity = stationSessionIdentitySummary(sessionId || resolvePromptTargetSessionId?.() || '');
+  // Slim wire rows: the context focus panel renders label/value/count/
+  // detail for categories and label/value/detail/tone for items.
   const categories = Array.from(analysis.byCategory.entries())
     .map(([category, stats]) => {
       const def = CONTEXT_CATEGORY_DEFS[category] || CONTEXT_CATEGORY_DEFS.other;
@@ -15055,26 +15100,22 @@ function stationBuildContextSummary() {
         .filter(part => part.category === category)
         .sort((a, b) => (b.tokens || 0) - (a.tokens || 0))[0] || null;
       return {
-        category,
         label: def.label,
         value: stationNum(stats.tokens),
         count: stationNum(stats.count),
-        partId: largest?.id || '',
         detail: largest
           ? `Largest: ${compactSessionText(largest.title || largest.subtitle || largest.path || largest.id || '')} (${stationCompactNumber(largest.tokens || largest.estimatedTokens || 0)} tok)`
           : `${stationCompactNumber(stats.count)} items`,
       };
     })
     .sort((a, b) => b.value - a.value)
-    .slice(0, 6);
+    .slice(0, 3);
   const topItems = [...analysis.parts]
     .sort((a, b) => (b.tokens || 0) - (a.tokens || 0))
-    .slice(0, 6)
+    .slice(0, 4)
     .map(part => {
       const def = CONTEXT_CATEGORY_DEFS[part.category] || CONTEXT_CATEGORY_DEFS.other;
       return {
-        id: part.id || '',
-        action: 'part',
         label: def.label,
         value: `${stationCompactNumber(part.tokens || part.estimatedTokens || 0)} tok`,
         detail: compactSessionText(part.title || part.subtitle || part.path || ''),
@@ -15113,7 +15154,7 @@ function stationBuildContextSummary() {
     effectiveWindow,
     hardWindow,
     itemCount: stationNum(snapshot.item_count || analysis.parts.length),
-    categoryCount: categories.length,
+    categoryCount: stationNum(analysis.byCategory.size),
     topCategories: categories,
     topItems,
     replayMode: contextReplayMode || 'live',
@@ -15168,50 +15209,6 @@ function stationManagedAnchorCount(sessionId) {
   return seen.size;
 }
 
-function stationManagedAnchorRows(sessionId) {
-  const target = String(sessionId || '').trim();
-  const seen = new Set();
-  const rows = [];
-  const add = (itemId, detail, value = 'anchor', rowSessionId = '') => {
-    const id = String(itemId || '').trim();
-    if (!id || seen.has(id)) return;
-    const sid = String(rowSessionId || sessionId || '').trim();
-    seen.add(id);
-    rows.push({
-      id,
-      sessionId: sid,
-      action: 'anchor',
-      label: id,
-      value,
-      detail: compactSessionText(detail || ''),
-      tone: 'peer',
-    });
-  };
-  const candidates = [];
-  for (const [sid, entry] of stationAnchorsBySession) {
-    if (!stationAnchorSessionMatches(sid, target)) continue;
-    candidates.push(...entry.tail);
-  }
-  candidates.sort((a, b) => (b.seq || 0) - (a.seq || 0));
-  for (const row of candidates) {
-    if (rows.length >= 8) break;
-    add(row.id, row.detail, row.value || 'log', row.sessionId);
-  }
-  for (const anchor of managedContextAnchors || []) {
-    add(
-      anchor.item_id || anchor.itemId,
-      [
-        anchor.tool_name || anchor.toolName || 'tool',
-        anchor.status ? `(${anchor.status})` : '',
-        anchor.preview || '',
-      ].filter(Boolean).join(' '),
-      anchor.status || 'tool',
-      anchor.session_id || anchor.sessionId || anchor.intendant_session_id || anchor.intendantSessionId || sessionId,
-    );
-  }
-  return rows.slice(0, 8);
-}
-
 function stationManagedRecordRows() {
   return [...(managedContextRecords || [])]
     .sort((a, b) => stationTimestampMs(b.created_at) - stationTimestampMs(a.created_at))
@@ -15234,35 +15231,15 @@ function stationManagedLedgerSummary() {
   const fission = Array.isArray(managedContextStatus?.fission_ledger?.groups)
     ? managedContextStatus.fission_ledger.groups
     : [];
-  const rows = [];
   let branches = 0;
   for (const group of [...lineage, ...fission]) {
     const groupBranches = Array.isArray(group?.branches) ? group.branches : [];
     branches += groupBranches.length;
   }
-  for (const group of fission) {
-    const groupId = String(group?.group_id || '').trim();
-    const expectedId = String(group?.canonical_session_id || '').trim();
-    const groupBranches = Array.isArray(group?.branches) ? group.branches : [];
-    for (const branch of groupBranches) {
-      const branchId = String(branch?.session_id || '').trim();
-      if (!groupId || !branchId) continue;
-      rows.push({
-        id: [groupId, branchId, expectedId].join('\u001f'),
-        sessionId: branchId,
-        action: 'branch',
-        label: shortSessionId(branchId),
-        value: branch.relationship || branch.status || 'branch',
-        detail: compactSessionText(branch.summary || branch.task || `canonical ${shortSessionId(expectedId)}`),
-        tone: 'managed',
-      });
-    }
-  }
   return {
     lineageGroups: lineage.length,
     fissionGroups: fission.length,
     branches,
-    recentBranches: rows.slice(0, 6),
   };
 }
 
@@ -15291,8 +15268,7 @@ function stationBuildManagedSummary(contextSummary) {
   const mode = sessionId
     ? managedContextEffectiveMode(sessionId, meta)
     : (controlCodexConfig.managed_context || 'vanilla');
-  const recentRecords = stationManagedRecordRows();
-  const recentAnchors = stationManagedAnchorRows(sessionId);
+  const recordRows = stationManagedRecordRows();
   const pressureState = {
     id: sessionId || 'managed-context',
     sessionId: sessionId || '',
@@ -15306,7 +15282,7 @@ function stationBuildManagedSummary(contextSummary) {
     ].filter(Boolean).join(' / '),
     tone: pressure.rewind_only ? 'red' : ((pressure.status === 'watch' || pressure.status === 'high' || pressure.status === 'critical') ? 'warning' : 'managed'),
   };
-  const latestRewind = recentRecords[0] || {};
+  const latestRewind = recordRows[0] || {};
   const latestBackout = summaryBackoutRow(stationManagedDraftValue('record', 'managed-context-record-id', '') || latestRewind.id || '', latestRewind, sessionId);
   const summary = {
     sessionId: sessionId || '',
@@ -15337,9 +15313,10 @@ function stationBuildManagedSummary(contextSummary) {
     pressureState,
     latestRewind,
     latestBackout,
-    recentRecords,
-    recentAnchors,
-    recentBranches: ledgers.recentBranches,
+    // Slim wire rows: the managed focus panel renders label/value/detail/
+    // tone for the latest rewind records. (Anchor and branch row arrays
+    // were serialized but never rendered; their counts above remain.)
+    recentRecords: recordRows.slice(0, 4).map(stationSlimDetailRow),
     activitySignal: stationManagedActivitySignal || {},
   };
   const ready = stationManagedReadiness(summary);
@@ -15395,15 +15372,14 @@ function stationChangesFileName(path) {
   return parts.pop() || path || 'file';
 }
 
+// Slim wire rows: the changes focus panel renders label/value/detail/tone.
 function stationChangesRows(entries) {
-  return entries.slice(0, 8).map(([path, info]) => {
+  return entries.slice(0, 5).map(([path, info]) => {
     const kind = String(info?.kind || 'modified');
     const added = stationNum(info?.lines_added);
     const removed = stationNum(info?.lines_removed);
     const hasTextDiff = info?.diff_available !== false;
     return {
-      id: path,
-      action: 'file',
       label: stationChangesFileName(path),
       value: hasTextDiff ? `+${stationCompactNumber(added)} -${stationCompactNumber(removed)}` : 'no text diff',
       detail: compactPathLabel(path, true) || stationChangesKindLabel(kind),
@@ -15427,8 +15403,6 @@ function stationBuildChangesSummary() {
       latestPath: mismatch,
       latestKind: 'mismatch',
       recent: [{
-        id: '',
-        action: '',
         label: 'target mismatch',
         value: 'check root',
         detail: compactSessionText(mismatch),
@@ -15563,9 +15537,11 @@ function stationBuildWorktreesSummary() {
   const scan = _cachedWorktreeScan || {};
   const summary = scan.summary || {};
   const rows = Array.isArray(scan.worktrees) ? scan.worktrees : [];
+  // Slim wire rows: the worktrees focus panel renders label/value/detail/
+  // tone.
   const recent = [...rows]
     .sort((a, b) => worktreeRiskRank(b) - worktreeRiskRank(a) || stationNum(b?.size_bytes) - stationNum(a?.size_bytes))
-    .slice(0, 5)
+    .slice(0, 4)
     .map(wt => {
       const path = String(wt?.path || '').trim();
       const branch = wt?.branch || wt?.head_short || '(unknown ref)';
@@ -15575,8 +15551,6 @@ function stationBuildWorktreesSummary() {
           ? `${wt.active_sessions} active`
           : (wt?.recommended_action || wt?.merge_status || 'review'));
       return {
-        id: path,
-        action: 'worktree',
         label: branch,
         value: status,
         detail: [
@@ -15694,9 +15668,11 @@ function stationBuildSessionsSummary() {
   }
   if (!active && isAgentActivePhase(currentPhase)) active = 1;
   const latest = sortedSessions[0] || null;
+  // Slim wire rows: the sessions focus panel renders label/value/detail/
+  // tone; the richer stationSessionRow shape stays dashboard-internal.
   const recent = sortedSessions
-    .slice(0, 6)
-    .map(session => stationSessionRow(session, indexedIds));
+    .slice(0, 4)
+    .map(session => stationSlimDetailRow(stationSessionRow(session, indexedIds)));
   let externalTargets = [];
   try {
     externalTargets = stationExternalTargetRows(5).map(row => ({
@@ -15755,14 +15731,15 @@ function stationBuildSessionsSummary() {
       ? 'loaded'
       : (stationSessionsIndexLoading ? 'indexing' : (stationSessionsIndexError ? 'error' : 'cold')),
     // The dock-era station-local session filters are gone (nothing ever set
-    // them); these stay in the snapshot because the WASM model deserializes
-    // them. The legacy Sessions tab search box still feeds searchQuery.
+    // them); the scalar placeholders stay because the WASM model
+    // deserializes them. The always-empty filteredSessions array was
+    // removed from both sides. The legacy Sessions tab search box still
+    // feeds searchQuery.
     searchQuery: sessionSearchQuery?.() || '',
     sourceFilter: '',
     statusFilter: '',
     projectFilter: '',
     filtered: sessions.length,
-    filteredSessions: [],
     externalTargets,
     recent,
     ...worktrees,
@@ -16225,6 +16202,18 @@ function stationSessionLooksCodex(sessionOrId) {
   return sessionConfigSource(sessionConfigMetadata(sessionOrId || sid)) === 'codex';
 }
 
+// Snapshot diet: detail rows cross the WASM boundary with exactly the
+// fields the Station focus panels render (label / value / detail / tone).
+// Richer row shapes stay dashboard-internal.
+function stationSlimDetailRow(row) {
+  return {
+    label: String(row?.label || ''),
+    value: String(row?.value || ''),
+    detail: String(row?.detail || ''),
+    tone: String(row?.tone || ''),
+  };
+}
+
 function buildStationSnapshot() {
   const hosts = [];
   const selfUsage = stationUsageForHost(selfPeerId);
@@ -16280,7 +16269,33 @@ function buildStationSnapshot() {
     sessions: stationBuildSessionsSummary(),
     controls,
     attentionQueue: stationBuildAttentionQueue(controls),
-    displayRunway: stationDisplayRunwayPayload(),
+    displayRunway: stationDisplayRunwaySnapshot(controls),
+  };
+}
+
+// Projection of the internal display-runway payload onto the slim shape
+// the Station peers panel renders. The full payload (per-lane ids,
+// telemetry fields, capability flags) stays dashboard-internal for action
+// routing; serializing it into every snapshot was pure dead weight.
+function stationDisplayRunwaySnapshot(controls = null) {
+  const payload = stationDisplayRunwayPayload(controls);
+  return {
+    selected_peer_id: payload.selected_peer_id,
+    selected_peer_label: payload.selected_peer_label,
+    selected_display_id: payload.selected_display_id,
+    peer_status: payload.peer_status,
+    peer_count: payload.peer_count,
+    connected_peers: payload.connected_peers,
+    display_peers: payload.display_peers,
+    local_streams: payload.local_streams,
+    remote_streams: payload.remote_streams,
+    lanes: payload.lanes.slice(0, 4).map(lane => ({
+      type: String(lane.type || ''),
+      title: String(lane.title || ''),
+      meta: String(lane.meta || ''),
+      detail: String(lane.detail || ''),
+      selected: !!lane.selected,
+    })),
   };
 }
 
@@ -37621,6 +37636,44 @@ class PeerDisplayConnection {
     this._diagSampler = null;
     this.displayStatusText = 'Connecting...';
     this.displayStatusKind = '';
+    // No-track watchdog: a viewed display that never delivers a video
+    // track (peer dropped the offer — e.g. no capture grant — or ICE
+    // stalled) previously sat in 'Offer sent…' forever while the Station
+    // thumbnail showed 'linking display' indefinitely. Armed in
+    // connect(), cleared by ontrack and close(); a retry click opens a
+    // fresh connection, which arms a fresh watchdog.
+    this._noTrackTimer = null;
+  }
+
+  static NO_TRACK_TIMEOUT_MS = 10000;
+
+  _armNoTrackWatchdog() {
+    this._clearNoTrackWatchdog();
+    this._noTrackTimer = window.setTimeout(() => {
+      this._noTrackTimer = null;
+      if (this.stream) return;
+      const message = 'peer did not answer — its display may need a capture grant';
+      this._log('warn', `no video track within ${PeerDisplayConnection.NO_TRACK_TIMEOUT_MS}ms — ${message}`);
+      this.setStatus(message, 'error');
+      stationPublishActivityEvent({
+        id: `peer-display-timeout:${this.hostId}:${this.displayId}:${this.sessionId}`,
+        hostId: this.hostId,
+        level: 'warn',
+        source: 'display',
+        msg: `Display ${this.displayId} on ${stationHostLabel(this.hostId)} sent no video within ${Math.round(PeerDisplayConnection.NO_TRACK_TIMEOUT_MS / 1000)}s — ${message}`,
+      });
+      // Drop the Station source so the HUD stops drawing a 'linking
+      // display' thumbnail for a stream that will never arrive.
+      stationUnregisterVideoSource(`peer:${this.hostId}:${this.displayId}:${this.sessionId}`);
+      stationScheduleUpdate();
+    }, PeerDisplayConnection.NO_TRACK_TIMEOUT_MS);
+  }
+
+  _clearNoTrackWatchdog() {
+    if (this._noTrackTimer !== null) {
+      window.clearTimeout(this._noTrackTimer);
+      this._noTrackTimer = null;
+    }
   }
 
   sessionKey() {
@@ -37961,6 +38014,7 @@ class PeerDisplayConnection {
     }
 
     this.pc.ontrack = (e) => {
+      this._clearNoTrackWatchdog();
       this.stream = e.streams[0];
       const preferStationEndpoint = stationPeerDisplayPrefersStationEndpoint();
       const container = (preferStationEndpoint && stationPeerDisplayContainer(this.hostId, true, true))
@@ -38120,6 +38174,7 @@ class PeerDisplayConnection {
       await this._sendSignal(offerSignal);
       this._log('info', `offer sent (sdp_len=${offerSignal.sdp.length})`);
       this.setStatus('Offer sent, awaiting answer…', '');
+      this._armNoTrackWatchdog();
     } catch (err) {
       this._log('error', `offer failed: ${err.message}`);
       this.setStatus(`Offer failed: ${err.message}`, 'error');
@@ -38615,6 +38670,7 @@ class PeerDisplayConnection {
   }
 
   async close() {
+    this._clearNoTrackWatchdog();
     stationUnregisterVideoSource(`peer:${this.hostId}:${this.displayId}:${this.sessionId}`);
     stationScheduleUpdate();
     // F-2: tear down input listeners FIRST. The `pc.close()` chain

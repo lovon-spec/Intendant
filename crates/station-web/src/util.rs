@@ -74,6 +74,16 @@ pub(crate) fn phase_color(phase: &str) -> Color {
     }
 }
 
+pub(crate) fn phase_color_css(phase: &str) -> &'static str {
+    match phase {
+        "thinking" => C_LAVENDER_CSS,
+        "running" => C_TEAL_CSS,
+        "waiting" => C_YELLOW_CSS,
+        "done" => C_GREEN_CSS,
+        _ => C_OVERLAY1_CSS,
+    }
+}
+
 pub(crate) fn level_color(level: &str) -> Color {
     match level {
         "error" => C_RED,
@@ -94,6 +104,32 @@ pub(crate) fn level_color_css(level: &str) -> &'static str {
         "agent" => C_TEAL_CSS,
         "subagent" => C_MAUVE_CSS,
         "presence" => C_GREEN_CSS,
+        _ => C_OVERLAY1_CSS,
+    }
+}
+
+/// Detail-row tone (the dashboard's snapshot `tone` strings) to an accent
+/// color for the focus-panel row label.
+pub(crate) fn tone_color_css(tone: &str) -> &'static str {
+    match tone {
+        "ok" => C_GREEN_CSS,
+        "red" => C_RED_CSS,
+        "warning" => C_YELLOW_CSS,
+        "context" => C_BLUE_CSS,
+        "managed" => C_MAUVE_CSS,
+        "peer" => C_PEACH_CSS,
+        "session" => C_TEAL_CSS,
+        "changes" => C_BLUE_CSS,
+        _ => C_OVERLAY1_CSS,
+    }
+}
+
+/// Attention-item level to its alert color (`blocked` is the hard stop).
+pub(crate) fn attention_level_color_css(level: &str) -> &'static str {
+    match level {
+        "blocked" => C_RED_CSS,
+        "warn" => C_YELLOW_CSS,
+        "ready" => C_GREEN_CSS,
         _ => C_OVERLAY1_CSS,
     }
 }
@@ -157,6 +193,22 @@ pub(crate) fn pressure_color(pct: f32) -> &'static str {
     }
 }
 
+/// Compact human number for HUD figures: 850, 12.5k, 1.2m.
+pub(crate) fn fmt_compact(value: f32) -> String {
+    let abs = value.abs();
+    if abs >= 10_000_000.0 {
+        format!("{:.0}m", value / 1_000_000.0)
+    } else if abs >= 1_000_000.0 {
+        format!("{:.1}m", value / 1_000_000.0)
+    } else if abs >= 10_000.0 {
+        format!("{:.0}k", value / 1_000.0)
+    } else if abs >= 1_000.0 {
+        format!("{:.1}k", value / 1_000.0)
+    } else {
+        format!("{}", value.round() as i64)
+    }
+}
+
 pub(crate) fn truncate(s: &str, max: usize) -> String {
     let mut out = String::new();
     for (idx, ch) in s.chars().enumerate() {
@@ -214,6 +266,16 @@ pub(crate) fn now_ms() -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fmt_compact_scales_units() {
+        assert_eq!(fmt_compact(0.0), "0");
+        assert_eq!(fmt_compact(850.0), "850");
+        assert_eq!(fmt_compact(12_600.0), "13k");
+        assert_eq!(fmt_compact(1_500.0), "1.5k");
+        assert_eq!(fmt_compact(1_200_000.0), "1.2m");
+        assert_eq!(fmt_compact(25_000_000.0), "25m");
+    }
 
     #[test]
     fn truncate_passes_short_strings_through() {

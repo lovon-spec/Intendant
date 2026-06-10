@@ -273,8 +273,6 @@ pub(crate) struct StationManagedSummary {
     pub(crate) latest_rewind: StationDetailRow,
     pub(crate) latest_backout: StationDetailRow,
     pub(crate) recent_records: Vec<StationDetailRow>,
-    pub(crate) recent_anchors: Vec<StationDetailRow>,
-    pub(crate) recent_branches: Vec<StationDetailRow>,
 }
 
 impl Default for StationManagedSummary {
@@ -310,8 +308,6 @@ impl Default for StationManagedSummary {
             latest_rewind: StationDetailRow::default(),
             latest_backout: StationDetailRow::default(),
             recent_records: Vec::new(),
-            recent_anchors: Vec::new(),
-            recent_branches: Vec::new(),
         }
     }
 }
@@ -392,7 +388,6 @@ pub(crate) struct StationSessionsSummary {
     pub(crate) project_filter: String,
     pub(crate) filtered: u32,
     pub(crate) external_targets: Vec<StationDetailRow>,
-    pub(crate) filtered_sessions: Vec<StationDetailRow>,
     pub(crate) recent: Vec<StationDetailRow>,
     pub(crate) recent_worktrees: Vec<StationDetailRow>,
 }
@@ -422,7 +417,6 @@ impl Default for StationSessionsSummary {
             project_filter: String::new(),
             filtered: 0,
             external_targets: Vec::new(),
-            filtered_sessions: Vec::new(),
             recent: Vec::new(),
             recent_worktrees: Vec::new(),
         }
@@ -691,35 +685,32 @@ pub(crate) struct StationAttentionQueueSummary {
     pub(crate) items: Vec<StationAttentionItem>,
 }
 
+/// One attention item, slimmed to exactly what the header alert strip and
+/// the controls focus panel render.
 #[derive(Clone, Deserialize, Default)]
 #[serde(default, rename_all = "camelCase")]
 pub(crate) struct StationAttentionItem {
-    pub(crate) id: String,
-    pub(crate) kind: String,
     pub(crate) level: String,
     pub(crate) title: String,
     pub(crate) meta: String,
     pub(crate) detail: String,
-    pub(crate) session_id: String,
-    pub(crate) can_cancel: bool,
 }
 
+/// Display-runway summary, slimmed to the figures the peers focus panel
+/// renders. The dashboard keeps its richer internal payload for its own
+/// action routing; only this projection crosses the snapshot boundary.
 #[derive(Clone, Deserialize, Default)]
 #[serde(default)]
 pub(crate) struct StationDisplayRunwaySummary {
     pub(crate) selected_peer_id: String,
     pub(crate) selected_peer_label: String,
     pub(crate) selected_display_id: i32,
-    pub(crate) selected_peer_connected: bool,
-    pub(crate) selected_peer_can_display: bool,
     pub(crate) peer_status: String,
     pub(crate) peer_count: u32,
     pub(crate) connected_peers: u32,
     pub(crate) display_peers: u32,
-    pub(crate) operator_session_id: String,
     pub(crate) local_streams: u32,
     pub(crate) remote_streams: u32,
-    pub(crate) shared_view_visible: bool,
     pub(crate) lanes: Vec<StationDisplayRunwayLane>,
 }
 
@@ -728,49 +719,30 @@ pub(crate) struct StationDisplayRunwaySummary {
 pub(crate) struct StationDisplayRunwayLane {
     #[serde(rename = "type")]
     pub(crate) kind: String,
-    pub(crate) id: String,
     pub(crate) title: String,
     pub(crate) meta: String,
     pub(crate) detail: String,
-    pub(crate) host_id: String,
-    pub(crate) display_id: i32,
-    pub(crate) session_id: String,
-    pub(crate) live_id: String,
-    pub(crate) host_label: String,
-    pub(crate) lane_label: String,
-    pub(crate) resolution: String,
-    #[serde(deserialize_with = "f32_or_default")]
-    pub(crate) fps: f32,
-    pub(crate) codec: String,
-    pub(crate) quality: String,
-    pub(crate) telemetry_label: String,
-    pub(crate) input_authority: String,
     pub(crate) selected: bool,
-    pub(crate) can_focus: bool,
-    pub(crate) can_interrupt: bool,
-    pub(crate) can_take_input: bool,
 }
 
+/// One context-category breakdown row, slimmed to what the context focus
+/// panel renders.
 #[derive(Clone, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub(crate) struct StationBreakdown {
-    pub(crate) category: String,
     pub(crate) label: String,
     #[serde(deserialize_with = "f32_or_default")]
     pub(crate) value: f32,
     pub(crate) count: u32,
-    pub(crate) part_id: String,
     pub(crate) detail: String,
 }
 
 impl Default for StationBreakdown {
     fn default() -> Self {
         Self {
-            category: String::new(),
             label: String::new(),
             value: 0.0,
             count: 0,
-            part_id: String::new(),
             detail: String::new(),
         }
     }
@@ -870,12 +842,34 @@ mod tests {
     fn display_runway_lane_renames_type_to_kind() {
         let lane: StationDisplayRunwayLane = serde_json::from_value(serde_json::json!({
             "type": "local_stream",
-            "id": "lane-1",
-            "fps": 30.0
+            "title": "local :0",
+            "meta": "connected",
+            "selected": true,
         }))
         .expect("lane should deserialize");
         assert_eq!(lane.kind, "local_stream");
-        assert_eq!(lane.fps, 30.0);
+        assert_eq!(lane.title, "local :0");
+        assert!(lane.selected);
+        assert!(lane.detail.is_empty());
+    }
+
+    #[test]
+    fn attention_queue_deserializes_slim_items() {
+        let queue: StationAttentionQueueSummary = serde_json::from_value(serde_json::json!({
+            "count": 2,
+            "blocked": 1,
+            "warn": 1,
+            "items": [
+                {"level": "blocked", "title": "Approval required", "meta": "approval / local", "detail": "rm -rf /tmp/x"},
+                {"level": "warn", "title": "Browser is passive", "meta": "voice elsewhere"}
+            ]
+        }))
+        .expect("attention queue should deserialize");
+        assert_eq!(queue.count, 2);
+        assert_eq!(queue.blocked, 1);
+        assert_eq!(queue.items.len(), 2);
+        assert_eq!(queue.items[0].title, "Approval required");
+        assert_eq!(queue.items[1].detail, "");
     }
 
     #[test]
