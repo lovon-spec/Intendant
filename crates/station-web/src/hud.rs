@@ -395,7 +395,7 @@ impl StationInner {
         let available_w = (w - margin * 2.0).max(760.0);
         let available_h = (h - top_y - 24.0).max(420.0);
         let command_h = if h < 640.0 { 78.0 } else { 92.0 };
-        let lane_h = if h < 640.0 { 68.0 } else { 78.0 };
+        let lane_h = lane_metrics(self.density, h).2;
         let main_h = (available_h - command_h - lane_h - gap * 2.0).max(250.0);
 
         let center_x = margin;
@@ -570,7 +570,11 @@ impl StationInner {
         let tile_w = (panel_w - 44.0) * 0.5;
         let mut tx = x + 14.0;
         let mut ty = y + 66.0;
-        for (idx, target) in targets.iter().take(8).enumerate() {
+        for (idx, target) in targets
+            .iter()
+            .take(compact_tile_count(self.density))
+            .enumerate()
+        {
             if idx > 0 && idx % 2 == 0 {
                 tx = x + 14.0;
                 ty += 58.0;
@@ -869,7 +873,7 @@ impl StationInner {
     }
 
     pub(crate) fn draw_station_activity_lane(&mut self, x: f32, h: f32, w: f32) {
-        let lane_h = 78.0;
+        let (rows, pitch, lane_h) = lane_metrics(self.density, h);
         let y = (h - lane_h - 24.0).max(282.0);
         self.glass_panel(x - 6.0, y, w + 12.0, lane_h + 10.0, 12.0, C_TEAL, 0.9, 0.9);
         self.hud.set_fill(C_TEAL_CSS);
@@ -884,12 +888,13 @@ impl StationInner {
             C_TEAL_CSS,
             "bold",
         );
+        let row_px = if rows > 3 { 8.5 } else { 9.0 };
         let latest = self
             .snapshot
             .events
             .iter()
             .rev()
-            .take(3)
+            .take(rows)
             .collect::<Vec<_>>();
         if latest.is_empty() {
             self.text(
@@ -902,7 +907,7 @@ impl StationInner {
             );
         } else {
             for (idx, event) in latest.into_iter().enumerate() {
-                let row_y = y + 43.0 + idx as f32 * 18.0;
+                let row_y = y + 43.0 + idx as f32 * pitch;
                 let color = level_color_css(&event.level);
                 self.hud.set_fill(color);
                 self.hud
@@ -912,7 +917,7 @@ impl StationInner {
                     &truncate(&nonempty(&event.ts, "--"), 10),
                     x + 33.0,
                     row_y,
-                    9.0,
+                    row_px,
                     C_OVERLAY1_CSS,
                     "normal",
                 );
@@ -920,7 +925,7 @@ impl StationInner {
                     &truncate(&event.level, 8),
                     x + 96.0,
                     row_y,
-                    9.0,
+                    row_px,
                     color,
                     "bold",
                 );
@@ -928,7 +933,7 @@ impl StationInner {
                     &truncate(&event.msg, ((w - 190.0) / 6.4).max(28.0) as usize),
                     x + 154.0,
                     row_y,
-                    9.0,
+                    row_px,
                     C_SUBTEXT0_CSS,
                     "normal",
                 );
@@ -964,7 +969,8 @@ impl StationInner {
         let panel_w = 370.0_f32.min(w - 48.0).max(280.0);
         let panel_h = 112.0;
         let x = (w - panel_w - 24.0).max(24.0);
-        let activity_lane_y = (h - 126.0 - 24.0).max(282.0);
+        // Sit just above the activity lane, wherever density placed it.
+        let activity_lane_y = (h - lane_metrics(self.density, h).2 - 24.0).max(282.0);
         let y = (activity_lane_y - panel_h - 12.0).max(58.0);
         let (title, value, detail, color) =
             match self.system_targets.iter().find(|target| target.id == id) {
@@ -1630,6 +1636,28 @@ impl StationInner {
     }
 }
 
+/// Activity-lane metrics for a density setting: `(rows, row_pitch,
+/// lane_height)`. Density meaningfully packs the HUD: 0.5 shows 2 event
+/// rows, 1.0 the classic 3, 1.8 up to 5 (with a tighter pitch). Short
+/// panes cap at 3 so the lane never eats the scene. At the default
+/// density the legacy 78/68px lane height is preserved exactly.
+pub(crate) fn lane_metrics(density: f32, h: f32) -> (usize, f32, f32) {
+    let mut rows = (3.0 * density).round() as i32;
+    if h < 640.0 {
+        rows = rows.min(3);
+    }
+    let rows = rows.clamp(2, 5) as usize;
+    let pitch = if rows > 3 { 15.5 } else { 18.0 };
+    let base = if h < 640.0 { 68.0 } else { 78.0 };
+    (rows, pitch, base + (rows as f32 - 3.0) * pitch)
+}
+
+/// How many summary tiles the compact (narrow) surface shows; density
+/// scales it between 4 and all 9, with 8 (the legacy count) at 1.0.
+pub(crate) fn compact_tile_count(density: f32) -> usize {
+    ((8.0 * density).round() as i32).clamp(4, 9) as usize
+}
+
 pub(crate) struct LaneAction {
     pub(crate) label: &'static str,
     pub(crate) width: f32,
@@ -1694,5 +1722,45 @@ impl LaneAction {
                 action: action.to_string(),
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lane_metrics_scale_rows_with_density() {
+        // Default density keeps the legacy geometry exactly.
+        assert_eq!(lane_metrics(1.0, 900.0), (3, 18.0, 78.0));
+        assert_eq!(lane_metrics(1.0, 600.0), (3, 18.0, 68.0));
+        // Sparse and dense settings change the row count and lane size.
+        let (rows, _, height) = lane_metrics(0.5, 900.0);
+        assert_eq!(rows, 2);
+        assert!(height < 78.0);
+        let (rows, pitch, height) = lane_metrics(1.8, 900.0);
+        assert_eq!(rows, 5);
+        assert!(pitch < 18.0);
+        assert!(height > 78.0);
+        // Short panes cap the row count so the lane can't eat the scene.
+        assert_eq!(lane_metrics(1.8, 600.0).0, 3);
+        // Rows always fit inside the lane: first row at +43, pitch apart.
+        for (density, h) in [(0.5, 900.0), (1.0, 900.0), (1.4, 900.0), (1.8, 900.0)] {
+            let (rows, pitch, height) = lane_metrics(density, h);
+            let last_row = 43.0 + (rows as f32 - 1.0) * pitch;
+            assert!(
+                last_row <= height + 3.0,
+                "density {density}: row {last_row} vs lane {height}"
+            );
+        }
+    }
+
+    #[test]
+    fn compact_tile_count_scales_and_clamps() {
+        assert_eq!(compact_tile_count(1.0), 8);
+        assert_eq!(compact_tile_count(0.5), 4);
+        assert_eq!(compact_tile_count(1.8), 9);
+        // There are only nine system targets to show.
+        assert!(compact_tile_count(5.0) <= 9);
     }
 }

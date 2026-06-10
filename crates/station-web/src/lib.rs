@@ -64,8 +64,12 @@ impl StationWeb {
         if use_webgpu {
             StationInner::start_gpu(inner.clone());
         } else {
+            // This branch is only reached via the URL opt-out; a browser
+            // without WebGPU support is detected later, in start_gpu's
+            // adapter/device request, with its own fallback warning.
             web_sys::console::warn_1(&JsValue::from_str(
-                "Station WebGPU disabled by station_gpu URL parameter; using Canvas renderer",
+                "Station WebGPU disabled by the station_gpu=canvas (or =off) URL parameter; \
+                 using the Canvas 2D wireframe renderer",
             ));
         }
         StationInner::start_loop(inner.clone());
@@ -597,6 +601,11 @@ impl StationInner {
                 || !self.particles.is_empty())
     }
 
+    /// Hard cap on live event particles; a burst of snapshot events (e.g.
+    /// history rehydration) keeps only the newest sparks instead of
+    /// growing the frame's vertex work without bound.
+    const MAX_PARTICLES: usize = 96;
+
     fn apply_snapshot(&mut self, snapshot: StationSnapshot) {
         // Spawn a particle per newly seen event, positioned with the layout
         // of the snapshot being replaced (the cache is rebuilt below).
@@ -624,6 +633,10 @@ impl StationInner {
                     color: level_color(&event.level),
                 });
             }
+        }
+        if self.particles.len() > Self::MAX_PARTICLES {
+            let excess = self.particles.len() - Self::MAX_PARTICLES;
+            self.particles.drain(0..excess);
         }
         // Event ids are unique and the snapshot carries a rolling window, so
         // retaining only the current window's ids bounds the set while still
