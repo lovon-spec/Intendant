@@ -18042,7 +18042,7 @@ pub fn spawn_web_gateway(
                                 Ok(log) => {
                                     let active_log_dir = log.dir().to_path_buf();
                                     managed_context_fission_response_from_home(
-                                        &request_line,
+                                        request_line,
                                         Some(active_log_dir.as_path()),
                                         &crate::platform::home_dir(),
                                     )
@@ -18053,7 +18053,7 @@ pub fn spawn_web_gateway(
                                 ),
                             },
                             None => managed_context_fission_response_from_home(
-                                &request_line,
+                                request_line,
                                 None,
                                 &crate::platform::home_dir(),
                             ),

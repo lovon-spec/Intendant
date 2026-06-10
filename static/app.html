@@ -6457,6 +6457,64 @@ body.context-focus-active {
   color: var(--overlay1);
   margin-top: 4px;
 }
+.managed-context-status-chip {
+  display: inline-block;
+  padding: 1px 8px;
+  border: 1px solid var(--surface2);
+  border-radius: 999px;
+  font-size: 11px;
+  font-family: var(--font-mono);
+  color: var(--overlay1);
+  white-space: nowrap;
+}
+.managed-context-status-chip.running { border-color: rgba(137, 180, 250, 0.55); color: var(--blue); }
+.managed-context-status-chip.blocked { border-color: rgba(249, 226, 175, 0.55); color: var(--yellow); }
+.managed-context-status-chip.completed { border-color: rgba(166, 227, 161, 0.55); color: var(--green); }
+.managed-context-status-chip.failed,
+.managed-context-status-chip.detached { border-color: rgba(243, 139, 168, 0.55); color: var(--red); }
+.managed-context-status-chip.cancelled { border-color: var(--surface2); color: var(--overlay0); }
+.managed-context-status-chip.canonical { border-color: rgba(137, 180, 250, 0.55); color: var(--blue); }
+.managed-context-status-chip.imported { border-color: rgba(166, 227, 161, 0.55); color: var(--green); }
+.managed-context-fission-branch {
+  border-top: 1px solid var(--surface1);
+  margin-top: 8px;
+  padding-top: 8px;
+  display: grid;
+  gap: 4px;
+}
+.managed-context-fission-spawn {
+  border: 1px solid var(--surface1);
+  border-radius: 5px;
+  padding: 8px;
+  margin-bottom: 10px;
+  display: grid;
+  gap: 6px;
+}
+.managed-context-fission-spawn select {
+  min-width: 0;
+  padding: 6px 8px;
+  border: 1px solid var(--surface1);
+  border-radius: 4px;
+  background: var(--surface0);
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+.managed-context-fission-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr) minmax(0, 0.6fr) auto;
+  gap: 6px;
+}
+.managed-context-fission-row input {
+  min-width: 0;
+  padding: 6px 8px;
+  border: 1px solid var(--surface1);
+  border-radius: 4px;
+  background: var(--surface0);
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
 .managed-context-raw {
   max-height: 280px;
   overflow: auto;
@@ -8708,6 +8766,21 @@ body.display-fullscreen-open {
                 <div class="managed-context-card-header">
                   <h3>Lineage and fission</h3>
                   <button type="button" class="managed-context-btn" id="managed-context-copy-status">Copy status JSON</button>
+                </div>
+                <div class="managed-context-fission-spawn">
+                  <div class="managed-context-inline" style="justify-content:space-between">
+                    <span class="managed-context-muted">Spawn fission branches (1-4 charters)</span>
+                    <div class="managed-context-inline">
+                      <select id="managed-context-fission-worktree" title="Worktree isolation override for spawned branches">
+                        <option value="">worktree: default</option>
+                        <option value="on">worktree: on</option>
+                        <option value="off">worktree: off</option>
+                      </select>
+                      <button type="button" class="managed-context-btn" id="managed-context-fission-add-row">Add branch</button>
+                      <button type="button" class="managed-context-btn primary" id="managed-context-fission-spawn">Spawn</button>
+                    </div>
+                  </div>
+                  <div id="managed-context-fission-rows"></div>
                 </div>
                 <div class="managed-context-ledger-list" id="managed-context-ledgers"></div>
               </div>
@@ -19448,8 +19521,10 @@ let _cachedSessions = [];
 let managedContextStatus = null;
 let managedContextRecords = [];
 let managedContextAnchors = [];
+let managedContextFissionGroups = [];
 let managedContextRecordsLoading = false;
 let managedContextAnchorsLoading = false;
+let managedContextFissionLoading = false;
 let managedContextLastError = '';
 let managedContextRefreshTimer = null;
 let managedContextRpcSeq = 1;
@@ -20032,6 +20107,15 @@ async function fetchManagedContextAnchors() {
   return Array.isArray(payload.anchors) ? payload.anchors : [];
 }
 
+async function fetchManagedContextFission() {
+  const query = managedContextHistoryQueryString();
+  if (!query) return [];
+  const resp = await authedFetch(`/api/managed-context/fission?${query}`);
+  const payload = await resp.json().catch(() => ({}));
+  if (!resp.ok) throw new Error(payload.error || `fission HTTP ${resp.status}`);
+  return Array.isArray(payload.groups) ? payload.groups : [];
+}
+
 function settleManagedContextPromise(promise) {
   return promise.then(
     value => ({ status: 'fulfilled', value }),
@@ -20064,8 +20148,10 @@ async function refreshManagedContextPane(options = {}) {
     managedContextStatus = null;
     managedContextRecords = [];
     managedContextAnchors = [];
+    managedContextFissionGroups = [];
     managedContextRecordsLoading = false;
     managedContextAnchorsLoading = false;
+    managedContextFissionLoading = false;
     managedContextLastError = '';
     renderManagedContextPane();
     return;
@@ -20073,10 +20159,12 @@ async function refreshManagedContextPane(options = {}) {
   managedContextLastError = '';
   managedContextRecordsLoading = true;
   managedContextAnchorsLoading = true;
+  managedContextFissionLoading = true;
   renderManagedContextPane();
   const statusPromise = settleManagedContextPromise(live ? fetchManagedContextStatus() : Promise.resolve(null));
   const recordsPromise = settleManagedContextPromise(fetchManagedContextRecords());
   const anchorsPromise = settleManagedContextPromise(fetchManagedContextAnchors());
+  const fissionPromise = settleManagedContextPromise(fetchManagedContextFission());
   const statusResult = await Promise.race([
     statusPromise,
     managedContextDelay(8000).then(() => ({
@@ -20097,15 +20185,17 @@ async function refreshManagedContextPane(options = {}) {
   }
   renderManagedContextPane();
 
-  const [recordsResult, anchorsResult] = await Promise.all([
+  const [recordsResult, anchorsResult, fissionResult] = await Promise.all([
     recordsPromise,
     anchorsPromise,
+    fissionPromise,
   ]);
   if (managedContextCurrentSessionId() !== sessionId) {
     return;
   }
   managedContextRecordsLoading = false;
   managedContextAnchorsLoading = false;
+  managedContextFissionLoading = false;
   const errors = [];
   if (recordsResult.status === 'fulfilled') {
     managedContextRecords = recordsResult.value;
@@ -20122,6 +20212,14 @@ async function refreshManagedContextPane(options = {}) {
     const message = anchorsResult.reason?.message || String(anchorsResult.reason || 'unknown error');
     errors.push(`Anchors unavailable: ${message}`);
     if (options.force) console.warn('Managed context anchors refresh failed:', anchorsResult.reason);
+  }
+  if (fissionResult.status === 'fulfilled') {
+    managedContextFissionGroups = fissionResult.value;
+  } else {
+    managedContextFissionGroups = [];
+    const message = fissionResult.reason?.message || String(fissionResult.reason || 'unknown error');
+    errors.push(`Fission groups unavailable: ${message}`);
+    if (options.force) console.warn('Managed context fission refresh failed:', fissionResult.reason);
   }
   managedContextLastError = [managedContextLastError, ...errors].filter(Boolean).join(' ');
   renderManagedContextPane();
@@ -20169,27 +20267,104 @@ function selectManagedContextRecord(record) {
   renderManagedContextRecords();
 }
 
+function managedContextFissionStatusClass(status) {
+  // Mirrors fission_ledger::normalize_branch_status so chip colors track the
+  // canonical status vocabulary even for legacy/observed raw values.
+  switch (String(status || '').trim()) {
+    case 'blocked': return 'blocked';
+    case 'completed': case 'ended': case 'shutdown': return 'completed';
+    case 'failed': case 'errored': return 'failed';
+    case 'detached': return 'detached';
+    case 'cancelled': case 'canceled': case 'interrupted': return 'cancelled';
+    default: return 'running';
+  }
+}
+
+function managedContextFissionBranchHtml(group, branch) {
+  const groupId = group.group_id || '';
+  const branchId = branch.session_id || '';
+  const canonicalId = group.canonical_session_id || '';
+  const status = String(branch.status || '').trim() || 'running';
+  const charter = branch.charter || null;
+  const changedFiles = Array.isArray(branch.changed_files) ? branch.changed_files.length : 0;
+  const chips = [
+    `<span class="managed-context-status-chip ${managedContextFissionStatusClass(status)}">${escapeHtml(status)}</span>`,
+    `<span class="managed-context-anchor-id" title="${escapeHtml(branchId)}">${escapeHtml(shortSessionId(branchId))}</span>`,
+  ];
+  if (branchId && branchId === canonicalId) {
+    chips.push('<span class="managed-context-status-chip canonical">canonical</span>');
+  }
+  if (branch.imported_at) {
+    chips.push(`<span class="managed-context-status-chip imported" title="imported ${escapeHtml(branch.imported_at)}">imported</span>`);
+  }
+  if (changedFiles) {
+    chips.push(`<span class="managed-context-muted">${changedFiles} changed file${changedFiles === 1 ? '' : 's'}</span>`);
+  }
+  const details = [];
+  if (charter?.objective) details.push(`objective: ${charter.objective}`);
+  if (charter?.write_scope) details.push(`write scope: ${charter.write_scope}`);
+  if (branch.worktree_path) details.push(`worktree: ${branch.worktree_path}`);
+  const summary = compactSessionText(branch.summary || branch.task) || '';
+  const actions = ['wait', 'import', 'cancel', 'detach'].map(op =>
+    `<button type="button" class="managed-context-btn${op === 'cancel' || op === 'detach' ? ' danger' : ''}"` +
+    ` data-fission-op="${op}" data-group-id="${escapeHtml(groupId)}" data-branch-id="${escapeHtml(branchId)}">` +
+    `${op.charAt(0).toUpperCase()}${op.slice(1)}</button>`
+  ).join('');
+  const claim = `<button type="button" class="managed-context-btn" data-claim-fission="${escapeHtml(groupId)}" data-branch-id="${escapeHtml(branchId)}" data-expected-id="${escapeHtml(canonicalId)}">Claim</button>`;
+  return `<div class="managed-context-fission-branch">` +
+    `<div class="managed-context-inline">${chips.join('')}</div>` +
+    (details.length ? `<div class="managed-context-muted">${escapeHtml(details.join(' · '))}</div>` : '') +
+    (summary ? `<div class="managed-context-muted">${escapeHtml(summary)}</div>` : '') +
+    `<div class="managed-context-inline">${actions}${claim}</div>` +
+    `</div>`;
+}
+
+function managedContextFissionGroupNode(group) {
+  const row = document.createElement('div');
+  row.className = 'managed-context-ledger-item';
+  const branches = Array.isArray(group.branches) ? group.branches : [];
+  const detached = group.detached === true || !!group.detached_at;
+  const header = [
+    '<strong>fission</strong>',
+    `<span class="managed-context-anchor-id">${escapeHtml(group.group_id || '')}</span>`,
+    `<span class="managed-context-muted">${escapeHtml(group.tool || '')}</span>`,
+    `<span class="managed-context-muted">anchor ${escapeHtml(group.anchor_item_id || '')}</span>`,
+    `<span class="managed-context-muted">canonical ${escapeHtml(shortSessionId(group.canonical_session_id || '') || '--')}</span>`,
+  ];
+  if (detached) {
+    header.push(`<span class="managed-context-status-chip detached"${group.detached_at ? ` title="detached ${escapeHtml(group.detached_at)}"` : ''}>detached</span>`);
+    const reason = compactSessionText(group.detach_reason) || '';
+    if (reason) header.push(`<span class="managed-context-muted">${escapeHtml(reason)}</span>`);
+  }
+  const objective = compactSessionText(group.objective) || '';
+  row.innerHTML =
+    `<div class="managed-context-inline">${header.join('')}</div>` +
+    (objective ? `<div class="managed-context-muted" style="margin-top:4px">${escapeHtml(objective)}</div>` : '') +
+    branches.map(branch => managedContextFissionBranchHtml(group, branch)).join('');
+  return row;
+}
+
 function renderManagedContextLedgers() {
   const host = managedContextEl('managed-context-ledgers');
   if (!host) return;
   host.innerHTML = '';
   const lineage = managedContextStatus?.lineage_ledger?.groups || [];
-  const fission = managedContextStatus?.fission_ledger?.groups || [];
+  // The fission endpoint serves the merged ledger + extension view (and works
+  // for historical sessions too); live-status groups are only a fallback for
+  // sessions the endpoint has nothing for yet.
+  const statusFission = managedContextStatus?.fission_ledger?.groups || [];
+  const fission = managedContextFissionGroups.length ? managedContextFissionGroups : statusFission;
   const addGroup = (kind, group) => {
     const row = document.createElement('div');
     row.className = 'managed-context-ledger-item';
     const branches = Array.isArray(group.branches) ? group.branches : [];
-    const branchHtml = branches.map(branch => {
-      const claim = kind === 'fission'
-        ? `<button type="button" class="managed-context-btn" data-claim-fission="${escapeHtml(group.group_id || '')}" data-branch-id="${escapeHtml(branch.session_id || '')}" data-expected-id="${escapeHtml(group.canonical_session_id || '')}">Claim</button>`
-        : '';
-      return `<div class="managed-context-inline" style="margin-top:6px">` +
-        `<span class="managed-context-anchor-id">${escapeHtml(shortSessionId(branch.session_id || ''))}</span>` +
-        `<span class="managed-context-muted">${escapeHtml(branch.relationship || branch.status || '')}</span>` +
-        `<span class="managed-context-muted">${escapeHtml(compactSessionText(branch.summary || branch.task) || '')}</span>` +
-        claim +
-        `</div>`;
-    }).join('');
+    const branchHtml = branches.map(branch =>
+      `<div class="managed-context-inline" style="margin-top:6px">` +
+      `<span class="managed-context-anchor-id">${escapeHtml(shortSessionId(branch.session_id || ''))}</span>` +
+      `<span class="managed-context-muted">${escapeHtml(branch.relationship || branch.status || '')}</span>` +
+      `<span class="managed-context-muted">${escapeHtml(compactSessionText(branch.summary || branch.task) || '')}</span>` +
+      `</div>`
+    ).join('');
     row.innerHTML =
       `<div class="managed-context-inline">` +
       `<strong>${escapeHtml(kind)}</strong>` +
@@ -20200,9 +20375,11 @@ function renderManagedContextLedgers() {
     host.appendChild(row);
   };
   lineage.forEach(group => addGroup('lineage', group));
-  fission.forEach(group => addGroup('fission', group));
+  fission.forEach(group => host.appendChild(managedContextFissionGroupNode(group)));
   if (!host.childElementCount) {
-    host.innerHTML = '<div class="managed-context-muted">No lineage or fission groups reported yet.</div>';
+    host.innerHTML = managedContextFissionLoading
+      ? '<div class="managed-context-muted">Loading fission groups...</div>'
+      : '<div class="managed-context-muted">No lineage or fission groups reported yet.</div>';
   }
 }
 
@@ -20217,7 +20394,7 @@ function renderManagedContextPane() {
   const managed =
     managedContextSessionIsLive(sessionId, meta) &&
     managedContextEffectiveMode(sessionId, meta) === 'managed';
-  ['managed-context-submit-rewind', 'managed-context-submit-backout'].forEach(id => {
+  ['managed-context-submit-rewind', 'managed-context-submit-backout', 'managed-context-fission-spawn'].forEach(id => {
     const btn = managedContextEl(id);
     if (btn) btn.disabled = !managed || !sessionId;
   });
@@ -20329,6 +20506,120 @@ async function claimManagedContextFissionCanonical(groupId, branchId, expectedId
   }
 }
 
+async function runManagedContextFissionOp(op, groupId, branchId) {
+  if (!op || !groupId) {
+    showControlToast('error', 'Fission action needs a group');
+    return;
+  }
+  if (op !== 'wait') {
+    const verb = op === 'import' ? 'Import the result of' : op === 'cancel' ? 'Cancel' : 'Detach';
+    const confirmed = await showDashboardConfirm({
+      title: `Confirm fission ${op}`,
+      message: `${verb} branch ${shortSessionId(branchId) || '?'} in group ${groupId}?`,
+      confirmLabel: op.charAt(0).toUpperCase() + op.slice(1),
+      danger: op !== 'import',
+    });
+    if (!confirmed) return;
+  }
+  const args = { group_id: groupId, op };
+  const sessionId = managedContextCurrentSessionId();
+  if (sessionId) args.session_id = sessionId;
+  if (branchId) args.branch_session_id = branchId;
+  if (op === 'wait') args.timeout_s = 60;
+  const result = managedContextEl('managed-context-action-result');
+  if (result) result.textContent = `Running fission ${op}...`;
+  try {
+    const text = await managedContextMcpTool('fission_control', args);
+    let parsed = null;
+    try { parsed = JSON.parse(text); } catch (_) { /* plain-text tool result */ }
+    if (result) result.textContent = parsed ? JSON.stringify(parsed) : (text || 'ok');
+    // `still_running` is a normal wait outcome, not a failure.
+    const stillRunning = op === 'wait' &&
+      (parsed?.status === 'still_running' || parsed?.result === 'still_running' || /\bstill_running\b/.test(text || ''));
+    showControlToast(stillRunning ? 'info' : 'success', stillRunning ? 'Branch still running' : `Fission ${op} complete`);
+    scheduleManagedContextRefresh(500);
+  } catch (err) {
+    if (result) result.textContent = err?.message || String(err);
+    showControlToast('error', err?.message || `Fission ${op} failed`);
+  }
+}
+
+const MANAGED_CONTEXT_FISSION_MAX_BRANCHES = 4;
+
+function managedContextFissionRowCount() {
+  return managedContextEl('managed-context-fission-rows')
+    ?.querySelectorAll('.managed-context-fission-row').length || 0;
+}
+
+function addManagedContextFissionRow() {
+  const host = managedContextEl('managed-context-fission-rows');
+  if (!host) return;
+  if (managedContextFissionRowCount() >= MANAGED_CONTEXT_FISSION_MAX_BRANCHES) {
+    showControlToast('error', `Fission spawns at most ${MANAGED_CONTEXT_FISSION_MAX_BRANCHES} branches`);
+    return;
+  }
+  const row = document.createElement('div');
+  row.className = 'managed-context-fission-row';
+  row.innerHTML =
+    '<input type="text" class="fission-objective" placeholder="objective (required)" autocomplete="off" spellcheck="true">' +
+    '<input type="text" class="fission-write-scope" placeholder="write scope, comma-separated" autocomplete="off" spellcheck="false">' +
+    '<input type="text" class="fission-name" placeholder="name" autocomplete="off" spellcheck="false">' +
+    '<button type="button" class="managed-context-btn" data-fission-remove-row title="Remove this branch row">&times;</button>';
+  host.appendChild(row);
+}
+
+function ensureManagedContextFissionRow() {
+  if (!managedContextFissionRowCount()) addManagedContextFissionRow();
+}
+
+async function submitManagedContextFissionSpawn() {
+  const sessionId = managedContextCurrentSessionId();
+  if (!sessionId) {
+    showControlToast('error', 'Fission spawn needs a session');
+    return;
+  }
+  const rows = Array.from(
+    managedContextEl('managed-context-fission-rows')?.querySelectorAll('.managed-context-fission-row') || []
+  );
+  const branches = [];
+  for (const row of rows) {
+    const objective = String(row.querySelector('.fission-objective')?.value || '').trim();
+    const writeScope = String(row.querySelector('.fission-write-scope')?.value || '').trim();
+    const name = String(row.querySelector('.fission-name')?.value || '').trim();
+    if (!objective) {
+      if (writeScope || name) {
+        showControlToast('error', 'Every fission branch row needs an objective');
+        return;
+      }
+      continue; // fully empty row: ignore it
+    }
+    const branch = { objective };
+    const scope = writeScope.split(',').map(part => part.trim()).filter(Boolean);
+    if (scope.length) branch.write_scope = scope;
+    if (name) branch.name = name;
+    branches.push(branch);
+  }
+  if (!branches.length || branches.length > MANAGED_CONTEXT_FISSION_MAX_BRANCHES) {
+    showControlToast('error', `Fission spawn needs 1-${MANAGED_CONTEXT_FISSION_MAX_BRANCHES} branch objectives`);
+    return;
+  }
+  const args = { session_id: sessionId, branches };
+  const worktree = String(managedContextEl('managed-context-fission-worktree')?.value || '');
+  if (worktree === 'on') args.use_worktree = true;
+  else if (worktree === 'off') args.use_worktree = false;
+  const result = managedContextEl('managed-context-action-result');
+  if (result) result.textContent = `Spawning ${branches.length} fission branch${branches.length === 1 ? '' : 'es'}...`;
+  try {
+    const text = await managedContextMcpTool('fission_spawn', args);
+    if (result) result.textContent = text || 'ok';
+    showControlToast('success', 'Fission spawn dispatched');
+    scheduleManagedContextRefresh(1000);
+  } catch (err) {
+    if (result) result.textContent = err?.message || String(err);
+    showControlToast('error', err?.message || 'Fission spawn failed');
+  }
+}
+
 function wireManagedContextListeners() {
   managedContextEl('managed-context-session')?.addEventListener('change', () => {
     managedContextSessionManuallySelected = true;
@@ -20358,6 +20649,15 @@ function wireManagedContextListeners() {
       .catch(err => showControlToast('error', 'Copy failed: ' + (err?.message || err)));
   });
   managedContextEl('managed-context-ledgers')?.addEventListener('click', ev => {
+    const opBtn = ev.target?.closest?.('button[data-fission-op]');
+    if (opBtn) {
+      runManagedContextFissionOp(
+        opBtn.dataset.fissionOp || '',
+        opBtn.dataset.groupId || '',
+        opBtn.dataset.branchId || ''
+      );
+      return;
+    }
     const btn = ev.target?.closest?.('button[data-claim-fission]');
     if (!btn) return;
     claimManagedContextFissionCanonical(
@@ -20366,6 +20666,18 @@ function wireManagedContextListeners() {
       btn.dataset.expectedId || ''
     );
   });
+  managedContextEl('managed-context-fission-add-row')?.addEventListener('click', addManagedContextFissionRow);
+  managedContextEl('managed-context-fission-spawn')?.addEventListener('click', submitManagedContextFissionSpawn);
+  managedContextEl('managed-context-fission-rows')?.addEventListener('click', ev => {
+    const btn = ev.target?.closest?.('button[data-fission-remove-row]');
+    if (!btn) return;
+    if (managedContextFissionRowCount() <= 1) {
+      showControlToast('info', 'Fission spawn keeps at least one branch row');
+      return;
+    }
+    btn.closest('.managed-context-fission-row')?.remove();
+  });
+  ensureManagedContextFissionRow();
 }
 
 if (document.readyState === 'loading') {
