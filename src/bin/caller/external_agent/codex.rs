@@ -450,6 +450,60 @@ impl CodexAgent {
         serde_json::Value::Object(obj)
     }
 
+    /// Build `thread/fork` params for a live-thread fission fork: `threadId`
+    /// selects the source thread (the fork inherits its full conversation
+    /// context and lineage prompt-cache key) and `cwd`, when given, moves the
+    /// branch into its own checkout — typically a git worktree of the parent
+    /// project.
+    ///
+    /// Worktree sandbox consideration: under Codex's `workspace-write`
+    /// sandbox the branch may write inside its cwd, but a linked git
+    /// worktree's git metadata lives under the MAIN repository's `.git`
+    /// (private dir `<main>/.git/worktrees/<name>` plus the shared object and
+    /// ref stores), so branch commits would be blocked. `thread/fork` accepts
+    /// per-fork `config` overrides applied as dotted-key CLI config
+    /// overrides, so when `cwd` is a linked worktree the main repository's
+    /// common `.git` directory is added to
+    /// `sandbox_workspace_write.writable_roots`. Launch-level extra roots are
+    /// re-included because a per-fork value for the same key replaces — not
+    /// extends — the launch-arg value.
+    fn fork_thread_with_options_params(
+        &self,
+        thread_id: &str,
+        cwd: Option<&Path>,
+    ) -> serde_json::Value {
+        let mut obj = serde_json::Map::new();
+        obj.insert(
+            "threadId".into(),
+            serde_json::Value::String(thread_id.to_string()),
+        );
+        if let Some(cwd) = cwd {
+            obj.insert(
+                "cwd".into(),
+                serde_json::Value::String(cwd.to_string_lossy().to_string()),
+            );
+            if let Some(common_git_dir) = git_worktree_common_git_dir(cwd) {
+                let roots: Vec<serde_json::Value> = self
+                    .writable_roots
+                    .iter()
+                    .cloned()
+                    .chain(std::iter::once(
+                        common_git_dir.to_string_lossy().to_string(),
+                    ))
+                    .map(serde_json::Value::String)
+                    .collect();
+                let mut config = serde_json::Map::new();
+                config.insert(
+                    "sandbox_workspace_write.writable_roots".into(),
+                    serde_json::Value::Array(roots),
+                );
+                obj.insert("config".into(), serde_json::Value::Object(config));
+            }
+        }
+        self.insert_service_tier_override(&mut obj);
+        serde_json::Value::Object(obj)
+    }
+
     /// Inner implementation of the `/undo` thread action. Returns a
     /// human-readable status string for the dashboard toast. The
     /// `ExternalAgent::rollback_turns` trait method (impl below) wraps
@@ -918,6 +972,59 @@ fn managed_context_developer_instructions_for_project(
         ),
         None => base,
     }
+}
+
+/// When `cwd` is a linked git worktree — its `.git` is a *file* containing
+/// `gitdir: <path>` — resolve the main repository's common `.git` directory.
+///
+/// A linked worktree's private git dir lives at `<main>/.git/worktrees/<name>`
+/// and commits made inside the worktree write through it into the shared
+/// object/ref stores under `<main>/.git`. The `commondir` file inside the
+/// private dir points at that shared directory (usually `../..`); when it is
+/// missing, fall back to the structural `worktrees/<name>` layout. Returns
+/// `None` for ordinary checkouts (`.git` directory), non-repos, or malformed
+/// `.git` files.
+fn git_worktree_common_git_dir(cwd: &Path) -> Option<PathBuf> {
+    let dot_git = cwd.join(".git");
+    if !dot_git.is_file() {
+        return None;
+    }
+    let contents = std::fs::read_to_string(&dot_git).ok()?;
+    let gitdir = contents
+        .lines()
+        .find_map(|line| line.strip_prefix("gitdir:"))
+        .map(str::trim)
+        .filter(|path| !path.is_empty())?;
+    let gitdir = if Path::new(gitdir).is_absolute() {
+        PathBuf::from(gitdir)
+    } else {
+        cwd.join(gitdir)
+    };
+    let common = match std::fs::read_to_string(gitdir.join("commondir")) {
+        Ok(commondir) => {
+            let commondir = commondir.trim();
+            if commondir.is_empty() {
+                return None;
+            }
+            if Path::new(commondir).is_absolute() {
+                PathBuf::from(commondir)
+            } else {
+                gitdir.join(commondir)
+            }
+        }
+        Err(_) => {
+            if gitdir.parent().and_then(Path::file_name)
+                != Some(std::ffi::OsStr::new("worktrees"))
+            {
+                return None;
+            }
+            gitdir.parent()?.parent()?.to_path_buf()
+        }
+    };
+    // `commondir` is usually relative (`../..`); canonicalize so the sandbox
+    // writable root is a clean absolute path without `..` segments. Keep the
+    // joined path as a best-effort fallback when canonicalization fails.
+    Some(std::fs::canonicalize(&common).unwrap_or(common))
 }
 
 fn side_boundary_prompt_item() -> serde_json::Value {
@@ -7000,6 +7107,41 @@ impl ExternalAgent for CodexAgent {
         Ok(AgentThread { thread_id })
     }
 
+    async fn fork_thread_with_options(
+        &mut self,
+        thread_id: &str,
+        name: Option<&str>,
+        cwd: Option<&Path>,
+    ) -> Result<AgentThread, CallerError> {
+        let thread_id = thread_id.trim();
+        if thread_id.is_empty() {
+            return Err(CallerError::ExternalAgent(
+                "live-thread fork requires a thread id".into(),
+            ));
+        }
+        let params = self.fork_thread_with_options_params(thread_id, cwd);
+        let response = self
+            .send_request("thread/fork", Some(params))
+            .await
+            .map_err(|e| CallerError::ExternalAgent(format!("thread/fork: {e}")))?;
+        let forked_thread_id = extract_thread_id(&response).ok_or_else(|| {
+            CallerError::ExternalAgent("thread/fork response missing thread id".into())
+        })?;
+        // Unlike rollback/restore/rollout-path forks — which rewrite or stand
+        // in for the active thread — a fission fork leaves the parent thread
+        // untouched, so its context-pressure floor must persist.
+        if let Some(name) = name.map(str::trim).filter(|name| !name.is_empty()) {
+            let request =
+                serde_json::json!({ "threadId": forked_thread_id.clone(), "name": name });
+            self.send_request("thread/name/set", Some(request))
+                .await
+                .map_err(|e| CallerError::ExternalAgent(format!("thread/name/set: {e}")))?;
+        }
+        Ok(AgentThread {
+            thread_id: forked_thread_id,
+        })
+    }
+
     async fn restore_thread_from_rollout_path(
         &mut self,
         thread_id: &str,
@@ -11676,6 +11818,140 @@ command = "asana-mcp"
         });
         assert_eq!(params["threadId"], "");
         assert_eq!(params["path"], "/tmp/rewind-source.jsonl");
+    }
+
+    /// Lay out `<root>/main` as a plain repository with a linked worktree at
+    /// `<root>/wt`, optionally writing the private dir's `commondir` pointer.
+    /// Returns (worktree_path, main_common_git_dir).
+    fn fake_linked_worktree(root: &Path, commondir: Option<&str>) -> (PathBuf, PathBuf) {
+        let main_git = root.join("main").join(".git");
+        let private_gitdir = main_git.join("worktrees").join("fission-a");
+        std::fs::create_dir_all(&private_gitdir).unwrap();
+        if let Some(commondir) = commondir {
+            std::fs::write(private_gitdir.join("commondir"), commondir).unwrap();
+        }
+        let worktree = root.join("wt");
+        std::fs::create_dir_all(&worktree).unwrap();
+        std::fs::write(
+            worktree.join(".git"),
+            format!("gitdir: {}\n", private_gitdir.display()),
+        )
+        .unwrap();
+        (worktree, main_git)
+    }
+
+    #[test]
+    fn thread_fork_with_options_wire_format_carries_thread_id_cwd_and_worktree_git_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (worktree, main_git) = fake_linked_worktree(tmp.path(), Some("../..\n"));
+
+        let mut agent = test_agent();
+        agent.writable_roots = vec!["/srv/shared-cache".to_string()];
+        let params = agent.fork_thread_with_options_params("thread-abc", Some(&worktree));
+
+        assert_eq!(params["threadId"], "thread-abc");
+        assert_eq!(params["cwd"], worktree.to_string_lossy().as_ref());
+        // No rollout path: this is a live-thread fork.
+        assert!(params.get("path").is_none());
+        let roots = params["config"]["sandbox_workspace_write.writable_roots"]
+            .as_array()
+            .expect("writable-roots config override");
+        // Launch-level extra roots are re-included (the per-fork key replaces
+        // the launch-arg value), then the main repo's common `.git` dir.
+        assert_eq!(roots.len(), 2);
+        assert_eq!(roots[0], "/srv/shared-cache");
+        let expected_git = std::fs::canonicalize(&main_git).unwrap();
+        assert_eq!(roots[1], expected_git.to_string_lossy().as_ref());
+    }
+
+    #[test]
+    fn thread_fork_with_options_wire_format_is_minimal_without_cwd() {
+        let agent = test_agent();
+        let params = agent.fork_thread_with_options_params("thread-abc", None);
+        assert_eq!(params["threadId"], "thread-abc");
+        assert!(params.get("cwd").is_none());
+        assert!(params.get("config").is_none());
+    }
+
+    #[test]
+    fn thread_fork_with_options_skips_config_override_for_plain_checkout() {
+        // A `.git` DIRECTORY means cwd is an ordinary repository whose git
+        // metadata already lives inside cwd — no writable-roots override.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".git")).unwrap();
+        let agent = test_agent();
+        let params = agent.fork_thread_with_options_params("thread-abc", Some(tmp.path()));
+        assert_eq!(params["cwd"], tmp.path().to_string_lossy().as_ref());
+        assert!(params.get("config").is_none());
+    }
+
+    #[test]
+    fn git_worktree_common_git_dir_resolves_commondir_pointer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (worktree, main_git) = fake_linked_worktree(tmp.path(), Some("../..\n"));
+        assert_eq!(
+            git_worktree_common_git_dir(&worktree),
+            Some(std::fs::canonicalize(&main_git).unwrap())
+        );
+    }
+
+    #[test]
+    fn git_worktree_common_git_dir_falls_back_to_worktrees_layout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (worktree, main_git) = fake_linked_worktree(tmp.path(), None);
+        assert_eq!(
+            git_worktree_common_git_dir(&worktree),
+            Some(std::fs::canonicalize(&main_git).unwrap())
+        );
+    }
+
+    #[test]
+    fn git_worktree_common_git_dir_resolves_relative_gitdir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (worktree, main_git) = fake_linked_worktree(tmp.path(), Some("../.."));
+        // Rewrite the `.git` file with a worktree-relative gitdir pointer.
+        std::fs::write(
+            worktree.join(".git"),
+            "gitdir: ../main/.git/worktrees/fission-a\n",
+        )
+        .unwrap();
+        assert_eq!(
+            git_worktree_common_git_dir(&worktree),
+            Some(std::fs::canonicalize(&main_git).unwrap())
+        );
+    }
+
+    #[test]
+    fn git_worktree_common_git_dir_ignores_plain_and_missing_repos() {
+        let tmp = tempfile::tempdir().unwrap();
+        // No .git at all.
+        assert_eq!(git_worktree_common_git_dir(tmp.path()), None);
+        // Ordinary checkout: .git is a directory.
+        std::fs::create_dir_all(tmp.path().join(".git")).unwrap();
+        assert_eq!(git_worktree_common_git_dir(tmp.path()), None);
+        // Malformed .git file.
+        let malformed = tmp.path().join("malformed");
+        std::fs::create_dir_all(&malformed).unwrap();
+        std::fs::write(malformed.join(".git"), "not a gitdir pointer\n").unwrap();
+        assert_eq!(git_worktree_common_git_dir(&malformed), None);
+    }
+
+    #[tokio::test]
+    async fn fork_thread_with_options_requires_thread_id() {
+        let mut agent = test_agent();
+        let err = agent
+            .fork_thread_with_options("  ", None, None)
+            .await
+            .unwrap_err();
+        match err {
+            CallerError::ExternalAgent(msg) => {
+                assert!(
+                    msg.contains("requires a thread id"),
+                    "expected thread-id error, got: {msg}"
+                );
+            }
+            other => panic!("expected ExternalAgent error, got {other:?}"),
+        }
     }
 
     #[test]
