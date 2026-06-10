@@ -13014,7 +13014,11 @@ fn apply_settings_payload(config: &mut crate::project::ProjectConfig, payload: &
     }
 }
 
-fn settings_post_result(body_text: &str, project_root: Option<&Path>) -> (&'static str, String) {
+fn settings_post_result(
+    body_text: &str,
+    project_root: Option<&Path>,
+    bus: &EventBus,
+) -> (&'static str, String) {
     let Some(root) = project_root else {
         return (
             "400 Bad Request",
@@ -13041,11 +13045,65 @@ fn settings_post_result(body_text: &str, project_root: Option<&Path>) -> (&'stat
     };
     apply_settings_payload(&mut proj.config, &payload);
     match proj.save_config() {
-        Ok(()) => ("200 OK", serde_json::json!({"ok": true}).to_string()),
+        Ok(()) => {
+            dispatch_codex_settings_control_msgs(bus, &payload);
+            ("200 OK", serde_json::json!({"ok": true}).to_string())
+        }
         Err(e) => (
             "500 Internal Server Error",
             serde_json::json!({"error": e.to_string()}).to_string(),
         ),
+    }
+}
+
+/// Mirror just-persisted `[agent.codex]` settings into the live control plane.
+///
+/// `apply_settings_payload` + `save_config` update the TOML, but session
+/// launches read the live `CodexRuntimeConfig`, which OVERLAYS the TOML
+/// (`project_with_runtime_config`). Without this, an API client that POSTs
+/// `codex_managed_context: "managed"` sees /api/settings echo the new value
+/// while sessions keep launching with the stale live value until a daemon
+/// restart. Frontends stay display-only, so we don't write shared state here:
+/// we emit the same `ControlMsg`s a dashboard would, and the control plane
+/// (the single writer) updates shared state, broadcasts `CodexConfigChanged`,
+/// and re-persists the normalized value. That second persist is intentional
+/// and idempotent — both paths run the same normalizers, and the gateway's
+/// own synchronous TOML write (kept above) is what makes an immediate
+/// GET /api/settings read back the saved values.
+///
+/// Only fields actually present in the payload are dispatched, mirroring
+/// `apply_settings_payload`'s conditional writes; only codex fields with a
+/// live control-plane setter are covered.
+fn dispatch_codex_settings_control_msgs(bus: &EventBus, payload: &SettingsPayload) {
+    if payload.codex_command.is_some() {
+        bus.send(AppEvent::ControlCommand(ControlMsg::SetCodexCommand {
+            command: payload.codex_command.clone(),
+        }));
+    }
+    if let Some(mode) = payload.codex_sandbox.clone() {
+        bus.send(AppEvent::ControlCommand(ControlMsg::SetCodexSandbox {
+            mode,
+        }));
+    }
+    if let Some(policy) = payload.codex_approval_policy.clone() {
+        bus.send(AppEvent::ControlCommand(
+            ControlMsg::SetCodexApprovalPolicy { policy },
+        ));
+    }
+    if payload.codex_service_tier.is_some() {
+        bus.send(AppEvent::ControlCommand(ControlMsg::SetCodexServiceTier {
+            service_tier: payload.codex_service_tier.clone(),
+        }));
+    }
+    if let Some(mode) = payload.codex_managed_context.clone() {
+        bus.send(AppEvent::ControlCommand(
+            ControlMsg::SetCodexManagedContext { mode },
+        ));
+    }
+    if let Some(mode) = payload.codex_context_archive.clone() {
+        bus.send(AppEvent::ControlCommand(
+            ControlMsg::SetCodexContextArchive { mode },
+        ));
     }
 }
 
@@ -16919,7 +16977,7 @@ pub fn spawn_web_gateway(
                             &body_owned
                         };
                         let (status, result) =
-                            settings_post_result(body_text, project_root.as_deref());
+                            settings_post_result(body_text, project_root.as_deref(), &bus);
                         let response = json_response(status, result);
                         let _ = stream.write_all(response.as_bytes()).await;
                     } else if request_line.starts_with("POST")
@@ -26732,7 +26790,11 @@ mod tests {
 
     #[test]
     fn settings_post_result_rejects_invalid_json_with_bad_request() {
-        let (status, body) = settings_post_result("{\"external_agent\":", Some(Path::new(".")));
+        let (status, body) = settings_post_result(
+            "{\"external_agent\":",
+            Some(Path::new(".")),
+            &EventBus::new(),
+        );
 
         assert_eq!(status, "400 Bad Request");
         assert!(body.contains("Invalid settings"));
@@ -26740,10 +26802,153 @@ mod tests {
 
     #[test]
     fn settings_post_result_rejects_missing_project_root_with_bad_request() {
-        let (status, body) = settings_post_result("{}", None);
+        let (status, body) = settings_post_result("{}", None, &EventBus::new());
 
         assert_eq!(status, "400 Bad Request");
         assert!(body.contains("No project root"));
+    }
+
+    /// POST /api/settings must keep the LIVE codex runtime config coherent,
+    /// not just the TOML: launches read the shared `CodexRuntimeConfig`,
+    /// which overrides the file. The gateway does that by re-dispatching
+    /// the codex fields as control-plane intents after a successful save.
+    #[test]
+    fn settings_post_dispatches_codex_control_msgs_for_live_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        let body = serde_json::json!({
+            "cu_provider": null,
+            "cu_model": null,
+            "cu_backend": "auto",
+            "presence_enabled": true,
+            "presence_provider": null,
+            "presence_model": null,
+            "presence_live_provider": null,
+            "presence_live_model": null,
+            "transcription_enabled": false,
+            "transcription_provider": "openai",
+            "transcription_model": "whisper-1",
+            "transcription_endpoint": null,
+            "transcription_language": null,
+            "recording_enabled": false,
+            "recording_framerate": 15,
+            "recording_quality": "medium",
+            "live_audio_enabled": false,
+            "live_audio_timeout_secs": 300,
+            "external_agent": "codex",
+            "codex_command": "/opt/codex/bin/codex",
+            "codex_sandbox": "danger-full-access",
+            "codex_approval_policy": "never",
+            "codex_service_tier": "priority",
+            "codex_managed_context": "managed",
+            "codex_context_archive": "exact"
+        })
+        .to_string();
+
+        let (status, _) = settings_post_result(&body, Some(dir.path()), &bus);
+        assert_eq!(status, "200 OK");
+
+        let mut saw_command = false;
+        let mut saw_sandbox = false;
+        let mut saw_approval = false;
+        let mut saw_service_tier = false;
+        let mut saw_managed = false;
+        let mut saw_archive = false;
+        while let Ok(event) = rx.try_recv() {
+            let AppEvent::ControlCommand(msg) = event else {
+                continue;
+            };
+            match msg {
+                ControlMsg::SetCodexCommand { command } => {
+                    assert_eq!(command.as_deref(), Some("/opt/codex/bin/codex"));
+                    saw_command = true;
+                }
+                ControlMsg::SetCodexSandbox { mode } => {
+                    assert_eq!(mode, "danger-full-access");
+                    saw_sandbox = true;
+                }
+                ControlMsg::SetCodexApprovalPolicy { policy } => {
+                    assert_eq!(policy, "never");
+                    saw_approval = true;
+                }
+                ControlMsg::SetCodexServiceTier { service_tier } => {
+                    assert_eq!(service_tier.as_deref(), Some("priority"));
+                    saw_service_tier = true;
+                }
+                ControlMsg::SetCodexManagedContext { mode } => {
+                    assert_eq!(mode, "managed");
+                    saw_managed = true;
+                }
+                ControlMsg::SetCodexContextArchive { mode } => {
+                    assert_eq!(mode, "exact");
+                    saw_archive = true;
+                }
+                _ => {}
+            }
+        }
+        assert!(saw_command, "SetCodexCommand was not dispatched");
+        assert!(saw_sandbox, "SetCodexSandbox was not dispatched");
+        assert!(saw_approval, "SetCodexApprovalPolicy was not dispatched");
+        assert!(saw_service_tier, "SetCodexServiceTier was not dispatched");
+        assert!(saw_managed, "SetCodexManagedContext was not dispatched");
+        assert!(saw_archive, "SetCodexContextArchive was not dispatched");
+
+        // The synchronous TOML write still happened (read-after-write
+        // consistency for an immediate GET /api/settings).
+        let saved = std::fs::read_to_string(dir.path().join("intendant.toml")).unwrap();
+        assert!(saved.contains("managed_context = \"managed\""));
+    }
+
+    /// Codex fields absent from the payload must not be re-dispatched —
+    /// a partial settings save must not clobber live state with defaults.
+    #[test]
+    fn settings_post_skips_codex_control_msgs_for_absent_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        let body = serde_json::json!({
+            "cu_provider": null,
+            "cu_model": null,
+            "cu_backend": "auto",
+            "presence_enabled": true,
+            "presence_provider": null,
+            "presence_model": null,
+            "presence_live_provider": null,
+            "presence_live_model": null,
+            "transcription_enabled": false,
+            "transcription_provider": "openai",
+            "transcription_model": "whisper-1",
+            "transcription_endpoint": null,
+            "transcription_language": null,
+            "recording_enabled": false,
+            "recording_framerate": 15,
+            "recording_quality": "medium",
+            "live_audio_enabled": false,
+            "live_audio_timeout_secs": 300,
+            "external_agent": "codex"
+        })
+        .to_string();
+
+        let (status, _) = settings_post_result(&body, Some(dir.path()), &bus);
+        assert_eq!(status, "200 OK");
+
+        while let Ok(event) = rx.try_recv() {
+            if let AppEvent::ControlCommand(msg) = event {
+                assert!(
+                    !matches!(
+                        msg,
+                        ControlMsg::SetCodexCommand { .. }
+                            | ControlMsg::SetCodexSandbox { .. }
+                            | ControlMsg::SetCodexApprovalPolicy { .. }
+                            | ControlMsg::SetCodexServiceTier { .. }
+                            | ControlMsg::SetCodexManagedContext { .. }
+                            | ControlMsg::SetCodexContextArchive { .. }
+                    ),
+                    "unexpected codex control msg for absent payload field: {msg:?}"
+                );
+            }
+        }
     }
 
     #[test]

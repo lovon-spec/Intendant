@@ -119,6 +119,30 @@ pub fn normalize_codex_approval_policy(policy: Option<&str>) -> Option<String> {
     Some(crate::project::normalize_approval_policy(trimmed))
 }
 
+/// Per-session managed-context override. `None` means "no per-session pin —
+/// inherit the global default". The `inherit` sentinel (and empty input) must
+/// map to `None` BEFORE the project-level normalizer runs, because that
+/// normalizer maps every unrecognized string — including "inherit" — to
+/// `"vanilla"`, which would silently pin vanilla into the session overlay.
+pub fn normalize_codex_managed_context(mode: Option<&str>) -> Option<String> {
+    let trimmed = mode.map(str::trim).filter(|value| !value.is_empty())?;
+    if matches!(trimmed, "inherit" | "default" | "global") {
+        return None;
+    }
+    Some(crate::project::normalize_codex_managed_context(trimmed))
+}
+
+/// Per-session context-archive override; same `inherit` semantics as
+/// [`normalize_codex_managed_context`] (the project-level normalizer would
+/// otherwise collapse "inherit" to `"summary"`).
+pub fn normalize_codex_context_archive(mode: Option<&str>) -> Option<String> {
+    let trimmed = mode.map(str::trim).filter(|value| !value.is_empty())?;
+    if matches!(trimmed, "inherit" | "default" | "global") {
+        return None;
+    }
+    Some(crate::project::normalize_codex_context_archive(trimmed))
+}
+
 pub fn effective_codex_home() -> Option<String> {
     let from_env = std::env::var_os("CODEX_HOME")
         .filter(|value| !value.is_empty())
@@ -140,7 +164,7 @@ pub fn from_wire(
         .map(crate::session_names::normalize_source)
         .filter(|value| !value.is_empty());
     let codex_managed_context = match source.as_deref() {
-        Some("codex") => codex_managed_context.map(crate::project::normalize_codex_managed_context),
+        Some("codex") => normalize_codex_managed_context(codex_managed_context),
         _ => None,
     };
     let codex_sandbox = match source.as_deref() {
@@ -152,7 +176,7 @@ pub fn from_wire(
         _ => None,
     };
     let codex_context_archive = match source.as_deref() {
-        Some("codex") => codex_context_archive.map(crate::project::normalize_codex_context_archive),
+        Some("codex") => normalize_codex_context_archive(codex_context_archive),
         _ => None,
     };
     let codex_service_tier = match source.as_deref() {
@@ -311,10 +335,10 @@ fn normalize_session_agent_config(
         config.codex_approval_policy = normalize_codex_approval_policy(Some(&policy));
     }
     if let Some(mode) = config.codex_managed_context.take() {
-        config.codex_managed_context = Some(crate::project::normalize_codex_managed_context(&mode));
+        config.codex_managed_context = normalize_codex_managed_context(Some(&mode));
     }
     if let Some(mode) = config.codex_context_archive.take() {
-        config.codex_context_archive = Some(crate::project::normalize_codex_context_archive(&mode));
+        config.codex_context_archive = normalize_codex_context_archive(Some(&mode));
     }
     if let Some(tier) = config.codex_service_tier.take() {
         config.codex_service_tier = normalize_codex_service_tier(Some(&tier));
@@ -788,6 +812,130 @@ mod tests {
         assert_eq!(loaded.codex_approval_policy.as_deref(), Some("never"));
         assert_eq!(loaded.codex_managed_context.as_deref(), Some("managed"));
         assert_eq!(loaded.codex_context_archive.as_deref(), Some("summary"));
+    }
+
+    /// "inherit" (and empty / default / global) must clear a per-session
+    /// managed-context / context-archive override rather than being
+    /// normalized to an explicit "vanilla" / "summary" pin. The sentinel
+    /// check has to run before the project-level normalizer, which maps
+    /// every unrecognized string to the default.
+    #[test]
+    fn from_wire_inherit_clears_managed_context_and_archive() {
+        for sentinel in ["inherit", "default", "global", "", "  "] {
+            let cfg = from_wire(
+                Some("codex"),
+                None,
+                None,
+                None,
+                Some(sentinel),
+                Some(sentinel),
+                None,
+            );
+            assert_eq!(
+                cfg.codex_managed_context, None,
+                "managed_context {sentinel:?} should clear, not pin"
+            );
+            assert_eq!(
+                cfg.codex_context_archive, None,
+                "context_archive {sentinel:?} should clear, not pin"
+            );
+        }
+        // Explicit values still pin.
+        let cfg = from_wire(
+            Some("codex"),
+            None,
+            None,
+            None,
+            Some("managed"),
+            Some("off"),
+            None,
+        );
+        assert_eq!(cfg.codex_managed_context.as_deref(), Some("managed"));
+        assert_eq!(cfg.codex_context_archive.as_deref(), Some("off"));
+    }
+
+    /// A persisted overlay that somehow stored the "inherit" sentinel must
+    /// read back as "no pin" instead of an explicit vanilla/summary pin.
+    #[test]
+    fn stored_inherit_sentinel_reads_back_as_unpinned() {
+        let raw = serde_json::json!({
+            "source": "codex",
+            "agent_command": "/tmp/codex",
+            "codex_managed_context": "inherit",
+            "codex_context_archive": "inherit",
+        });
+        let config: SessionAgentConfig = serde_json::from_value(raw).unwrap();
+        let normalized = normalize_session_agent_config(config, Some("codex"));
+        assert_eq!(normalized.codex_managed_context, None);
+        assert_eq!(normalized.codex_context_archive, None);
+        assert_eq!(normalized.agent_command.as_deref(), Some("/tmp/codex"));
+    }
+
+    /// Replacing the overlay with an inherit-derived config un-pins the
+    /// managed-context / context-archive fields while keeping the rest.
+    #[test]
+    fn replace_overlay_inherit_unpins_managed_context_and_archive() {
+        let home = tempfile::tempdir().unwrap();
+        let full = from_wire(
+            Some("codex"),
+            Some("/tmp/codex"),
+            Some("danger-full-access"),
+            Some("never"),
+            Some("vanilla"),
+            Some("exact"),
+            None,
+        );
+        write_external_overlay(home.path(), "codex", "thread-1", &full).unwrap();
+
+        let inherit = from_wire(
+            Some("codex"),
+            Some("/tmp/codex"),
+            Some("danger-full-access"),
+            Some("never"),
+            Some("inherit"),
+            Some("inherit"),
+            None,
+        );
+        replace_external_overlay(home.path(), "codex", "thread-1", &inherit).unwrap();
+
+        let loaded = lookup_external_overlay(home.path(), "codex", "thread-1").unwrap();
+        assert_eq!(loaded.agent_command.as_deref(), Some("/tmp/codex"));
+        assert_eq!(loaded.codex_sandbox.as_deref(), Some("danger-full-access"));
+        assert_eq!(loaded.codex_managed_context, None);
+        assert_eq!(loaded.codex_context_archive, None);
+    }
+
+    /// An absent managed-context / context-archive on a merge write leaves
+    /// the existing pin untouched (only the explicit sentinel clears).
+    #[test]
+    fn partial_overlay_write_preserves_existing_managed_context_pin() {
+        let home = tempfile::tempdir().unwrap();
+        let full = from_wire(
+            Some("codex"),
+            Some("/tmp/codex"),
+            None,
+            None,
+            Some("managed"),
+            Some("exact"),
+            None,
+        );
+        write_external_overlay(home.path(), "codex", "thread-1", &full).unwrap();
+
+        let partial = from_wire(
+            Some("codex"),
+            Some("/tmp/other-codex"),
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        write_external_overlay(home.path(), "codex", "thread-1", &partial).unwrap();
+
+        let loaded = lookup_external_overlay(home.path(), "codex", "thread-1").unwrap();
+        assert_eq!(loaded.agent_command.as_deref(), Some("/tmp/other-codex"));
+        assert_eq!(loaded.codex_managed_context.as_deref(), Some("managed"));
+        assert_eq!(loaded.codex_context_archive.as_deref(), Some("exact"));
     }
 
     #[test]

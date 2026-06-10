@@ -2637,6 +2637,15 @@ impl SessionSupervisor {
             && session_config_clear_value(codex_sandbox.as_deref());
         let clear_codex_approval_policy = matches!(backend, external_agent::AgentBackend::Codex)
             && session_config_clear_value(codex_approval_policy.as_deref());
+        // The clear sentinel must be checked on the RAW wire value, before
+        // from_wire's normalization, and re-applied after the merge passes
+        // below re-fill cleared fields from the persisted configs — same
+        // dance as sandbox/approval. Otherwise "inherit" would either pin
+        // the default into the overlay or be resurrected by the merge.
+        let clear_codex_managed_context = matches!(backend, external_agent::AgentBackend::Codex)
+            && session_config_clear_value(codex_managed_context.as_deref());
+        let clear_codex_context_archive = matches!(backend, external_agent::AgentBackend::Codex)
+            && session_config_clear_value(codex_context_archive.as_deref());
         let mut config = crate::session_config::from_wire(
             Some(backend.as_short_str()),
             agent_command.as_deref(),
@@ -2676,6 +2685,12 @@ impl SessionSupervisor {
         }
         if clear_codex_approval_policy {
             config.codex_approval_policy = None;
+        }
+        if clear_codex_managed_context {
+            config.codex_managed_context = None;
+        }
+        if clear_codex_context_archive {
+            config.codex_context_archive = None;
         }
         if config.is_empty() {
             let message = "Session config failed: no launch settings supplied".to_string();
@@ -3313,7 +3328,7 @@ fn normalize_session_agent_command(command: Option<&str>) -> Option<String> {
 }
 
 fn normalize_session_codex_managed_context(mode: Option<&str>) -> Option<String> {
-    mode.map(crate::project::normalize_codex_managed_context)
+    crate::session_config::normalize_codex_managed_context(mode)
 }
 
 fn session_config_clear_value(value: Option<&str>) -> bool {
@@ -3332,7 +3347,7 @@ fn normalize_session_codex_approval_policy(policy: Option<&str>) -> Option<Strin
 }
 
 fn normalize_session_codex_context_archive(mode: Option<&str>) -> Option<String> {
-    mode.map(crate::project::normalize_codex_context_archive)
+    crate::session_config::normalize_codex_context_archive(mode)
 }
 
 fn normalize_session_codex_service_tier(tier: Option<&str>) -> Option<String> {
@@ -5323,6 +5338,45 @@ mod tests {
             project.config.agent.claude_code.command,
             "/opt/claude/bin/claude"
         );
+    }
+
+    /// The create/resume wire normalizers must treat the `inherit` sentinel
+    /// (and empty strings) as "no per-session override" — not pin the
+    /// project-level default. Explicit values still pin, and absent stays
+    /// absent. This is what lets a launch-config save change only the
+    /// binary path without permanently pinning vanilla into the session.
+    #[test]
+    fn session_codex_managed_context_inherit_means_no_override() {
+        for sentinel in [Some("inherit"), Some("default"), Some("global"), Some(""), None] {
+            assert_eq!(
+                normalize_session_codex_managed_context(sentinel),
+                None,
+                "{sentinel:?} should not produce a managed-context override"
+            );
+            assert_eq!(
+                normalize_session_codex_context_archive(sentinel),
+                None,
+                "{sentinel:?} should not produce a context-archive override"
+            );
+        }
+        assert_eq!(
+            normalize_session_codex_managed_context(Some("managed")).as_deref(),
+            Some("managed")
+        );
+        assert_eq!(
+            normalize_session_codex_managed_context(Some("vanilla")).as_deref(),
+            Some("vanilla")
+        );
+        assert_eq!(
+            normalize_session_codex_context_archive(Some("exact")).as_deref(),
+            Some("exact")
+        );
+        // The configure_session_agent clear flags use the same sentinel set.
+        assert!(session_config_clear_value(Some("inherit")));
+        assert!(session_config_clear_value(Some("")));
+        assert!(!session_config_clear_value(Some("managed")));
+        assert!(!session_config_clear_value(Some("vanilla")));
+        assert!(!session_config_clear_value(None));
     }
 
     #[test]

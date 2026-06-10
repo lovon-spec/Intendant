@@ -288,9 +288,33 @@ pub fn codex_service_tier_is_standard_clear(tier: &str) -> bool {
 
 pub fn normalize_codex_managed_context(input: &str) -> String {
     match input.trim().to_ascii_lowercase().as_str() {
-        "managed" | "patched" | "intendant" | "on" | "true" | "enabled" => "managed".to_string(),
+        "managed" | "patched" | "intendant" | "on" | "true" | "enabled" | "1" => {
+            "managed".to_string()
+        }
+        // Everything else maps to the fork-safe default — both the
+        // deliberate vanilla aliases ("vanilla"/"off"/"false"/"disabled"/"0")
+        // and unrecognized typos. Config ingestion points use
+        // `codex_managed_context_is_recognized` to tell them apart and warn.
         _ => "vanilla".to_string(),
     }
+}
+
+/// Whether `input` is a deliberate managed-context value (any managed or
+/// vanilla alias accepted by [`normalize_codex_managed_context`], or empty =
+/// "use the default"). Unrecognized values still normalize to `"vanilla"`,
+/// silently disabling the feature on a typo like `"managd"` — callers that
+/// ingest config (TOML load, control-plane setters) should check this and
+/// warn. Kept separate so the normalizer itself stays pure.
+pub fn codex_managed_context_is_recognized(input: &str) -> bool {
+    matches!(
+        input.trim().to_ascii_lowercase().as_str(),
+        // managed aliases
+        "managed" | "patched" | "intendant" | "on" | "true" | "enabled" | "1"
+        // vanilla aliases (explicitly recognized rather than typo-fallback)
+        | "vanilla" | "off" | "false" | "disabled" | "0"
+        // empty = "use the default"
+        | ""
+    )
 }
 
 pub fn codex_managed_context_enabled(mode: &str) -> bool {
@@ -303,6 +327,28 @@ pub fn normalize_codex_context_archive(input: &str) -> String {
         "off" | "none" | "disabled" | "false" | "0" => "off".to_string(),
         _ => "summary".to_string(),
     }
+}
+
+/// Companion of [`codex_managed_context_is_recognized`] for the context
+/// archive mode: unrecognized values normalize to `"summary"`; warn at the
+/// config ingestion points instead of silently absorbing typos.
+pub fn codex_context_archive_is_recognized(input: &str) -> bool {
+    matches!(
+        input.trim().to_ascii_lowercase().as_str(),
+        "summary"
+            | "exact"
+            | "full"
+            | "raw"
+            | "on"
+            | "true"
+            | "1"
+            | "off"
+            | "none"
+            | "disabled"
+            | "false"
+            | "0"
+            | ""
+    )
 }
 
 pub fn codex_context_archive_exact(mode: &str) -> bool {
@@ -1030,12 +1076,29 @@ impl Project {
     /// Build a Project from an explicit root path, loading intendant.toml if present.
     pub fn from_root(root: PathBuf) -> Result<Self, CallerError> {
         let config_path = root.join("intendant.toml");
-        let config = if config_path.exists() {
+        let config: ProjectConfig = if config_path.exists() {
             let content = std::fs::read_to_string(&config_path).map_err(|e| {
                 CallerError::Config(format!("Failed to read intendant.toml: {}", e))
             })?;
-            toml::from_str(&content)
-                .map_err(|e| CallerError::Toml(format!("Failed to parse intendant.toml: {}", e)))?
+            let config: ProjectConfig = toml::from_str(&content)
+                .map_err(|e| CallerError::Toml(format!("Failed to parse intendant.toml: {}", e)))?;
+            // Unrecognized values normalize to the safe default downstream,
+            // which silently disables the feature on a typo like
+            // `managed_context = "managd"` — surface that here, at the one
+            // place every load funnels through.
+            if !codex_managed_context_is_recognized(&config.agent.codex.managed_context) {
+                eprintln!(
+                    "[project] intendant.toml [agent.codex] managed_context = {:?} is not recognized; treating it as \"vanilla\" (expected \"managed\" or \"vanilla\")",
+                    config.agent.codex.managed_context
+                );
+            }
+            if !codex_context_archive_is_recognized(&config.agent.codex.context_archive) {
+                eprintln!(
+                    "[project] intendant.toml [agent.codex] context_archive = {:?} is not recognized; treating it as \"summary\" (expected \"summary\", \"exact\", or \"off\")",
+                    config.agent.codex.context_archive
+                );
+            }
+            config
         } else {
             ProjectConfig::default()
         };
@@ -1689,5 +1752,76 @@ default_backend = "codex"
             Some(CODEX_STANDARD_SERVICE_TIER)
         );
         assert_eq!(normalize_codex_service_tier(Some("inherit")), None);
+    }
+
+    /// "1" is a managed alias (matching "on"/"true"), and the recognizer
+    /// accepts every deliberate alias on both sides while rejecting typos —
+    /// the normalizer itself stays pure and still maps typos to "vanilla".
+    #[test]
+    fn codex_managed_context_alias_one_and_recognizer() {
+        assert_eq!(normalize_codex_managed_context("1"), "managed");
+        assert_eq!(normalize_codex_managed_context(" ON "), "managed");
+        assert_eq!(normalize_codex_managed_context("0"), "vanilla");
+        assert_eq!(normalize_codex_managed_context("off"), "vanilla");
+        assert_eq!(normalize_codex_managed_context("managd"), "vanilla");
+
+        for value in [
+            "managed", "patched", "intendant", "on", "true", "enabled", "1", "vanilla", "off",
+            "false", "disabled", "0", "", "  Vanilla  ",
+        ] {
+            assert!(
+                codex_managed_context_is_recognized(value),
+                "{value:?} should be recognized"
+            );
+        }
+        for value in ["managd", "vanila", "yes", "default-ish"] {
+            assert!(
+                !codex_managed_context_is_recognized(value),
+                "{value:?} should NOT be recognized"
+            );
+        }
+    }
+
+    #[test]
+    fn codex_context_archive_recognizer() {
+        for value in [
+            "summary", "exact", "full", "raw", "on", "true", "1", "off", "none", "disabled",
+            "false", "0", "", " EXACT ",
+        ] {
+            assert!(
+                codex_context_archive_is_recognized(value),
+                "{value:?} should be recognized"
+            );
+        }
+        for value in ["summry", "exactt", "archive"] {
+            assert!(
+                !codex_context_archive_is_recognized(value),
+                "{value:?} should NOT be recognized"
+            );
+        }
+        // Typos still normalize to the safe default.
+        assert_eq!(normalize_codex_context_archive("summry"), "summary");
+    }
+
+    /// `managed_context` defaults to "vanilla" when absent and is also
+    /// readable through its legacy `context_recovery` TOML alias.
+    #[test]
+    fn parse_codex_managed_context_default_and_context_recovery_alias() {
+        let config: ProjectConfig = toml::from_str("").unwrap();
+        assert_eq!(config.agent.codex.managed_context, "vanilla");
+
+        let toml_str = r#"
+[agent.codex]
+managed_context = "managed"
+"#;
+        let config: ProjectConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.agent.codex.managed_context, "managed");
+
+        let alias_toml = r#"
+[agent.codex]
+context_recovery = "managed"
+"#;
+        let config: ProjectConfig = toml::from_str(alias_toml).unwrap();
+        assert_eq!(config.agent.codex.managed_context, "managed");
     }
 }

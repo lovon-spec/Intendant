@@ -10158,6 +10158,7 @@ body.display-fullscreen-open {
     <div class="session-config-row" id="session-config-managed-row">
       <label for="session-config-managed-context">Managed context</label>
       <select id="session-config-managed-context">
+        <option value="">inherit Control default</option>
         <option value="vanilla">vanilla</option>
         <option value="managed">managed</option>
       </select>
@@ -10184,6 +10185,7 @@ body.display-fullscreen-open {
     <div class="session-config-row" id="session-config-archive-row">
       <label for="session-config-context-archive">Context replay</label>
       <select id="session-config-context-archive">
+        <option value="">inherit Control default</option>
         <option value="summary">summary</option>
         <option value="exact">exact</option>
         <option value="off">off</option>
@@ -13407,15 +13409,17 @@ function stationSessionConfigEditingFor(sessionOrId) {
 }
 
 function stationSessionConfigDraftFor(editing) {
-  if (!editing?.sessionId) return { command: '', managed: 'vanilla', sandbox: '', approval: '', archive: 'summary' };
+  // '' for managed/archive means "inherit the global default" — seeding the
+  // draft from the effective mode here would re-pin it on the next dock save.
+  if (!editing?.sessionId) return { command: '', managed: '', sandbox: '', approval: '', archive: '' };
   const existing = stationSessionConfigDrafts.get(editing.sessionId);
   if (existing) return existing;
   const draft = {
     command: sessionConfigCommand(editing.meta),
-    managed: editing.source === 'codex' ? sessionConfigManagedMode(editing.meta) : 'vanilla',
+    managed: editing.source === 'codex' ? sessionConfigExplicitManagedMode(editing.meta) : '',
     sandbox: editing.source === 'codex' ? sessionConfigExplicitSandboxMode(editing.meta) : '',
     approval: editing.source === 'codex' ? sessionConfigExplicitApprovalPolicy(editing.meta) : '',
-    archive: editing.source === 'codex' ? sessionConfigArchiveMode(editing.meta) : 'summary',
+    archive: editing.source === 'codex' ? sessionConfigExplicitArchiveMode(editing.meta) : '',
   };
   stationSessionConfigDrafts.set(editing.sessionId, draft);
   return draft;
@@ -13431,10 +13435,12 @@ function stationSetSessionConfigResult(sessionId, text, kind = '') {
 
 function stationSessionConfigPayload(editing, draft) {
   const command = String(draft.command || '').trim();
-  const mode = draft.managed === 'managed' ? 'managed' : 'vanilla';
+  // '' = inherit the global default; only explicit 'managed'/'vanilla' pin.
+  const modeValue = String(draft.managed || '').trim();
+  const mode = modeValue === 'managed' || modeValue === 'vanilla' ? modeValue : '';
   const sandboxMode = normalizeOptionalCodexSandbox(draft.sandbox || '');
   const approvalPolicy = normalizeOptionalCodexApprovalPolicy(draft.approval || '');
-  const archiveMode = normalizeContextArchiveMode(draft.archive || controlCodexConfig.context_archive);
+  const archiveMode = normalizeContextArchiveModeOptional(draft.archive || '');
   return {
     payload: {
       action: 'configure_session_agent',
@@ -13446,8 +13452,8 @@ function stationSessionConfigPayload(editing, draft) {
       ...(editing.source === 'codex' ? {
         codex_sandbox: sandboxMode || 'inherit',
         codex_approval_policy: approvalPolicy || 'inherit',
-        codex_managed_context: mode,
-        codex_context_archive: archiveMode,
+        codex_managed_context: mode || 'inherit',
+        codex_context_archive: archiveMode || 'inherit',
       } : {}),
     },
     command,
@@ -15515,8 +15521,12 @@ function stationBuildControlsSummary() {
     sessionContextArchive,
     sessionSandbox: sessionSource === 'codex' ? sessionConfigSandboxMode(sessionMeta) : '',
     sessionApprovalPolicy: sessionSource === 'codex' ? sessionConfigApprovalPolicy(sessionMeta) : '',
-    sessionConfigManaged: sessionConfigDraft?.managed || sessionManagedContext || '',
-    sessionConfigArchive: sessionConfigDraft?.archive || sessionContextArchive || '',
+    // Dock config-editor draft values — '' means "inherit the global
+    // default". Don't fall back to the effective sessionManagedContext /
+    // sessionContextArchive published above: that would surface (and on a
+    // dock save re-pin) a value the session never pinned.
+    sessionConfigManaged: sessionConfigDraft ? (sessionConfigDraft.managed || '') : '',
+    sessionConfigArchive: sessionConfigDraft ? (sessionConfigDraft.archive || '') : '',
     sessionConfigResult: sessionConfigResultActive ? (stationSessionConfigResult.text || '') : '',
     sessionConfigResultKind: sessionConfigResultActive ? (stationSessionConfigResult.kind || '') : '',
     sessionConfigHasDraft: sessionConfigHadDraft,
@@ -23564,6 +23574,28 @@ function sessionConfigExplicitApprovalPolicy(meta = {}) {
   );
 }
 
+// Explicitly pinned per-session managed-context value ('' = no pin, i.e.
+// inherit the global default). Unlike sessionConfigManagedMode this never
+// falls back to capabilities or coerces unknown to 'vanilla' — it seeds the
+// launch-config selects, where defaulting to 'vanilla' would re-pin vanilla
+// into the session overlay on the next save.
+function sessionConfigExplicitManagedMode(meta = {}) {
+  const mode = String(
+    meta.codexManagedContext ||
+    meta.codex_managed_context ||
+    ''
+  ).trim();
+  return mode === 'managed' || mode === 'vanilla' ? mode : '';
+}
+
+function sessionConfigExplicitArchiveMode(meta = {}) {
+  return normalizeContextArchiveModeOptional(
+    meta.codexContextArchive ||
+    meta.codex_context_archive ||
+    ''
+  );
+}
+
 function sessionConfigSandboxMode(meta = {}) {
   return normalizeCodexSandbox(
     sessionConfigExplicitSandboxMode(meta) ||
@@ -23717,13 +23749,13 @@ function openSessionConfigModal(sessionOrId) {
   const archiveRow = document.getElementById('session-config-archive-row');
   const archiveSel = document.getElementById('session-config-context-archive');
   if (managedRow) managedRow.style.display = source === 'codex' ? '' : 'none';
-  if (managedSel) managedSel.value = sessionConfigManagedMode(meta);
+  if (managedSel) managedSel.value = sessionConfigExplicitManagedMode(meta);
   if (sandboxRow) sandboxRow.style.display = source === 'codex' ? '' : 'none';
   if (sandboxSel) sandboxSel.value = sessionConfigExplicitSandboxMode(meta);
   if (approvalRow) approvalRow.style.display = source === 'codex' ? '' : 'none';
   if (approvalSel) approvalSel.value = sessionConfigExplicitApprovalPolicy(meta);
   if (archiveRow) archiveRow.style.display = source === 'codex' ? '' : 'none';
-  if (archiveSel) archiveSel.value = sessionConfigArchiveMode(meta);
+  if (archiveSel) archiveSel.value = sessionConfigExplicitArchiveMode(meta);
   const status = document.getElementById('session-config-status');
   if (status) {
     status.className = 'session-config-status';
@@ -23851,8 +23883,8 @@ function applySessionConfigLocal(meta, command, sandboxMode, approvalPolicy, mod
       ...(meta.source === 'codex' ? {
         codexSandbox: sandboxMode ? normalizeCodexSandbox(sandboxMode) : '',
         codexApprovalPolicy: approvalPolicy ? normalizeCodexApprovalPolicy(approvalPolicy) : '',
-        codexManagedContext: mode,
-        codexContextArchive: archiveMode,
+        codexManagedContext: mode || '',
+        codexContextArchive: archiveMode || '',
       } : {}),
     };
     sessionMetadataById.set(id, next);
@@ -23885,8 +23917,16 @@ function applySessionConfigLocal(meta, command, sandboxMode, approvalPolicy, mod
       } else {
         delete session.codex_approval_policy;
       }
-      session.codex_managed_context = mode;
-      session.codex_context_archive = archiveMode;
+      if (mode) {
+        session.codex_managed_context = mode;
+      } else {
+        delete session.codex_managed_context;
+      }
+      if (archiveMode) {
+        session.codex_context_archive = archiveMode;
+      } else {
+        delete session.codex_context_archive;
+      }
     }
   }
   persistSessionWindowState();
@@ -23901,11 +23941,12 @@ function saveSessionConfigModal(options = {}) {
   const approvalPolicy = normalizeOptionalCodexApprovalPolicy(
     document.getElementById('session-config-approval-policy')?.value || ''
   );
-  const mode = document.getElementById('session-config-managed-context')?.value === 'managed'
-    ? 'managed'
-    : 'vanilla';
-  const archiveMode = normalizeContextArchiveMode(
-    document.getElementById('session-config-context-archive')?.value || controlCodexConfig.context_archive
+  // '' = inherit the global default (un-pins the per-session override);
+  // only explicit 'managed'/'vanilla' pin a value into the session overlay.
+  const modeValue = String(document.getElementById('session-config-managed-context')?.value || '').trim();
+  const mode = modeValue === 'managed' || modeValue === 'vanilla' ? modeValue : '';
+  const archiveMode = normalizeContextArchiveModeOptional(
+    document.getElementById('session-config-context-archive')?.value || ''
   );
   const payload = {
     action: 'configure_session_agent',
@@ -23917,8 +23958,8 @@ function saveSessionConfigModal(options = {}) {
     ...(sessionConfigEditing.source === 'codex' ? {
       codex_sandbox: sandboxMode || 'inherit',
       codex_approval_policy: approvalPolicy || 'inherit',
-      codex_managed_context: mode,
-      codex_context_archive: archiveMode,
+      codex_managed_context: mode || 'inherit',
+      codex_context_archive: archiveMode || 'inherit',
     } : {}),
   };
   try {
@@ -39106,16 +39147,22 @@ async function saveSettings() {
   } catch (e) {
     console.error('Failed to save settings:', e);
   }
-  // Also emit the control message so the in-memory shared state
+  // Also emit the control messages so the in-memory shared state
   // updates immediately (without waiting for the next daemon restart
-  // to re-read the TOML). The POST above persists, this command
-  // propagates.
+  // to re-read the TOML). The POST above persists — and the gateway
+  // re-dispatches the codex fields server-side too — but keep this
+  // list complete so the dashboard never depends on that, and cover
+  // every codex field with a live control-plane setter.
   const agentVal = g('set-external-agent').value || null;
   if (app) {
     app.send_server_action({ action: 'set_external_agent', agent: agentVal });
     app.send_server_action({
       action: 'set_codex_command',
       command: (g('set-codex-command').value || '').trim() || null,
+    });
+    app.send_server_action({
+      action: 'set_codex_managed_context',
+      mode: controlCodexConfig.managed_context || 'vanilla',
     });
     app.send_server_action({
       action: 'set_codex_context_archive',

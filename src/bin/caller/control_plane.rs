@@ -382,6 +382,13 @@ async fn handle_control_msg(msg: &ControlMsg, state: &ControlPlaneState) {
             }));
         }
         ControlMsg::SetCodexManagedContext { mode } => {
+            // Normalization maps unrecognized values to "vanilla", which
+            // would silently disable the feature on a typo — warn first.
+            if !crate::project::codex_managed_context_is_recognized(mode) {
+                eprintln!(
+                    "[control_plane] unrecognized codex managed_context {mode:?}; treating it as \"vanilla\" (expected \"managed\" or \"vanilla\")"
+                );
+            }
             let normalized = crate::project::normalize_codex_managed_context(mode);
             {
                 let mut guard = state.codex_config.write().await;
@@ -402,6 +409,13 @@ async fn handle_control_msg(msg: &ControlMsg, state: &ControlPlaneState) {
             }));
         }
         ControlMsg::SetCodexContextArchive { mode } => {
+            // Same typo guard as SetCodexManagedContext: unrecognized values
+            // normalize to "summary" silently otherwise.
+            if !crate::project::codex_context_archive_is_recognized(mode) {
+                eprintln!(
+                    "[control_plane] unrecognized codex context_archive {mode:?}; treating it as \"summary\" (expected \"summary\", \"exact\", or \"off\")"
+                );
+            }
             let normalized = crate::project::normalize_codex_context_archive(mode);
             {
                 let mut guard = state.codex_config.write().await;
