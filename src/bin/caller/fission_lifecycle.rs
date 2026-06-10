@@ -349,10 +349,8 @@ fn record_session_ended(state: &mut LifecycleWatcherState, session_id: &str, rea
         "ended"
     };
     let summary = if branch.summary.is_none() {
-        Some(reason)
-            .map(str::trim)
-            .filter(|reason| !reason.is_empty())
-            .map(trim_branch_summary)
+        let reason = reason.trim();
+        (!reason.is_empty()).then(|| trim_branch_summary(reason))
     } else {
         None
     };
