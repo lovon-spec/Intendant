@@ -202,6 +202,91 @@ impl StationWeb {
             inner.present_fps(),
         )
     }
+
+    /// Structured introspection for agents driving the canvas UI: render
+    /// health, snapshot counters, view state, and every named clickable
+    /// rect in CSS px. `hitZones` lists all named zones in draw order
+    /// (`{name, action, x, y, w, h}`); `systemTargets` is the deduped
+    /// system/layout hotspot set (same shape minus `action`) that
+    /// `hotspot_rects` returns. The flat `debug_state` token format is
+    /// frozen for the validator probe; new fields land here instead.
+    pub fn debug_json(&self) -> String {
+        let inner = self.inner.borrow();
+        let hit_zones: Vec<serde_json::Value> = inner
+            .hit_zones
+            .iter()
+            .filter_map(|zone| {
+                let name = input::zone_name(&zone.action)?;
+                Some(serde_json::json!({
+                    "name": name,
+                    "action": input::zone_kind(&zone.action),
+                    "x": zone.x,
+                    "y": zone.y,
+                    "w": zone.w,
+                    "h": zone.h,
+                }))
+            })
+            .collect();
+        serde_json::json!({
+            "fps": inner.present_fps(),
+            "renderer": if inner.gpu.is_some() { "WebGPU" } else { "Canvas" },
+            "gpu": inner.gpu.is_some(),
+            "hosts": inner.snapshot.hosts.len(),
+            "agents": inner.snapshot.agents.len(),
+            "events": inner.snapshot.events.len(),
+            "displays": inner.display_sources.len(),
+            "selectedId": inner.selected_id,
+            "layout": inner.layout.label(),
+            "mood": inner.mood.label(),
+            "motion": inner.motion,
+            "hitZones": hit_zones,
+            "systemTargets": hotspot_json(&inner.hit_zones),
+        })
+        .to_string()
+    }
+
+    /// JSON array of the system/layout hotspot targets currently drawn,
+    /// `[{name, x, y, w, h}]` in CSS px, exported from the real draw
+    /// geometry (the dashboard positions its accessibility overlay from
+    /// this instead of hand-mirroring panel math). Rects reflect the last
+    /// painted HUD; empty until the first paint.
+    pub fn hotspot_rects(&self) -> String {
+        let inner = self.inner.borrow();
+        serde_json::Value::Array(hotspot_json(&inner.hit_zones)).to_string()
+    }
+
+    /// Programmatically trigger the action a click on the named
+    /// hotspot/hit-zone would dispatch (same path as a pointer click,
+    /// including the JS action callback). Returns false for unknown
+    /// names. Names are the ones `debug_json`/`hotspot_rects` report.
+    pub fn activate(&self, name: String) -> bool {
+        let (outbound, callback) = {
+            let mut inner = self.inner.borrow_mut();
+            let Some(action) = input::zone_action_by_name(&inner.hit_zones, &name) else {
+                return false;
+            };
+            // Parity with a real click: wake the interactive window so the
+            // resulting state change paints immediately at full fidelity.
+            inner.mark_input();
+            (inner.dispatch_hit(action), inner.action_callback.clone())
+        };
+        StationInner::schedule_frame(&self.inner);
+        if let Some(action) = outbound {
+            StationInner::emit_action(callback, action);
+        }
+        true
+    }
+}
+
+/// Hotspot targets as JSON objects (shared by `debug_json` and
+/// `hotspot_rects`).
+fn hotspot_json(zones: &[HitZone]) -> Vec<serde_json::Value> {
+    input::hotspot_rects_from_zones(zones)
+        .into_iter()
+        .map(|(name, x, y, w, h)| {
+            serde_json::json!({ "name": name, "x": x, "y": y, "w": w, "h": h })
+        })
+        .collect()
 }
 
 struct StationInner {

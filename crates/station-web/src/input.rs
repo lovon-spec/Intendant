@@ -414,6 +414,76 @@ pub(crate) enum HitAction {
     ControlsAction { action: String },
 }
 
+/// Stable name for a hit zone, used by the agentic introspection API
+/// (`debug_json` / `hotspot_rects` / `activate`). `None` for inert zones
+/// (panel bodies that only swallow clicks). Select zones use the node id
+/// itself (`system:peers`, `host:alpha`, agent ids); layout buttons use
+/// the `layout:<name>` convention the dashboard's accessibility overlay
+/// already speaks.
+pub(crate) fn zone_name(action: &HitAction) -> Option<String> {
+    match action {
+        HitAction::Layout(layout) => Some(format!("layout:{}", layout.label())),
+        HitAction::Select(id) => Some(id.clone()),
+        HitAction::ClosePanel => Some("close-panel".to_string()),
+        HitAction::ActivityAction { action, id } => Some(if id.is_empty() {
+            format!("activity:{action}")
+        } else {
+            format!("activity:{action}:{id}")
+        }),
+        HitAction::ControlsAction { action } => Some(format!("controls:{action}")),
+        HitAction::Noop => None,
+    }
+}
+
+/// Coarse kind tag reported alongside each named zone in `debug_json`.
+pub(crate) fn zone_kind(action: &HitAction) -> &'static str {
+    match action {
+        HitAction::Layout(_) => "layout",
+        HitAction::Select(_) => "select",
+        HitAction::ClosePanel => "close-panel",
+        HitAction::ActivityAction { .. } => "activity",
+        HitAction::ControlsAction { .. } => "controls",
+        HitAction::Noop => "panel",
+    }
+}
+
+/// The system/layout hotspot rects currently drawn (CSS px), one entry
+/// per name with the same precedence a click has (later-drawn zones
+/// win). This is the truthful geometry source for the dashboard's
+/// accessibility overlay, replacing its hand-mirrored constants.
+pub(crate) fn hotspot_rects_from_zones(zones: &[HitZone]) -> Vec<(String, f32, f32, f32, f32)> {
+    let mut out: Vec<(String, f32, f32, f32, f32)> = Vec::new();
+    for zone in zones {
+        let is_hotspot = match &zone.action {
+            HitAction::Layout(_) => true,
+            HitAction::Select(id) => id.starts_with("system:"),
+            _ => false,
+        };
+        if !is_hotspot {
+            continue;
+        }
+        let Some(name) = zone_name(&zone.action) else {
+            continue;
+        };
+        let entry = (name, zone.x, zone.y, zone.w, zone.h);
+        match out.iter_mut().find(|existing| existing.0 == entry.0) {
+            Some(existing) => *existing = entry,
+            None => out.push(entry),
+        }
+    }
+    out
+}
+
+/// Resolve an `activate` name to the action a click on that zone would
+/// dispatch, honoring hit-test precedence (last-drawn zone wins).
+pub(crate) fn zone_action_by_name(zones: &[HitZone], name: &str) -> Option<HitAction> {
+    zones
+        .iter()
+        .rev()
+        .find(|zone| zone_name(&zone.action).as_deref() == Some(name))
+        .map(|zone| zone.action.clone())
+}
+
 pub(crate) struct HitZone {
     pub(crate) x: f32,
     pub(crate) y: f32,
@@ -441,4 +511,122 @@ pub(crate) struct PointerDrag {
 pub(crate) struct PinchZoom {
     pub(crate) start_distance: f32,
     pub(crate) start_camera_distance: f32,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn zone_names_cover_every_action_kind() {
+        assert_eq!(
+            zone_name(&HitAction::Layout(LayoutName::Orbital)).as_deref(),
+            Some("layout:orbital")
+        );
+        assert_eq!(
+            zone_name(&HitAction::Layout(LayoutName::Constellation)).as_deref(),
+            Some("layout:constellation")
+        );
+        assert_eq!(
+            zone_name(&HitAction::Select("system:peers".into())).as_deref(),
+            Some("system:peers")
+        );
+        assert_eq!(zone_name(&HitAction::ClosePanel).as_deref(), Some("close-panel"));
+        assert_eq!(
+            zone_name(&HitAction::ActivityAction {
+                action: "copy-visible".into(),
+                id: String::new(),
+            })
+            .as_deref(),
+            Some("activity:copy-visible")
+        );
+        assert_eq!(
+            zone_name(&HitAction::ActivityAction {
+                action: "open".into(),
+                id: "evt-1".into(),
+            })
+            .as_deref(),
+            Some("activity:open:evt-1")
+        );
+        assert_eq!(
+            zone_name(&HitAction::ControlsAction {
+                action: "shared-view-take-input".into(),
+            })
+            .as_deref(),
+            Some("controls:shared-view-take-input")
+        );
+        assert_eq!(zone_name(&HitAction::Noop), None);
+        assert_eq!(zone_kind(&HitAction::Noop), "panel");
+        assert_eq!(zone_kind(&HitAction::Layout(LayoutName::Orbital)), "layout");
+        assert_eq!(zone_kind(&HitAction::Select(String::new())), "select");
+    }
+
+    #[test]
+    fn hotspot_rects_filter_and_dedupe_last_wins() {
+        let zones = vec![
+            HitZone::new(96.0, 10.0, 78.0, 23.0, HitAction::Layout(LayoutName::Orbital)),
+            // Inert and non-system zones are not overlay hotspots.
+            HitZone::new(0.0, 0.0, 10.0, 10.0, HitAction::Noop),
+            HitZone::new(0.0, 0.0, 10.0, 10.0, HitAction::ClosePanel),
+            HitZone::new(
+                1.0,
+                1.0,
+                10.0,
+                10.0,
+                HitAction::Select("host:alpha".into()),
+            ),
+            // The orbital node zone is superseded by the matrix zone for
+            // the same target, mirroring click precedence.
+            HitZone::new(
+                100.0,
+                100.0,
+                200.0,
+                60.0,
+                HitAction::Select("system:peers".into()),
+            ),
+            HitZone::new(
+                30.0,
+                400.0,
+                120.0,
+                25.0,
+                HitAction::Select("system:peers".into()),
+            ),
+        ];
+        let rects = hotspot_rects_from_zones(&zones);
+        assert_eq!(rects.len(), 2);
+        assert_eq!(rects[0].0, "layout:orbital");
+        let peers = &rects[1];
+        assert_eq!(
+            (peers.0.as_str(), peers.1, peers.2, peers.3, peers.4),
+            ("system:peers", 30.0, 400.0, 120.0, 25.0)
+        );
+    }
+
+    #[test]
+    fn zone_action_lookup_resolves_names_and_rejects_unknown() {
+        let zones = vec![
+            HitZone::new(0.0, 0.0, 10.0, 10.0, HitAction::Select("system:view".into())),
+            HitZone::new(
+                5.0,
+                5.0,
+                10.0,
+                10.0,
+                HitAction::ActivityAction {
+                    action: "send".into(),
+                    id: String::new(),
+                },
+            ),
+        ];
+        // Unknown names resolve to nothing.
+        assert!(zone_action_by_name(&zones, "system:bogus").is_none());
+        assert!(zone_action_by_name(&zones, "").is_none());
+        assert!(matches!(
+            zone_action_by_name(&zones, "system:view"),
+            Some(HitAction::Select(id)) if id == "system:view"
+        ));
+        assert!(matches!(
+            zone_action_by_name(&zones, "activity:send"),
+            Some(HitAction::ActivityAction { action, .. }) if action == "send"
+        ));
+    }
 }
