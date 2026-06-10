@@ -12,6 +12,42 @@ export class StationWeb {
         wasm.__wbg_stationweb_free(ptr, 0);
     }
     /**
+     * Programmatically trigger the action a click on the named
+     * hotspot/hit-zone would dispatch (same path as a pointer click,
+     * including the JS action callback). Returns false for unknown
+     * names. Names are the ones `debug_json`/`hotspot_rects` report.
+     * @param {string} name
+     * @returns {boolean}
+     */
+    activate(name) {
+        const ptr0 = passStringToWasm0(name, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ret = wasm.stationweb_activate(this.__wbg_ptr, ptr0, len0);
+        return ret !== 0;
+    }
+    /**
+     * Structured introspection for agents driving the canvas UI: render
+     * health, snapshot counters, view state, and every named clickable
+     * rect in CSS px. `hitZones` lists all named zones in draw order
+     * (`{name, action, x, y, w, h}`); `systemTargets` is the deduped
+     * system/layout hotspot set (same shape minus `action`) that
+     * `hotspot_rects` returns. The flat `debug_state` token format is
+     * frozen for the validator probe; new fields land here instead.
+     * @returns {string}
+     */
+    debug_json() {
+        let deferred1_0;
+        let deferred1_1;
+        try {
+            const ret = wasm.stationweb_debug_json(this.__wbg_ptr);
+            deferred1_0 = ret[0];
+            deferred1_1 = ret[1];
+            return getStringFromWasm0(ret[0], ret[1]);
+        } finally {
+            wasm.__wbindgen_free(deferred1_0, deferred1_1, 1);
+        }
+    }
+    /**
      * @returns {string}
      */
     debug_state() {
@@ -33,6 +69,26 @@ export class StationWeb {
         const ptr0 = passStringToWasm0(id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
         const len0 = WASM_VECTOR_LEN;
         wasm.stationweb_focus_on(this.__wbg_ptr, ptr0, len0);
+    }
+    /**
+     * JSON array of the system/layout hotspot targets currently drawn,
+     * `[{name, x, y, w, h}]` in CSS px, exported from the real draw
+     * geometry (the dashboard positions its accessibility overlay from
+     * this instead of hand-mirroring panel math). Rects reflect the last
+     * painted HUD; empty until the first paint.
+     * @returns {string}
+     */
+    hotspot_rects() {
+        let deferred1_0;
+        let deferred1_1;
+        try {
+            const ret = wasm.stationweb_hotspot_rects(this.__wbg_ptr);
+            deferred1_0 = ret[0];
+            deferred1_1 = ret[1];
+            return getStringFromWasm0(ret[0], ret[1]);
+        } finally {
+            wasm.__wbindgen_free(deferred1_0, deferred1_1, 1);
+        }
     }
     /**
      * @param {HTMLCanvasElement} scene_canvas
@@ -72,6 +128,8 @@ export class StationWeb {
         wasm.stationweb_resize(this.__wbg_ptr);
     }
     /**
+     * Select a node (or clear the selection with `null`); the scene halo
+     * and HUD focus panel follow `selected_id` on the next paint.
      * @param {string | null} [id]
      */
     select_by_id(id) {
@@ -295,6 +353,10 @@ function __wbg_get_imports() {
         }, arguments); },
         __wbg_createCommandEncoder_768bb3e23047aa44: function(arg0, arg1) {
             const ret = arg0.createCommandEncoder(arg1);
+            return ret;
+        },
+        __wbg_createLinearGradient_b3d3d1a53abe5362: function(arg0, arg1, arg2, arg3, arg4) {
+            const ret = arg0.createLinearGradient(arg1, arg2, arg3, arg4);
             return ret;
         },
         __wbg_createPipelineLayout_ac3fd64be5410a6b: function(arg0, arg1) {
@@ -1153,23 +1215,23 @@ function __wbg_get_imports() {
             arg0.writeBuffer(arg1, arg2, getArrayU8FromWasm0(arg3, arg4), arg5, arg6);
         }, arguments); },
         __wbindgen_cast_0000000000000001: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { dtor_idx: 108, function: Function { arguments: [F64], shim_idx: 109, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
-            const ret = makeMutClosure(arg0, arg1, wasm.wasm_bindgen__closure__destroy__h544cef30fa11676b, wasm_bindgen__convert__closures_____invoke__he59c630b1b02e0f5);
+            // Cast intrinsic for `Closure(Closure { dtor_idx: 204, function: Function { arguments: [Externref], shim_idx: 205, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            const ret = makeMutClosure(arg0, arg1, wasm.wasm_bindgen__closure__destroy__hccf83c1ad0c1d3f3, wasm_bindgen__convert__closures_____invoke__h63b5eb8c1813e0ac);
             return ret;
         },
         __wbindgen_cast_0000000000000002: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { dtor_idx: 108, function: Function { arguments: [NamedExternref("Event")], shim_idx: 111, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
-            const ret = makeMutClosure(arg0, arg1, wasm.wasm_bindgen__closure__destroy__h544cef30fa11676b, wasm_bindgen__convert__closures_____invoke__hfa5895c89262f4d9);
+            // Cast intrinsic for `Closure(Closure { dtor_idx: 63, function: Function { arguments: [F64], shim_idx: 64, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            const ret = makeMutClosure(arg0, arg1, wasm.wasm_bindgen__closure__destroy__h544cef30fa11676b, wasm_bindgen__convert__closures_____invoke__he59c630b1b02e0f5);
             return ret;
         },
         __wbindgen_cast_0000000000000003: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { dtor_idx: 108, function: Function { arguments: [], shim_idx: 113, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
-            const ret = makeMutClosure(arg0, arg1, wasm.wasm_bindgen__closure__destroy__h544cef30fa11676b, wasm_bindgen__convert__closures_____invoke__he6ccb7f2bccd870d);
+            // Cast intrinsic for `Closure(Closure { dtor_idx: 63, function: Function { arguments: [NamedExternref("Event")], shim_idx: 66, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            const ret = makeMutClosure(arg0, arg1, wasm.wasm_bindgen__closure__destroy__h544cef30fa11676b, wasm_bindgen__convert__closures_____invoke__hfa5895c89262f4d9);
             return ret;
         },
         __wbindgen_cast_0000000000000004: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { dtor_idx: 177, function: Function { arguments: [Externref], shim_idx: 178, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
-            const ret = makeMutClosure(arg0, arg1, wasm.wasm_bindgen__closure__destroy__hccf83c1ad0c1d3f3, wasm_bindgen__convert__closures_____invoke__h63b5eb8c1813e0ac);
+            // Cast intrinsic for `Closure(Closure { dtor_idx: 63, function: Function { arguments: [], shim_idx: 68, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            const ret = makeMutClosure(arg0, arg1, wasm.wasm_bindgen__closure__destroy__h544cef30fa11676b, wasm_bindgen__convert__closures_____invoke__he6ccb7f2bccd870d);
             return ret;
         },
         __wbindgen_cast_0000000000000005: function(arg0) {
@@ -1212,12 +1274,12 @@ function wasm_bindgen__convert__closures_____invoke__he6ccb7f2bccd870d(arg0, arg
     wasm.wasm_bindgen__convert__closures_____invoke__he6ccb7f2bccd870d(arg0, arg1);
 }
 
-function wasm_bindgen__convert__closures_____invoke__hfa5895c89262f4d9(arg0, arg1, arg2) {
-    wasm.wasm_bindgen__convert__closures_____invoke__hfa5895c89262f4d9(arg0, arg1, arg2);
-}
-
 function wasm_bindgen__convert__closures_____invoke__h63b5eb8c1813e0ac(arg0, arg1, arg2) {
     wasm.wasm_bindgen__convert__closures_____invoke__h63b5eb8c1813e0ac(arg0, arg1, arg2);
+}
+
+function wasm_bindgen__convert__closures_____invoke__hfa5895c89262f4d9(arg0, arg1, arg2) {
+    wasm.wasm_bindgen__convert__closures_____invoke__hfa5895c89262f4d9(arg0, arg1, arg2);
 }
 
 function wasm_bindgen__convert__closures_____invoke__he59c630b1b02e0f5(arg0, arg1, arg2) {

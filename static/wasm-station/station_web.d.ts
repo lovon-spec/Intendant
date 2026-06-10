@@ -4,11 +4,40 @@
 export class StationWeb {
     free(): void;
     [Symbol.dispose](): void;
+    /**
+     * Programmatically trigger the action a click on the named
+     * hotspot/hit-zone would dispatch (same path as a pointer click,
+     * including the JS action callback). Returns false for unknown
+     * names. Names are the ones `debug_json`/`hotspot_rects` report.
+     */
+    activate(name: string): boolean;
+    /**
+     * Structured introspection for agents driving the canvas UI: render
+     * health, snapshot counters, view state, and every named clickable
+     * rect in CSS px. `hitZones` lists all named zones in draw order
+     * (`{name, action, x, y, w, h}`); `systemTargets` is the deduped
+     * system/layout hotspot set (same shape minus `action`) that
+     * `hotspot_rects` returns. The flat `debug_state` token format is
+     * frozen for the validator probe; new fields land here instead.
+     */
+    debug_json(): string;
     debug_state(): string;
     focus_on(id: string): void;
+    /**
+     * JSON array of the system/layout hotspot targets currently drawn,
+     * `[{name, x, y, w, h}]` in CSS px, exported from the real draw
+     * geometry (the dashboard positions its accessibility overlay from
+     * this instead of hand-mirroring panel math). Rects reflect the last
+     * painted HUD; empty until the first paint.
+     */
+    hotspot_rects(): string;
     constructor(scene_canvas: HTMLCanvasElement, hud_canvas: HTMLCanvasElement);
     register_display_source(source_id: string, host_id: string, _display_id: string, label: string, _kind: string, video: HTMLVideoElement): void;
     resize(): void;
+    /**
+     * Select a node (or clear the selection with `null`); the scene halo
+     * and HUD focus panel follow `selected_id` on the next paint.
+     */
     select_by_id(id?: string | null): void;
     set_action_callback(callback: Function): void;
     set_active(active: boolean): void;
@@ -23,8 +52,11 @@ export type InitInput = RequestInfo | URL | Response | BufferSource | WebAssembl
 export interface InitOutput {
     readonly memory: WebAssembly.Memory;
     readonly __wbg_stationweb_free: (a: number, b: number) => void;
+    readonly stationweb_activate: (a: number, b: number, c: number) => number;
+    readonly stationweb_debug_json: (a: number) => [number, number];
     readonly stationweb_debug_state: (a: number) => [number, number];
     readonly stationweb_focus_on: (a: number, b: number, c: number) => void;
+    readonly stationweb_hotspot_rects: (a: number) => [number, number];
     readonly stationweb_new: (a: any, b: any) => [number, number, number];
     readonly stationweb_register_display_source: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: any) => void;
     readonly stationweb_resize: (a: number) => void;
@@ -35,11 +67,11 @@ export interface InitOutput {
     readonly stationweb_set_visuals: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => void;
     readonly stationweb_unregister_display_source: (a: number, b: number, c: number) => void;
     readonly stationweb_update_snapshot: (a: number, b: any) => [number, number];
-    readonly wasm_bindgen__closure__destroy__h544cef30fa11676b: (a: number, b: number) => void;
     readonly wasm_bindgen__closure__destroy__hccf83c1ad0c1d3f3: (a: number, b: number) => void;
+    readonly wasm_bindgen__closure__destroy__h544cef30fa11676b: (a: number, b: number) => void;
     readonly wasm_bindgen__convert__closures_____invoke__he59c630b1b02e0f5: (a: number, b: number, c: number) => void;
-    readonly wasm_bindgen__convert__closures_____invoke__hfa5895c89262f4d9: (a: number, b: number, c: any) => void;
     readonly wasm_bindgen__convert__closures_____invoke__h63b5eb8c1813e0ac: (a: number, b: number, c: any) => void;
+    readonly wasm_bindgen__convert__closures_____invoke__hfa5895c89262f4d9: (a: number, b: number, c: any) => void;
     readonly wasm_bindgen__convert__closures_____invoke__he6ccb7f2bccd870d: (a: number, b: number) => void;
     readonly __wbindgen_malloc: (a: number, b: number) => number;
     readonly __wbindgen_realloc: (a: number, b: number, c: number, d: number) => number;
