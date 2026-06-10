@@ -465,6 +465,7 @@ pub struct AgentConfig {
 }
 
 /// Handle to a conversation thread within an external agent.
+#[derive(Debug)]
 pub struct AgentThread {
     pub thread_id: String,
 }
@@ -735,6 +736,24 @@ pub trait ExternalAgent: Send + Sync {
         ))
     }
 
+    /// Fork a LIVE backend thread by id into a full-context sibling branch.
+    /// Patched managed Codex creates a new thread id while inheriting the
+    /// source thread's full conversation context and lineage prompt-cache
+    /// key. `cwd` optionally overrides the branch's working directory so a
+    /// fission branch can run in an isolated git worktree instead of sharing
+    /// the parent's checkout.
+    async fn fork_thread_with_options(
+        &mut self,
+        thread_id: &str,
+        name: Option<&str>,
+        cwd: Option<&Path>,
+    ) -> Result<AgentThread, CallerError> {
+        let _ = (thread_id, name, cwd);
+        Err(CallerError::ExternalAgent(
+            "live-thread fork not supported by this backend".into(),
+        ))
+    }
+
     /// Restore a loaded backend thread from a persisted rollout path while
     /// preserving the same backend thread id. Codex implements this through
     /// app-server `thread/restore`; other backends use the default error.
@@ -993,5 +1012,69 @@ mod tests {
 
         let parsed: AgentBackend = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, AgentBackend::GeminiCli);
+    }
+
+    /// Minimal backend that only implements the required trait methods, so
+    /// the default implementations can be exercised directly.
+    struct DefaultOnlyBackend;
+
+    #[async_trait]
+    impl ExternalAgent for DefaultOnlyBackend {
+        fn name(&self) -> &str {
+            "default-only"
+        }
+
+        async fn initialize(
+            &mut self,
+            _config: AgentConfig,
+        ) -> Result<mpsc::UnboundedReceiver<AgentEvent>, CallerError> {
+            Err(CallerError::ExternalAgent("not used in this test".into()))
+        }
+
+        async fn start_thread(&mut self) -> Result<AgentThread, CallerError> {
+            Err(CallerError::ExternalAgent("not used in this test".into()))
+        }
+
+        async fn send_message(
+            &mut self,
+            _thread: &AgentThread,
+            _message: &str,
+        ) -> Result<(), CallerError> {
+            Err(CallerError::ExternalAgent("not used in this test".into()))
+        }
+
+        async fn resolve_approval(
+            &mut self,
+            _request_id: &str,
+            _decision: ApprovalDecision,
+        ) -> Result<(), CallerError> {
+            Err(CallerError::ExternalAgent("not used in this test".into()))
+        }
+
+        async fn shutdown(&mut self) -> Result<(), CallerError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn fork_thread_with_options_default_is_unsupported() {
+        let mut backend = DefaultOnlyBackend;
+        let err = backend
+            .fork_thread_with_options(
+                "thread-abc",
+                Some("fission-1"),
+                Some(Path::new("/tmp/worktree")),
+            )
+            .await
+            .unwrap_err();
+        match err {
+            CallerError::ExternalAgent(msg) => {
+                assert!(
+                    msg.contains("live-thread fork not supported"),
+                    "expected unsupported-fork error, got: {msg}"
+                );
+            }
+            other => panic!("expected ExternalAgent error, got {other:?}"),
+        }
     }
 }
