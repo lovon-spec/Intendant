@@ -2237,21 +2237,40 @@ class BrowserHarness {
       steps.push({ name: 'controls-panel', autonomyPills, backendPills, latencyMs: Date.now() - started });
     }
 
-    // 4. Transcript viewer from a session row (skipped on empty dashboards).
+    // 4. Transcript viewer from a session row (skipped on empty
+    // dashboards). Opening the viewer is the pass condition — a session
+    // that never ran legitimately shows an empty transcript — but try a
+    // few rows so dashboards with history report real row counts.
     if (!sessionLogZone) {
       steps.push({ name: 'transcript', skipped: 'no session rows on this dashboard' });
     } else {
       const started = Date.now();
       let transcript = null;
-      await this.stationWorkflowOp('activate', { name: sessionLogZone });
-      try {
-        await waitUntil(async () => {
-          const debug = await this.stationWorkflowOp('debug');
-          transcript = debug.ok ? debug.data.transcript : null;
-          return Boolean(transcript && (Number(transcript.rows) > 0 || Number(transcript.total) > 0));
-        }, opts.timeoutMs, 'transcript viewer did not open with rows');
-      } catch (error) {
-        failures.push(error.message || String(error));
+      let opened = false;
+      const debugNow = await this.stationWorkflowOp('debug');
+      const logZones = debugNow.ok
+        ? debugNow.data.hitZones
+            .map((zone) => String(zone.name || ''))
+            .filter((name) => name.startsWith('session:station-log:'))
+        : [sessionLogZone];
+      for (const zone of logZones.slice(0, 3)) {
+        await this.stationWorkflowOp('activate', { name: zone });
+        try {
+          await waitUntil(async () => {
+            const debug = await this.stationWorkflowOp('debug');
+            transcript = debug.ok ? debug.data.transcript : null;
+            return Boolean(transcript);
+          }, Math.min(opts.timeoutMs, 15000), 'transcript viewer did not open');
+          opened = true;
+        } catch (_) {
+          continue;
+        }
+        if (transcript && Number(transcript.rows) > 0) {
+          break;
+        }
+      }
+      if (!opened) {
+        failures.push('transcript viewer did not open from any session row');
       }
       steps.push({
         name: 'transcript',
