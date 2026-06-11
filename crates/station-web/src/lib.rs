@@ -23,8 +23,8 @@ use web_sys::{CanvasRenderingContext2d, Event, HtmlCanvasElement, HtmlVideoEleme
 
 use gpu::{GpuFrame, GpuState};
 use hud::{Hud, SystemTarget};
-use input::{HitZone, PinchZoom, PointerDrag};
-use model::{StationEvent, StationSnapshot};
+use input::{HitZone, PinchZoom, PointerDrag, ScrollZone};
+use model::{StationEvent, StationSnapshot, StationTranscript};
 use scene::{layout_positions, LayoutName, Mood, Particle, Vec2, Vec3};
 use util::{lcg, level_color, now_ms, station_enable_webgpu, unit};
 
@@ -243,6 +243,31 @@ impl StationWeb {
             "layout": inner.layout.label(),
             "mood": inner.mood.label(),
             "motion": inner.motion,
+            "composer": {
+                "open": inner.composer_open,
+                "mode": inner.composer_mode,
+            },
+            "transcript": inner.transcript.as_ref().map(|t| serde_json::json!({
+                "sessionId": t.session_id,
+                "mode": t.mode,
+                "rows": t.rows.len(),
+                "total": t.total,
+            })),
+            "scroll": inner
+                .scroll_zones
+                .iter()
+                .map(|zone| {
+                    serde_json::json!({
+                        "panel": zone.panel,
+                        "offset": inner.scroll_offset(&zone.panel, zone.content_h, zone.h),
+                        "max": (zone.content_h - zone.h).max(0.0),
+                        "x": zone.x,
+                        "y": zone.y,
+                        "w": zone.w,
+                        "h": zone.h,
+                    })
+                })
+                .collect::<Vec<_>>(),
             "hitZones": hit_zones,
             "systemTargets": hotspot_json(&inner.hit_zones),
         })
@@ -257,6 +282,72 @@ impl StationWeb {
     pub fn hotspot_rects(&self) -> String {
         let inner = self.inner.borrow();
         serde_json::Value::Array(hotspot_json(&inner.hit_zones)).to_string()
+    }
+
+    /// Feed (or refresh) the transcript/diff viewer. Payload shape is
+    /// `model::StationTranscript`. A `refresh: true` payload is only
+    /// applied while the viewer is still open on the same session —
+    /// returns false otherwise so the dashboard stops live-refreshing.
+    /// A non-refresh payload always opens the viewer.
+    pub fn set_transcript(&self, payload: JsValue) -> Result<bool, JsValue> {
+        let transcript: StationTranscript = serde_wasm_bindgen::from_value(payload)?;
+        let accepted = {
+            let mut inner = self.inner.borrow_mut();
+            if transcript.refresh {
+                match inner.transcript.as_ref() {
+                    Some(open) if open.session_id == transcript.session_id => {}
+                    _ => return Ok(false),
+                }
+            } else {
+                // Fresh open: start reading at the latest entries.
+                inner.panel_scroll.remove("transcript");
+                inner.transcript_follow = true;
+            }
+            inner.transcript = Some(transcript);
+            inner.hud_dirty = true;
+            true
+        };
+        StationInner::schedule_frame(&self.inner);
+        Ok(accepted)
+    }
+
+    /// Close the transcript viewer (dashboard-side counterpart of the
+    /// panel's close pill / Escape).
+    pub fn close_transcript(&self) {
+        self.inner.borrow_mut().close_transcript();
+        StationInner::schedule_frame(&self.inner);
+    }
+
+    /// Open/close the composer strip. `mode` is `send` or `launch`.
+    /// The dashboard calls this from its short-circuit replacements
+    /// (e.g. the legacy new-session route) and when its input overlay
+    /// loses relevance (Escape inside the input).
+    pub fn set_composer(&self, open: bool, mode: String) {
+        {
+            let mut inner = self.inner.borrow_mut();
+            if open {
+                inner.open_composer(&mode);
+            } else {
+                inner.close_composer();
+            }
+        }
+        StationInner::schedule_frame(&self.inner);
+    }
+
+    /// Composer overlay geometry + state for the dashboard's DOM input:
+    /// `{open, mode, rect: {x,y,w,h} | null}`. The rect is the input
+    /// slot inside the drawn composer strip (CSS px), present only after
+    /// the strip painted.
+    pub fn composer_state(&self) -> String {
+        let inner = self.inner.borrow();
+        serde_json::json!({
+            "open": inner.composer_open,
+            "mode": inner.composer_mode,
+            "rect": inner.composer_input_rect.map(|(x, y, w, h)| {
+                serde_json::json!({ "x": x, "y": y, "w": w, "h": h })
+            }),
+        })
+        .to_string()
     }
 
     /// Programmatically trigger the action a click on the named
@@ -344,6 +435,26 @@ struct StationInner {
     /// any change forces a full repaint. None until first paint.
     hud_camera_sig: Option<(f32, f32, f32, f32, f32)>,
     hit_zones: Vec<HitZone>,
+    /// Scrollable viewports registered by the last HUD paint (cleared
+    /// alongside `hit_zones`); wheel/scrollbar/PageUp-Down route here.
+    scroll_zones: Vec<ScrollZone>,
+    /// Persistent scroll offsets keyed by panel id; survive repaints and
+    /// panel close/reopen (transcript resets on open).
+    panel_scroll: HashMap<String, f32>,
+    /// Composer strip state. The strip chrome is canvas-drawn; the text
+    /// editing happens in a dashboard DOM overlay positioned over
+    /// `composer_input_rect`.
+    composer_open: bool,
+    composer_mode: String,
+    composer_input_rect: Option<(f32, f32, f32, f32)>,
+    /// Transcript/diff viewer payload (side-channel, not snapshot).
+    transcript: Option<StationTranscript>,
+    /// Cached wrapped-line layout for the transcript viewer (rebuilt when
+    /// the content signature or wrap width changes).
+    transcript_layout: Option<hud::TranscriptLayout>,
+    /// Keep the transcript pinned to the latest rows on refresh while
+    /// the user has not scrolled away from the bottom.
+    transcript_follow: bool,
     action_callback: Option<js_sys::Function>,
     /// World positions per node id, rebuilt when the snapshot or layout
     /// changes (never per frame).
@@ -431,6 +542,14 @@ impl StationInner {
             hud_dirty: true,
             hud_camera_sig: None,
             hit_zones: Vec::new(),
+            scroll_zones: Vec::new(),
+            panel_scroll: HashMap::new(),
+            composer_open: false,
+            composer_mode: "send".to_string(),
+            composer_input_rect: None,
+            transcript: None,
+            transcript_layout: None,
+            transcript_follow: true,
             action_callback: None,
             layout_cache: HashMap::new(),
             system_targets: Vec::new(),

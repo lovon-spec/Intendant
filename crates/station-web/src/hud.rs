@@ -153,6 +153,8 @@ impl StationInner {
         let h = self.css_height();
         self.hud.ctx.clear_rect(0.0, 0.0, w as f64, h as f64);
         self.hit_zones.clear();
+        self.scroll_zones.clear();
+        self.composer_input_rect = None;
 
         if self.gpu.is_none() && self.scene_ctx.is_none() {
             // Runtime WebGPU failure with a consumed scene canvas: paint the
@@ -176,6 +178,14 @@ impl StationInner {
         self.draw_compass(w, h);
         if let Some(id) = self.selected_id.clone() {
             self.draw_station_focus_detail(&id, w, h);
+        }
+        // The transcript viewer and composer float above everything else
+        // (drawn last = clicked first).
+        if self.transcript.is_some() {
+            self.draw_transcript_panel(w, h);
+        }
+        if self.composer_open {
+            self.draw_composer_strip(w, h);
         }
     }
 
@@ -970,6 +980,19 @@ impl StationInner {
             for (idx, event) in latest.into_iter().enumerate() {
                 let row_y = y + 43.0 + idx as f32 * pitch;
                 let color = level_color_css(&event.level);
+                let row_rect = (x + 16.0, row_y - 11.0, w - 36.0, pitch - 1.0);
+                let hovered = !event.session_id.is_empty()
+                    && self.hover_xy.is_some_and(|(hx, hy)| {
+                        hx >= row_rect.0
+                            && hx <= row_rect.0 + row_rect.2
+                            && hy >= row_rect.1
+                            && hy <= row_rect.1 + row_rect.3
+                    });
+                if hovered {
+                    self.rounded_path(row_rect.0, row_rect.1, row_rect.2, row_rect.3, 5.0);
+                    self.hud.set_fill("rgba(148,226,213,0.10)");
+                    self.hud.ctx.fill();
+                }
                 self.hud.set_fill(color);
                 self.hud
                     .ctx
@@ -998,6 +1021,19 @@ impl StationInner {
                     C_SUBTEXT0_CSS,
                     "normal",
                 );
+                // Runway rows with a session open that session's transcript.
+                if !event.session_id.is_empty() {
+                    self.hit_zones.push(HitZone::new(
+                        row_rect.0,
+                        row_rect.1,
+                        row_rect.2,
+                        row_rect.3,
+                        HitAction::SessionAction {
+                            action: "station-log".into(),
+                            id: event.session_id.clone(),
+                        },
+                    ));
+                }
             }
         }
         let actions = [
@@ -1024,7 +1060,7 @@ impl StationInner {
     }
 
     pub(crate) fn draw_station_focus_detail(&mut self, id: &str, w: f32, h: f32) {
-        let panel_w = 370.0_f32.min(w - 48.0).max(280.0);
+        let panel_w = 460.0_f32.min(w - 48.0).max(280.0);
         let x = (w - panel_w - 24.0).max(24.0);
         // Sit just above the activity lane, wherever density placed it.
         let activity_lane_y = (h - lane_metrics(self.density, h).2 - 24.0).max(282.0);
@@ -1049,7 +1085,6 @@ impl StationInner {
             return;
         }
         if id.starts_with("system:") {
-            let rows = self.system_focus_rows(id);
             let Some((title, value, detail, color)) = self
                 .system_targets
                 .iter()
@@ -1065,15 +1100,25 @@ impl StationInner {
             else {
                 return;
             };
-            let panel_h = 112.0 + rows.len() as f32 * 17.0;
-            let y = (activity_lane_y - panel_h - 12.0).max(58.0);
-            self.focus_panel_frame(x, y, panel_w, panel_h, &title, color);
-            self.text(&value, x + 16.0, y + 68.0, 11.0, C_TEXT_CSS, "normal");
-            self.text(&detail, x + 16.0, y + 88.0, 10.0, C_SUBTEXT0_CSS, "normal");
-            let mut row_y = y + 110.0;
-            for (label, value, color) in &rows {
-                row_y = self.focus_row(x, row_y, panel_w, label, value, color);
-            }
+            let surface = self.system_panel_surface(id);
+            // Tall actionable surface: anchored under the command deck,
+            // down to the activity lane — rows scroll inside it.
+            let command_h = if h < 640.0 { 78.0 } else { 92.0 };
+            let top = if w < 820.0 { 120.0 } else { 58.0 + command_h + 16.0 };
+            let panel_h = (activity_lane_y - 12.0 - top).max(220.0);
+            let y = top;
+            self.rows_panel(
+                id,
+                &title,
+                color,
+                &value,
+                &detail,
+                surface,
+                x,
+                y,
+                panel_w,
+                panel_h,
+            );
             return;
         }
         let panel_h = 112.0;
@@ -1090,151 +1135,752 @@ impl StationInner {
         );
     }
 
-    /// Detail rows for a system target's focus panel — this is where the
-    /// snapshot's per-domain arrays (context items, managed records, recent
-    /// sessions/worktrees/changes, display lanes, attention items) become
-    /// visible pixels. Returns `(label, value, label_color)` triplets.
-    fn system_focus_rows(&self, id: &str) -> Vec<(String, String, &'static str)> {
-        let mut rows: Vec<(String, String, &'static str)> = Vec::new();
+    /// Actionable surface for a system target's focus panel: header pills
+    /// (panel-wide operations) plus scrollable rows whose clicks and pills
+    /// dispatch the dashboard's real handlers. This is where the
+    /// snapshot's per-domain arrays become *operable* pixels.
+    fn system_panel_surface(&self, id: &str) -> PanelSurface {
         match id {
-            "system:context" => {
-                for cat in self.snapshot.context.top_categories.iter().take(3) {
-                    rows.push((
-                        cat.label.clone(),
-                        format!("{} tok / {} / {}", fmt_compact(cat.value), cat.count, cat.detail),
-                        C_BLUE_CSS,
-                    ));
-                }
-                for item in self.snapshot.context.top_items.iter().take(4) {
-                    rows.push((
-                        item.label.clone(),
-                        format!("{} / {}", item.value, item.detail),
-                        tone_color_css(&item.tone),
-                    ));
-                }
-            }
-            "system:managed" => {
-                for record in self.snapshot.managed.recent_records.iter().take(4) {
-                    rows.push((
-                        record.label.clone(),
-                        format!("{} / {}", record.value, record.detail),
-                        tone_color_css(&record.tone),
-                    ));
-                }
-                if rows.is_empty() {
-                    rows.push((
-                        "records".to_string(),
-                        "no managed rewind records yet".to_string(),
-                        C_OVERLAY1_CSS,
-                    ));
-                }
-            }
-            "system:sessions" => {
-                for session in self.snapshot.sessions.recent.iter().take(4) {
-                    rows.push((
-                        session.value.clone(),
-                        format!("{} / {}", session.label, session.detail),
-                        tone_color_css(&session.tone),
-                    ));
-                }
-            }
-            "system:worktrees" => {
-                for worktree in self.snapshot.sessions.recent_worktrees.iter().take(4) {
-                    rows.push((
-                        worktree.value.clone(),
-                        format!("{} / {}", worktree.label, worktree.detail),
-                        tone_color_css(&worktree.tone),
-                    ));
-                }
-            }
-            "system:changes" => {
-                for change in self.snapshot.changes.recent.iter().take(5) {
-                    rows.push((
-                        change.value.clone(),
-                        format!("{} / {}", change.label, change.detail),
-                        tone_color_css(&change.tone),
-                    ));
-                }
-            }
-            "system:peers" => {
-                let runway = &self.snapshot.display_runway;
-                rows.push((
-                    "peers".to_string(),
-                    format!(
-                        "{}/{} connected / {} display-capable",
-                        runway.connected_peers, runway.peer_count, runway.display_peers
-                    ),
-                    C_PEACH_CSS,
-                ));
-                rows.push((
-                    "streams".to_string(),
-                    format!(
-                        "{} local / {} remote",
-                        runway.local_streams, runway.remote_streams
-                    ),
-                    C_TEAL_CSS,
-                ));
-                if !runway.selected_peer_id.is_empty() {
-                    rows.push((
-                        "target".to_string(),
-                        format!(
-                            "{} :{}",
-                            nonempty(&runway.selected_peer_label, &runway.selected_peer_id),
-                            runway.selected_display_id
-                        ),
-                        C_BLUE_CSS,
-                    ));
-                }
-                if !runway.peer_status.trim().is_empty() {
-                    rows.push((
-                        "status".to_string(),
-                        runway.peer_status.trim().to_string(),
-                        C_OVERLAY1_CSS,
-                    ));
-                }
-                for lane in runway.lanes.iter().take(3) {
-                    let tag = match lane.kind.as_str() {
-                        "local_stream" => "local",
-                        "remote_stream" => "remote",
-                        "peer_target" => "target",
-                        "operator_target" => "operator",
-                        "shared_view" => "shared",
-                        other => other,
-                    };
-                    rows.push((
-                        tag.to_string(),
-                        format!("{} / {} / {}", lane.title, lane.meta, lane.detail),
-                        if lane.selected { C_BLUE_CSS } else { C_PEACH_CSS },
-                    ));
-                }
-            }
-            "system:controls" => {
-                let queue = &self.snapshot.attention_queue;
-                rows.push((
-                    "attention".to_string(),
-                    format!(
-                        "{} blocked / {} warn / {} ready",
-                        queue.blocked, queue.warn, queue.ready
-                    ),
-                    if queue.blocked > 0 {
-                        C_RED_CSS
-                    } else if queue.warn > 0 {
-                        C_YELLOW_CSS
-                    } else {
-                        C_GREEN_CSS
-                    },
-                ));
-                for item in queue.items.iter().take(4) {
-                    rows.push((
-                        item.level.clone(),
-                        format!("{} / {} / {}", item.title, item.meta, item.detail),
-                        attention_level_color_css(&item.level),
-                    ));
-                }
-            }
-            _ => {}
+            "system:context" => self.context_panel_surface(),
+            "system:managed" => self.managed_panel_surface(),
+            "system:sessions" => self.sessions_panel_surface(),
+            "system:worktrees" => self.worktrees_panel_surface(),
+            "system:changes" => self.changes_panel_surface(),
+            "system:peers" => self.peers_panel_surface(),
+            "system:activity" => self.activity_panel_surface(),
+            "system:controls" => self.controls_panel_surface(),
+            _ => PanelSurface::default(),
         }
-        rows
+    }
+
+    fn sessions_panel_surface(&self) -> PanelSurface {
+        let mut surface = PanelSurface {
+            header: vec![
+                HeaderPill::new("new", C_TEAL_CSS, HitAction::Composer { op: "open-launch" }),
+                HeaderPill::new(
+                    "refresh",
+                    C_BLUE_CSS,
+                    HitAction::SessionAction {
+                        action: "refresh".into(),
+                        id: String::new(),
+                    },
+                ),
+                HeaderPill::new(
+                    "worktrees",
+                    C_OVERLAY1_CSS,
+                    HitAction::Select("system:worktrees".into()),
+                ),
+            ],
+            empty: "no sessions yet — new launches one",
+            ..Default::default()
+        };
+        for target in self.snapshot.sessions.external_targets.iter() {
+            let sid = nonempty(&target.session_id, &target.id);
+            let mut row = PanelRow::new(
+                truncate(&nonempty(&target.label, "external"), 16),
+                format!("{} / {}", target.value, target.detail),
+                tone_color_css(&target.tone),
+            )
+            .click(HitAction::SessionAction {
+                action: "station-log".into(),
+                id: sid.clone(),
+            });
+            if target.can_focus {
+                row = row.pill("focus", C_PEACH_CSS, HitAction::SessionAction {
+                    action: "focus".into(),
+                    id: sid.clone(),
+                });
+            }
+            if target.can_attach {
+                row = row.pill("attach", C_TEAL_CSS, HitAction::SessionAction {
+                    action: "attach".into(),
+                    id: sid.clone(),
+                });
+            }
+            if target.can_stop {
+                row = row.pill("stop", C_RED_CSS, HitAction::SessionAction {
+                    action: "stop".into(),
+                    id: sid.clone(),
+                });
+            }
+            surface.rows.push(row);
+        }
+        for session in self.snapshot.sessions.recent.iter() {
+            let sid = nonempty(&session.session_id, &session.id);
+            let mut row = PanelRow::new(
+                truncate(&session.value, 16),
+                format!("{} / {}", session.label, session.detail),
+                tone_color_css(&session.tone),
+            )
+            .click(HitAction::SessionAction {
+                action: "station-log".into(),
+                id: sid.clone(),
+            });
+            if session.can_focus {
+                row = row.pill("focus", C_PEACH_CSS, HitAction::SessionAction {
+                    action: "focus".into(),
+                    id: sid.clone(),
+                });
+            }
+            if session.can_resume {
+                row = row.pill("resume", C_GREEN_CSS, HitAction::SessionAction {
+                    action: "resume".into(),
+                    id: sid.clone(),
+                });
+            }
+            if session.can_stop {
+                row = row.pill("stop", C_RED_CSS, HitAction::SessionAction {
+                    action: "stop".into(),
+                    id: sid.clone(),
+                });
+            } else if session.can_interrupt {
+                row = row.pill("stop", C_RED_CSS, HitAction::SessionAction {
+                    action: "interrupt".into(),
+                    id: sid.clone(),
+                });
+            }
+            surface.rows.push(row);
+        }
+        surface
+    }
+
+    fn worktrees_panel_surface(&self) -> PanelSurface {
+        let mut surface = PanelSurface {
+            header: vec![
+                HeaderPill::new(
+                    "scan",
+                    C_BLUE_CSS,
+                    HitAction::SessionAction {
+                        action: "worktrees-scan".into(),
+                        id: String::new(),
+                    },
+                ),
+                HeaderPill::new(
+                    "sessions",
+                    C_OVERLAY1_CSS,
+                    HitAction::Select("system:sessions".into()),
+                ),
+            ],
+            empty: "no worktrees scanned — scan discovers them",
+            ..Default::default()
+        };
+        for worktree in self.snapshot.sessions.recent_worktrees.iter() {
+            let path = nonempty(&worktree.id, &worktree.value);
+            surface.rows.push(
+                PanelRow::new(
+                    truncate(&worktree.value, 16),
+                    format!("{} / {}", worktree.label, worktree.detail),
+                    tone_color_css(&worktree.tone),
+                )
+                .click(HitAction::SessionAction {
+                    action: "worktree".into(),
+                    id: path.clone(),
+                })
+                .pill("copy", C_BLUE_CSS, HitAction::SessionAction {
+                    action: "worktree-copy".into(),
+                    id: path,
+                }),
+            );
+        }
+        surface
+    }
+
+    fn activity_panel_surface(&self) -> PanelSurface {
+        let activity = &self.snapshot.activity;
+        let level = nonempty(&activity.level_filter, "all");
+        let next_level = match activity.level_filter.as_str() {
+            "" => "error",
+            "error" => "warn",
+            "warn" => "info",
+            _ => "",
+        };
+        let mut surface = PanelSurface {
+            header: vec![
+                HeaderPill::new_owned(
+                    format!("lvl {}", truncate(&level, 6)),
+                    C_YELLOW_CSS,
+                    HitAction::ActivityAction {
+                        action: format!("level:{next_level}"),
+                        id: String::new(),
+                    },
+                ),
+                HeaderPill::new(
+                    "copy",
+                    C_BLUE_CSS,
+                    HitAction::ActivityAction {
+                        action: "copy-visible".into(),
+                        id: String::new(),
+                    },
+                ),
+                HeaderPill::new(
+                    "clear",
+                    C_RED_CSS,
+                    HitAction::ActivityAction {
+                        action: "clear-log".into(),
+                        id: String::new(),
+                    },
+                ),
+            ],
+            empty: "no retained activity yet",
+            ..Default::default()
+        };
+        for event in self.snapshot.events.iter().rev() {
+            let color = level_color_css(&event.level);
+            let mut row = PanelRow::new(
+                format!(
+                    "{} {}",
+                    truncate(&nonempty(&event.ts, "--"), 8),
+                    truncate(&event.level, 5)
+                ),
+                truncate(&event.msg, 200),
+                color,
+            )
+            .pill("copy", C_BLUE_CSS, HitAction::ActivityAction {
+                action: "copy-event".into(),
+                id: event.id.clone(),
+            });
+            if !event.session_id.is_empty() {
+                row = row
+                    .click(HitAction::SessionAction {
+                        action: "station-log".into(),
+                        id: event.session_id.clone(),
+                    })
+                    .pill("log", C_TEAL_CSS, HitAction::SessionAction {
+                        action: "station-log".into(),
+                        id: event.session_id.clone(),
+                    });
+            }
+            surface.rows.push(row);
+        }
+        surface
+    }
+
+    fn context_panel_surface(&self) -> PanelSurface {
+        let context = &self.snapshot.context;
+        let mut surface = PanelSurface {
+            header: vec![
+                HeaderPill::new(
+                    "live",
+                    C_GREEN_CSS,
+                    HitAction::ContextAction {
+                        action: "live".into(),
+                        id: String::new(),
+                    },
+                ),
+                HeaderPill::new(
+                    "replay",
+                    C_BLUE_CSS,
+                    HitAction::ContextAction {
+                        action: "replay".into(),
+                        id: String::new(),
+                    },
+                ),
+                HeaderPill::new(
+                    "prev",
+                    C_OVERLAY1_CSS,
+                    HitAction::ContextAction {
+                        action: "replay-prev".into(),
+                        id: String::new(),
+                    },
+                ),
+                HeaderPill::new(
+                    "next",
+                    C_OVERLAY1_CSS,
+                    HitAction::ContextAction {
+                        action: "replay-next".into(),
+                        id: String::new(),
+                    },
+                ),
+                HeaderPill::new(
+                    "copy",
+                    C_LAVENDER_CSS,
+                    HitAction::ContextAction {
+                        action: "copy-snapshot".into(),
+                        id: String::new(),
+                    },
+                ),
+            ],
+            empty: "no live context snapshot yet",
+            ..Default::default()
+        };
+        if context.replay_count > 0 {
+            surface.rows.push(PanelRow::new(
+                "replay".to_string(),
+                format!(
+                    "{} / {} of {} / {}",
+                    context.replay_mode,
+                    context.replay_index,
+                    context.replay_count,
+                    nonempty(&context.replay_time, "-")
+                ),
+                C_BLUE_CSS,
+            ));
+        }
+        for cat in context.top_categories.iter() {
+            surface.rows.push(PanelRow::new(
+                truncate(&cat.label, 16),
+                format!("{} tok / {} / {}", fmt_compact(cat.value), cat.count, cat.detail),
+                C_BLUE_CSS,
+            ));
+        }
+        for item in context.top_items.iter() {
+            surface.rows.push(
+                PanelRow::new(
+                    truncate(&item.label, 16),
+                    format!("{} / {}", item.value, item.detail),
+                    tone_color_css(&item.tone),
+                )
+                .pill("copy", C_BLUE_CSS, HitAction::ContextAction {
+                    action: "copy-part".into(),
+                    id: item.id.clone(),
+                }),
+            );
+        }
+        surface
+    }
+
+    fn managed_panel_surface(&self) -> PanelSurface {
+        let managed = &self.snapshot.managed;
+        let state = &managed.action_state;
+        let mut header = vec![HeaderPill::new(
+            "seed",
+            C_BLUE_CSS,
+            HitAction::ManagedAction {
+                action: "seed-context".into(),
+                id: String::new(),
+            },
+        )];
+        if state.can_rewind {
+            header.push(HeaderPill::new(
+                "rewind",
+                C_YELLOW_CSS,
+                HitAction::ManagedAction {
+                    action: "dispatch-rewind".into(),
+                    id: String::new(),
+                },
+            ));
+        }
+        if state.can_backout {
+            header.push(HeaderPill::new(
+                "backout",
+                C_RED_CSS,
+                HitAction::ManagedAction {
+                    action: "run-backout".into(),
+                    id: String::new(),
+                },
+            ));
+        }
+        header.push(HeaderPill::new(
+            "status",
+            C_OVERLAY1_CSS,
+            HitAction::ManagedAction {
+                action: "copy-status".into(),
+                id: String::new(),
+            },
+        ));
+        let mut surface = PanelSurface {
+            header,
+            empty: "no managed rewind records yet",
+            ..Default::default()
+        };
+        if !state.readiness.trim().is_empty() || !state.result.trim().is_empty() {
+            surface.rows.push(PanelRow::new(
+                "state".to_string(),
+                format!(
+                    "{}{}",
+                    state.readiness.trim(),
+                    if state.result.trim().is_empty() {
+                        String::new()
+                    } else {
+                        format!(" / {}", state.result.trim())
+                    }
+                ),
+                C_LAVENDER_CSS,
+            ));
+        }
+        for record in managed.recent_records.iter() {
+            let rid = nonempty(&record.id, &record.label);
+            surface.rows.push(
+                PanelRow::new(
+                    truncate(&record.label, 16),
+                    format!("{} / {}", record.value, record.detail),
+                    tone_color_css(&record.tone),
+                )
+                .click(HitAction::ManagedAction {
+                    action: "record-inspect".into(),
+                    id: rid.clone(),
+                })
+                .pill("fork", C_TEAL_CSS, HitAction::ManagedAction {
+                    action: "record-fork".into(),
+                    id: rid.clone(),
+                })
+                .pill("restore", C_YELLOW_CSS, HitAction::ManagedAction {
+                    action: "record-restore".into(),
+                    id: rid,
+                }),
+            );
+        }
+        surface
+    }
+
+    fn changes_panel_surface(&self) -> PanelSurface {
+        let mut surface = PanelSurface {
+            header: vec![
+                HeaderPill::new(
+                    "refresh",
+                    C_BLUE_CSS,
+                    HitAction::ChangesAction {
+                        action: "refresh".into(),
+                        path: String::new(),
+                    },
+                ),
+                HeaderPill::new(
+                    "copy paths",
+                    C_OVERLAY1_CSS,
+                    HitAction::ChangesAction {
+                        action: "copy-paths".into(),
+                        path: String::new(),
+                    },
+                ),
+            ],
+            empty: "working tree clean",
+            ..Default::default()
+        };
+        for change in self.snapshot.changes.recent.iter() {
+            let path = nonempty(&change.id, &change.value);
+            surface.rows.push(
+                PanelRow::new(
+                    truncate(&change.label, 16),
+                    format!("{} / {}", change.value, change.detail),
+                    tone_color_css(&change.tone),
+                )
+                .click(HitAction::ChangesAction {
+                    action: "station-diff".into(),
+                    path: path.clone(),
+                })
+                .pill("diff", C_TEAL_CSS, HitAction::ChangesAction {
+                    action: "station-diff".into(),
+                    path: path.clone(),
+                })
+                .pill("copy", C_BLUE_CSS, HitAction::ChangesAction {
+                    action: "copy-diff".into(),
+                    path,
+                }),
+            );
+        }
+        surface
+    }
+
+    fn peers_panel_surface(&self) -> PanelSurface {
+        let runway = &self.snapshot.display_runway;
+        let mut surface = PanelSurface {
+            header: vec![
+                HeaderPill::new(
+                    "refresh",
+                    C_BLUE_CSS,
+                    HitAction::ControlsAction {
+                        action: "peer-refresh".into(),
+                    },
+                ),
+                HeaderPill::new(
+                    "open",
+                    C_PEACH_CSS,
+                    HitAction::ControlsAction {
+                        action: "peer-open-selected".into(),
+                    },
+                ),
+                HeaderPill::new(
+                    "share",
+                    C_GREEN_CSS,
+                    HitAction::ControlsAction {
+                        action: "display-toggle".into(),
+                    },
+                ),
+            ],
+            empty: "no peers or display lanes yet",
+            ..Default::default()
+        };
+        if !runway.peer_status.trim().is_empty() {
+            surface.rows.push(PanelRow::new(
+                "status".to_string(),
+                runway.peer_status.trim().to_string(),
+                C_OVERLAY1_CSS,
+            ));
+        }
+        for lane in runway.lanes.iter() {
+            let tag = match lane.kind.as_str() {
+                "local_stream" => "local",
+                "remote_stream" => "remote",
+                "peer_target" => "target",
+                "operator_target" => "operator",
+                "shared_view" => "shared",
+                other => other,
+            };
+            let default_op = match lane.kind.as_str() {
+                "peer_target" => "select",
+                "operator_target" | "shared_view" => "focus",
+                _ => "open",
+            };
+            let mut row = PanelRow::new(
+                tag.to_string(),
+                format!("{} / {} / {}", lane.title, lane.meta, lane.detail),
+                if lane.selected { C_BLUE_CSS } else { C_PEACH_CSS },
+            );
+            if !lane.id.is_empty() {
+                row = row
+                    .click(HitAction::RunwayAction {
+                        action: default_op.into(),
+                        lane_id: lane.id.clone(),
+                    })
+                    .pill("open", C_PEACH_CSS, HitAction::RunwayAction {
+                        action: "open".into(),
+                        lane_id: lane.id.clone(),
+                    })
+                    .pill("copy", C_BLUE_CSS, HitAction::RunwayAction {
+                        action: "copy".into(),
+                        lane_id: lane.id.clone(),
+                    });
+                if !lane.session_id.is_empty() {
+                    row = row.pill("log", C_TEAL_CSS, HitAction::SessionAction {
+                        action: "station-log".into(),
+                        id: lane.session_id.clone(),
+                    });
+                }
+            }
+            surface.rows.push(row);
+        }
+        surface
+    }
+
+    fn controls_panel_surface(&self) -> PanelSurface {
+        let controls = &self.snapshot.controls;
+        let queue = &self.snapshot.attention_queue;
+        let mut surface = PanelSurface {
+            header: vec![
+                HeaderPill::new("compose", C_BLUE_CSS, HitAction::Composer { op: "open-send" }),
+                HeaderPill::new("launch", C_TEAL_CSS, HitAction::Composer { op: "open-launch" }),
+            ],
+            empty: "",
+            ..Default::default()
+        };
+
+        // Attention queue first: blocked work is what the operator came for.
+        surface.rows.push(PanelRow::new(
+            "attention".to_string(),
+            format!(
+                "{} blocked / {} warn / {} ready",
+                queue.blocked, queue.warn, queue.ready
+            ),
+            if queue.blocked > 0 {
+                C_RED_CSS
+            } else if queue.warn > 0 {
+                C_YELLOW_CSS
+            } else {
+                C_GREEN_CSS
+            },
+        ));
+        for item in queue.items.iter() {
+            let mut row = PanelRow::new(
+                truncate(&item.level, 16),
+                format!("{} / {} / {}", item.title, item.meta, item.detail),
+                attention_level_color_css(&item.level),
+            );
+            // `log:<session>` targets open that session's transcript;
+            // anything else selects the named scene/system node.
+            if let Some(session_id) = item.target.strip_prefix("log:") {
+                row = row.click(HitAction::SessionAction {
+                    action: "station-log".into(),
+                    id: session_id.to_string(),
+                });
+            } else if !item.target.is_empty() {
+                row = row.click(HitAction::Select(item.target.clone()));
+            }
+            surface.rows.push(row);
+        }
+
+        // Autonomy + backend selection as choice pill rows.
+        surface.rows.push(PanelRow::choices(
+            "autonomy",
+            C_LAVENDER_CSS,
+            ["low", "medium", "high", "full"]
+                .into_iter()
+                .map(|level| {
+                    (
+                        level.to_string(),
+                        controls.autonomy == level,
+                        HitAction::ControlsAction {
+                            action: format!("autonomy:{level}"),
+                        },
+                    )
+                })
+                .collect(),
+        ));
+        surface.rows.push(PanelRow::choices(
+            "backend",
+            C_MAUVE_CSS,
+            [
+                ("intendant", "internal"),
+                ("codex", "codex"),
+                ("claude", "claude-code"),
+                ("gemini", "gemini"),
+            ]
+            .into_iter()
+            .map(|(label, id)| {
+                (
+                    label.to_string(),
+                    controls.backend == id || (id == "internal" && controls.backend.is_empty()),
+                    HitAction::ControlsAction {
+                        action: format!("backend:{id}"),
+                    },
+                )
+            })
+            .collect(),
+        ));
+        if controls.backend == "codex" {
+            surface.rows.push(PanelRow::choices(
+                "approval",
+                C_YELLOW_CSS,
+                ["untrusted", "on-request", "never"]
+                    .into_iter()
+                    .map(|policy| {
+                        (
+                            policy.to_string(),
+                            controls.approval_policy == policy,
+                            HitAction::ControlsAction {
+                                action: format!("codex-approval:{policy}"),
+                            },
+                        )
+                    })
+                    .collect(),
+            ));
+        }
+
+        // Voice / video / display sharing toggles.
+        surface.rows.push(PanelRow::choices(
+            "av",
+            C_TEAL_CSS,
+            vec![
+                (
+                    if controls.mic_active { "mic on" } else { "mic off" }.to_string(),
+                    controls.mic_active,
+                    HitAction::ControlsAction {
+                        action: "voice-toggle".into(),
+                    },
+                ),
+                (
+                    if controls.video_active { "cam on" } else { "cam off" }.to_string(),
+                    controls.video_active,
+                    HitAction::ControlsAction {
+                        action: "video-toggle".into(),
+                    },
+                ),
+                (
+                    "make active".to_string(),
+                    controls.active_browser,
+                    HitAction::ControlsAction {
+                        action: "voice-active".into(),
+                    },
+                ),
+            ],
+        ));
+        surface.rows.push(
+            PanelRow::new(
+                "display".to_string(),
+                format!("share: {}", nonempty(&controls.display_access, "off")),
+                C_PEACH_CSS,
+            )
+            .pill("toggle", C_PEACH_CSS, HitAction::ControlsAction {
+                action: "display-toggle".into(),
+            })
+            .pill("list", C_BLUE_CSS, HitAction::ControlsAction {
+                action: "display-list".into(),
+            }),
+        );
+
+        // Browser workspaces.
+        let mut browser_row = PanelRow::new(
+            "browser".to_string(),
+            format!(
+                "{} workspace{} / {}",
+                controls.browser_workspaces,
+                if controls.browser_workspaces == 1 { "" } else { "s" },
+                nonempty(&controls.browser_workspace_status, "idle")
+            ),
+            C_BLUE_CSS,
+        );
+        if controls.browser_workspace_can_create {
+            browser_row = browser_row.pill("create", C_GREEN_CSS, HitAction::ControlsAction {
+                action: "browser-create".into(),
+            });
+        }
+        if controls.browser_workspace_can_acquire {
+            browser_row = browser_row.pill("acquire", C_TEAL_CSS, HitAction::ControlsAction {
+                action: "browser-acquire".into(),
+            });
+        }
+        if controls.browser_workspace_can_close {
+            browser_row = browser_row.pill("close", C_RED_CSS, HitAction::ControlsAction {
+                action: "browser-close".into(),
+            });
+        }
+        if !controls.browser_workspace_url.is_empty() {
+            browser_row = browser_row.pill("copy", C_BLUE_CSS, HitAction::ControlsAction {
+                action: "browser-copy".into(),
+            });
+        }
+        surface.rows.push(browser_row);
+
+        // Recordings: live state + per-stream rows from the side cache.
+        surface.rows.push(
+            PanelRow::new(
+                "recording".to_string(),
+                if controls.active_recording.is_empty() {
+                    format!("{} stored", controls.recordings)
+                } else {
+                    format!("recording {} / {} stored", controls.active_recording, controls.recordings)
+                },
+                if controls.debug_recording { C_RED_CSS } else { C_OVERLAY1_CSS },
+            )
+            .pill(
+                if controls.debug_recording { "stop rec" } else { "record" },
+                C_RED_CSS,
+                HitAction::ControlsAction {
+                    action: "debug-record".into(),
+                },
+            )
+            .pill("screen", C_BLUE_CSS, HitAction::ControlsAction {
+                action: "debug-screen".into(),
+            }),
+        );
+        for stream in controls.recording_streams.iter() {
+            let name = nonempty(&stream.action_id, &stream.label);
+            surface.rows.push(
+                PanelRow::new(
+                    truncate(&stream.label, 16),
+                    format!("{} / {}", stream.value, stream.detail),
+                    C_LAVENDER_CSS,
+                )
+                .click(HitAction::ControlsAction {
+                    action: format!("recording-open:{name}"),
+                })
+                .pill("play", C_TEAL_CSS, HitAction::ControlsAction {
+                    action: format!("recording-open:{name}"),
+                }),
+            );
+        }
+
+        // Computer use status.
+        surface.rows.push(PanelRow::new(
+            "computer".to_string(),
+            format!(
+                "{} / {} / {}",
+                nonempty(&controls.cu_backend, "cu"),
+                nonempty(&controls.cu_provider, "provider"),
+                nonempty(&controls.cu_validation_state, "unvalidated")
+            ),
+            C_OVERLAY1_CSS,
+        ));
+        surface
     }
 
     /// Shared focus-panel chrome: glass body, FOCUS kicker, title, and the
@@ -1261,6 +1907,528 @@ impl StationInner {
             23.0,
             HitAction::ClosePanel,
         ));
+    }
+
+    /// Scrollable, actionable rows panel: shared frame + header pills +
+    /// uniform-height rows (click zones, per-row pills, choice pills) +
+    /// scrollbar + a footer inspector line echoing the hovered row in
+    /// full. The workhorse behind every system focus panel.
+    #[allow(clippy::too_many_arguments)]
+    fn rows_panel(
+        &mut self,
+        panel_id: &str,
+        title: &str,
+        color: &str,
+        value: &str,
+        detail: &str,
+        surface: PanelSurface,
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+    ) {
+        self.focus_panel_frame(x, y, w, h, title, color);
+        self.text(value, x + 16.0, y + 66.0, 10.5, C_TEXT_CSS, "normal");
+        self.text(
+            &truncate(detail, ((w - 30.0) / 5.8) as usize),
+            x + 16.0,
+            y + 84.0,
+            9.0,
+            C_SUBTEXT0_CSS,
+            "normal",
+        );
+
+        // Header pills: panel-wide operations, left to right.
+        let mut px = x + 16.0;
+        let py = y + 96.0;
+        for pill in &surface.header {
+            let pw = pill.label.chars().count() as f32 * 6.1 + 18.0;
+            if px + pw > x + w - 16.0 {
+                break;
+            }
+            self.pill_at(px, py, pw, 22.0, &pill.label, pill.color, pill.active);
+            self.hit_zones
+                .push(HitZone::new(px, py, pw, 22.0, pill.action.clone()));
+            px += pw + 8.0;
+        }
+
+        // Scrollable rows viewport.
+        let y0 = y + 128.0;
+        let y1 = y + h - 26.0;
+        let viewport_h = (y1 - y0).max(40.0);
+        let rows = &surface.rows;
+        let content_h = rows.len() as f32 * PANEL_ROW_H;
+        self.scroll_zones.push(crate::input::ScrollZone {
+            x,
+            y: y0,
+            w,
+            h: viewport_h,
+            panel: panel_id.to_string(),
+            content_h,
+        });
+        let offset = self.scroll_offset(panel_id, content_h, viewport_h);
+        let scrollable = content_h > viewport_h;
+        let right_pad = if scrollable { 26.0 } else { 18.0 };
+
+        if rows.is_empty() {
+            if !surface.empty.is_empty() {
+                self.text(
+                    surface.empty,
+                    x + 16.0,
+                    y0 + 22.0,
+                    10.0,
+                    C_SUBTEXT0_CSS,
+                    "normal",
+                );
+            }
+            return;
+        }
+
+        let ctx = self.hud.ctx.clone();
+        ctx.save();
+        self.rounded_path(x + 2.0, y0, w - 4.0, viewport_h, 6.0);
+        ctx.clip();
+
+        let first = (offset / PANEL_ROW_H).floor().max(0.0) as usize;
+        let mut hovered_row: Option<usize> = None;
+        for (idx, row) in rows.iter().enumerate().skip(first) {
+            let ry = y0 + idx as f32 * PANEL_ROW_H - offset;
+            if ry > y1 {
+                break;
+            }
+            let hovered = self.hover_xy.is_some_and(|(hx, hy)| {
+                hx >= x && hx <= x + w && hy >= ry && hy <= ry + PANEL_ROW_H && hy >= y0 && hy <= y1
+            });
+            if hovered {
+                hovered_row = Some(idx);
+                self.rounded_path(x + 8.0, ry + 1.0, w - 8.0 - right_pad + 4.0, PANEL_ROW_H - 3.0, 6.0);
+                self.hud.set_fill("rgba(137,180,250,0.10)");
+                ctx.fill();
+            }
+            // Label column.
+            self.text(&truncate(&row.label, 17), x + 16.0, ry + 19.0, 9.0, row.color, "bold");
+            // Right-aligned pills; the value text yields to them.
+            let mut pill_x = x + w - right_pad;
+            for pill in row.pills.iter().rev() {
+                let pw = pill.label.chars().count() as f32 * 5.6 + 14.0;
+                pill_x -= pw;
+                if pill_x < x + 130.0 {
+                    break;
+                }
+                self.pill_at(pill_x, ry + 4.5, pw, 21.0, &pill.label, pill.color, false);
+                self.hit_zones.push(HitZone::new(
+                    pill_x,
+                    ry + 4.5,
+                    pw,
+                    21.0,
+                    pill.action.clone(),
+                ));
+                pill_x -= 6.0;
+            }
+            if row.choices.is_empty() {
+                let max_chars = (((pill_x - 6.0) - (x + 124.0)) / 5.7).max(6.0) as usize;
+                self.text(
+                    &truncate(&row.value, max_chars),
+                    x + 124.0,
+                    ry + 19.0,
+                    9.5,
+                    C_TEXT_CSS,
+                    "normal",
+                );
+            } else {
+                // Choice pills row (autonomy / backend / toggles).
+                let mut cx = x + 124.0;
+                for (label, selected, action) in &row.choices {
+                    let cw = label.chars().count() as f32 * 5.8 + 16.0;
+                    if cx + cw > pill_x - 6.0 {
+                        break;
+                    }
+                    self.pill_at(cx, ry + 4.5, cw, 21.0, label, if *selected { row.color } else { C_OVERLAY1_CSS }, *selected);
+                    self.hit_zones
+                        .push(HitZone::new(cx, ry + 4.5, cw, 21.0, action.clone()));
+                    cx += cw + 6.0;
+                }
+            }
+            // Row body click zone (under the pills, which were pushed after
+            // and therefore win hit-testing).
+            if let Some(action) = &row.click {
+                self.hit_zones.push(HitZone::new(
+                    x + 8.0,
+                    ry,
+                    w - 8.0 - right_pad,
+                    PANEL_ROW_H,
+                    action.clone(),
+                ));
+            }
+        }
+        ctx.restore();
+        self.hud.invalidate_styles();
+
+        if scrollable {
+            self.draw_scrollbar(x + w - 14.0, y0, viewport_h, content_h, offset);
+        }
+
+        // Footer inspector: the hovered row in full, since row values
+        // truncate aggressively next to pills.
+        if let Some(row) = hovered_row.and_then(|idx| rows.get(idx)) {
+            self.text(
+                &truncate(
+                    &format!("{} — {}", row.label, row.value),
+                    ((w - 28.0) / 4.9) as usize,
+                ),
+                x + 16.0,
+                y + h - 9.0,
+                8.5,
+                C_SUBTEXT0_CSS,
+                "normal",
+            );
+        }
+    }
+
+    /// Slim scrollbar: rounded track + position thumb.
+    fn draw_scrollbar(&self, x: f32, y: f32, viewport_h: f32, content_h: f32, offset: f32) {
+        self.hud.set_fill("rgba(49,50,68,0.65)");
+        self.rounded_path(x, y + 2.0, 6.0, viewport_h - 4.0, 3.0);
+        self.hud.ctx.fill();
+        let (thumb_h, thumb_off) =
+            crate::input::scrollbar_thumb(viewport_h - 4.0, content_h, viewport_h, offset);
+        self.hud.set_fill("rgba(137,180,250,0.55)");
+        self.rounded_path(x, y + 2.0 + thumb_off, 6.0, thumb_h, 3.0);
+        self.hud.ctx.fill();
+    }
+
+    /// Composer strip rect for the current mode: `(x, y, w, h)`. Shared
+    /// between the strip painter and the transcript panel (which yields
+    /// vertical space when both are open).
+    pub(crate) fn composer_rect(&self, w: f32, h: f32) -> (f32, f32, f32, f32) {
+        let lane_y = (h - lane_metrics(self.density, h).2 - 24.0).max(282.0);
+        let strip_h = if self.composer_mode == "launch" { 96.0 } else { 56.0 };
+        let sw = (w * 0.52).clamp(320.0, 660.0);
+        (24.0, lane_y - strip_h - 12.0, sw, strip_h)
+    }
+
+    /// The composer strip: canvas-drawn chrome for the DOM input overlay.
+    /// Send mode: target chip + input slot + send. Launch mode: input slot
+    /// + agent choice pills + direct toggle + launch.
+    fn draw_composer_strip(&mut self, w: f32, h: f32) {
+        let (x, y, sw, sh) = self.composer_rect(w, h);
+        let controls = &self.snapshot.controls;
+        let launch = self.composer_mode == "launch";
+        self.glass_panel(x, y, sw, sh, 12.0, C_BLUE, 1.8, 1.08);
+        self.hit_zones
+            .push(HitZone::new(x, y, sw, sh, HitAction::Noop));
+
+        let kicker = if launch {
+            let missing = controls.launch_missing.trim();
+            if controls.launch_ready || missing.is_empty() {
+                "LAUNCH NEW SESSION".to_string()
+            } else {
+                format!("LAUNCH NEW SESSION — needs {}", truncate(missing, 28))
+            }
+        } else {
+            format!(
+                "COMPOSE → {}",
+                truncate(&self.station_target_label(), 36)
+            )
+        };
+        self.text(&kicker, x + 16.0, y + 16.0, 8.0, C_BLUE_CSS, "bold");
+        self.text(
+            "enter sends / esc closes",
+            x + sw - 150.0,
+            y + 16.0,
+            7.5,
+            C_OVERLAY1_CSS,
+            "normal",
+        );
+
+        // Input slot: dark inset the DOM textarea sits over.
+        let action_w = if launch { 88.0 } else { 76.0 };
+        let slot_x = x + 14.0;
+        let slot_w = sw - 28.0 - action_w - 10.0;
+        let slot_y = y + 24.0;
+        self.rounded_path(slot_x, slot_y, slot_w, 24.0, 7.0);
+        self.hud.set_fill("rgba(9,10,18,0.78)");
+        self.hud.ctx.fill();
+        self.rounded_path(slot_x, slot_y, slot_w, 24.0, 7.0);
+        self.hud.set_stroke("rgba(137,180,250,0.35)");
+        self.hud.ctx.stroke();
+        self.composer_input_rect = Some((slot_x + 6.0, slot_y + 2.0, slot_w - 12.0, 20.0));
+
+        let send_x = slot_x + slot_w + 10.0;
+        if launch {
+            self.pill_at(send_x, slot_y + 1.0, action_w, 22.0, "launch", C_TEAL_CSS, true);
+            self.hit_zones.push(HitZone::new(
+                send_x,
+                slot_y + 1.0,
+                action_w,
+                22.0,
+                HitAction::Composer { op: "launch" },
+            ));
+        } else {
+            let label = if controls.prompt_mode == "steer" { "steer" } else { "send" };
+            self.pill_at(send_x, slot_y + 1.0, action_w, 22.0, label, C_BLUE_CSS, true);
+            self.hit_zones.push(HitZone::new(
+                send_x,
+                slot_y + 1.0,
+                action_w,
+                22.0,
+                HitAction::Composer { op: "send" },
+            ));
+        }
+
+        if launch {
+            // Agent choice pills + direct-mode toggle.
+            self.text("agent", x + 16.0, y + 70.0, 8.0, C_TEAL_CSS, "bold");
+            let mut cx = x + 58.0;
+            let selected_agent = controls.launch_agent.as_str();
+            for (label, id) in [
+                ("auto", ""),
+                ("intendant", "internal"),
+                ("codex", "codex"),
+                ("claude", "claude-code"),
+                ("gemini", "gemini"),
+            ] {
+                let cw = label.chars().count() as f32 * 5.8 + 16.0;
+                if cx + cw > x + sw - 86.0 {
+                    break;
+                }
+                let active = selected_agent == id;
+                self.pill_at(cx, y + 58.0, cw, 21.0, label, if active { C_TEAL_CSS } else { C_OVERLAY1_CSS }, active);
+                self.hit_zones.push(HitZone::new(
+                    cx,
+                    y + 58.0,
+                    cw,
+                    21.0,
+                    HitAction::ControlsAction {
+                        action: format!("launch-agent:{id}"),
+                    },
+                ));
+                cx += cw + 6.0;
+            }
+            let direct = controls.launch_mode == "direct";
+            self.pill_at(
+                x + sw - 80.0,
+                y + 58.0,
+                64.0,
+                21.0,
+                "direct",
+                if direct { C_PEACH_CSS } else { C_OVERLAY1_CSS },
+                direct,
+            );
+            self.hit_zones.push(HitZone::new(
+                x + sw - 80.0,
+                y + 58.0,
+                64.0,
+                21.0,
+                HitAction::ControlsAction {
+                    action: "launch-direct:toggle".into(),
+                },
+            ));
+        } else {
+            // Target chip: click opens the sessions panel to retarget.
+            let chip_w = 70.0;
+            self.pill_at(x + sw - 78.0 - action_w, y + 1.0, chip_w, 18.0, "target", C_PEACH_CSS, false);
+            self.hit_zones.push(HitZone::new(
+                x + sw - 78.0 - action_w,
+                y + 1.0,
+                chip_w,
+                18.0,
+                HitAction::Composer { op: "target" },
+            ));
+        }
+    }
+
+    /// Transcript / diff viewer: a large left-anchored panel with
+    /// word-wrapped, kind-colored rows and pixel scrolling. Content
+    /// layout (wrapping) is cached per (content, width) signature.
+    fn draw_transcript_panel(&mut self, w: f32, h: f32) {
+        let Some(transcript) = self.transcript.clone() else {
+            return;
+        };
+        let lane_y = (h - lane_metrics(self.density, h).2 - 24.0).max(282.0);
+        let x = 24.0;
+        let tw = (w * 0.56).clamp(340.0, 820.0).min(w - 48.0);
+        let top = 58.0 + 14.0;
+        let bottom = if self.composer_open {
+            self.composer_rect(w, h).1 - 10.0
+        } else {
+            lane_y - 12.0
+        };
+        let th = (bottom - top).max(180.0);
+        let diff = transcript.mode == "diff";
+        let accent = if diff { C_YELLOW_CSS } else { C_TEAL_CSS };
+
+        self.glass_panel(x, top, tw, th, 12.0, hex_color(accent).unwrap_or(C_TEAL), 1.4, 1.06);
+        self.hit_zones
+            .push(HitZone::new(x, top, tw, th, HitAction::Noop));
+        self.text(
+            if diff { "DIFF" } else { "TRANSCRIPT" },
+            x + 16.0,
+            top + 21.0,
+            10.0,
+            C_OVERLAY1_CSS,
+            "bold",
+        );
+        self.text(
+            &truncate(&nonempty(&transcript.label, &transcript.session_id), 42),
+            x + 16.0,
+            top + 43.0,
+            13.0,
+            accent,
+            "bold",
+        );
+        self.pill_at(x + tw - 66.0, top + 12.0, 50.0, 22.0, "close", C_OVERLAY1_CSS, false);
+        self.hit_zones.push(HitZone::new(
+            x + tw - 66.0,
+            top + 12.0,
+            50.0,
+            22.0,
+            HitAction::CloseTranscript,
+        ));
+        // Header ops.
+        let mut hx = x + 16.0;
+        let header_pills: Vec<(&str, &str, HitAction)> = if diff {
+            vec![(
+                "copy diff",
+                C_BLUE_CSS,
+                HitAction::ChangesAction {
+                    action: "copy-diff".into(),
+                    path: transcript.session_id.clone(),
+                },
+            )]
+        } else {
+            vec![
+                (
+                    "steer",
+                    C_BLUE_CSS,
+                    HitAction::Composer { op: "open-send" },
+                ),
+                (
+                    "focus",
+                    C_PEACH_CSS,
+                    HitAction::SessionAction {
+                        action: "focus".into(),
+                        id: transcript.session_id.clone(),
+                    },
+                ),
+                (
+                    "copy id",
+                    C_OVERLAY1_CSS,
+                    HitAction::SessionAction {
+                        action: "copy".into(),
+                        id: transcript.session_id.clone(),
+                    },
+                ),
+            ]
+        };
+        for (label, color, action) in header_pills {
+            let pw = label.chars().count() as f32 * 6.1 + 18.0;
+            self.pill_at(hx, top + 52.0, pw, 22.0, label, color, false);
+            self.hit_zones.push(HitZone::new(hx, top + 52.0, pw, 22.0, action));
+            hx += pw + 8.0;
+        }
+        self.text(
+            &format!(
+                "{} of {} entries",
+                transcript.rows.len(),
+                transcript.total.max(transcript.rows.len() as u32)
+            ),
+            x + tw - 190.0,
+            top + 66.0,
+            8.5,
+            C_SUBTEXT0_CSS,
+            "normal",
+        );
+
+        let y0 = top + 84.0;
+        let y1 = top + th - 14.0;
+        let viewport_h = (y1 - y0).max(60.0);
+
+        if !transcript.error.is_empty() {
+            self.text(
+                &truncate(&transcript.error, ((tw - 30.0) / 5.8) as usize),
+                x + 16.0,
+                y0 + 18.0,
+                10.0,
+                C_RED_CSS,
+                "normal",
+            );
+            return;
+        }
+        if transcript.rows.is_empty() {
+            self.text(
+                "no entries — waiting for the session log",
+                x + 16.0,
+                y0 + 18.0,
+                10.0,
+                C_SUBTEXT0_CSS,
+                "normal",
+            );
+            return;
+        }
+
+        // Wrapped layout, cached against a cheap content signature.
+        let gutter = if diff { 16.0 } else { 64.0 };
+        let wrap_px = tw - gutter - 16.0 - 18.0;
+        let wrap_chars = ((wrap_px / 5.6).max(20.0)) as usize;
+        let sig = transcript_signature(&transcript, wrap_chars as u32);
+        if self.transcript_layout.as_ref().map(|l| l.sig) != Some(sig) {
+            let mut layout = layout_transcript(&transcript, wrap_chars);
+            layout.sig = sig;
+            self.transcript_layout = Some(layout);
+        }
+        let layout = self.transcript_layout.as_ref().unwrap();
+        let content_h = layout.content_h;
+        self.scroll_zones.push(crate::input::ScrollZone {
+            x,
+            y: y0,
+            w: tw,
+            h: viewport_h,
+            panel: "transcript".to_string(),
+            content_h,
+        });
+        if self.transcript_follow {
+            let max = (content_h - viewport_h).max(0.0);
+            self.panel_scroll.insert("transcript".to_string(), max);
+        }
+        let offset = self.scroll_offset("transcript", content_h, viewport_h);
+
+        let ctx = self.hud.ctx.clone();
+        ctx.save();
+        self.rounded_path(x + 2.0, y0, tw - 4.0, viewport_h, 6.0);
+        ctx.clip();
+        let layout = self.transcript_layout.take().unwrap();
+        for line in &layout.lines {
+            let ly = y0 + line.y - offset;
+            if ly < y0 - TRANSCRIPT_LINE_H {
+                continue;
+            }
+            if ly > y1 + TRANSCRIPT_LINE_H {
+                break;
+            }
+            let color = transcript_kind_color(&line.kind);
+            if line.first && !diff {
+                self.text(&truncate(&line.kind, 9), x + 16.0, ly, 8.0, color, "bold");
+                if !line.ts.is_empty() {
+                    self.text(&truncate(&line.ts, 8), x + 16.0, ly + 9.0, 6.5, C_OVERLAY1_CSS, "normal");
+                }
+            }
+            self.text(
+                &line.text,
+                x + gutter,
+                ly,
+                9.5,
+                if diff { color } else if line.kind == "user" { C_TEXT_CSS } else { color },
+                if line.first && line.kind == "user" { "bold" } else { "normal" },
+            );
+        }
+        self.transcript_layout = Some(layout);
+        ctx.restore();
+        self.hud.invalidate_styles();
+
+        if content_h > viewport_h {
+            self.draw_scrollbar(x + tw - 14.0, y0, viewport_h, content_h, offset);
+        }
     }
 
     /// One labeled row inside a focus panel: colored label column, value
@@ -1311,6 +2479,16 @@ impl StationInner {
             C_SUBTEXT0_CSS,
             "normal",
         );
+        // Direct line to the worker: open the composer targeted at the
+        // current prompt target (the dashboard resolves the routing).
+        self.pill_at(x + panel_w - 132.0, y + 13.0, 54.0, 23.0, "steer", C_BLUE_CSS, false);
+        self.hit_zones.push(HitZone::new(
+            x + panel_w - 132.0,
+            y + 13.0,
+            54.0,
+            23.0,
+            HitAction::Composer { op: "open-send" },
+        ));
 
         let mut row_y = y + 70.0;
         row_y = self.focus_row(
@@ -1803,18 +2981,20 @@ impl StationInner {
 
     pub(crate) fn station_primary_actions(&self) -> Vec<LaneAction> {
         let controls = &self.snapshot.controls;
+        // send/new session open the in-canvas composer (send + launch
+        // modes) — they used to focus inputs on hidden dashboard tabs.
         let mut actions = vec![
-            LaneAction::activity(
+            LaneAction::composer(
                 if controls.prompt_mode == "steer" {
                     "steer"
                 } else {
                     "send"
                 },
-                "send",
+                "open-send",
                 72.0,
                 C_BLUE_CSS,
             ),
-            LaneAction::activity("new session", "new-session", 112.0, C_TEAL_CSS),
+            LaneAction::composer("new session", "open-launch", 112.0, C_TEAL_CSS),
         ];
         if controls.session_can_focus {
             actions.push(LaneAction::activity("focus", "target", 72.0, C_PEACH_CSS));
@@ -2307,6 +3487,242 @@ pub(crate) fn compact_grid(density: f32, panel_h: f32) -> (usize, f32, f32) {
     (preferred.min(rows * 2), pitch, pitch - 10.0)
 }
 
+/// Uniform row height in the scrollable focus panels.
+pub(crate) const PANEL_ROW_H: f32 = 30.0;
+/// Line pitch in the transcript viewer.
+pub(crate) const TRANSCRIPT_LINE_H: f32 = 13.0;
+
+/// One header pill in a rows panel (panel-wide operation).
+pub(crate) struct HeaderPill {
+    pub(crate) label: String,
+    pub(crate) color: &'static str,
+    pub(crate) active: bool,
+    pub(crate) action: HitAction,
+}
+
+impl HeaderPill {
+    pub(crate) fn new(label: &str, color: &'static str, action: HitAction) -> Self {
+        Self {
+            label: label.to_string(),
+            color,
+            active: false,
+            action,
+        }
+    }
+
+    pub(crate) fn new_owned(label: String, color: &'static str, action: HitAction) -> Self {
+        Self {
+            label,
+            color,
+            active: false,
+            action,
+        }
+    }
+}
+
+/// One pill attached to a panel row.
+pub(crate) struct RowPill {
+    pub(crate) label: String,
+    pub(crate) color: &'static str,
+    pub(crate) action: HitAction,
+}
+
+/// One row in a scrollable focus panel.
+pub(crate) struct PanelRow {
+    pub(crate) label: String,
+    pub(crate) value: String,
+    pub(crate) color: &'static str,
+    pub(crate) click: Option<HitAction>,
+    pub(crate) pills: Vec<RowPill>,
+    /// When non-empty the row renders choice pills instead of value text
+    /// (autonomy / backend / toggle rows).
+    pub(crate) choices: Vec<(String, bool, HitAction)>,
+}
+
+impl PanelRow {
+    pub(crate) fn new(label: String, value: String, color: &'static str) -> Self {
+        Self {
+            label,
+            value,
+            color,
+            click: None,
+            pills: Vec::new(),
+            choices: Vec::new(),
+        }
+    }
+
+    pub(crate) fn choices(
+        label: &str,
+        color: &'static str,
+        choices: Vec<(String, bool, HitAction)>,
+    ) -> Self {
+        Self {
+            label: label.to_string(),
+            value: String::new(),
+            color,
+            click: None,
+            pills: Vec::new(),
+            choices,
+        }
+    }
+
+    pub(crate) fn click(mut self, action: HitAction) -> Self {
+        self.click = Some(action);
+        self
+    }
+
+    pub(crate) fn pill(mut self, label: &str, color: &'static str, action: HitAction) -> Self {
+        self.pills.push(RowPill {
+            label: label.to_string(),
+            color,
+            action,
+        });
+        self
+    }
+}
+
+/// Everything a rows panel shows: header pills + rows + empty-state hint.
+#[derive(Default)]
+pub(crate) struct PanelSurface {
+    pub(crate) header: Vec<HeaderPill>,
+    pub(crate) rows: Vec<PanelRow>,
+    pub(crate) empty: &'static str,
+}
+
+/// Cached wrapped-line layout for the transcript viewer.
+pub(crate) struct TranscriptLayout {
+    pub(crate) sig: u64,
+    pub(crate) lines: Vec<TranscriptLine>,
+    pub(crate) content_h: f32,
+}
+
+pub(crate) struct TranscriptLine {
+    pub(crate) y: f32,
+    pub(crate) kind: String,
+    pub(crate) ts: String,
+    pub(crate) text: String,
+    pub(crate) first: bool,
+}
+
+/// Cheap content signature for the transcript layout cache: row count,
+/// total text length, wrap width, and the tail row's length (catches
+/// in-place tail growth).
+pub(crate) fn transcript_signature(
+    transcript: &crate::model::StationTranscript,
+    wrap_chars: u32,
+) -> u64 {
+    let mut sig = transcript.rows.len() as u64;
+    sig = sig
+        .wrapping_mul(31)
+        .wrapping_add(transcript.session_id.len() as u64);
+    sig = sig.wrapping_mul(31).wrapping_add(wrap_chars as u64);
+    let total: u64 = transcript.rows.iter().map(|r| r.text.len() as u64).sum();
+    sig = sig.wrapping_mul(31).wrapping_add(total);
+    if let Some(last) = transcript.rows.last() {
+        sig = sig.wrapping_mul(31).wrapping_add(last.text.len() as u64);
+    }
+    sig
+}
+
+/// Word-wrap every transcript row into draw lines with precomputed y
+/// offsets. Rows are separated by a small gap; the first line of a row
+/// carries its kind/ts gutter.
+pub(crate) fn layout_transcript(
+    transcript: &crate::model::StationTranscript,
+    wrap_chars: usize,
+) -> TranscriptLayout {
+    let mut lines = Vec::new();
+    let mut y = TRANSCRIPT_LINE_H;
+    for row in &transcript.rows {
+        let mut first = true;
+        for raw_line in row.text.lines().filter(|l| !l.trim().is_empty()) {
+            for piece in wrap_line(raw_line.trim_end(), wrap_chars) {
+                lines.push(TranscriptLine {
+                    y,
+                    kind: row.kind.clone(),
+                    ts: row.ts.clone(),
+                    text: piece,
+                    first,
+                });
+                first = false;
+                y += TRANSCRIPT_LINE_H;
+            }
+        }
+        if first {
+            // Whitespace-only payload: keep the row visible as its kind.
+            lines.push(TranscriptLine {
+                y,
+                kind: row.kind.clone(),
+                ts: row.ts.clone(),
+                text: String::new(),
+                first: true,
+            });
+            y += TRANSCRIPT_LINE_H;
+        }
+        y += 5.0;
+    }
+    TranscriptLayout {
+        sig: 0,
+        lines,
+        content_h: y,
+    }
+}
+
+/// Greedy word wrap with hard breaks for words longer than the width.
+pub(crate) fn wrap_line(line: &str, max_chars: usize) -> Vec<String> {
+    let max = max_chars.max(8);
+    let mut out = Vec::new();
+    let mut current = String::new();
+    for word in line.split_whitespace() {
+        let word_len = word.chars().count();
+        let cur_len = current.chars().count();
+        if cur_len == 0 && word_len <= max {
+            current.push_str(word);
+        } else if cur_len + 1 + word_len <= max {
+            current.push(' ');
+            current.push_str(word);
+        } else {
+            if !current.is_empty() {
+                out.push(std::mem::take(&mut current));
+            }
+            if word_len <= max {
+                current.push_str(word);
+            } else {
+                // Hard-break an overlong token (path, hash, minified blob).
+                let mut chunk = String::with_capacity(max);
+                for ch in word.chars() {
+                    chunk.push(ch);
+                    if chunk.chars().count() == max {
+                        out.push(std::mem::take(&mut chunk));
+                    }
+                }
+                current = chunk;
+            }
+        }
+    }
+    if !current.is_empty() {
+        out.push(current);
+    }
+    if out.is_empty() {
+        out.push(String::new());
+    }
+    out
+}
+
+/// Color for a transcript row kind.
+pub(crate) fn transcript_kind_color(kind: &str) -> &'static str {
+    match kind {
+        "user" => C_GREEN_CSS,
+        "model" | "assistant" => C_BLUE_CSS,
+        "agent" | "run" => C_TEAL_CSS,
+        "tool" | "command" | "detail" => C_LAVENDER_CSS,
+        "error" | "diff-del" => C_RED_CSS,
+        "warn" | "diff-meta" => C_YELLOW_CSS,
+        "diff-add" => C_GREEN_CSS,
+        _ => C_SUBTEXT0_CSS,
+    }
+}
+
 pub(crate) struct LaneAction {
     pub(crate) label: &'static str,
     pub(crate) width: f32,
@@ -2372,6 +3788,20 @@ impl LaneAction {
             },
         }
     }
+
+    pub(crate) fn composer(
+        label: &'static str,
+        op: &'static str,
+        width: f32,
+        color: &'static str,
+    ) -> Self {
+        Self {
+            label,
+            width,
+            color,
+            hit: HitAction::Composer { op },
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2401,6 +3831,72 @@ mod tests {
                 last_row <= height + 3.0,
                 "density {density}: row {last_row} vs lane {height}"
             );
+        }
+    }
+
+    #[test]
+    fn wrap_line_wraps_words_and_hard_breaks_long_tokens() {
+        assert_eq!(wrap_line("short line", 20), vec!["short line"]);
+        let wrapped = wrap_line("alpha beta gamma delta epsilon", 11);
+        assert!(wrapped.iter().all(|l| l.chars().count() <= 11), "{wrapped:?}");
+        assert_eq!(wrapped.join(" "), "alpha beta gamma delta epsilon");
+        // Overlong tokens hard-break instead of overflowing the panel.
+        let token = "a".repeat(30);
+        let broken = wrap_line(&token, 10);
+        assert_eq!(broken.len(), 3);
+        assert!(broken.iter().all(|l| l.chars().count() <= 10));
+        // Empty input still yields one (empty) line.
+        assert_eq!(wrap_line("", 10), vec![""]);
+    }
+
+    #[test]
+    fn transcript_layout_assigns_monotonic_offsets_and_marks_first_lines() {
+        let transcript = crate::model::StationTranscript {
+            session_id: "s1".into(),
+            rows: vec![
+                crate::model::StationTranscriptRow {
+                    kind: "user".into(),
+                    ts: "12:00".into(),
+                    text: "do the thing".into(),
+                },
+                crate::model::StationTranscriptRow {
+                    kind: "model".into(),
+                    ts: "12:01".into(),
+                    text: "first paragraph that is long enough to wrap across lines\nsecond line".into(),
+                },
+            ],
+            ..Default::default()
+        };
+        let layout = layout_transcript(&transcript, 24);
+        assert!(layout.lines.len() >= 4);
+        assert!(layout.lines[0].first);
+        assert_eq!(layout.lines[0].kind, "user");
+        // Exactly one `first` line per row.
+        assert_eq!(layout.lines.iter().filter(|l| l.first).count(), 2);
+        // Offsets strictly increase and content height covers them all.
+        for pair in layout.lines.windows(2) {
+            assert!(pair[1].y > pair[0].y);
+        }
+        assert!(layout.content_h >= layout.lines.last().unwrap().y);
+        // Signature changes when content grows.
+        let sig_a = transcript_signature(&transcript, 24);
+        let mut grown = transcript.clone();
+        grown.rows.push(crate::model::StationTranscriptRow {
+            kind: "agent".into(),
+            ts: String::new(),
+            text: "tail".into(),
+        });
+        assert_ne!(sig_a, transcript_signature(&grown, 24));
+        assert_ne!(sig_a, transcript_signature(&transcript, 30));
+    }
+
+    #[test]
+    fn transcript_kind_colors_cover_the_vocabulary() {
+        for kind in [
+            "user", "model", "assistant", "agent", "tool", "error", "warn", "diff-add",
+            "diff-del", "diff-meta", "info", "",
+        ] {
+            assert!(!transcript_kind_color(kind).is_empty());
         }
     }
 

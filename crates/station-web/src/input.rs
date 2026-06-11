@@ -36,6 +36,22 @@ impl StationInner {
                     s.begin_pinch();
                     s.pointer_down = None;
                     s.set_cursor("drag");
+                } else if let Some(scroll) = s.scrollbar_drag_at(x, y) {
+                    // A press on a panel scrollbar starts a thumb drag;
+                    // pressing the track outside the thumb jumps there
+                    // first, then keeps dragging.
+                    s.apply_scroll_drag(&scroll, y);
+                    s.set_cursor("pointer");
+                    s.pointer_down = Some(PointerDrag {
+                        x,
+                        y,
+                        last_x: x,
+                        last_y: y,
+                        moved: false,
+                        pending_action: None,
+                        slider: None,
+                        scrollbar: Some(scroll),
+                    });
                 } else {
                     // A press on a slider track starts a scrub: jump the
                     // value to the press point and keep tracking the
@@ -52,6 +68,7 @@ impl StationInner {
                             moved: false,
                             pending_action: None,
                             slider: Some(slider),
+                            scrollbar: None,
                         });
                     } else {
                         let pending_action = s.hit_action_at(x, y);
@@ -68,6 +85,7 @@ impl StationInner {
                             moved: false,
                             pending_action,
                             slider: None,
+                            scrollbar: None,
                         });
                     }
                 }
@@ -107,10 +125,18 @@ impl StationInner {
                     s.ar_y = ((y / ch) * 2.0 - 1.0).clamp(-1.0, 1.0) * 0.6;
                 }
                 let active_slider = s.pointer_down.as_ref().and_then(|drag| drag.slider);
+                let active_scrollbar = s
+                    .pointer_down
+                    .as_ref()
+                    .and_then(|drag| drag.scrollbar.clone());
                 if s.active_pointers.len() >= 2 {
                     s.apply_pinch();
                     s.mark_input();
                     s.set_cursor("drag");
+                } else if let Some(scroll) = active_scrollbar {
+                    s.apply_scroll_drag(&scroll, y);
+                    s.mark_input();
+                    s.set_cursor("pointer");
                 } else if let Some(slider) = active_slider {
                     s.apply_slider(slider, x);
                     s.mark_input();
@@ -160,7 +186,10 @@ impl StationInner {
                     s.pinch_zoom = None;
                 }
                 if let Some(drag) = s.pointer_down.take() {
-                    if let Some(slider) = drag.slider {
+                    if let Some(scroll) = drag.scrollbar {
+                        s.apply_scroll_drag(&scroll, y);
+                        None
+                    } else if let Some(slider) = drag.slider {
                         // Final scrub position, then hand the value to the
                         // dashboard for persistence + set_visuals re-apply.
                         s.apply_slider(slider, x);
@@ -224,7 +253,12 @@ impl StationInner {
             {
                 let mut s = wheel_inner.borrow_mut();
                 s.mark_input();
-                s.distance = (s.distance + e.delta_y() as f32 * 0.014).clamp(4.2, 25.0);
+                // Wheel over a scrollable panel scrolls that panel; only
+                // open scene space zooms the camera.
+                let (x, y) = s.event_xy(e.client_x() as f64, e.client_y() as f64);
+                if !s.scroll_panel_by(x, y, e.delta_y() as f32) {
+                    s.distance = (s.distance + e.delta_y() as f32 * 0.014).clamp(4.2, 25.0);
+                }
             }
             StationInner::schedule_frame(&wheel_inner);
         }) as Box<dyn FnMut(_)>);
@@ -253,12 +287,13 @@ impl StationInner {
             {
                 return;
             }
-            let used = {
+            let (used, outbound) = {
                 let mut s = key_inner.borrow_mut();
                 if !s.active {
                     return;
                 }
                 let mut used = true;
+                let mut outbound: Option<serde_json::Value> = None;
                 match e.key().as_str() {
                     "ArrowLeft" | "a" | "A" => s.yaw += 0.08,
                     "ArrowRight" | "d" | "D" => s.yaw -= 0.08,
@@ -266,11 +301,21 @@ impl StationInner {
                     "ArrowDown" | "s" | "S" => s.pitch = (s.pitch + 0.06).clamp(-1.05, 1.05),
                     "+" | "=" => s.distance = (s.distance - 0.6).clamp(4.2, 25.0),
                     "-" | "_" => s.distance = (s.distance + 0.6).clamp(4.2, 25.0),
-                    // Only consume Escape when it actually closes a
-                    // selection; otherwise leave it to the dashboard
-                    // (modal dismissal, etc.).
+                    // Slack-style composer summon: `/` opens the composer
+                    // and hands keyboard focus to its input overlay.
+                    "/" => outbound = Some(s.open_composer("send")),
+                    "PageDown" => used = s.scroll_focused_panel(0.85),
+                    "PageUp" => used = s.scroll_focused_panel(-0.85),
+                    // Escape unwinds Station surfaces innermost-first:
+                    // composer, then transcript viewer, then selection.
+                    // Only consumed when it actually closed something;
+                    // otherwise left to the dashboard (modal dismissal).
                     "Escape" => {
-                        if s.selected_id.is_some() {
+                        if s.composer_open {
+                            outbound = Some(s.close_composer());
+                        } else if s.transcript.is_some() {
+                            s.close_transcript();
+                        } else if s.selected_id.is_some() {
                             s.selected_id = None;
                             s.hud_dirty = true;
                         } else {
@@ -285,10 +330,13 @@ impl StationInner {
                     e.prevent_default();
                     s.mark_input();
                 }
-                used
+                (used, outbound.map(|action| (action, s.action_callback.clone())))
             };
             if used {
                 StationInner::schedule_frame(&key_inner);
+            }
+            if let Some((action, callback)) = outbound {
+                StationInner::emit_action(callback, action);
             }
         }) as Box<dyn FnMut(_)>);
         window.add_event_listener_with_callback("keydown", key.as_ref().unchecked_ref())?;
@@ -370,12 +418,42 @@ impl StationInner {
                 self.hud_dirty = true;
                 None
             }
+            HitAction::CloseTranscript => {
+                self.close_transcript();
+                None
+            }
             HitAction::Select(id) => {
                 self.selected_id = Some(id);
                 self.hud_dirty = true;
                 None
             }
             HitAction::Noop => None,
+            HitAction::Composer { op } => Some(self.composer_op(op)),
+            HitAction::SessionAction { action, id } => Some(serde_json::json!({
+                    "type": "session_action",
+                    "action": action,
+                    "session_id": id,
+            })),
+            HitAction::ManagedAction { action, id } => Some(serde_json::json!({
+                    "type": "managed_action",
+                    "action": action,
+                    "id": id,
+            })),
+            HitAction::ChangesAction { action, path } => Some(serde_json::json!({
+                    "type": "changes_action",
+                    "action": action,
+                    "path": path,
+            })),
+            HitAction::ContextAction { action, id } => Some(serde_json::json!({
+                    "type": "context_action",
+                    "action": action,
+                    "id": id,
+            })),
+            HitAction::RunwayAction { action, lane_id } => Some(serde_json::json!({
+                    "type": "display_runway_action",
+                    "action": action,
+                    "lane_id": lane_id,
+            })),
             HitAction::ActivityAction { action, id } => Some(serde_json::json!({
                     "type": "activity_action",
                     "action": action,
@@ -527,6 +605,161 @@ impl StationInner {
             .find(|z| x >= z.x && x <= z.x + z.w && y >= z.y && y <= z.y + z.h)
     }
 
+    /// Composer-related local state transitions, shared by pills and keys.
+    /// Every transition is also emitted to the dashboard (`{type:
+    /// 'composer', op, mode}`) so it can place/focus/hide the DOM input
+    /// overlay that does the actual text editing.
+    pub(crate) fn open_composer(&mut self, mode: &str) -> serde_json::Value {
+        self.composer_open = true;
+        self.composer_mode = if mode == "launch" { "launch" } else { "send" }.to_string();
+        self.hud_dirty = true;
+        serde_json::json!({ "type": "composer", "op": "focus", "mode": self.composer_mode })
+    }
+
+    pub(crate) fn close_composer(&mut self) -> serde_json::Value {
+        self.composer_open = false;
+        self.hud_dirty = true;
+        serde_json::json!({ "type": "composer", "op": "closed", "mode": self.composer_mode })
+    }
+
+    pub(crate) fn close_transcript(&mut self) {
+        if self.transcript.take().is_some() {
+            self.transcript_layout = None;
+            self.panel_scroll.remove("transcript");
+            self.transcript_follow = true;
+            self.hud_dirty = true;
+        }
+    }
+
+    fn composer_op(&mut self, op: &'static str) -> serde_json::Value {
+        match op {
+            "open-send" => self.open_composer("send"),
+            "open-launch" => self.open_composer("launch"),
+            "close" => self.close_composer(),
+            // send / launch / target-pick: the dashboard owns the input
+            // text and the submit path; pass the op through with the mode.
+            other => serde_json::json!({
+                "type": "composer",
+                "op": other,
+                "mode": self.composer_mode,
+            }),
+        }
+    }
+
+    /// Scroll the panel under the pointer by a wheel delta. Returns false
+    /// when no scrollable region sits there (the camera should zoom).
+    pub(crate) fn scroll_panel_by(&mut self, x: f32, y: f32, delta: f32) -> bool {
+        let Some(zone) = self
+            .scroll_zones
+            .iter()
+            .rev()
+            .find(|z| x >= z.x && x <= z.x + z.w && y >= z.y && y <= z.y + z.h)
+        else {
+            return false;
+        };
+        let panel = zone.panel.clone();
+        let max = (zone.content_h - zone.h).max(0.0);
+        if max <= 0.0 {
+            // Nothing to scroll, but the pointer is over panel content —
+            // swallowing the wheel keeps the camera from zooming "through"
+            // a panel the user is reading.
+            return true;
+        }
+        let cur = self.panel_scroll.get(&panel).copied().unwrap_or(0.0);
+        let next = (cur + delta).clamp(0.0, max);
+        if (next - cur).abs() > 0.01 {
+            // Scrolling the transcript away from the bottom pauses
+            // follow-latest; scrolling back to the bottom resumes it.
+            if panel == "transcript" {
+                self.transcript_follow = next >= max - 4.0;
+            }
+            self.panel_scroll.insert(panel, next);
+            self.hud_dirty = true;
+        }
+        true
+    }
+
+    /// Keyboard paging for the most relevant open panel: the transcript
+    /// viewer when open, else the selected system panel. `pages` is in
+    /// viewport fractions (negative = up). Returns whether a scrollable
+    /// surface existed.
+    pub(crate) fn scroll_focused_panel(&mut self, pages: f32) -> bool {
+        let key = if self.transcript.is_some() {
+            Some("transcript".to_string())
+        } else {
+            self.selected_id.clone()
+        };
+        let Some(key) = key else {
+            return false;
+        };
+        let Some(zone) = self.scroll_zones.iter().find(|z| z.panel == key) else {
+            return false;
+        };
+        let max = (zone.content_h - zone.h).max(0.0);
+        if max <= 0.0 {
+            return false;
+        }
+        let cur = self.panel_scroll.get(&key).copied().unwrap_or(0.0);
+        let next = (cur + zone.h * pages).clamp(0.0, max);
+        if (next - cur).abs() > 0.01 {
+            self.panel_scroll.insert(key, next);
+            self.hud_dirty = true;
+        }
+        true
+    }
+
+    /// Current clamped scroll offset for a panel key.
+    pub(crate) fn scroll_offset(&self, panel: &str, content_h: f32, viewport_h: f32) -> f32 {
+        let max = (content_h - viewport_h).max(0.0);
+        self.panel_scroll
+            .get(panel)
+            .copied()
+            .unwrap_or(0.0)
+            .clamp(0.0, max)
+    }
+
+    /// Scrollbar drag descriptor when the press sits on a panel's
+    /// scrollbar gutter (the right edge strip of a scrollable zone).
+    pub(crate) fn scrollbar_drag_at(&self, x: f32, y: f32) -> Option<ScrollDrag> {
+        let zone = self
+            .scroll_zones
+            .iter()
+            .rev()
+            .find(|z| y >= z.y && y <= z.y + z.h && x >= z.x + z.w - SCROLLBAR_GUTTER && x <= z.x + z.w + 2.0)?;
+        let max = (zone.content_h - zone.h).max(0.0);
+        if max <= 0.0 {
+            return None;
+        }
+        Some(ScrollDrag {
+            panel: zone.panel.clone(),
+            track_y: zone.y,
+            track_h: zone.h,
+            content_h: zone.content_h,
+            viewport_h: zone.h,
+        })
+    }
+
+    /// Move a dragged scrollbar thumb so it tracks pointer y (the thumb
+    /// center follows the pointer — a press on the track jumps there).
+    pub(crate) fn apply_scroll_drag(&mut self, drag: &ScrollDrag, y: f32) {
+        let max = (drag.content_h - drag.viewport_h).max(0.0);
+        if max <= 0.0 {
+            return;
+        }
+        let (thumb_h, _) = scrollbar_thumb(drag.track_h, drag.content_h, drag.viewport_h, 0.0);
+        let travel = (drag.track_h - thumb_h).max(1.0);
+        let t = ((y - drag.track_y - thumb_h * 0.5) / travel).clamp(0.0, 1.0);
+        let next = max * t;
+        let cur = self.panel_scroll.get(&drag.panel).copied().unwrap_or(0.0);
+        if (next - cur).abs() > 0.01 {
+            if drag.panel == "transcript" {
+                self.transcript_follow = next >= max - 4.0;
+            }
+            self.panel_scroll.insert(drag.panel.clone(), next);
+            self.hud_dirty = true;
+        }
+    }
+
     /// Slider scrub descriptor when the point sits on a slider track zone.
     pub(crate) fn slider_at(&self, x: f32, y: f32) -> Option<ActiveSlider> {
         let zone = self.zone_at(x, y)?;
@@ -567,8 +800,28 @@ pub(crate) enum HitAction {
     Noop,
     Select(String),
     ClosePanel,
+    /// Close the transcript/diff viewer (it floats independently of the
+    /// focus-panel selection).
+    CloseTranscript,
     ActivityAction { action: String, id: String },
     ControlsAction { action: String },
+    /// Session row / pill ops, emitted as the dashboard's existing
+    /// `{type:'session_action', action, session_id}` shape
+    /// (stationHandleSessionAction: focus/resume/stop/copy/fork/...).
+    SessionAction { action: String, id: String },
+    /// Managed-context record ops (`{type:'managed_action', action, id}`).
+    ManagedAction { action: String, id: String },
+    /// Changed-file ops (`{type:'changes_action', action, path}`).
+    ChangesAction { action: String, path: String },
+    /// Context part/replay ops (`{type:'context_action', action, id}`).
+    ContextAction { action: String, id: String },
+    /// Display-runway lane ops (`{type:'display_runway_action', action,
+    /// lane_id}`), routed by the dashboard per lane type.
+    RunwayAction { action: String, lane_id: String },
+    /// Composer surface ops. open-send/open-launch/close mutate local
+    /// state and notify the dashboard (which owns the DOM input overlay);
+    /// send/launch/target pass through for the dashboard to submit.
+    Composer { op: &'static str },
     /// Approve/deny pill in the agent focus panel. Emits the dashboard's
     /// existing `{type:'approval', host_id, approval_id, decision}` action
     /// (handleStationAction routes local approvals to `app.send_approval`
@@ -654,16 +907,26 @@ pub(crate) struct ActiveSlider {
 /// the `layout:<name>` convention the dashboard's accessibility overlay
 /// already speaks.
 pub(crate) fn zone_name(action: &HitAction) -> Option<String> {
+    fn scoped(scope: &str, action: &str, id: &str) -> String {
+        if id.is_empty() {
+            format!("{scope}:{action}")
+        } else {
+            format!("{scope}:{action}:{id}")
+        }
+    }
     match action {
         HitAction::Layout(layout) => Some(format!("layout:{}", layout.label())),
         HitAction::Select(id) => Some(id.clone()),
         HitAction::ClosePanel => Some("close-panel".to_string()),
-        HitAction::ActivityAction { action, id } => Some(if id.is_empty() {
-            format!("activity:{action}")
-        } else {
-            format!("activity:{action}:{id}")
-        }),
+        HitAction::CloseTranscript => Some("close-transcript".to_string()),
+        HitAction::ActivityAction { action, id } => Some(scoped("activity", action, id)),
         HitAction::ControlsAction { action } => Some(format!("controls:{action}")),
+        HitAction::SessionAction { action, id } => Some(scoped("session", action, id)),
+        HitAction::ManagedAction { action, id } => Some(scoped("managed", action, id)),
+        HitAction::ChangesAction { action, path } => Some(scoped("changes", action, path)),
+        HitAction::ContextAction { action, id } => Some(scoped("ctx", action, id)),
+        HitAction::RunwayAction { action, lane_id } => Some(scoped("runway", action, lane_id)),
+        HitAction::Composer { op } => Some(format!("composer:{op}")),
         HitAction::Approval {
             host_id,
             approval_id,
@@ -688,8 +951,15 @@ pub(crate) fn zone_kind(action: &HitAction) -> &'static str {
         HitAction::Layout(_) => "layout",
         HitAction::Select(_) => "select",
         HitAction::ClosePanel => "close-panel",
+        HitAction::CloseTranscript => "close-transcript",
         HitAction::ActivityAction { .. } => "activity",
         HitAction::ControlsAction { .. } => "controls",
+        HitAction::SessionAction { .. } => "session",
+        HitAction::ManagedAction { .. } => "managed",
+        HitAction::ChangesAction { .. } => "changes",
+        HitAction::ContextAction { .. } => "ctx",
+        HitAction::RunwayAction { .. } => "runway",
+        HitAction::Composer { .. } => "composer",
         HitAction::Approval { .. } => "approval",
         HitAction::ViewSet { .. } => "view-set",
         HitAction::ViewSlider { .. } => "slider",
@@ -758,6 +1028,49 @@ pub(crate) struct PointerDrag {
     /// Set when the press landed on a slider track: the drag scrubs the
     /// slider instead of orbiting the camera or arming a click.
     pub(crate) slider: Option<ActiveSlider>,
+    /// Set when the press landed on a panel scrollbar: the drag moves
+    /// that panel's scroll thumb.
+    pub(crate) scrollbar: Option<ScrollDrag>,
+}
+
+/// Width of the grabbable scrollbar gutter on a scrollable panel's right
+/// edge (the drawn track is thinner; the hit area is forgiving).
+pub(crate) const SCROLLBAR_GUTTER: f32 = 16.0;
+
+/// One scrollable viewport registered during the HUD paint (cleared and
+/// refilled like `hit_zones`). `panel` keys the persistent scroll offset.
+pub(crate) struct ScrollZone {
+    pub(crate) x: f32,
+    pub(crate) y: f32,
+    pub(crate) w: f32,
+    pub(crate) h: f32,
+    pub(crate) panel: String,
+    pub(crate) content_h: f32,
+}
+
+/// In-flight scrollbar drag: the track geometry captured at pointer-down.
+#[derive(Clone)]
+pub(crate) struct ScrollDrag {
+    pub(crate) panel: String,
+    pub(crate) track_y: f32,
+    pub(crate) track_h: f32,
+    pub(crate) content_h: f32,
+    pub(crate) viewport_h: f32,
+}
+
+/// Thumb geometry for a scrollbar: `(thumb_h, thumb_y_offset)` within a
+/// track of `track_h` showing `viewport_h` of `content_h` at `offset`.
+pub(crate) fn scrollbar_thumb(
+    track_h: f32,
+    content_h: f32,
+    viewport_h: f32,
+    offset: f32,
+) -> (f32, f32) {
+    let visible = (viewport_h / content_h.max(1.0)).clamp(0.05, 1.0);
+    let thumb_h = (track_h * visible).max(22.0).min(track_h);
+    let max = (content_h - viewport_h).max(0.0);
+    let t = if max > 0.0 { (offset / max).clamp(0.0, 1.0) } else { 0.0 };
+    (thumb_h, (track_h - thumb_h) * t)
 }
 
 #[derive(Clone, Copy)]
@@ -812,6 +1125,88 @@ mod tests {
         assert_eq!(zone_kind(&HitAction::Noop), "panel");
         assert_eq!(zone_kind(&HitAction::Layout(LayoutName::Orbital)), "layout");
         assert_eq!(zone_kind(&HitAction::Select(String::new())), "select");
+    }
+
+    #[test]
+    fn row_action_zone_names_scope_action_and_id() {
+        assert_eq!(
+            zone_name(&HitAction::SessionAction {
+                action: "station-log".into(),
+                id: "sid-1".into(),
+            })
+            .as_deref(),
+            Some("session:station-log:sid-1")
+        );
+        assert_eq!(
+            zone_name(&HitAction::ManagedAction {
+                action: "record-inspect".into(),
+                id: "rec-9".into(),
+            })
+            .as_deref(),
+            Some("managed:record-inspect:rec-9")
+        );
+        assert_eq!(
+            zone_name(&HitAction::ChangesAction {
+                action: "station-diff".into(),
+                path: "src/main.rs".into(),
+            })
+            .as_deref(),
+            Some("changes:station-diff:src/main.rs")
+        );
+        assert_eq!(
+            zone_name(&HitAction::RunwayAction {
+                action: "open".into(),
+                lane_id: "lane-2".into(),
+            })
+            .as_deref(),
+            Some("runway:open:lane-2")
+        );
+        assert_eq!(
+            zone_name(&HitAction::Composer { op: "open-send" }).as_deref(),
+            Some("composer:open-send")
+        );
+        assert_eq!(
+            zone_name(&HitAction::CloseTranscript).as_deref(),
+            Some("close-transcript")
+        );
+        assert_eq!(zone_kind(&HitAction::Composer { op: "send" }), "composer");
+        assert_eq!(
+            zone_kind(&HitAction::SessionAction {
+                action: "focus".into(),
+                id: String::new(),
+            }),
+            "session"
+        );
+        // Row/composer zones stay out of the system hotspot overlay.
+        let zones = vec![HitZone::new(
+            0.0,
+            0.0,
+            10.0,
+            10.0,
+            HitAction::SessionAction {
+                action: "focus".into(),
+                id: "s".into(),
+            },
+        )];
+        assert!(hotspot_rects_from_zones(&zones).is_empty());
+    }
+
+    #[test]
+    fn scrollbar_thumb_scales_with_content_and_clamps() {
+        // Content fits: thumb fills the track, no offset.
+        let (h, off) = scrollbar_thumb(200.0, 100.0, 200.0, 0.0);
+        assert_eq!((h, off), (200.0, 0.0));
+        // 4x content: quarter thumb, offset tracks position.
+        let (h, off) = scrollbar_thumb(200.0, 800.0, 200.0, 0.0);
+        assert_eq!(h, 50.0);
+        assert_eq!(off, 0.0);
+        let (_, off) = scrollbar_thumb(200.0, 800.0, 200.0, 600.0);
+        assert_eq!(off, 150.0);
+        let (_, off) = scrollbar_thumb(200.0, 800.0, 200.0, 9000.0);
+        assert_eq!(off, 150.0);
+        // Tiny viewport keeps a grabbable minimum thumb.
+        let (h, _) = scrollbar_thumb(100.0, 100_000.0, 100.0, 0.0);
+        assert!(h >= 22.0);
     }
 
     #[test]

@@ -119,6 +119,14 @@ Checks:
   --station-perf-eval         Scripted perf sequence: settle, idle smooth sample, activate three
                               targets (or each --station-activate NAME) timing each, smooth sample
                               again; emits one JSON report and fails on threshold violations
+  --station-workflows         In-canvas operability sweep: composer opens/accepts text/closes (no
+                              dispatch), the sessions/controls panels expose actionable row zones,
+                              the transcript viewer opens from a session row (when sessions exist),
+                              and a scrollable panel responds to a real wheel event
+  --station-send TEXT         MUTATING: type TEXT into the Station composer and submit it through
+                              the real dispatch path (steer / follow-up / create_session). Passes
+                              when the composer clears and the dispatch surfaces in Station state.
+                              Use against disposable sessions only
 
 Options:
   --host HOST                 Host used with --port (default: 127.0.0.1)
@@ -184,6 +192,8 @@ function parseArgs(argv, env = process.env) {
     requireDebugJson: false,
     stationActivateTargets: [],
     stationPerfEval: false,
+    stationWorkflows: false,
+    stationSendText: '',
     timeoutMs: DEFAULT_TIMEOUT_MS,
     cdpTimeoutMs: DEFAULT_CDP_TIMEOUT_MS,
     logLines: DEFAULT_LOG_LINES,
@@ -279,6 +289,12 @@ function parseArgs(argv, env = process.env) {
       opts.stationActivateTargets.push(normalizeStationActivateTarget(arg.slice('--station-activate='.length)));
     } else if (arg === '--station-perf-eval') {
       opts.stationPerfEval = true;
+    } else if (arg === '--station-workflows') {
+      opts.stationWorkflows = true;
+    } else if (arg === '--station-send') {
+      opts.stationSendText = readValue();
+    } else if (arg.startsWith('--station-send=')) {
+      opts.stationSendText = arg.slice('--station-send='.length);
     } else if (arg === '--station-probe') {
       opts.stationProbes.push(...parseStationProbeArgument(readValue()));
     } else if (arg.startsWith('--station-probe=')) {
@@ -634,6 +650,8 @@ async function main() {
       stationInteractions: validation.stationInteraction ? validation.stationInteraction.count : 0,
       stationActivation: validation.stationActivation,
       stationActivations: validation.stationActivation ? validation.stationActivation.count : 0,
+      stationWorkflows: validation.stationWorkflows,
+      stationSend: validation.stationSend,
       stationPerfEval: validation.stationPerfEval,
       stationState: validation.stationState,
       harnessRetries: Object.keys(harnessRetries).length ? harnessRetries : undefined,
@@ -669,6 +687,7 @@ async function main() {
       artifacts: failureArtifacts(opts, harness),
       logs: collectFailureLogs(opts.logLines, dashboard, harness),
       stationPerfEval: error && error.stationPerfEval,
+      stationWorkflows: error && error.stationWorkflows,
       diagnostics,
       diagnosticsAuto: Boolean(diagnostics && !opts.diagnostics),
       harnessFallbacks,
@@ -693,6 +712,8 @@ function staticScriptsOnly(opts) {
       && !opts.stationInteractionProbe
       && opts.stationActivateTargets.length === 0
       && !opts.stationPerfEval
+      && !opts.stationWorkflows
+      && !opts.stationSendText
       && !opts.requireStationState
       && !opts.requireAiProviderSession
       && !opts.requireExternalAgent
@@ -821,6 +842,14 @@ function printResult(opts, result) {
     if (displayResult.stationActivation) {
       console.log(formatStationActivationPass(displayResult.stationActivation));
     }
+    if (displayResult.stationWorkflows) {
+      console.log(formatStationWorkflowsLine(displayResult.stationWorkflows));
+    }
+    if (displayResult.stationSend) {
+      console.log(
+        `  station send status=${displayResult.stationSend.status} text=${quote(displayResult.stationSend.text || '')} statusText=${quote(displayResult.stationSend.statusText || '')}`,
+      );
+    }
     if (displayResult.stationPerfEval) {
       console.log(formatStationPerfEvalLine(displayResult.stationPerfEval));
     }
@@ -840,6 +869,9 @@ function printResult(opts, result) {
   );
   if (displayResult.stationPerfEval) {
     console.error(formatStationPerfEvalLine(displayResult.stationPerfEval));
+  }
+  if (displayResult.stationWorkflows) {
+    console.error(formatStationWorkflowsLine(displayResult.stationWorkflows));
   }
   for (const line of displayResult.logs || []) {
     console.error(`  ${line}`);
@@ -977,6 +1009,26 @@ function formatStationPerfEvalLine(report) {
     json = String(report);
   }
   return `  station perf-eval ${truncateMiddle(json, FORMATTED_STATION_STATUS_LINE_LIMIT)}`;
+}
+
+// One line per workflow step: `composer ok(12ms)` / `transcript rows=42` /
+// `scroll transcript 480→240` / `sessions-panel skipped(...)`.
+function formatStationWorkflowsLine(report) {
+  const steps = (report && Array.isArray(report.steps) ? report.steps : []).map((step) => {
+    if (step.skipped) {
+      return `${step.name} skipped(${step.skipped})`;
+    }
+    const bits = [];
+    if (step.rowZones !== undefined) bits.push(`rows=${step.rowZones}`);
+    if (step.autonomyPills !== undefined) bits.push(`autonomy=${step.autonomyPills}`);
+    if (step.backendPills !== undefined) bits.push(`backend=${step.backendPills}`);
+    if (step.rows !== undefined) bits.push(`rows=${step.rows}`);
+    if (step.panel !== undefined) bits.push(`${step.panel} ${step.from}→${step.to}`);
+    if (step.latencyMs !== undefined) bits.push(`${step.latencyMs}ms`);
+    return `${step.name} ${bits.join(' ') || 'ok'}`;
+  });
+  const status = report && report.status ? report.status : 'unknown';
+  return `  station workflows status=${status} ${truncateMiddle(steps.join(' | '), FORMATTED_STATION_STATUS_LINE_LIMIT)}`;
 }
 
 function collectFailureLogs(lineCount, dashboard, harness) {
@@ -1842,6 +1894,12 @@ class BrowserHarness {
       if (opts.stationActivateTargets.length > 0) {
         validation.stationActivation = await this.runStationActivateProbe(opts);
       }
+      if (opts.stationWorkflows) {
+        validation.stationWorkflows = await this.runStationWorkflowsProbe(opts);
+      }
+      if (opts.stationSendText) {
+        validation.stationSend = await this.runStationSendProbe(opts);
+      }
       if (opts.stationPerfEval) {
         validation.stationPerfEval = await this.runStationPerfEval(opts);
       }
@@ -2082,6 +2140,212 @@ class BrowserHarness {
     } catch (_) {
       return undefined;
     }
+  }
+
+  async stationWorkflowOp(op, args) {
+    return this.evaluate(`(${stationWorkflowOpSource()})(${JSON.stringify(op)}, ${JSON.stringify(args || {})})`);
+  }
+
+  // In-canvas operability sweep: proves the Station is usable purely from
+  // inside the canvas — composer round-trip (no dispatch), actionable
+  // session rows, settings pills, the transcript viewer, and real wheel
+  // scrolling. Read-mostly: it opens/closes surfaces but sends nothing.
+  async runStationWorkflowsProbe(opts) {
+    const steps = [];
+    const failures = [];
+    let sessionLogZone = '';
+
+    // 1. Composer round-trip: open → overlay visible → accepts text → close.
+    {
+      const started = Date.now();
+      const open = await this.stationWorkflowOp('composer-open', { mode: 'send' });
+      if (!open.ok) {
+        failures.push(`composer-open failed: ${open.reason || 'build without composer support'}`);
+      } else {
+        try {
+          await waitUntil(async () => {
+            const state = await this.stationWorkflowOp('composer-state');
+            return state && state.ok && state.open && state.inputVisible;
+          }, opts.timeoutMs, 'composer overlay did not appear');
+          const typed = await this.stationWorkflowOp('composer-type', { text: 'station workflows probe' });
+          if (!typed.ok || typed.value !== 'station workflows probe') {
+            failures.push('composer input did not accept text');
+          }
+          await this.stationWorkflowOp('composer-type', { text: '' });
+          const closed = await this.stationWorkflowOp('composer-close');
+          if (!closed.ok) {
+            failures.push('composer-close unsupported');
+          }
+          await waitUntil(async () => {
+            const state = await this.stationWorkflowOp('composer-state');
+            return state && state.ok && !state.open && !state.inputVisible;
+          }, opts.timeoutMs, 'composer overlay did not hide after close');
+        } catch (error) {
+          failures.push(error.message || String(error));
+        }
+      }
+      steps.push({ name: 'composer', via: open.via || '', latencyMs: Date.now() - started });
+    }
+
+    // 2. Sessions panel: actionable row zones (and remember a transcript row).
+    {
+      const started = Date.now();
+      let rowZones = 0;
+      await this.stationWorkflowOp('activate', { name: 'system:sessions' });
+      try {
+        await waitUntil(async () => {
+          const debug = await this.stationWorkflowOp('debug');
+          if (!debug.ok) return false;
+          const hit = Array.isArray(debug.data.hitZones) ? debug.data.hitZones : [];
+          rowZones = hit.filter((zone) => String(zone.name || '').startsWith('session:')).length;
+          const log = hit.find((zone) => String(zone.name || '').startsWith('session:station-log:'));
+          sessionLogZone = log ? String(log.name) : sessionLogZone;
+          return debug.data.selectedId === 'system:sessions';
+        }, opts.timeoutMs, 'sessions panel did not open');
+      } catch (error) {
+        failures.push(error.message || String(error));
+      }
+      steps.push({ name: 'sessions-panel', rowZones, latencyMs: Date.now() - started });
+    }
+
+    // 3. Controls panel: autonomy/backend choice pills present.
+    {
+      const started = Date.now();
+      let autonomyPills = 0;
+      let backendPills = 0;
+      await this.stationWorkflowOp('activate', { name: 'system:controls' });
+      try {
+        await waitUntil(async () => {
+          const debug = await this.stationWorkflowOp('debug');
+          if (!debug.ok) return false;
+          const hit = Array.isArray(debug.data.hitZones) ? debug.data.hitZones : [];
+          autonomyPills = hit.filter((zone) => String(zone.name || '').startsWith('controls:autonomy:')).length;
+          backendPills = hit.filter((zone) => String(zone.name || '').startsWith('controls:backend:')).length;
+          return autonomyPills >= 3 && backendPills >= 3;
+        }, opts.timeoutMs, 'controls panel did not expose autonomy/backend pills');
+      } catch (error) {
+        failures.push(error.message || String(error));
+      }
+      steps.push({ name: 'controls-panel', autonomyPills, backendPills, latencyMs: Date.now() - started });
+    }
+
+    // 4. Transcript viewer from a session row (skipped on empty dashboards).
+    if (!sessionLogZone) {
+      steps.push({ name: 'transcript', skipped: 'no session rows on this dashboard' });
+    } else {
+      const started = Date.now();
+      let transcript = null;
+      await this.stationWorkflowOp('activate', { name: sessionLogZone });
+      try {
+        await waitUntil(async () => {
+          const debug = await this.stationWorkflowOp('debug');
+          transcript = debug.ok ? debug.data.transcript : null;
+          return Boolean(transcript && (Number(transcript.rows) > 0 || Number(transcript.total) > 0));
+        }, opts.timeoutMs, 'transcript viewer did not open with rows');
+      } catch (error) {
+        failures.push(error.message || String(error));
+      }
+      steps.push({
+        name: 'transcript',
+        rows: transcript ? Number(transcript.rows) || 0 : 0,
+        latencyMs: Date.now() - started,
+      });
+    }
+
+    // 5. Real wheel event over a scrollable panel moves its offset.
+    {
+      const started = Date.now();
+      const debug = await this.stationWorkflowOp('debug');
+      const scrolls = debug.ok && Array.isArray(debug.data.scroll) ? debug.data.scroll : [];
+      const zone = scrolls.find((entry) => Number(entry.max) > 0);
+      if (!zone) {
+        steps.push({ name: 'scroll', skipped: 'no panel had scrollable content' });
+      } else {
+        const rect = await this.stationWorkflowOp('canvas-rect');
+        if (!rect.ok) {
+          failures.push('scroll probe could not resolve the hud canvas rect');
+        } else {
+          const x = rect.left + Number(zone.x) + Number(zone.w) / 2;
+          const y = rect.top + Number(zone.y) + Number(zone.h) / 2;
+          const before = Number(zone.offset) || 0;
+          const deltaY = before >= Number(zone.max) - 1 ? -240 : 240;
+          await this.cdp.send(
+            'Input.dispatchMouseEvent',
+            { type: 'mouseWheel', x, y, deltaX: 0, deltaY },
+            this.sessionId,
+          );
+          let after = before;
+          try {
+            await waitUntil(async () => {
+              const next = await this.stationWorkflowOp('debug');
+              const entry = next.ok && Array.isArray(next.data.scroll)
+                ? next.data.scroll.find((item) => item.panel === zone.panel)
+                : null;
+              if (entry) after = Number(entry.offset) || 0;
+              return Math.abs(after - before) > 1;
+            }, opts.timeoutMs, `wheel over ${zone.panel} did not change its scroll offset`);
+          } catch (error) {
+            failures.push(error.message || String(error));
+          }
+          steps.push({
+            name: 'scroll',
+            panel: zone.panel,
+            from: Math.round(before),
+            to: Math.round(after),
+            latencyMs: Date.now() - started,
+          });
+        }
+      }
+    }
+
+    // Leave the surface tidy (transcript closed, nothing selected).
+    await this.stationWorkflowOp('activate', { name: 'close-transcript' });
+
+    if (failures.length) {
+      const error = new Error(`station workflows probe did not pass (${failures.join('; ')})`);
+      error.stationWorkflows = { status: 'fail', steps, failures };
+      throw error;
+    }
+    return { status: 'pass', steps };
+  }
+
+  // MUTATING: drive the composer's real dispatch path with the given text.
+  // The composer only clears its input when submitComposedText dispatched
+  // (steer / follow-up / create_session), so a cleared input is the pass
+  // signal; the status chip text is captured as evidence.
+  async runStationSendProbe(opts) {
+    const text = String(opts.stationSendText || '').trim();
+    if (!text) {
+      throw new Error('--station-send requires non-empty text');
+    }
+    const open = await this.stationWorkflowOp('composer-open', { mode: 'send' });
+    if (!open.ok) {
+      throw new Error(`station send probe could not open the composer (${open.reason || 'unsupported build'})`);
+    }
+    await waitUntil(async () => {
+      const state = await this.stationWorkflowOp('composer-state');
+      return state && state.ok && state.open && state.inputVisible;
+    }, opts.timeoutMs, 'composer overlay did not appear for the send probe');
+    const typed = await this.stationWorkflowOp('composer-type', { text });
+    if (!typed.ok) {
+      throw new Error('station send probe could not type into the composer');
+    }
+    const submitted = await this.stationWorkflowOp('composer-submit');
+    if (!submitted.ok) {
+      throw new Error('station send probe could not submit the composer');
+    }
+    let statusText = '';
+    await waitUntil(async () => {
+      const state = await this.stationWorkflowOp('composer-state');
+      const status = await this.stationWorkflowOp('status-text');
+      statusText = status && status.ok ? status.text : statusText;
+      return state && state.ok && state.value === '';
+    }, opts.timeoutMs, 'composer did not clear after submit (dispatch may have failed)');
+    return {
+      status: 'pass',
+      text: truncateMiddle(text, 80),
+      statusText: truncateMiddle(statusText, 120),
+    };
   }
 
   async runStationPerfEval(opts) {
@@ -3907,6 +4171,81 @@ function stationHotspotPointSource() {
   }.toString();
 }
 
+// Page-side multiplexer for the workflows/send probes: every op funnels
+// through window.stationProbe (the same facade agents use), so the probe
+// exercises the real programmatic surface, not validator-private hooks.
+function stationWorkflowOpSource() {
+  return `(op, args) => {
+    const probe = window.stationProbe || {};
+    const input = document.getElementById('station-composer-input');
+    const inputVisible = () => Boolean(input) && getComputedStyle(input).display !== 'none';
+    const debug = () => {
+      try {
+        return JSON.parse(typeof probe.debugJson === 'function' ? probe.debugJson() || 'null' : 'null');
+      } catch (_) {
+        return null;
+      }
+    };
+    try {
+      if (op === 'composer-open') {
+        const mode = args && args.mode === 'launch' ? 'launch' : 'send';
+        const name = mode === 'launch' ? 'composer:open-launch' : 'composer:open-send';
+        let via = 'activate';
+        let ok = typeof probe.activate === 'function' && probe.activate(name) === true;
+        if (!ok && typeof probe.composerOpen === 'function') {
+          ok = probe.composerOpen(mode) === true;
+          via = 'facade';
+        }
+        return { ok, via, mode };
+      }
+      if (op === 'composer-state') {
+        const state = typeof probe.composer === 'function' ? probe.composer() : null;
+        return {
+          ok: state !== undefined,
+          open: Boolean(state && state.open),
+          mode: state && state.mode ? String(state.mode) : '',
+          rect: state && state.rect ? state.rect : null,
+          inputVisible: inputVisible(),
+          value: input ? String(input.value || '') : '',
+        };
+      }
+      if (op === 'composer-type') {
+        const ok = typeof probe.composerType === 'function' && probe.composerType(args && args.text || '') === true;
+        return { ok, value: input ? String(input.value || '') : '' };
+      }
+      if (op === 'composer-close') {
+        return { ok: typeof probe.composerClose === 'function' && probe.composerClose() === true };
+      }
+      if (op === 'composer-submit') {
+        const ok = typeof probe.composerSubmit === 'function' && probe.composerSubmit() === true;
+        return { ok, value: input ? String(input.value || '') : '' };
+      }
+      if (op === 'activate') {
+        return { ok: typeof probe.activate === 'function' && probe.activate(args && args.name || '') === true };
+      }
+      if (op === 'debug') {
+        const data = debug();
+        return data ? { ok: true, data } : { ok: false, reason: 'debug_json unavailable' };
+      }
+      if (op === 'status-text') {
+        const el = document.getElementById('station-status-text');
+        return { ok: true, text: el ? String(el.textContent || '') : '' };
+      }
+      if (op === 'canvas-rect') {
+        const canvas = document.getElementById('station-hud-canvas');
+        if (!canvas) {
+          return { ok: false, reason: 'no hud canvas' };
+        }
+        const rect = canvas.getBoundingClientRect();
+        return { ok: true, left: rect.left, top: rect.top, width: rect.width, height: rect.height };
+      }
+      return { ok: false, reason: 'unknown op ' + op };
+    } catch (error) {
+      return { ok: false, reason: error && error.message ? error.message : String(error) };
+    }
+  }`;
+}
+
 function stationHotspotActivateSource() {
   return function activateStationHotspot(target) {
     const stateFor = function collectStationInteractionStateInline(targetText, settleMs) {
@@ -5186,6 +5525,42 @@ async function runSelfTest() {
   assert.strictEqual(parsed.requireManagedContextState, true);
   assert.strictEqual(parsed.allowEmptyStationState, true);
   assert.deepStrictEqual(parsed.browserArgs, ['--ozone-platform=x11']);
+
+  // Workflows / send probe flags + report formatting.
+  const workflowParsed = parseArgs(
+    ['--port', '1234', '--station-workflows', '--station-send', 'probe task text'],
+    {},
+  );
+  assert.strictEqual(workflowParsed.stationWorkflows, true);
+  assert.strictEqual(workflowParsed.stationSendText, 'probe task text');
+  assert.strictEqual(
+    parseArgs(['--port', '1', '--station-send=eq form'], {}).stationSendText,
+    'eq form',
+  );
+  assert.strictEqual(parseArgs(['--port', '1'], {}).stationWorkflows, false);
+  const workflowsLine = formatStationWorkflowsLine({
+    status: 'pass',
+    steps: [
+      { name: 'composer', via: 'activate', latencyMs: 12 },
+      { name: 'sessions-panel', rowZones: 9, latencyMs: 40 },
+      { name: 'controls-panel', autonomyPills: 4, backendPills: 4, latencyMs: 18 },
+      { name: 'transcript', rows: 42, latencyMs: 230 },
+      { name: 'scroll', panel: 'transcript', from: 480, to: 240, latencyMs: 60 },
+    ],
+  });
+  assert.ok(workflowsLine.includes('status=pass'));
+  assert.ok(workflowsLine.includes('composer'));
+  assert.ok(workflowsLine.includes('rows=42'));
+  assert.ok(workflowsLine.includes('transcript 480→240'));
+  const skippedLine = formatStationWorkflowsLine({
+    status: 'pass',
+    steps: [{ name: 'transcript', skipped: 'no session rows on this dashboard' }],
+  });
+  assert.ok(skippedLine.includes('transcript skipped(no session rows on this dashboard)'));
+  // The page-side workflow op source must stay valid JS.
+  assert.strictEqual(typeof stationWorkflowOpSource(), 'string');
+  new Function(`return (${stationWorkflowOpSource()});`)();
+
   assert.ok(browserArgs('/tmp/profile', parseArgs([], {})).includes('--disable-gpu'));
   const gpuBrowserArgs = browserArgs('/tmp/profile', parsed);
   assert.ok(!gpuBrowserArgs.includes('--disable-gpu'));

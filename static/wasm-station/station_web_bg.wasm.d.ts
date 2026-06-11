@@ -3,6 +3,8 @@
 export const memory: WebAssembly.Memory;
 export const __wbg_stationweb_free: (a: number, b: number) => void;
 export const stationweb_activate: (a: number, b: number, c: number) => number;
+export const stationweb_close_transcript: (a: number) => void;
+export const stationweb_composer_state: (a: number) => [number, number];
 export const stationweb_debug_json: (a: number) => [number, number];
 export const stationweb_debug_state: (a: number) => [number, number];
 export const stationweb_focus_on: (a: number, b: number, c: number) => void;
@@ -13,7 +15,9 @@ export const stationweb_resize: (a: number) => void;
 export const stationweb_select_by_id: (a: number, b: number, c: number) => void;
 export const stationweb_set_action_callback: (a: number, b: any) => void;
 export const stationweb_set_active: (a: number, b: number) => void;
+export const stationweb_set_composer: (a: number, b: number, c: number, d: number) => void;
 export const stationweb_set_layout: (a: number, b: number, c: number) => void;
+export const stationweb_set_transcript: (a: number, b: any) => [number, number, number];
 export const stationweb_set_visuals: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => void;
 export const stationweb_unregister_display_source: (a: number, b: number, c: number) => void;
 export const stationweb_update_snapshot: (a: number, b: any) => [number, number];

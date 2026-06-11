@@ -504,6 +504,13 @@ pub(crate) struct StationControlsSummary {
     pub(crate) browser_workspace_can_close: bool,
     pub(crate) recordings: u32,
     pub(crate) active_recording: String,
+    /// Recording streams for the current session: label/value/detail rows
+    /// with an `action_id` carrying the stream name, cached by the
+    /// dashboard and refreshed when the controls panel opens.
+    pub(crate) recording_streams: Vec<StationDetailRow>,
+    /// Current global autonomy level (low/medium/high) so the controls
+    /// panel can render actionable autonomy pills.
+    pub(crate) autonomy: String,
     pub(crate) cu_provider: String,
     pub(crate) cu_model: String,
     pub(crate) cu_backend: String,
@@ -629,6 +636,8 @@ impl Default for StationControlsSummary {
             browser_workspace_can_close: false,
             recordings: 0,
             active_recording: String::new(),
+            recording_streams: Vec::new(),
+            autonomy: String::new(),
             cu_provider: String::new(),
             cu_model: String::new(),
             cu_backend: String::new(),
@@ -694,6 +703,43 @@ pub(crate) struct StationAttentionItem {
     pub(crate) title: String,
     pub(crate) meta: String,
     pub(crate) detail: String,
+    /// Scene/system node id this item is about (`agent:*`, `system:*`);
+    /// clicking the item selects it. Empty = inert row.
+    pub(crate) target: String,
+}
+
+/// Transcript side-channel payload (`set_transcript`): the conversation
+/// tail for one session, projected by the dashboard from
+/// `/api/session/{id}` entries. Deliberately NOT part of the snapshot —
+/// transcripts are fetched lazily when the viewer opens and refreshed
+/// while it stays open, so the 300ms snapshot diff stays small.
+#[derive(Clone, Deserialize, Default)]
+#[serde(default, rename_all = "camelCase")]
+pub(crate) struct StationTranscript {
+    pub(crate) session_id: String,
+    pub(crate) source: String,
+    pub(crate) label: String,
+    pub(crate) error: String,
+    /// True for a live refresh of an already-open viewer: only applied
+    /// when the viewer is still open on the same session (returns false
+    /// otherwise so the dashboard stops refreshing).
+    pub(crate) refresh: bool,
+    /// Total entries the backend reported (may exceed rows.len()).
+    pub(crate) total: u32,
+    /// What this payload shows: a session conversation (`log`) or a
+    /// unified file diff (`diff`).
+    pub(crate) mode: String,
+    pub(crate) rows: Vec<StationTranscriptRow>,
+}
+
+#[derive(Clone, Deserialize, Default)]
+#[serde(default, rename_all = "camelCase")]
+pub(crate) struct StationTranscriptRow {
+    /// Row tone: user / model / agent / tool / error / warn / info /
+    /// diff-add / diff-del / diff-meta.
+    pub(crate) kind: String,
+    pub(crate) ts: String,
+    pub(crate) text: String,
 }
 
 /// Display-runway summary, slimmed to the figures the peers focus panel
@@ -719,6 +765,12 @@ pub(crate) struct StationDisplayRunwaySummary {
 pub(crate) struct StationDisplayRunwayLane {
     #[serde(rename = "type")]
     pub(crate) kind: String,
+    /// Dashboard lane id — the routing key `display_runway_action`
+    /// handlers resolve, so lane rows in the peers panel can act.
+    pub(crate) id: String,
+    pub(crate) host_id: String,
+    pub(crate) display_id: Option<i32>,
+    pub(crate) session_id: String,
     pub(crate) title: String,
     pub(crate) meta: String,
     pub(crate) detail: String,

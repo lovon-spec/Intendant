@@ -497,6 +497,27 @@ html {
   outline: none;
   box-shadow: none;
 }
+/* Composer input overlay: visually part of the canvas-drawn glass strip
+   (transparent background, no border) — the canvas paints the slot. */
+.station-composer-input {
+  position: absolute;
+  z-index: 5;
+  background: transparent;
+  border: 0;
+  outline: none;
+  resize: none;
+  overflow: hidden;
+  color: var(--text);
+  caret-color: var(--blue);
+  font-family: 'SF Mono', Menlo, Consolas, monospace;
+  font-size: 11px;
+  line-height: 18px;
+  padding: 1px 2px;
+}
+.station-composer-input::placeholder {
+  color: var(--overlay1);
+  opacity: 0.75;
+}
 /* Glass status chip pinned to the lower-left of the Station canvas. The
    metrics span carries the always-on `renderer · fps · displays` readout;
    the text span carries the transient status line the validator asserts on
@@ -8640,6 +8661,13 @@ body.display-fullscreen-open {
           <button class="station-hotspot" type="button" data-station-hotspot="system:controls" title="Control surfaces" aria-label="Control surfaces"></button>
           <button class="station-hotspot" type="button" data-station-hotspot="system:view" title="Station view" aria-label="Station view"></button>
         </div>
+        <!-- Composer input overlay: the canvas draws the strip chrome; this
+             real textarea sits exactly over the drawn input slot so typing,
+             IME, and paste all behave natively. Positioned from
+             station.composer_state() geometry. -->
+        <textarea id="station-composer-input" class="station-composer-input" rows="1"
+          placeholder="type a task — enter sends, esc closes"
+          aria-label="Station composer" spellcheck="false" style="display:none"></textarea>
         <div id="station-display-endpoints" aria-hidden="true" style="position:absolute;left:-10000px;top:-10000px;width:1px;height:1px;overflow:hidden"></div>
       </div>
     </div>
@@ -11123,6 +11151,7 @@ async function ensureStation() {
     station = new StationWeb(scene, hud);
     stationLastSnapshotJson = '';
     station.set_action_callback((action) => handleStationAction(action));
+    stationSetupComposerInput();
     stationApplyViewSettings(false);
     const active = activeTab === 'station';
     station.set_active(active);
@@ -11164,6 +11193,9 @@ function stationSetActive(active) {
       stationUpdateSnapshot();
       stationRegisterExistingSources();
       stationUpdateMetricsChip();
+    } else {
+      // The composer overlay must never float over another tab.
+      stationSyncComposer();
     }
   } else if (active) {
     ensureStation().catch(err => {
@@ -11243,6 +11275,9 @@ function stationUpdateSnapshot() {
       stationSyncHotspots();
       stationUpdateHotspotAria(snapshot);
     }
+    // Live transcript follow: new activity for the open session triggers
+    // a coalesced refetch (no-op when the viewer is closed).
+    stationMaybeRefreshTranscript();
     stationLastSnapshotError = '';
     stationStatus(station.debug_state());
   } catch (e) {
@@ -11314,6 +11349,41 @@ window.stationProbe = Object.assign(window.stationProbe || {}, {
     return stationResolvedHotspotBoxes(rect.width || 1, rect.height || 1);
   },
   snapshot: () => buildStationSnapshot(),
+  // Composer + transcript accessors for agents / the validator: drive the
+  // full in-canvas paths programmatically.
+  composer: () => {
+    try {
+      return station && typeof station.composer_state === 'function'
+        ? JSON.parse(station.composer_state() || 'null')
+        : null;
+    } catch (_) {
+      return null;
+    }
+  },
+  composerType: (text) => {
+    const input = stationComposerInputEl();
+    if (!input) return false;
+    input.value = String(text ?? '');
+    return true;
+  },
+  composerSubmit: () => {
+    stationComposerSubmit();
+    return true;
+  },
+  composerOpen: (mode) => {
+    if (!station || typeof station.set_composer !== 'function') return false;
+    station.set_composer(true, mode === 'launch' ? 'launch' : 'send');
+    stationHandleComposerEvent({ op: 'focus' });
+    return true;
+  },
+  composerClose: () => {
+    if (!station || typeof station.set_composer !== 'function') return false;
+    station.set_composer(false, stationComposerMode);
+    stationSyncComposer();
+    return true;
+  },
+  openTranscript: (sessionId, source) => stationOpenTranscript(sessionId, source ? { source } : {}),
+  openDiff: (path) => stationOpenDiff(path),
   select: (target) => {
     station?.select_by_id?.(target ? String(target) : null);
     return station?.debug_state?.() || '';
@@ -11442,7 +11512,7 @@ function stationBuildActivitySummary(allEventsInput = null) {
     latestHost: latest ? (latest.hostId || latest.host_id || selfPeerId || 'local') : '',
     latestSessionId: latest ? (latest.sessionId || latest.session_id || '') : '',
     latestText: latest ? stationActivityEventCopyText(latest) : '',
-    visibleEvents: events.slice(-24),
+    visibleEvents: events.slice(-60),
     topLevels: stationActivityTopSummary(events, stationActivityLevelFor),
     topSources: stationActivityTopSummary(events, stationActivitySourceFor),
     topHosts: stationActivityTopSummary(events, ev => {
@@ -11480,6 +11550,8 @@ function handleStationAction(action) {
     stationHandleActivityAction(action);
   } else if (action.type === 'controls_action') {
     stationHandleControlsAction(action);
+  } else if (action.type === 'composer') {
+    stationHandleComposerEvent(action);
   } else if (action.type === 'view_set') {
     // Canvas View-panel control (mood pill or slider release): persist the
     // draft and re-apply through set_visuals. The renderer already shows
@@ -11750,6 +11822,10 @@ function stationResolvedHotspotBoxes(cssW, cssH) {
 let stationLastHotspotBoxesJson = '';
 
 function stationSyncHotspots() {
+  // The composer overlay tracks the drawn strip independently of the
+  // hotspot boxes (which cover only system/layout zones and may be
+  // unchanged while the composer opens/closes).
+  stationSyncComposer();
   const layer = document.getElementById('station-hotspots');
   if (!layer) return;
   const rect = stationHudRect();
@@ -14188,6 +14264,11 @@ function stationBuildAttentionQueue(controls) {
       title: row.command || 'Approval required',
       meta: ['approval', row.local ? 'local' : stationHostLabel(row.hostId), row.category].filter(Boolean).join(' / '),
       detail: row.approvalId,
+      // Clicking the item in the rendered controls panel selects the
+      // agent node whose focus panel carries the approve/deny pills.
+      target: row.local
+        ? 'primary-agent'
+        : `approval-${sanitizeStationId(row.hostId)}-${sanitizeStationId(row.approvalId)}`,
     });
   }
 
@@ -14200,6 +14281,7 @@ function stationBuildAttentionQueue(controls) {
       title: 'Human input requested',
       meta: 'agent is waiting',
       detail: compactSessionText(question, 180),
+      target: 'primary-agent',
     });
   }
 
@@ -14211,6 +14293,7 @@ function stationBuildAttentionQueue(controls) {
       title: 'Shared view input request',
       meta: controls.sharedViewTarget || 'shared display',
       detail: controls.sharedViewNote || controls.sharedViewAction || 'Input authority is available.',
+      target: 'system:peers',
     });
   }
 
@@ -14222,6 +14305,7 @@ function stationBuildAttentionQueue(controls) {
       title: 'New session spawning',
       meta: newSessionSpawnName || 'pending start confirmation',
       detail: stationLaunchNoticeText() || compactSessionText(newSessionSpawnTask, 180) || 'Waiting for session start confirmation.',
+      target: 'system:sessions',
     });
   }
 
@@ -14234,6 +14318,7 @@ function stationBuildAttentionQueue(controls) {
       title: `${controls.pendingAttachments} pending attachment${controls.pendingAttachments === 1 ? '' : 's'}`,
       meta: names.join(' / ') || 'staged for next send',
       detail: controls.pendingAttachments > names.length ? `Showing ${names.length} of ${controls.pendingAttachments}` : 'Ready for next task or follow-up.',
+      target: '',
     });
   }
 
@@ -14248,6 +14333,7 @@ function stationBuildAttentionQueue(controls) {
       detail: [compactSessionText(row.text, 160), row.reason].filter(Boolean).join(' / '),
       sessionId: row.sessionId || '',
       canCancel: cancellable,
+      target: row.sessionId ? `log:${row.sessionId}` : 'system:sessions',
     });
   }
 
@@ -14259,6 +14345,7 @@ function stationBuildAttentionQueue(controls) {
       title: 'Browser is passive',
       meta: 'voice/video control is elsewhere',
       detail: 'Make this browser active before using live voice or video controls from Station.',
+      target: '',
     });
   }
 
@@ -14272,6 +14359,7 @@ function stationBuildAttentionQueue(controls) {
       detail: controls.sessionCanSteer ? 'Steer is available from the execution composer.' : 'Follow-up may be queued until the turn ends.',
       sessionId: controls.sessionLiveId || controls.sessionId || '',
       canCancel: false,
+      target: (controls.sessionLiveId || controls.sessionId) ? `log:${controls.sessionLiveId || controls.sessionId}` : '',
     });
   }
 
@@ -14285,11 +14373,12 @@ function stationBuildAttentionQueue(controls) {
     // Slim wire rows: the header alert strip and the controls focus panel
     // render level/title/meta/detail for the top items; the counts above
     // cover the rest.
-    items: items.slice(0, 4).map(item => ({
+    items: items.slice(0, 10).map(item => ({
       level: String(item.level || ''),
       title: String(item.title || ''),
       meta: String(item.meta || ''),
       detail: String(item.detail || ''),
+      target: String(item.target || ''),
     })),
   };
 }
@@ -14361,12 +14450,28 @@ function stationHandleSessionAction(action) {
     return;
   }
   if (op === 'new-session') {
-    if (stationRenderedSelectPanel('system:controls', 'New-session controls stay in Station')) return;
+    if (stationRenderedPrimaryActive()) {
+      station?.set_composer?.(true, 'launch');
+      stationHandleComposerEvent({ op: 'focus' });
+      return;
+    }
     stationForceRouteTo('sessions', 'new', () => document.getElementById('new-session-input')?.focus());
     return;
   }
   if (op === 'worktree') {
     stationFocusWorktree(sessionId);
+    return;
+  }
+  if (op === 'worktree-copy') {
+    if (sessionId) {
+      copyTextToClipboard(sessionId)
+        .then(() => showControlToast?.('success', `Copied worktree path ${sessionId}`))
+        .catch(err => showControlToast?.('error', `Copy failed: ${err?.message || err}`));
+    }
+    return;
+  }
+  if (op === 'station-log') {
+    stationOpenTranscript(sessionId);
     return;
   }
   if (!sessionId) return;
@@ -14495,7 +14600,11 @@ function stationHandleSessionAction(action) {
 }
 
 function stationFocusWorktree(path) {
-  if (stationRenderedSelectPanel('system:worktrees', 'Worktree selected')) return;
+  const full = String(path || '').trim();
+  if (stationRenderedSelectPanel('system:worktrees', full || 'Worktree selected')) {
+    if (full) showControlToast?.('info', full);
+    return;
+  }
   stationForceRouteTo('sessions', 'worktrees', () => document.getElementById('worktrees-search')?.focus());
 }
 
@@ -14691,6 +14800,14 @@ function stationHandleActivityAction(action) {
     return;
   }
   if (op === 'send') {
+    // Rendered Station: the in-canvas composer takes the text. (This used
+    // to focus the hidden Activity-tab input — invisible while Station
+    // was the active tab.)
+    if (stationRenderedPrimaryActive()) {
+      station?.set_composer?.(true, 'send');
+      stationHandleComposerEvent({ op: 'focus' });
+      return;
+    }
     const input = document.getElementById('activity-task-input');
     if (input && input.value.trim()) {
       window.submitActivityOrSteer?.();
@@ -14708,7 +14825,11 @@ function stationHandleActivityAction(action) {
     return;
   }
   if (op === 'new-session') {
-    if (stationRenderedSelectPanel('system:controls', 'New-session controls stay in Station')) return;
+    if (stationRenderedPrimaryActive()) {
+      station?.set_composer?.(true, 'launch');
+      stationHandleComposerEvent({ op: 'focus' });
+      return;
+    }
     stationForceRouteTo('sessions', 'new', () => document.getElementById('new-session-input')?.focus());
     return;
   }
@@ -14788,6 +14909,50 @@ function stationHandleActivityAction(action) {
 function stationHandleControlsAction(action) {
   const op = String(action.action || '').trim();
   if (!op) return;
+  if (op.startsWith('autonomy:')) {
+    const level = op.slice('autonomy:'.length).trim().toLowerCase();
+    if (!['low', 'medium', 'high', 'full'].includes(level)) return;
+    updateStatusBar({ autonomy: level.charAt(0).toUpperCase() + level.slice(1) });
+    sendRawMessage({ action: 'set_autonomy', level });
+    showControlToast?.('success', `Autonomy: ${level}`);
+    return;
+  }
+  if (op.startsWith('backend:')) {
+    const agent = op.slice('backend:'.length).trim();
+    const value = agent === 'internal' ? null : agent;
+    if (value && !['codex', 'claude-code', 'gemini'].includes(value)) return;
+    if (app) app.send_server_action({ action: 'set_external_agent', agent: value });
+    showControlToast?.('success', `Backend: ${value || 'intendant'}`);
+    return;
+  }
+  if (op.startsWith('codex-approval:')) {
+    const policy = op.slice('codex-approval:'.length).trim();
+    if (!['untrusted', 'on-request', 'never'].includes(policy)) return;
+    dispatchControlMsg({ action: 'set_codex_approval_policy', policy });
+    showControlToast?.('success', `Codex approval policy: ${policy}`);
+    return;
+  }
+  if (op.startsWith('launch-agent:')) {
+    stationLaunchDraft.agent = op.slice('launch-agent:'.length).trim();
+    stationScheduleUpdate({ immediate: true });
+    return;
+  }
+  if (op === 'launch-direct:toggle') {
+    stationLaunchDraft.direct = !stationLaunchDraft.direct;
+    stationScheduleUpdate({ immediate: true });
+    return;
+  }
+  if (op.startsWith('recording-open:')) {
+    const name = op.slice('recording-open:'.length).trim();
+    stationForceRouteTo('displays', undefined, () => {
+      const select = document.getElementById('recording-stream-select');
+      if (select && name) {
+        select.value = name;
+        select.dispatchEvent(new Event('change'));
+      }
+    });
+    return;
+  }
   if (op === 'display-toggle') {
     window.toggleUserDisplay?.();
     return;
@@ -14876,12 +15041,16 @@ function stationHandleControlsAction(action) {
     return;
   }
   if (op === 'recordings') {
-    if (stationRenderedSelectPanel('system:controls', 'Recording controls stay in Station')) return;
+    if (stationRenderedSelectPanel('system:controls', 'Recordings listed in the Controls panel')) return;
     stationForceRouteTo('displays', undefined, () => document.getElementById('recording-stream-select')?.focus());
     return;
   }
   if (op === 'launch-dock') {
-    if (stationRenderedSelectPanel('system:controls', 'Launch controls stay in Station')) return;
+    if (stationRenderedPrimaryActive()) {
+      station?.set_composer?.(true, 'launch');
+      stationHandleComposerEvent({ op: 'focus' });
+      return;
+    }
     stationForceRouteTo('sessions', 'new', () => document.getElementById('new-session-input')?.focus());
     return;
   }
@@ -14924,6 +15093,313 @@ function stationHandleControlsAction(action) {
   }
 }
 
+// ── Station composer ──
+// The canvas draws the composer strip chrome; the real text editing
+// happens in #station-composer-input, a transparent textarea positioned
+// exactly over the drawn input slot (station.composer_state() geometry).
+let stationComposerMode = 'send';
+
+function stationComposerInputEl() {
+  return document.getElementById('station-composer-input');
+}
+
+// One-time wiring of the composer overlay textarea (station init).
+function stationSetupComposerInput() {
+  const input = stationComposerInputEl();
+  if (!input || input.dataset.stationWired) return;
+  input.dataset.stationWired = '1';
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      stationComposerSubmit();
+    } else if (e.key === 'Escape') {
+      e.preventDefault();
+      station?.set_composer?.(false, stationComposerMode);
+      stationSyncComposer();
+      input.blur();
+    }
+    // Keep dashboard-global hotkeys away from composer typing.
+    e.stopPropagation();
+  });
+  window.addEventListener('resize', () => stationSyncComposer());
+}
+
+function stationSyncComposer() {
+  const input = stationComposerInputEl();
+  if (!input) return;
+  let state = null;
+  try {
+    state = station && typeof station.composer_state === 'function'
+      ? JSON.parse(station.composer_state() || 'null')
+      : null;
+  } catch (_) {
+    state = null;
+  }
+  if (!state || !state.open || !state.rect || !stationRenderedPrimaryActive()) {
+    if (input.style.display !== 'none') {
+      input.style.display = 'none';
+      if (document.activeElement === input) input.blur();
+    }
+    return;
+  }
+  stationComposerMode = state.mode === 'launch' ? 'launch' : 'send';
+  input.placeholder = stationComposerMode === 'launch'
+    ? 'describe the task for the new session — enter launches'
+    : 'type a task or steer — enter sends, esc closes';
+  input.style.display = '';
+  input.style.left = `${state.rect.x}px`;
+  input.style.top = `${state.rect.y}px`;
+  input.style.width = `${state.rect.w}px`;
+  input.style.height = `${state.rect.h}px`;
+}
+
+function stationComposerSubmit() {
+  const input = stationComposerInputEl();
+  if (!input) return;
+  const text = String(input.value || '').trim();
+  if (stationComposerMode === 'launch') {
+    if (!text) {
+      showControlToast?.('error', 'Describe the task for the new session first');
+      input.focus();
+      return;
+    }
+    stationLaunchDraft.task = text;
+    input.value = '';
+    station?.set_composer?.(false, 'launch');
+    stationSyncComposer();
+    stationStartSession();
+    return;
+  }
+  if (!text) {
+    input.focus();
+    return;
+  }
+  if (editMessageDraft) {
+    showControlToast?.('info', 'Finish or cancel the message edit in the Activity tab first');
+    return;
+  }
+  if (submitComposedText(text)) {
+    input.value = '';
+    stationStatus('Dispatched from Station composer');
+    stationScheduleUpdate({ immediate: true });
+    stationMaybeRefreshTranscript(true);
+  }
+}
+
+function stationHandleComposerEvent(action) {
+  const op = String(action.op || '').trim();
+  if (op === 'focus') {
+    // The strip just opened (pill, `/` key, or set_composer): the next
+    // paint computes the slot rect, so place + focus on the next frame.
+    requestAnimationFrame(() => {
+      stationSyncComposer();
+      stationComposerInputEl()?.focus();
+    });
+    return;
+  }
+  if (op === 'closed') {
+    stationSyncComposer();
+    return;
+  }
+  if (op === 'send' || op === 'launch') {
+    stationComposerSubmit();
+    return;
+  }
+  if (op === 'target') {
+    stationRenderedSelectPanel('system:sessions', 'Pick a session — its focus pill makes it the prompt target');
+  }
+}
+
+// ── Station transcript viewer ──
+// Conversation tails are fetched from /api/session/{id} on demand and fed
+// through the set_transcript side-channel (never the 300ms snapshot).
+// While the viewer is open, new activity for that session triggers a
+// coalesced refetch; the WASM rejects refreshes once the viewer closed.
+let stationTranscriptLive = null;
+
+function stationTranscriptKindForEntry(entry) {
+  if (isSessionDetailUserEntry(entry)) return 'user';
+  const level = String(entry?.level || '').toLowerCase();
+  if (level === 'error') return 'error';
+  if (level === 'warn') return 'warn';
+  if (level === 'model') return 'model';
+  if (level === 'agent' || level === 'subagent') return 'agent';
+  const source = String(entry?.source || '').toLowerCase();
+  if (source === 'worker') return 'model';
+  if (source === 'agent' || source === 'orch' || source === 'sub') return 'agent';
+  if (entry?.event === 'command' || entry?.command !== undefined || entry?.stdout !== undefined || entry?.stderr !== undefined) return 'tool';
+  return 'info';
+}
+
+function stationTranscriptTextForEntry(entry) {
+  for (const key of ['content', 'message', 'summary', 'text', 'stdout', 'stderr', 'task', 'reasoning_summary', 'reasoningSummary', 'command']) {
+    const value = entry?.[key];
+    if (typeof value === 'string' && value.trim()) return value;
+  }
+  if (typeof entry?.msg === 'string' && entry.msg.trim()) return entry.msg;
+  return '';
+}
+
+function stationTranscriptTsForEntry(entry) {
+  const raw = String(entry?.ts || entry?.timestamp || entry?.time || '').trim();
+  if (!raw) return '';
+  const t = formatContextTimestamp(raw);
+  return String(t || raw).slice(-8);
+}
+
+function stationTranscriptRowsFromEntries(entries) {
+  const rows = [];
+  for (const entry of entries || []) {
+    if (!entry || entry.event === 'context_snapshot' || entry.event === 'replay_start') continue;
+    const text = stationTranscriptTextForEntry(entry);
+    if (!text.trim()) continue;
+    rows.push({
+      kind: stationTranscriptKindForEntry(entry),
+      ts: stationTranscriptTsForEntry(entry),
+      // Cap pathological single entries; the viewer wraps the rest.
+      text: text.length > 4000 ? `${text.slice(0, 4000)} …` : text,
+    });
+  }
+  // The viewer follows the tail; keep the freshest entries.
+  return rows.slice(-260);
+}
+
+function stationLatestEventKeyForSession(sessionId) {
+  const events = stationActivityEvents();
+  for (let i = events.length - 1; i >= 0; i--) {
+    const ev = events[i];
+    if (String(ev?.sessionId || ev?.session_id || '') === sessionId) {
+      return stationActivityEventKey(ev);
+    }
+  }
+  return '';
+}
+
+async function stationOpenTranscript(sessionId, opts = {}) {
+  const sid = String(sessionId || '').trim();
+  if (!sid || !station || typeof station.set_transcript !== 'function') return false;
+  const session = stationFindSessionById(sid);
+  const source = String(
+    opts.source ||
+    sessionConfigSource(sessionConfigMetadata(session || sid)) ||
+    session?.backend_source || session?.backendSource || session?.source ||
+    'intendant'
+  ).trim() || 'intendant';
+  const label = stationSessionTask(session) || shortSessionId(sid);
+  if (!opts.refresh) stationStatus(`Loading transcript ${shortSessionId(sid)}`);
+  let payload;
+  try {
+    const resp = await fetch(`/api/session/${encodeURIComponent(sid)}?source=${encodeURIComponent(source)}&limit=300`);
+    const data = await resp.json();
+    if (data.error) {
+      payload = { sessionId: sid, source, label, mode: 'log', refresh: !!opts.refresh, error: String(data.error), total: 0, rows: [] };
+    } else {
+      const entries = Array.isArray(data.entries) ? data.entries : [];
+      payload = {
+        sessionId: sid,
+        source,
+        label,
+        mode: 'log',
+        refresh: !!opts.refresh,
+        error: '',
+        total: entries.length,
+        rows: stationTranscriptRowsFromEntries(entries),
+      };
+    }
+  } catch (e) {
+    payload = { sessionId: sid, source, label, mode: 'log', refresh: !!opts.refresh, error: `transcript fetch failed: ${e?.message || e}`, total: 0, rows: [] };
+  }
+  let accepted = false;
+  try {
+    accepted = station.set_transcript(payload) === true;
+  } catch (err) {
+    console.warn('station set_transcript rejected:', err);
+  }
+  if (accepted) {
+    stationTranscriptLive = {
+      sessionId: sid,
+      source,
+      fetchedAt: Date.now(),
+      lastEventKey: stationLatestEventKeyForSession(sid),
+    };
+    if (!opts.refresh) stationStatus(`Transcript ${shortSessionId(sid)} loaded`);
+  } else if (opts.refresh && stationTranscriptLive?.sessionId === sid) {
+    // Viewer closed (or moved to another session): stop live refresh.
+    stationTranscriptLive = null;
+  }
+  return accepted;
+}
+
+// Coalesced live refresh, called from the snapshot apply path: refetch
+// when fresh activity arrived for the open session (or every ~8s for
+// sessions whose output doesn't surface in the activity stream).
+function stationMaybeRefreshTranscript(force = false) {
+  const live = stationTranscriptLive;
+  if (!live || !stationRenderedPrimaryActive()) return;
+  const age = Date.now() - live.fetchedAt;
+  if (!force && age < 1500) return;
+  const key = stationLatestEventKeyForSession(live.sessionId);
+  if (!force && key && key === live.lastEventKey && age < 8000) return;
+  if (!force && !key && age < 8000) return;
+  live.fetchedAt = Date.now();
+  live.lastEventKey = key;
+  stationOpenTranscript(live.sessionId, { source: live.source, refresh: true });
+}
+
+// ── Station diff viewer ──
+// Changed-file rows feed the same viewer in diff mode (kind-colored
+// +/-/@@ lines); diffs are static, so no live refresh.
+function stationDiffRows(diffText) {
+  return String(diffText || '').split('\n').slice(0, 1500).map(line => ({
+    kind: line.startsWith('+') && !line.startsWith('+++')
+      ? 'diff-add'
+      : line.startsWith('-') && !line.startsWith('---')
+        ? 'diff-del'
+        : (line.startsWith('@@') || line.startsWith('+++') || line.startsWith('---') || line.startsWith('diff '))
+          ? 'diff-meta'
+          : 'info',
+    ts: '',
+    text: line || ' ',
+  }));
+}
+
+async function stationOpenDiff(path) {
+  const p = String(path || '').trim();
+  if (!p || !station || typeof station.set_transcript !== 'function') return;
+  stationStatus(`Loading diff ${p}`);
+  let rows = [];
+  let error = '';
+  try {
+    const resp = await fetch(changesRequestUrl(p));
+    const data = await parseChangesResponse(resp);
+    if (data.diff_available === false) {
+      error = data.reason || 'Textual diff is unavailable for this file.';
+    } else {
+      rows = stationDiffRows(String(data.diff || '').trimEnd());
+      if (!rows.length || (rows.length === 1 && !rows[0].text.trim())) {
+        error = 'No text diff for this file.';
+      }
+    }
+  } catch (e) {
+    error = `diff fetch failed: ${e?.message || e}`;
+  }
+  try {
+    station.set_transcript({
+      sessionId: p,
+      source: 'diff',
+      label: p,
+      mode: 'diff',
+      refresh: false,
+      error,
+      total: rows.length,
+      rows: error ? [] : rows,
+    });
+  } catch (err) {
+    console.warn('station diff viewer rejected:', err);
+  }
+  stationTranscriptLive = null;
+}
+
 function stationSetActivityVerbosity(level) {
   const next = String(level || '').trim();
   if (!['normal', 'verbose', 'debug'].includes(next)) return;
@@ -14951,6 +15427,10 @@ function stationClearActivityHostFilter() {
 function stationHandleChangesAction(action) {
   const op = String(action.action || 'file').trim();
   const path = String(action.path || action.id || '').trim();
+  if (op === 'station-diff') {
+    stationOpenDiff(path);
+    return;
+  }
   if (op === 'refresh') {
     if (typeof refreshHistory === 'function') refreshHistory();
     refreshChangesList({ selectFirst: true, refreshActive: true, quiet: true })
@@ -15313,10 +15793,14 @@ function stationBuildManagedSummary(contextSummary) {
     pressureState,
     latestRewind,
     latestBackout,
-    // Slim wire rows: the managed focus panel renders label/value/detail/
-    // tone for the latest rewind records. (Anchor and branch row arrays
-    // were serialized but never rendered; their counts above remain.)
-    recentRecords: recordRows.slice(0, 4).map(stationSlimDetailRow),
+    // Actionable wire rows: the managed focus panel scrolls these and
+    // the inspect/fork/restore pills act on the record ids. (Anchor and
+    // branch row arrays were serialized but never rendered; their counts
+    // above remain.)
+    recentRecords: recordRows.slice(0, 12).map(row => ({
+      ...stationSlimDetailRow(row),
+      id: String(row?.id || ''),
+    })),
     activitySignal: stationManagedActivitySignal || {},
   };
   const ready = stationManagedReadiness(summary);
@@ -15374,12 +15858,13 @@ function stationChangesFileName(path) {
 
 // Slim wire rows: the changes focus panel renders label/value/detail/tone.
 function stationChangesRows(entries) {
-  return entries.slice(0, 5).map(([path, info]) => {
+  return entries.slice(0, 30).map(([path, info]) => {
     const kind = String(info?.kind || 'modified');
     const added = stationNum(info?.lines_added);
     const removed = stationNum(info?.lines_removed);
     const hasTextDiff = info?.diff_available !== false;
     return {
+      id: String(path || ''),
       label: stationChangesFileName(path),
       value: hasTextDiff ? `+${stationCompactNumber(added)} -${stationCompactNumber(removed)}` : 'no text diff',
       detail: compactPathLabel(path, true) || stationChangesKindLabel(kind),
@@ -15541,7 +16026,7 @@ function stationBuildWorktreesSummary() {
   // tone.
   const recent = [...rows]
     .sort((a, b) => worktreeRiskRank(b) - worktreeRiskRank(a) || stationNum(b?.size_bytes) - stationNum(a?.size_bytes))
-    .slice(0, 4)
+    .slice(0, 16)
     .map(wt => {
       const path = String(wt?.path || '').trim();
       const branch = wt?.branch || wt?.head_short || '(unknown ref)';
@@ -15551,6 +16036,7 @@ function stationBuildWorktreesSummary() {
           ? `${wt.active_sessions} active`
           : (wt?.recommended_action || wt?.merge_status || 'review'));
       return {
+        id: path,
         label: branch,
         value: status,
         detail: [
@@ -15668,11 +16154,11 @@ function stationBuildSessionsSummary() {
   }
   if (!active && isAgentActivePhase(currentPhase)) active = 1;
   const latest = sortedSessions[0] || null;
-  // Slim wire rows: the sessions focus panel renders label/value/detail/
-  // tone; the richer stationSessionRow shape stays dashboard-internal.
+  // Actionable wire rows: the sessions focus panel scrolls these and
+  // its row pills act on the ids/capability flags.
   const recent = sortedSessions
-    .slice(0, 4)
-    .map(session => stationSlimDetailRow(stationSessionRow(session, indexedIds)));
+    .slice(0, 20)
+    .map(session => stationActionRow(stationSessionRow(session, indexedIds)));
   let externalTargets = [];
   try {
     externalTargets = stationExternalTargetRows(5).map(row => ({
@@ -15991,6 +16477,19 @@ function stationBuildControlsSummary() {
     browserWorkspaceCanClose: !!browserWorkspaceStatus.can_close,
     recordings: recordingStreams.size,
     activeRecording: activeRecordingStream || '',
+    // Per-stream rows for the rendered controls panel (click → recording
+    // browser). Sorted for snapshot stability.
+    recordingStreams: [...recordingStreams.entries()]
+      .sort((a, b) => a[0].localeCompare(b[0]))
+      .slice(0, 12)
+      .map(([name, info]) => ({
+        label: name.startsWith('display_') ? `:${name.slice(8)}` : name,
+        value: info?.active ? 'recording' : 'stored',
+        detail: info?.totalDuration ? `${Math.round(info.totalDuration)}s` : (Array.isArray(info?.segments) ? `${info.segments.length} segments` : ''),
+        tone: info?.active ? 'red' : 'session',
+        actionId: name,
+      })),
+    autonomy: normalizeAutonomyLabel(document.getElementById('sb-autonomy')?.textContent || 'Medium').toLowerCase(),
     cuProvider: stationComputerUseValue('set-cu-provider', '') || 'auto',
     cuModel: stationComputerUseValue('set-cu-model', '') || 'default',
     cuBackend: stationComputerUseValue('set-cu-backend', 'auto') || 'auto',
@@ -16024,7 +16523,9 @@ function stationBuildControlsSummary() {
     latestOperationalActivity: latestOperationalActivity.detail || '',
     latestOperationalActivityLabel: latestOperationalActivity.label || '',
     launchReady: !!launchReadiness.ready,
-    launchMissing: (launchReadiness.missing || []).join(', '),
+    // 'task' is omitted: in the Station flow the task text lives in the
+    // composer input until launch, so listing it as missing is noise.
+    launchMissing: (launchReadiness.missing || []).filter(item => item !== 'task').join(', '),
     launchAgent: launchReadiness.agent || '',
     launchAgentLabel: launchReadiness.agentLabel || '',
     launchCommand: launchReadiness.command || '',
@@ -16214,6 +16715,28 @@ function stationSlimDetailRow(row) {
   };
 }
 
+// Actionable wire row: the slim display fields plus the ids and
+// capability flags the rendered Station's row pills key off (the
+// snapshot diet had stripped these along with the dead fields, leaving
+// the canvas rows inert).
+function stationActionRow(row) {
+  return {
+    ...stationSlimDetailRow(row),
+    id: String(row?.id || ''),
+    sessionId: String(row?.sessionId || row?.session_id || row?.id || ''),
+    actionId: String(row?.actionId || ''),
+    attachId: String(row?.attachId || ''),
+    stopId: String(row?.stopId || ''),
+    canResume: !!row?.canResume,
+    canFocus: !!row?.canFocus,
+    canAttach: !!row?.canAttach,
+    canStop: !!row?.canStop,
+    canInterrupt: !!row?.canInterrupt,
+    canOpenLog: !!row?.canOpenLog,
+    canFork: !!row?.canFork,
+  };
+}
+
 function buildStationSnapshot() {
   const hosts = [];
   const selfUsage = stationUsageForHost(selfPeerId);
@@ -16289,8 +16812,14 @@ function stationDisplayRunwaySnapshot(controls = null) {
     display_peers: payload.display_peers,
     local_streams: payload.local_streams,
     remote_streams: payload.remote_streams,
-    lanes: payload.lanes.slice(0, 4).map(lane => ({
+    lanes: payload.lanes.slice(0, 10).map(lane => ({
       type: String(lane.type || ''),
+      // Routing keys for the rendered peers panel's lane rows: the
+      // dashboard's display_runway_action handlers resolve lanes by id.
+      id: String(lane.id || ''),
+      host_id: String(lane.host_id || ''),
+      display_id: lane.display_id ?? null,
+      session_id: String(lane.session_id || ''),
       title: String(lane.title || ''),
       meta: String(lane.meta || ''),
       detail: String(lane.detail || ''),
@@ -41533,18 +42062,17 @@ function autoAttachUnmanagedFollowUp(evt = {}) {
   return true;
 }
 
-window.submitActivityTask = function(options = {}) {
-  const input = document.getElementById('activity-task-input');
-  if (!input || !app) return;
-  const text = input.value.trim();
-  if (!text) return;
-  clearTaskTextarea(input);
-  // Unified submit: always send `start_task` regardless of current phase.
-  // The backend dispatcher routes appropriately (presence-mediated vs direct,
-  // task_tx vs follow_up_tx) based on mode and the `direct` flag. The old
-  // phase-based fork between start_task / follow_up was a TUI-centric
-  // artifact — all agents (native, Codex, Claude Code, Gemini CLI) treat
-  // subsequent messages as new turns in the existing conversation.
+// Unified task dispatch: always send `start_task` regardless of current
+// phase. The backend dispatcher routes appropriately (presence-mediated vs
+// direct, task_tx vs follow_up_tx) based on mode and the `direct` flag. The
+// old phase-based fork between start_task / follow_up was a TUI-centric
+// artifact — all agents (native, Codex, Claude Code, Gemini CLI) treat
+// subsequent messages as new turns in the existing conversation.
+// Shared by the Activity composer and the Station composer.
+function dispatchTaskText(text, options = {}) {
+  if (!app) return false;
+  text = String(text || '').trim();
+  if (!text) return false;
   const attachments = pendingAttachments.map(a => a.frameId);
   const attachmentReceipt = pendingAttachments.slice();
   const direct = document.getElementById('direct-mode-toggle')?.checked || false;
@@ -41552,7 +42080,6 @@ window.submitActivityTask = function(options = {}) {
   const msg = targetSessionId
     ? { action: 'start_task', task: text, session_id: targetSessionId }
     : { action: 'create_session', task: text };
-  if (!msg) return;
   if (targetSessionId && msg.action === 'start_task') {
     const id = nextFollowUpId();
     msg.follow_up_id = id;
@@ -41578,38 +42105,29 @@ window.submitActivityTask = function(options = {}) {
     renderAttachmentReceipt(text, attachmentReceipt, 'Sent', targetSessionId);
     clearPendingAttachments();
   }
-};
+  return true;
+}
 
-// Phase-aware submit entrypoint.
-//
-// When the agent is idle / done / interrupted / waiting-follow-up, the
-// click starts a new task (the existing submitActivityTask path).
-// When the agent is actively working (thinking / running / orchestrating /
-// waiting-approval / waiting-human), the click injects a
-// mid-turn steer via a session-scoped server action, which round-trips
-// through the backend as ControlMsg::Steer and comes back as steer_requested /
-// steer_accepted / steer_queued / steer_delivered events.
-// While an interrupt is already in flight, input is queued as the next
-// follow-up instead of trying to steer a turn that is being cancelled.
-//
-// The submit button's label tracks the phase (Send vs ↗ Steer) so the
-// user sees which behavior will fire before clicking.
-window.submitActivityOrSteer = function() {
-  if (!app) return;
+window.submitActivityTask = function(options = {}) {
   const input = document.getElementById('activity-task-input');
-  if (!input) return;
+  if (!input || !app) return;
   const text = input.value.trim();
   if (!text) return;
-  if (editMessageDraft) {
-    submitEditedUserMessage(input, text);
-    return;
-  }
+  clearTaskTextarea(input);
+  dispatchTaskText(text, options);
+};
+
+// Text-parametrized submit core shared by both composers: codex slash
+// commands, mid-turn steer when the target turn accepts it, else the
+// start_task / create_session path. Returns true when dispatched (the
+// caller clears its own input).
+function submitComposedText(text) {
+  if (!app) return false;
+  text = String(text || '').trim();
+  if (!text) return false;
   const codexSlash = parseCodexSlashCommand(text);
   if (codexSlash) {
-    if (dispatchCodexSlashCommand(codexSlash)) {
-      clearTaskTextarea(input);
-    }
-    return;
+    return !!dispatchCodexSlashCommand(codexSlash);
   }
   const targetSessionId = resolvePromptTargetSessionId();
   if (
@@ -41642,16 +42160,43 @@ window.submitActivityOrSteer = function() {
       renderAttachmentReceipt(text, attachmentReceipt, 'Steered', targetSessionId);
       clearPendingAttachments();
     }
+    return true;
+  }
+  return dispatchTaskText(text, {
+    queuedFollowUp: !!(
+      targetSessionId &&
+      isSessionWindowEffectivelyActive(targetSessionId) &&
+      (!sessionSupportsSteer(targetSessionId) || !isSessionWindowSteerActive(targetSessionId))
+    ),
+  });
+}
+
+// Phase-aware submit entrypoint.
+//
+// When the agent is idle / done / interrupted / waiting-follow-up, the
+// click starts a new task (the existing submitActivityTask path).
+// When the agent is actively working (thinking / running / orchestrating /
+// waiting-approval / waiting-human), the click injects a
+// mid-turn steer via a session-scoped server action, which round-trips
+// through the backend as ControlMsg::Steer and comes back as steer_requested /
+// steer_accepted / steer_queued / steer_delivered events.
+// While an interrupt is already in flight, input is queued as the next
+// follow-up instead of trying to steer a turn that is being cancelled.
+//
+// The submit button's label tracks the phase (Send vs ↗ Steer) so the
+// user sees which behavior will fire before clicking.
+window.submitActivityOrSteer = function() {
+  if (!app) return;
+  const input = document.getElementById('activity-task-input');
+  if (!input) return;
+  const text = input.value.trim();
+  if (!text) return;
+  if (editMessageDraft) {
+    submitEditedUserMessage(input, text);
+    return;
+  }
+  if (submitComposedText(text)) {
     clearTaskTextarea(input);
-  } else {
-    // Normal task / follow-up path.
-    submitActivityTask({
-      queuedFollowUp: !!(
-        targetSessionId &&
-        isSessionWindowEffectivelyActive(targetSessionId) &&
-        (!sessionSupportsSteer(targetSessionId) || !isSessionWindowSteerActive(targetSessionId))
-      ),
-    });
   }
 };
 

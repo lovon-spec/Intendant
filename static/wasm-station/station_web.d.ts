@@ -12,6 +12,18 @@ export class StationWeb {
      */
     activate(name: string): boolean;
     /**
+     * Close the transcript viewer (dashboard-side counterpart of the
+     * panel's close pill / Escape).
+     */
+    close_transcript(): void;
+    /**
+     * Composer overlay geometry + state for the dashboard's DOM input:
+     * `{open, mode, rect: {x,y,w,h} | null}`. The rect is the input
+     * slot inside the drawn composer strip (CSS px), present only after
+     * the strip painted.
+     */
+    composer_state(): string;
+    /**
      * Structured introspection for agents driving the canvas UI: render
      * health, snapshot counters, view state, and every named clickable
      * rect in CSS px. `hitZones` lists all named zones in draw order
@@ -41,7 +53,22 @@ export class StationWeb {
     select_by_id(id?: string | null): void;
     set_action_callback(callback: Function): void;
     set_active(active: boolean): void;
+    /**
+     * Open/close the composer strip. `mode` is `send` or `launch`.
+     * The dashboard calls this from its short-circuit replacements
+     * (e.g. the legacy new-session route) and when its input overlay
+     * loses relevance (Escape inside the input).
+     */
+    set_composer(open: boolean, mode: string): void;
     set_layout(layout: string): void;
+    /**
+     * Feed (or refresh) the transcript/diff viewer. Payload shape is
+     * `model::StationTranscript`. A `refresh: true` payload is only
+     * applied while the viewer is still open on the same session —
+     * returns false otherwise so the dashboard stops live-refreshing.
+     * A non-refresh payload always opens the viewer.
+     */
+    set_transcript(payload: any): boolean;
     set_visuals(mood: string, fov_deg: number, motion: number, ar_strength: number, density: number): void;
     unregister_display_source(source_id: string): void;
     update_snapshot(snapshot: any): void;
@@ -53,6 +80,8 @@ export interface InitOutput {
     readonly memory: WebAssembly.Memory;
     readonly __wbg_stationweb_free: (a: number, b: number) => void;
     readonly stationweb_activate: (a: number, b: number, c: number) => number;
+    readonly stationweb_close_transcript: (a: number) => void;
+    readonly stationweb_composer_state: (a: number) => [number, number];
     readonly stationweb_debug_json: (a: number) => [number, number];
     readonly stationweb_debug_state: (a: number) => [number, number];
     readonly stationweb_focus_on: (a: number, b: number, c: number) => void;
@@ -63,7 +92,9 @@ export interface InitOutput {
     readonly stationweb_select_by_id: (a: number, b: number, c: number) => void;
     readonly stationweb_set_action_callback: (a: number, b: any) => void;
     readonly stationweb_set_active: (a: number, b: number) => void;
+    readonly stationweb_set_composer: (a: number, b: number, c: number, d: number) => void;
     readonly stationweb_set_layout: (a: number, b: number, c: number) => void;
+    readonly stationweb_set_transcript: (a: number, b: any) => [number, number, number];
     readonly stationweb_set_visuals: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => void;
     readonly stationweb_unregister_display_source: (a: number, b: number, c: number) => void;
     readonly stationweb_update_snapshot: (a: number, b: any) => [number, number];

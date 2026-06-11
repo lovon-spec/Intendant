@@ -26,6 +26,32 @@ export class StationWeb {
         return ret !== 0;
     }
     /**
+     * Close the transcript viewer (dashboard-side counterpart of the
+     * panel's close pill / Escape).
+     */
+    close_transcript() {
+        wasm.stationweb_close_transcript(this.__wbg_ptr);
+    }
+    /**
+     * Composer overlay geometry + state for the dashboard's DOM input:
+     * `{open, mode, rect: {x,y,w,h} | null}`. The rect is the input
+     * slot inside the drawn composer strip (CSS px), present only after
+     * the strip painted.
+     * @returns {string}
+     */
+    composer_state() {
+        let deferred1_0;
+        let deferred1_1;
+        try {
+            const ret = wasm.stationweb_composer_state(this.__wbg_ptr);
+            deferred1_0 = ret[0];
+            deferred1_1 = ret[1];
+            return getStringFromWasm0(ret[0], ret[1]);
+        } finally {
+            wasm.__wbindgen_free(deferred1_0, deferred1_1, 1);
+        }
+    }
+    /**
      * Structured introspection for agents driving the canvas UI: render
      * health, snapshot counters, view state, and every named clickable
      * rect in CSS px. `hitZones` lists all named zones in draw order
@@ -150,12 +176,41 @@ export class StationWeb {
         wasm.stationweb_set_active(this.__wbg_ptr, active);
     }
     /**
+     * Open/close the composer strip. `mode` is `send` or `launch`.
+     * The dashboard calls this from its short-circuit replacements
+     * (e.g. the legacy new-session route) and when its input overlay
+     * loses relevance (Escape inside the input).
+     * @param {boolean} open
+     * @param {string} mode
+     */
+    set_composer(open, mode) {
+        const ptr0 = passStringToWasm0(mode, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        wasm.stationweb_set_composer(this.__wbg_ptr, open, ptr0, len0);
+    }
+    /**
      * @param {string} layout
      */
     set_layout(layout) {
         const ptr0 = passStringToWasm0(layout, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
         const len0 = WASM_VECTOR_LEN;
         wasm.stationweb_set_layout(this.__wbg_ptr, ptr0, len0);
+    }
+    /**
+     * Feed (or refresh) the transcript/diff viewer. Payload shape is
+     * `model::StationTranscript`. A `refresh: true` payload is only
+     * applied while the viewer is still open on the same session —
+     * returns false otherwise so the dashboard stops live-refreshing.
+     * A non-refresh payload always opens the viewer.
+     * @param {any} payload
+     * @returns {boolean}
+     */
+    set_transcript(payload) {
+        const ret = wasm.stationweb_set_transcript(this.__wbg_ptr, payload);
+        if (ret[2]) {
+            throw takeFromExternrefTable0(ret[1]);
+        }
+        return ret[0] !== 0;
     }
     /**
      * @param {string} mood
@@ -344,6 +399,9 @@ function __wbg_get_imports() {
         __wbg_clientY_e28509acb9b4a42a: function(arg0) {
             const ret = arg0.clientY;
             return ret;
+        },
+        __wbg_clip_f2700ac6171df6c4: function(arg0) {
+            arg0.clip();
         },
         __wbg_closePath_de4e48859360b1b1: function(arg0) {
             arg0.closePath();
@@ -1252,22 +1310,22 @@ function __wbg_get_imports() {
             arg0.writeBuffer(arg1, arg2, getArrayU8FromWasm0(arg3, arg4), arg5, arg6);
         }, arguments); },
         __wbindgen_cast_0000000000000001: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { dtor_idx: 206, function: Function { arguments: [Externref], shim_idx: 207, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { dtor_idx: 208, function: Function { arguments: [Externref], shim_idx: 209, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm.wasm_bindgen__closure__destroy__hccf83c1ad0c1d3f3, wasm_bindgen__convert__closures_____invoke__h63b5eb8c1813e0ac);
             return ret;
         },
         __wbindgen_cast_0000000000000002: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { dtor_idx: 91, function: Function { arguments: [F64], shim_idx: 92, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { dtor_idx: 70, function: Function { arguments: [F64], shim_idx: 71, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm.wasm_bindgen__closure__destroy__h544cef30fa11676b, wasm_bindgen__convert__closures_____invoke__he59c630b1b02e0f5);
             return ret;
         },
         __wbindgen_cast_0000000000000003: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { dtor_idx: 91, function: Function { arguments: [NamedExternref("Event")], shim_idx: 94, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { dtor_idx: 70, function: Function { arguments: [NamedExternref("Event")], shim_idx: 73, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm.wasm_bindgen__closure__destroy__h544cef30fa11676b, wasm_bindgen__convert__closures_____invoke__hfa5895c89262f4d9);
             return ret;
         },
         __wbindgen_cast_0000000000000004: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { dtor_idx: 91, function: Function { arguments: [], shim_idx: 96, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { dtor_idx: 70, function: Function { arguments: [], shim_idx: 75, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm.wasm_bindgen__closure__destroy__h544cef30fa11676b, wasm_bindgen__convert__closures_____invoke__he6ccb7f2bccd870d);
             return ret;
         },
