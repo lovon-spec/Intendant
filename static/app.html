@@ -11084,6 +11084,43 @@ function stationEnsureMetricsTimer() {
   stationUpdateMetricsChip();
 }
 
+// Render-liveness watchdog: while the Station is the active tab and the
+// page is visible, the WebGPU loop never parks (surface keepalive), so a
+// sustained fps=0 means the renderer's active flag desynced from the DOM
+// tab state (e.g. a legacy flow toggled tabs mid-action) or the loop lost
+// its rAF. Re-assert active + resize + repaint; cheap (one debug_state
+// parse every 5s) and a no-op when healthy.
+let stationLivenessTimer = null;
+let stationLivenessZeroStreak = 0;
+
+function stationEnsureLivenessWatchdog() {
+  if (stationLivenessTimer) return;
+  stationLivenessTimer = window.setInterval(() => {
+    if (!station || activeTab !== 'station' || document.hidden) {
+      stationLivenessZeroStreak = 0;
+      return;
+    }
+    const state = station.debug_state?.() || '';
+    const fpsMatch = state.match(/fps=(\d+)/);
+    const gpuActive = state.includes('gpu=true');
+    const fps = fpsMatch ? Number(fpsMatch[1]) : 0;
+    if (gpuActive && fps === 0) {
+      stationLivenessZeroStreak += 1;
+    } else {
+      stationLivenessZeroStreak = 0;
+      return;
+    }
+    if (stationLivenessZeroStreak >= 2) {
+      stationLivenessZeroStreak = 0;
+      console.warn('station liveness watchdog: renderer parked while tab active — recovering');
+      stationStatus('Renderer paused unexpectedly — recovering');
+      station.set_active(true);
+      station.resize();
+      stationScheduleUpdate({ immediate: true });
+    }
+  }, 5000);
+}
+
 function stationWebgpuRequested() {
   return !window.location.href.includes('station_gpu=canvas')
     && !window.location.href.includes('station_gpu=off');
@@ -11170,6 +11207,7 @@ async function ensureStation() {
     stationRegisterExistingSources();
     stationRenderPeerChips();
     stationEnsureMetricsTimer();
+    stationEnsureLivenessWatchdog();
     if (active) stationRefreshSharedCaches();
     return station;
   })().catch(err => {
@@ -45387,7 +45425,16 @@ function resumeSession(s) {
     direct: true,
     ...overrides,
   });
-  routeTo('activity');
+  // Resuming from the rendered Station must not yank the user out of the
+  // canvas (routeTo deactivates the Station renderer — the surface looked
+  // frozen with stale hit zones). Stay put and open the resumed session's
+  // transcript instead; the legacy tabs keep their original routing.
+  if (stationRenderedPrimaryActive()) {
+    stationStatus(`Resumed ${shortSessionId(sid)} — transcript follows live`);
+    stationOpenTranscript(sid, { source });
+  } else {
+    routeTo('activity');
+  }
 }
 
 function showSessionDeleteStatus(message, kind = '') {

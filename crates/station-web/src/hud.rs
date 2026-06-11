@@ -1237,6 +1237,14 @@ impl StationInner {
                     action: "interrupt".into(),
                     id: sid.clone(),
                 });
+            } else if session.can_fork {
+                // Codex threads: fork when no lifecycle pill needs the slot
+                // (running sessions keep stop; /fork via the composer covers
+                // them).
+                row = row.pill("fork", C_MAUVE_CSS, HitAction::SessionAction {
+                    action: "fork".into(),
+                    id: sid.clone(),
+                });
             }
             surface.rows.push(row);
         }
@@ -1739,7 +1747,11 @@ impl StationInner {
             })
             .collect(),
         ));
-        if controls.backend == "codex" {
+        // Codex runtime rows: visible whenever codex is the global backend
+        // OR the launch composer is aimed at codex — configuring a codex
+        // launch (approval/managed mode) must not require flipping the
+        // global backend first.
+        if controls.backend == "codex" || controls.launch_agent == "codex" {
             surface.rows.push(PanelRow::choices(
                 "approval",
                 C_YELLOW_CSS,
