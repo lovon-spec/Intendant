@@ -39,6 +39,7 @@ Usage (from the LongCLI checkout, with this directory on PYTHONPATH):
 
 import json
 import os
+import shlex
 from pathlib import Path
 
 from terminal_bench.agents.installed_agents.codex.codex_agent import CodexAgent
@@ -62,11 +63,25 @@ class PersistentAuthCodex(CodexAgent):
     def name() -> str:
         return "persistent-auth-codex"
 
-    def __init__(self, *args, command_timeout_sec: float | None = None, **kwargs):
+    def __init__(
+        self,
+        *args,
+        command_timeout_sec: float | None = None,
+        reasoning_effort: str | None = None,
+        **kwargs,
+    ):
         super().__init__(*args, **kwargs)
         # Stock CodexAgent defaults version to "latest"; pin unless overridden.
         if kwargs.get("version") is None:
             self._version = DEFAULT_CODEX_VERSION
+        # Optional third delta (disclosed): pin the model reasoning effort so
+        # lanes can be compared at matched effort. The stock command sets no
+        # effort (codex model default; observed as reasoning_effort=null in
+        # smoke rollouts) while the managed lane defaults to xhigh — pass
+        # reasoning_effort=xhigh to equalize.
+        self._reasoning_effort = (
+            str(reasoning_effort).strip() if reasoning_effort else None
+        )
         # Bound the in-container codex command so the post-run auth
         # persistence in perform_task() still executes on slow tasks. The
         # stock agent blocks unboundedly and relies on the harness-level
@@ -109,6 +124,23 @@ class PersistentAuthCodex(CodexAgent):
         if self._command_timeout_sec is not None:
             commands = [
                 command.model_copy(update={"max_timeout_sec": self._command_timeout_sec})
+                for command in commands
+            ]
+        if self._reasoning_effort:
+            # Splice the -c override into the stock `codex exec` invocation,
+            # before the `--` end-of-flags marker, leaving everything else
+            # byte-identical.
+            effort = json.dumps(self._reasoning_effort)  # toml-compatible quoting
+            commands = [
+                command.model_copy(
+                    update={
+                        "command": command.command.replace(
+                            " -- ",
+                            f" -c model_reasoning_effort={shlex.quote(effort)} -- ",
+                            1,
+                        )
+                    }
+                )
                 for command in commands
             ]
         return commands
