@@ -43,6 +43,15 @@ Three proven-image (make-pytest) tasks first, the two c-env tasks last — the
 c-env base image was built today; if it misbehaves, three trials of signal
 exist before it bites, and the failure point is identical in every lane.
 
+**Execution mechanics:** one `tb run` per task, sequentially, per lane
+(run-ids `pilot3-<lane>-<date>-<n>-<task>`). A single multi-`-t` invocation
+cannot pin the order: the vendored harness materializes the task list from a
+Python *set difference* (`Dataset._init_dataset`,
+`included_task_ids - excluded_task_ids`), whose iteration order is
+hash-randomized per process — the order would be arbitrary and could differ
+between lanes. Per-task invocations also isolate 429 recovery (rerun one
+task) without disturbing the rest of the lane.
+
 ## Lane parameters (pinned)
 
 - model `gpt-5.5`, reasoning effort **xhigh in all three lanes** — the managed
