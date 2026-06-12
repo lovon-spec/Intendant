@@ -22229,6 +22229,7 @@ mod tests {
             used_tokens_at_rewind: None,
             context_window_at_rewind: None,
             pressure_band_at_rewind: None,
+            surgical: false,
         }
     }
 

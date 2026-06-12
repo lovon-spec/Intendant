@@ -53,6 +53,18 @@ pub struct ContextRewindRecord {
     /// Backward compatible: `None` on older records.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pressure_band_at_rewind: Option<String>,
+    /// True when the supervisor itself chose the anchor and authored the
+    /// primer (surgical recovery after the model exhausted its recovery
+    /// step limit without rewinding), as opposed to a model-authored
+    /// `rewind_context` call. Backward compatible: records written before
+    /// the field existed deserialize as `false` and the key is omitted for
+    /// ordinary model rewinds.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub surgical: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -262,6 +274,7 @@ mod tests {
             used_tokens_at_rewind: None,
             context_window_at_rewind: None,
             pressure_band_at_rewind: None,
+            surgical: false,
         }
     }
 
@@ -345,6 +358,7 @@ mod tests {
             used_tokens_at_rewind: Some(36_500),
             context_window_at_rewind: Some(38_000),
             pressure_band_at_rewind: Some("watch".to_string()),
+            surgical: false,
         };
 
         persist_record(dir.path(), &record).unwrap();
@@ -367,6 +381,7 @@ mod tests {
         assert!(!raw.contains("used_tokens_at_rewind"));
         assert!(!raw.contains("context_window_at_rewind"));
         assert!(!raw.contains("pressure_band_at_rewind"));
+        assert!(!raw.contains("surgical"));
 
         let read = read_record(dir.path(), "rewind-2").unwrap();
         assert_eq!(read, record);
@@ -374,6 +389,40 @@ mod tests {
         assert!(read.used_tokens_at_rewind.is_none());
         assert!(read.context_window_at_rewind.is_none());
         assert!(read.pressure_band_at_rewind.is_none());
+        assert!(!read.surgical);
+    }
+
+    #[test]
+    fn surgical_record_round_trips_and_legacy_records_deserialize_as_model_rewinds() {
+        let dir = tempdir().unwrap();
+        let mut record = minimal_record("rewind-surgical", "2026-06-12T00:00:00Z", None, "t-1");
+        record.surgical = true;
+
+        persist_record(dir.path(), &record).unwrap();
+        let raw = fs::read_to_string(record_path(dir.path(), "rewind-surgical")).unwrap();
+        assert!(raw.contains("\"surgical\": true"));
+        assert_eq!(read_record(dir.path(), "rewind-surgical").unwrap(), record);
+
+        // Records written before the field existed carry no `surgical` key
+        // and must deserialize as ordinary model rewinds.
+        let legacy = serde_json::json!({
+            "record_id": "rewind-legacy-3",
+            "created_at": "2026-06-12T00:00:00Z",
+            "session_id": null,
+            "thread_id": "t-1",
+            "item_id": "call-1",
+            "position": "after",
+            "reason": "trim noisy output",
+            "primer": "keep this",
+            "preserve": [],
+            "discard": [],
+            "artifacts": [],
+            "next_steps": [],
+            "source_rollout_path": null,
+            "recovery_rollout_path": null,
+        });
+        let legacy: ContextRewindRecord = serde_json::from_value(legacy).unwrap();
+        assert!(!legacy.surgical);
     }
 
     #[test]
