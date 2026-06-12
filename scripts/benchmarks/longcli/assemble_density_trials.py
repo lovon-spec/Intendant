@@ -109,8 +109,13 @@ def assemble(raw_root: Path, out_root: Path) -> int:
             print(f"WARN: no sessions dir in {agent_logs}", file=sys.stderr)
             continue
 
-        name = f"{lane}-{idx}-{task}"
-        dest = out_root / name
+        # Layout: <out-root>/<lane>/<lane>__<idx>__<task>/ — the per-lane
+        # subdirectory is a "run dir" for summarize_harbor_results.py (which
+        # discovers trials by glob("*__*") and treats each run dir as a
+        # lane), while each trial dir individually feeds
+        # managed_density_report.py.
+        name = f"{lane}__{idx}__{task}"
+        dest = out_root / lane / name
         agent = dest / "agent"
         agent.mkdir(parents=True, exist_ok=True)
         for link_name, target in (

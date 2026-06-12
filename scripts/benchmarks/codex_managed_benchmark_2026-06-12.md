@@ -1,9 +1,10 @@
-# Codex Managed-Context Benchmark — Constrained Window (2026-06-12) — DRAFT
+# Codex Managed-Context Benchmark — Constrained Window (2026-06-12)
 
-> **Status: DRAFT.** The PRIMARY tier (20 tasks x 2 attempts, context window
-> 40k) is complete and analyzed below. The DEEP tier (8 tasks x 2 attempts,
-> window 28k) is still running; its section is stubbed and this report gets
-> finalized when that lane lands.
+> **Status: FINAL.** Both tiers are complete and analyzed: the PRIMARY tier
+> (20 tasks x 2 attempts, context window 40k — the headline result) and the
+> DEEP tier (8 tasks x 2 attempts, window 28k — a mechanism-robustness stress
+> test at an artificial floor, §Deep Tier). Campaign timeline, total cost,
+> and the follow-up tracks this data motivates are at the end.
 
 This is the constrained-window follow-up to
 `codex_lineage_benchmark_2026-05-27.md`. The May run showed reward parity at
@@ -61,8 +62,17 @@ now merged at `b49d6923`: noise-triggered pruning, living-index primer).
 
 Run artifacts:
 
-- Managed: `/home/user/tbench-jobs/managed-w40-p20/2026-06-12__01-35-17`
-- Vanilla: `/home/user/tbench-jobs/vanilla-w40-p20/2026-06-12__05-02-38`
+- Managed (primary): `/home/user/tbench-jobs/managed-w40-p20/2026-06-12__01-35-17`
+- Vanilla (primary): `/home/user/tbench-jobs/vanilla-w40-p20/2026-06-12__05-02-38`
+- Managed (deep): `/home/user/tbench-jobs/managed-w28-d8/2026-06-12__08-43-17`
+- Vanilla (deep): `/home/user/tbench-jobs/vanilla-w28-d8/2026-06-12__10-39-43`
+
+The deep tier reuses everything above except: `context_window=28000` (reported
+effective window **26,600** = 95%, hard window 28,000; managed rewind-only
+gate **22,610** = 85% of 26,600; vanilla auto-compact **25,200** = 0.9 x 28,000
+per the agent def), fresh per-lane auth homes
+(`/home/user/tbench-codex-homes/{managed-w28,vanilla-w28}`), and strict
+serialization again (managed finished 10:03, vanilla started 10:39).
 
 ## Terminal-Bench Summary (primary tier, w40)
 
@@ -466,17 +476,361 @@ What managed mode should keep: the primer/carry machinery (83%/74%, 6x less
 re-derivation than compaction summaries) and the lean baseline (14k vs 23k,
 which is also why managed remains 16% faster in wall-clock).
 
-## Deep Tier (w28, 8 tasks x 2) — PENDING
+## Deep Tier (w28, 8 tasks x 2) — Mechanism Robustness at an Artificial Floor
 
-> **Stub.** `managed-w28-d8` / `vanilla-w28-d8` (window 28,000 — chosen so
-> the managed baseline + post-rewind headroom forces several cycles per
-> trial) were launching as of this draft; the managed lane is running. This
-> section will get: the same matrix, engagement split, band distribution,
-> taxonomy, and overhead decomposition at the harsher window, plus
-> cross-window scaling of the per-cycle cost. Expectation set by the primary
-> tier: more forced cycles per trial should *amplify* the cliff-edge
-> mechanisms quantified above; if it does not, that is evidence the w40
-> failure modes are threshold-tuning artifacts rather than structural.
+> **Read this section as a stress test, not a product benchmark.** w28 is an
+> artificial floor chosen so the context machinery must cycle several times
+> per trial: vanilla's ~22.9k baseline prompt starts at **91% of its own
+> auto-compact ceiling** (25,200) and managed's ~14.1k baseline at 62% of the
+> rewind gate (22,610). No realistic deployment runs gpt-5.5 at a 28k window
+> on these tasks. The question answered here is **mechanism robustness** —
+> which w40 failure modes recur, amplify, or vanish when *every* trial is
+> forced into heavy engagement — explicitly **not** which lane is the better
+> product. The w40 primary tier above remains the headline result. The
+> managed lane ran the **same pre-`feat/density-policy` binaries** as the
+> primary tier, i.e. the OLD cliff-edge policy this report indicts.
+>
+> The stub for this section pre-registered the test: *"more forced cycles
+> per trial should amplify the cliff-edge mechanisms quantified above; if it
+> does not, that is evidence the w40 failure modes are threshold-tuning
+> artifacts rather than structural."* Verdict below: **amplified — structural.**
+
+### Summary (deep tier, w28)
+
+| Lane | Trials | Reward | pass@2 | Cost | Input tokens | Cached (hit rate) | Output | Agent s (sum) | Job wall | Cap-outs |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| Intendant-managed Codex | 16 | 2.0/16, 0.125 | 0.25 | $37.17 | 14,192,448 | 9,669,760 (68.1%) | 324,034 | 12,241 | 4,829s | **0** |
+| Vanilla Codex 0.133.0 | 16 | 4.0/16, 0.250 | 0.375 | $18.73 | 10,196,042 | 8,239,616 (80.8%) | 161,037 | 25,445 | 9,245s | **11** (AgentTimeoutError) |
+
+Both lanes collapse at this floor — w40 pass rates on these same 8 tasks
+were managed 5/16, vanilla 11/16, so the window squeeze cost vanilla more
+ground (-7) than managed (-3) on the matched subset while leaving vanilla
+ahead — and they collapse in **opposite ways**: vanilla
+burned 80% of the lane's aggregate task-cap budget (25,445s of 31,800s) and
+died at the time cap in 11/16 trials; managed used 38% of budget, hit zero
+caps and zero harness exceptions, and instead ended **13/16 sessions at the
+recovery step limit**. Managed cost 1.98x vanilla ($2.32 vs $1.17 per trial)
+while being 2.1x faster in agent wall-clock. Engagement was total: managed
+40 rewind records across 16/16 trials (2.50/trial), vanilla 325 compaction
+events across 16/16 trials (20.3/trial). Cost decomposition (managed -
+vanilla): uncached input +2.57M = +$12.83, output +163k = +$4.89, cached
++1.43M = +$0.72 → +$18.44 (fitted pricing identical to the primary tier,
+residual <$0.0001 across all 32 trials).
+
+### Task Matrix (deep tier)
+
+Same format as the primary matrix; both attempts sorted by trial suffix.
+`P/F EXC` = the trial hit the task time cap (900s build-cython/gcode/sqlite,
+1800s make-mips/rstan, 2400s schemelike, 3600s regex/train-fasttext).
+
+| Task | Managed a1 | Managed a2 | Vanilla a1 | Vanilla a2 | M/V |
+| --- | --- | --- | --- | --- | --- |
+| build-cython-ext | P $2.75 644s r5 | F $2.00 337s r2 | F EXC $0.79 901s c12 | F EXC $0.84 900s c13 | 1/0 |
+| gcode-to-text | F $1.43 346s r1 | F $1.75 358s r1 | F EXC $1.01 900s c10 | F EXC $1.03 901s c12 | 0/0 |
+| make-mips-interpreter | F $2.31 379s r4 | F $1.77 308s r1 | F EXC $1.48 1801s c20 | F EXC $1.27 1801s c20 | 0/0 |
+| regex-chess | F $3.15 1733s r5 | F $3.36 846s r4 | P EXC $2.47 3601s c46 | F $0.58 712s c5 | 0/1 |
+| rstan-to-pystan | F $2.00 257s r1 | F $1.81 297s r1 | F EXC $1.17 1801s c19 | F EXC $1.27 1801s c25 | 0/0 |
+| schemelike-metacircular-eval | F $1.09 178s r1 | P $2.55 614s r4 | P $0.49 735s c8 | F $1.24 1299s c19 | 1/1 |
+| sqlite-with-gcov | F $1.04 272s r1 | F $1.90 334s r2 | P $0.53 639s c12 | P $0.58 419s c8 | 0/2 |
+| train-fasttext | F $4.87 3561s r5 | F $3.39 1777s r2 | F EXC $1.97 3615s c48 | F EXC $2.02 3620s c48 | 0/0 |
+
+Per-task reading (n=2, so single flips are noise; the *shapes* are the data):
+
+- **Managed's lone task win, build-cython-ext (1/2 vs 0/2):** the pass went
+  *through* 5 rewinds — including a 139%-of-window record and a
+  no-eligible-anchor dead-end message it survived by declining the rewind
+  ("No density-valid rewind anchor is available, so I'm leaving context
+  unchanged") — at $2.75, 3.3x vanilla's cap-out price. Vanilla burned both
+  900s caps in compaction churn (12-13 events) without converging.
+- **Vanilla's wins, sqlite-with-gcov (2/2 vs 0/2) and regex-chess (1/2 vs
+  0/2):** sqlite is the cleanest protocol-kill contrast — vanilla finished
+  in 419-639s; managed died at the step limit at 272s/334s on a 900s cap
+  with the build mid-flight. Vanilla's regex pass spent the *full* 3600s cap
+  (46 compactions) and still passed because the work was already on disk
+  when the cap hit (`P EXC`).
+- **Both-lane zeros (5 tasks):** gcode (managed transcribed flag characters
+  again, vanilla double-capped), make-mips (vanilla reached Doom's demo loop
+  at both 1800s caps; managed step-limited at 308s/379s), rstan (vanilla
+  capped mid-sampling x2), train-fasttext (training-dominated in both lanes,
+  as at w40 and in May), schemelike split 1/1.
+
+### Engagement: bands, conditional reward, and context quality
+
+All 40 managed rewind records predate `pressure_at_rewind` (same binaries as
+the primary tier); bands recovered from each record's archived pre-rewind
+rollout via `summarize_harbor_results.py` (band source `rollout` for 40/40),
+thresholds vs the reported 26,600 window: gate 22,610, window 26,600.
+
+| Band | Records (w28) | Share | w40 share |
+| --- | ---: | ---: | ---: |
+| ok (voluntary) | 14 | 35% | 45% |
+| watch (gate zone) | 15 | 38% | 28% |
+| high (over window) | 11 | 28% | 26% |
+
+The forced share grew 55%→65%, and the overshoot got *relatively* worse: max
+54,067 used = **203% of the reported window** (193% of the 28,000 hard
+window; the w40 max was 196% of its reported window), with 5 records past
+the hard window (54.1k, 37.0k, 36.7k, 34.6k, 32.2k —
+`make-mips__VF3n96r` the worst). Single-turn parallel-tool ingestion remains the
+overshoot mechanism — and it is not managed-specific: **21% of vanilla's
+requests (83/396) also exceeded the reported window intra-turn** (max
+36,616); auto-compact can't pre-empt mid-turn ingestion either.
+
+Engagement-conditional reward collapses to one row per lane at w28 — there
+is no control group left, which is exactly what the tier was built to do:
+
+| Group | Trials | Pass | Rate | w40 rate |
+| --- | ---: | ---: | ---: | ---: |
+| Managed, never engaged | 0 | — | — | 100% |
+| Managed, voluntary rewinds only | 0 | — | — | 64% |
+| Managed, gate-forced | 16 | 2 | **12.5%** | 33% |
+| Vanilla, never compacted | 0 | — | — | 100% |
+| Vanilla, compacted | 16 | 4 | **25%** | 59% |
+
+Both lanes' engaged pass rates roughly halve from w40 (33→12.5%, 59→25%) —
+the *ordering* is preserved and the forced-engagement gap (~2x) neither
+opens nor closes. Context-quality metrics
+(`managed_density_report.py` on all 32 trials; calibration TRUSTED at
+corrected p50 1.000-1.001 everywhere):
+
+| Metric | Managed (n=16) | Vanilla (n=16) |
+| --- | ---: | ---: |
+| Mean density / tail density | 0.950 / 0.884 | **1.000 / 1.000** |
+| Tier-1 old-output share (mean) | 0.150 | **0.000** |
+| Re-derivation, post-prune (count / tokens) | **7 / 2,626** (all `primer_ignored`) | 91 / 192,056 (all `compaction`) |
+| Re-derivation, in-context (count / tokens) | 102 / 42,127 | 1 / 122 |
+| Primer facts carried → next primer | 90% (577/644) | n/a |
+| Primer facts referenced after rewind | 83% (928/1,124) | n/a |
+| Primer tokens (median / max, n=40) | 814 / 1,556 | n/a |
+
+The w40 readout sharpens into caricature at the floor. Vanilla compacting
+every ~1.2 requests keeps its visible context *perfectly* clean (density
+1.000 — nothing stale survives long enough to be measured) while losing so
+much state that it re-derived **192k tokens of already-done work** (73x
+managed's post-prune weight) — re-running builds and tests is a large part
+of why 11 trials hit the wall clock. Managed's primer machinery, conversely,
+got *better* under pressure (90%/83% vs 83%/74% at w40) and held post-prune
+re-derivation to 2.6k tokens. (Managed's large *in-context* duplicate count
+— 102 calls / 42k tokens vs vanilla's ~0 — is almost entirely `write_stdin`
+poll loops on long-running processes, 70 of them in the two train-fasttext
+trials and 14 in regex `4yFSpez`; process-watching behavior, not a context
+mechanism. Hygiene tools are excluded from duplicate tracking.) The
+mechanisms keep their w40 characters: compaction is clean-but-lossy,
+managed rewind is retentive-but-disruptive.
+
+### Timeout Taxonomy — who degrades how at 28k
+
+**Vanilla: 11/16 trials died at the task cap** (verified per-trial
+`AgentTimeoutError`: 4 @ 900s — build-cython x2, gcode x2; 4 @ 1800s —
+make-mips x2, rstan x2; 3 @ 3600s — regex-chess `anNMUu4` (which still
+passed: work was on disk before the cap), train-fasttext x2). Where the time
+went: **18,715s — 73.6% of vanilla's total agent wall-clock — sat inside
+compaction summarization gaps** (325 gaps, mean 57.6s, measured from each
+`compacted` event back to the preceding rollout line; same measure at w40:
+6,345s = 23.1%). The per-event price is flat across windows (~56-58s); the
+*frequency* exploded (2.9 → 20.3/trial). regex `anNMUu4` spent 2,830s of its
+3,601s inside summarization; the train-fasttext pair ~2,100-2,600s each. Add
+the 192k tokens of post-compaction re-derivation above and vanilla's cap-out
+mode is fully explained: it never stops, it just pays a ~58s tax every ~1.2
+requests, re-runs what the summaries forgot, and runs out of clock.
+
+**Managed: 0 cap-outs, 0 exceptions — 13/16 sessions ended at the recovery
+step limit instead.** In every one of the 13, the step-limit event
+("Managed context recovery reached the follow-up step limit before reducing
+context") is the *final* session-log event — gap to session end 0s. Those
+endings came at 178-846s on 900-3600s caps (the 12 step-limit *misses* left
+51-93% of their task budget unused, mean ~72%), after 1-5 recovery
+kickstarts (34 lane-wide, in 15/16 trials; w40: >=1 in 20/40) and 53-261s of
+post-kickstart work. The remaining 3 trials: `9UEb8fw` (pass, survived a
+no-eligible-anchor dead-end), `4yFSpez` (delivered a wrong regex solution at
+1,733s — ordinary quality miss; its session ended at a kickstart), and
+`krPycUZ` (3,561s ≈ the 3600s cap monitoring a real training run, the one
+managed trial that behaved like vanilla's cap-outs).
+
+So at 28k the degradation modes are mirror images: **vanilla degrades by
+externally-imposed truncation after spending the whole budget on churn;
+managed degrades by self-truncation with most of the budget unspent.** Note
+the censoring asymmetry when reading the 2-vs-4 reward gap: a cap-out can
+still pass if work landed early (vanilla got exactly one of those), while a
+step-limit death ends the session mid-flight by construction.
+
+### Recovery-step-limit recurrence — the pre-registered check
+
+The primary tier's headline failure mode **recurred and amplified**, on
+every axis the w40 taxonomy quantified:
+
+| Mechanism | w40 (40 trials) | w28 (16 trials) |
+| --- | ---: | ---: |
+| Trials hitting the recovery step limit | 10 (25%) | **13 (81%)** |
+| Misses ending inside the protocol | 8 of 20 (Class A+B) | **12 of 14** |
+| `list_rewind_anchors` per completed rewind | 3.06 (162/53) | **4.60 (184/40)** |
+| Worst listing loop | 16 listings / 2 rewinds | 14 listings / 1 rewind (`XLua3cM`); 23 / 4 (`cwtbQZc`) |
+| Recovery kickstarts (trials with >=1) | 20/40 | 15/16 (34 total) |
+| `<turn_aborted>` injections per trial | 2.5 (101/40) | **5.2 (83/16)** |
+| `rewind_context` calls / completions | 53/53 | 45/40 (5 aborted/failed calls) |
+| `inspect_rewind_anchor` / `rewind_backout` | 0 / 0 | 0 / 0 |
+| Rapid re-rewind pairs (<=150s) / records | 14/53 (26%) | **15/40 (38%)** |
+| Resets re-exceeding the window <=100s later | 7/53 (13%) | **14/40 (35%)** |
+
+Two qualitative notes. First, the step limit is now visibly the session
+*terminator*, not a warning the model recovers from — 13 terminal events,
+including one in a passing trial (`eZwHvX3`: the solution was already
+written when the protocol died, the verifier passed it posthumously).
+Second, the Class-B anchor-catalog corner recurred too (`9UEb8fw`: handoff
+demanded a rewind, catalog offered only management/status anchors) but the
+model survived it this time by refusing to rewind and resuming work — at
+w28's shallower depth that refusal was recoverable; at w40 it dead-ended.
+Per the stub's pre-registered criterion, this is the structural verdict:
+**the w40 failure modes are not threshold-tuning artifacts.**
+
+### Cross-window per-cycle scaling
+
+Uniform method across all four lanes (forced episode = the contiguous run
+of gate-zone requests ending in a completed rewind, priced uncached;
+vanilla cycle = uncached on the requests flanking each `compacted` event):
+
+| | Managed w40 | Managed w28 | Vanilla w40 | Vanilla w28 |
+| --- | ---: | ---: | ---: | ---: |
+| Cycles per trial | 1.33 | 2.50 | 2.85 | **20.3** |
+| Forced cycles (episodes) | 26 | 23 | 114 | 325 |
+| Per-cycle uncached tokens (mean) | 107.8k | 61.1k | 13.4k | 9.4k |
+| Per-cycle $ | $0.54 | $0.31 | $0.067 | $0.047 |
+| Managed/vanilla per-cycle ratio | 8.0x | 6.5x | | |
+| Per-cycle wall-clock (mean) | 81s | 62s | ~56s | ~58s |
+| Gate-zone share of lane uncached | 53% | 59% | 25% | 89%* |
+
+\* At w28 vanilla *lives* above the 22.6k cut (96% of its requests), so its
+"gate-zone" share is just life near the ceiling, not interception cost; the
+within-lane comparable number is the 73.6% of wall-clock in summarization.
+(The uniform per-episode measure also refines the w40 worked example's ~10x
+single-episode illustration to a measured lane-wide 8.0x.)
+
+The scaling law this table fixes: **per-cycle price tracks prompt size
+(window), cycle count tracks inverse headroom.** Managed's forced episode
+got 43% cheaper when the window shrank 30% (smaller prompts at the cliff,
+4.5-4.8 gate-zone requests per episode at both windows — the round-trip
+*count* is policy-determined, not window-determined). Run the same
+structure at a production window (200k+) and each forced episode re-bills
+5x-larger prompts: the cliff tax grows with exactly the deployments that
+matter, while vanilla's compaction stays a fixed ~58s/~$0.05 nuisance. The
+gate-zone uncached penalty compressed from 5.1x to 2.2x (9.98k vs 4.59k
+per request) for the same reason in reverse — vanilla at w28 pays its own
+near-ceiling cache penalties — without changing the structural conclusion.
+
+### Did managed thrash at 28k?
+
+Quantified: **more churn per trial, but no runaway thrash — the failure
+mode is fast protocol death, not budget burn.** Cycles rose to 2.50/trial
+(max 5, in three trials: the build-cython pass, regex `4yFSpez`, train
+`krPycUZ`); 38% of records were followed by another rewind within 150s; 35%
+of resets re-exceeded the window within 100s (re-blow). But the lane
+completed in 4,829s of job wall (vanilla: 9,245s), used 38% of its
+aggregate cap budget, produced zero harness exceptions, and the launch
+notes' thrash guard — *"stop the deep tier if >2 consecutive trials burn
+the full 3600s thrashing"* — never tripped: the only near-cap trial
+(`krPycUZ`, 3,561s) was supervising an actual fastText training run, and
+its 5 rewinds were spread across 3,561s, not looping. The step limit is
+doing its job as a circuit breaker in the narrow sense — it reliably stops
+infinite loops — but at w28 it converted 81% of trials' recovery attempts
+into session terminations, which is the wrong convergence (see
+§Implications #3: a failed recovery must hand the task back).
+
+### What the deep tier adds
+
+1. The w40 protocol failure modes are **structural** (pre-registered test
+   passed: step-limit endings 25%→81%, listings/rewind 3.06→4.60, rapid
+   pairs 26%→38%).
+2. The primer/content machinery is robust at the floor (90% carry, 83%
+   post-rewind reference, 73x less post-prune re-derivation than
+   compaction) — the *content* half of managed mode keeps earning its keep.
+3. Vanilla's cheap valve stops scaling when per-cycle frequency explodes:
+   73.6% of wall-clock in summarization, 11/16 cap-outs, 192k re-derived
+   tokens. Cheap-dumb wins at moderate pressure (w40), loses its margin at
+   extreme pressure — its 4/16 is no triumph either.
+4. Neither mechanism handles single-turn overshoot (managed 203% of window;
+   21% of vanilla requests over-window intra-turn) — per-turn ingestion
+   budgeting (§Implications #5) is mechanism-independent.
+
+## Campaign Timeline & Cost
+
+| When (2026) | Stage | Outcome | Cost |
+| --- | --- | --- | ---: |
+| May 27 | Unconstrained baseline (`codex_lineage_benchmark_2026-05-27.md`): 22 tasks x 1, effort `low`, no window cap | Parity 17/22 = 17/22; managed -12.2% cost; zero context-machinery engagement | $72.32 (incl. $0.96 bare-patched sanity lane) |
+| Jun 11 | Benchmark binaries built (`bench-binaries-20260611`): codex fork `f7a06d81f`, intendant `bench/managed-harness` @ `a4fd05ec` | — | — |
+| Jun 11 23:44 | Pilot attempt 1 (`pilot-managed-w40-attempt1-mtlsfail`): 6 trials | All 6 errored at agent launch (mTLS/env mistake); zero model calls | $0 |
+| Jun 11 23:49 | Pilot attempt 2 (`pilot-managed-w40-attempt2-bugdiag`): 3 trials | Surfaced the two pilot-era managed-context bugs; fixes committed as `edc13230` (rollback-aware anchor catalog, autonomous density-gate continuation), intendant binary rebuilt at that sha | $4.18 |
+| Jun 12 00:38 / 01:07 | Pilot gate (`pilot-managed-w40` 3/6, `pilot-vanilla-w40` 4/6) | PASSED with no retune | $15.73 |
+| Jun 12 01:35→04:06 / 05:02→07:57 | **Primary tier** `managed-w40-p20` / `vanilla-w40-p20` (20 tasks x 2, w40, effort `xhigh`) | Managed 20/40 vs vanilla 25/40; +39.8% cost | $124.61 |
+| Jun 12 08:43→10:03 / 10:39→13:13 | **Deep tier** `managed-w28-d8` / `vanilla-w28-d8` (8 tasks x 2, w28) | Managed 2/16 vs vanilla 4/16; mechanisms amplified | $55.90 |
+
+Version pins for the June campaign: lineage-fork codex `f7a06d81f`
+(ubuntu:22.04 build), vanilla npm codex `0.133.0`, intendant
+`bench/managed-harness` @ `edc13230` (= `a4fd05ec` + the pilot-era fixes
+above; debian:12 build), model `gpt-5.5` at reasoning effort `xhigh`,
+analysis tooling @ `b49d6923`. Note the May baseline ran at effort `low` —
+the May/June cost levels are not directly comparable, the within-June
+managed-vs-vanilla deltas are.
+
+**Total campaign cost: $200.42** for the June constrained-window campaign
+(133 trials inventoried in `INVENTORY-20260612.txt`: $0 + $4.18 + $15.73 +
+$124.61 + $55.90, pilot attempts priced from rollout token counts at the
+fitted rates where `result.json` usage is absent); **$272.74** for the full
+program including the May-27 baseline.
+
+**Fission usage: 0.** No trial in any lane of the campaign produced a
+fission ledger (inventory: "fission usage (trials with a
+fission_ledger.json): 0" across all 133 trials; the summarizer confirms 0
+groups / 0 branches in all four June lanes). The fission machinery shipped
+in these binaries but was never triggered at constrained windows — every
+context-pressure event resolved through the rewind/compaction paths
+measured above, so nothing in this report's economics is attributable to
+fission.
+
+## What This Motivates
+
+This campaign bought, for ~$200, a measured mechanism-by-mechanism bill of
+what cliff-edge managed context actually costs. The numbers that matter:
+**33% pass under gate-forced recovery vs 64% under voluntary rewinds**
+(w40; 12.5% when w28 forces everything), the **5.1x gate-zone uncached
+penalty** (w40; the gate interrupt re-bills the largest prompts at ~17%
+cache 2-3x per episode), **cache-prefix busting** by the turn-abort +
+tool-surface swap (53-59% of lane uncached spend lands in the gate zone),
+and **recovery-loop deaths** (step-limit endings in 25% of w40 trials →
+81% at w28; 3.06 → 4.60 listings per rewind; the catalog that grows as you
+page it). Each maps to a follow-up track already in flight:
+
+1. **Density-first policy** — `feat/density-policy`, merged at `b49d6923`;
+   built + live-validated. Kills the cliff by construction: noise-triggered
+   pruning operates in the ok/watch band where this report measures zero
+   reward cost vs vanilla, and the living-index primer is maintained during
+   normal turns so no at-pressure listing/decision loop exists. Directly
+   targets the 33%-vs-64% split and the band distribution (45% voluntary at
+   w40 shrinking to 35% at w28 — the old policy drifts cliff-ward exactly
+   when pressure rises).
+2. **Recovery robustness** — `fix/recovery-robustness` (idempotent,
+   dead-end-proof anchor catalog; state-aware kickstart/gate texts that
+   commit from a catalog already in view) plus the fork-side
+   `fix/recovery-instruction`; built + live-validated, with listings per
+   rewind measured 3.06 → <=1 in live validation. Directly targets the
+   step-limit deaths (7 w40 misses, 12 w28 misses), the offset-0 re-listing
+   loop, the catalog-pollution corner (`WysfhkX` w40, survived-by-luck
+   `9UEb8fw` w28), and the rule that a failed recovery must hand the task
+   back rather than end the session.
+3. **Cache-stable gating** — designed, pending pilot data. Targets the
+   prefix-busting economics: constant tool surface and appended-not-injected
+   control messages so pressure interception stops re-billing 38-48k
+   prompts; the cross-window scaling result (per-cycle price tracks window
+   size — $0.31 at w28, $0.54 at w40, growing with prompt size into
+   production windows) is the quantified reason this track exists.
+
+What the campaign says to *keep*: the primer/carry machinery (83-90% fact
+carry, 73x less post-prune re-derivation than compaction at w28) and the
+lean ~14k baseline (which is also why managed stays 16% (w40) to 52% (w28)
+faster in agent wall-clock). The mechanisms are sound; the *policy* around
+them — when to engage, what it costs to engage, and what happens when
+engagement stalls — is what the three tracks replace. A follow-up
+constrained-window run on the density-first binaries, against this report
+as the baseline, is the natural next benchmark.
 
 ## Reproduction
 
@@ -505,6 +859,16 @@ cd /home/user/tbench-agents && /home/user/tbench-harbor-venv/bin/harbor run \
   -n 4 -k 2 --debug -o /home/user/tbench-jobs/vanilla-w40-p20
 ```
 
+Deep tier: identical launches with `$DEEP_TASKS` instead of
+`$PRIMARY_TASKS`, `--ak context_window=28000`, auth homes
+`{managed-w28,vanilla-w28}`, and `-o .../{managed-w28-d8,vanilla-w28-d8}`
+(w28 not 24k: the managed baseline is ~13.8k + ~8k post-rewind headroom, so
+24k sits on the floor; 28k forces many cycles while staying workable):
+
+```bash
+DEEP_TASKS="-i build-cython-ext -i gcode-to-text -i make-mips-interpreter -i regex-chess -i rstan-to-pystan -i schemelike-metacircular-eval -i sqlite-with-gcov -i train-fasttext"
+```
+
 Analysis (run from this repo; rsync the run dirs locally first, excluding the
 heavyweight `file_snapshots`/`frames` subdirs):
 
@@ -523,18 +887,62 @@ python3 scripts/benchmarks/managed_density_report.py \
   --out /tmp/mbench/density-subset --no-plot
 ```
 
+Deep-tier analysis, same tools (density on all 32 trials):
+
+```bash
+rsync -a --exclude file_snapshots --exclude frames \
+  user@192.168.1.206:/home/user/tbench-jobs/managed-w28-d8/2026-06-12__08-43-17/ /tmp/mbench/managed-w28-d8/
+rsync -a \
+  user@192.168.1.206:/home/user/tbench-jobs/vanilla-w28-d8/2026-06-12__10-39-43/ /tmp/mbench/vanilla-w28-d8/
+
+python3 scripts/benchmarks/summarize_harbor_results.py \
+  /tmp/mbench/managed-w28-d8 /tmp/mbench/vanilla-w28-d8 \
+  --csv /tmp/mbench/trials-w28.csv --lanes-csv /tmp/mbench/lanes-w28.csv
+
+python3 scripts/benchmarks/managed_density_report.py \
+  /tmp/mbench/{managed,vanilla}-w28-d8/*__* \
+  --out /tmp/mbench/density-w28 --no-plot
+```
+
+The request-level buckets, episode pricing, and cross-window scaling tables
+were computed from the rollout `token_count` series with the same bucket
+definitions as the primary tier (validated by exact reproduction of the
+primary tier's published request counts, bucket totals, first-prompt
+medians, hygiene-tool counts, and overshoot maximum before being applied to
+w28).
+
 ## Limitations
 
 - 2 attempts per task; per-task flips of +-1 are within attempt noise —
   the engagement-conditional and taxonomy results, which aggregate across
   tasks, are the load-bearing findings.
 - Rewind-record pressure bands use the archived pre-rewind rollout fallback
-  (all 53 records; the records predate the `pressure_at_rewind` fields) —
-  band source is uniform, so the distribution is internally consistent.
-- Density/M-metrics are computed on a 5-task subset (20 trials), not the
-  full 80.
+  (all 53 w40 records and all 40 w28 records; the records predate the
+  `pressure_at_rewind` fields) — band source is uniform, so the
+  distributions are internally consistent.
+- Primary-tier density/M-metrics are computed on a 5-task subset (20
+  trials), not the full 80; the deep tier's density metrics cover all 32
+  w28 trials.
 - The vanilla lane ran 3.5h after the managed lane (serialized); both lanes
   hit the same org prompt-cache, and the first-request cache behavior was
   symmetric (2,432-token static-preamble hits only).
 - `db-wal-recovery`'s managed pass is legitimate but unusually efficient;
   with n=2 it contributes a +1 flip that should not be over-read.
+- Deep tier: rewards sit near the floor (2/16 vs 4/16), so the w28 reward
+  gap itself carries wide error bars; the load-bearing w28 results are the
+  mechanism counts (step-limit endings, cycles/trial, band shares,
+  summarization wall-clock), which aggregate many events per trial.
+- The w28 lanes' losses are censored differently — vanilla's by the
+  external task cap (partial work still verifiable; one cap-out passed),
+  managed's by the protocol's own step limit (always mid-flight) — so the
+  reward comparison at w28 compares truncation regimes, not just solution
+  quality. This is intended (it is the mechanism contrast under study) but
+  it is not a clean quality measurement.
+- At w28, vanilla's per-cycle working room (~0.3-2.3k tokens between its
+  post-compaction prompt and the 25,200 auto-compact ceiling) makes the
+  per-request bucket shares interpretation-different across lanes; cross-
+  lane bucket comparisons at w28 are reported but the within-lane
+  wall-clock and re-derivation numbers are the reliable contrasts.
+- Pilot lanes did not record usage in `result.json`; their costs in the
+  campaign total are priced from rollout `token_count` series at the fitted
+  rates (validated exact on the one pilot trial that did record cost).
