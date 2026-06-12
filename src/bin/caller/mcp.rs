@@ -1105,7 +1105,7 @@ impl McpAppState {
                 "Context is above the recommended density threshold but below the rewind-only limit. Normal tools are allowed; at handoff or before broad follow-up work, exact-anchor density maintenance is optional only if it materially improves density."
             }
         } else {
-            "Context is below the recommended density threshold. Normal tools are allowed; no rewind preparation is needed unless a recent tool result was genuinely noisy or unexpectedly large."
+            "Context is below the recommended density threshold. Normal tools are allowed and normal work continues. Routinely pruning a recent genuinely noisy or unexpectedly large output whose durable facts are already crystallized is normal at this pressure; do not browse anchors without such a noisy trigger."
         };
 
         serde_json::json!({
@@ -1480,7 +1480,7 @@ fn append_manual_http_tool_definitions(
         "rewind_context",
         manual_http_tool_definition!(
             "rewind_context",
-            "Schedule a Codex context rewind to an exact item/tool-call anchor. Use only after managed-context recovery/density handoff guidance, rewind-only context pressure, a watch-pressure density decision, or genuinely noisy/unexpectedly large recent output makes a rewind necessary; do not use for ordinary low-pressure startup/search work. First call list_rewind_anchors and choose one returned item_id; call inspect_rewind_anchor when the compact row is ambiguous. Do not synthesize anchor ids from prior failed tool calls. The current turn will finish, Intendant will roll back Codex to the anchor, inject the primer as developer context, and resume the branch.",
+            "Schedule a Codex context rewind to an exact item/tool-call anchor. Use it for routine noise-triggered hygiene — pruning genuinely noisy/unexpectedly large recent output at any pressure including ok, crystallizing its durable facts in the primer itself — and for managed-context recovery/density handoff guidance, rewind-only context pressure, or a watch-pressure density decision; do not use during ordinary startup/search work when nothing noisy happened. Call list_rewind_anchors once, choose one returned item_id, and rewind in the same turn; call inspect_rewind_anchor only when the compact row is ambiguous. Do not synthesize anchor ids from prior failed tool calls. The current turn will finish, Intendant will roll back Codex to the anchor, inject the primer as developer context, and resume the branch.",
             RewindContextParams
         ),
     );
@@ -1488,7 +1488,7 @@ fn append_manual_http_tool_definitions(
         "list_rewind_anchors",
         manual_http_tool_definition!(
             "list_rewind_anchors",
-            "List exact Codex rewind anchors only after recovery/density guidance, rewind-only/watch pressure, or genuinely noisy/unexpectedly large output. Do not call during ordinary startup/status/search turns, or after bounded low-output searches while context_pressure.status is ok. Default output is a compact valid non-management page with exact item_id values, positions, summaries, filtered_total, and next_offset. Under managed density pressure, an omitted limit defaults to a one-anchor density/pruning page. Use offset/limit/query/reverse/detail for deliberate paging. For density, use density_candidates_only=true and include_pruning_estimates=true; rows hide anchors without density-valid positions and narrow positions to rewind_context-valid choices. include_non_recovery=true is diagnostic only; never pass recovery_eligible=false rows. Inspect ambiguous rows, then call rewind_context with an exact returned item_id and position.",
+            "List exact Codex rewind anchors for routine noise-triggered hygiene — after genuinely noisy/unexpectedly large output, at any pressure including ok — or after recovery/density guidance or rewind-only/watch pressure. List once, then act on the returned rows via rewind_context in the same turn; do not call repeatedly — re-listing adds noise without surfacing better candidates. Do not call during ordinary startup/status/search turns or after bounded low-output searches when nothing noisy happened. Default output is a compact valid non-management page with exact item_id values, positions, summaries, filtered_total, and next_offset. Under managed density pressure, an omitted limit defaults to a one-anchor density/pruning page. Use offset/limit/query/reverse/detail for deliberate paging. For density, use density_candidates_only=true and include_pruning_estimates=true; rows hide anchors without density-valid positions and narrow positions to rewind_context-valid choices. include_non_recovery=true is diagnostic only; never pass recovery_eligible=false rows. Inspect ambiguous rows, then call rewind_context with an exact returned item_id and position.",
             ListRewindAnchorsParams
         ),
     );
@@ -9011,7 +9011,7 @@ fn mark_fission_branch_cancelled(
 
 impl IntendantServer {
     #[tool(
-        description = "Schedule a Codex context rewind to an exact item/tool-call anchor. Use only after managed-context recovery/density handoff guidance, rewind-only context pressure, a watch-pressure density decision, or genuinely noisy/unexpectedly large recent output makes a rewind necessary; do not use for ordinary low-pressure startup/search work. First call list_rewind_anchors and choose one returned item_id; call inspect_rewind_anchor when the compact row is ambiguous. Do not synthesize anchor ids from prior failed tool calls. The current turn will finish, Intendant will roll back Codex to the anchor, inject the primer as developer context, and resume the branch."
+        description = "Schedule a Codex context rewind to an exact item/tool-call anchor. Use it for routine noise-triggered hygiene — pruning genuinely noisy/unexpectedly large recent output at any pressure including ok, crystallizing its durable facts in the primer itself — and for managed-context recovery/density handoff guidance, rewind-only context pressure, or a watch-pressure density decision; do not use during ordinary startup/search work when nothing noisy happened. Call list_rewind_anchors once, choose one returned item_id, and rewind in the same turn; call inspect_rewind_anchor only when the compact row is ambiguous. Do not synthesize anchor ids from prior failed tool calls. The current turn will finish, Intendant will roll back Codex to the anchor, inject the primer as developer context, and resume the branch."
     )]
     async fn rewind_context(&self, Parameters(params): Parameters<RewindContextParams>) -> String {
         let reason = params.reason.trim();
@@ -9054,7 +9054,7 @@ impl IntendantServer {
     }
 
     #[tool(
-        description = "List exact Codex rewind anchors only after recovery/density guidance, rewind-only/watch pressure, or genuinely noisy/unexpectedly large output. Do not call during ordinary startup/status/search turns, or after bounded low-output searches while context_pressure.status is ok. Default output is a compact valid non-management page with exact item_id values, positions, summaries, filtered_total, and next_offset. Under managed density pressure, an omitted limit defaults to a one-anchor density/pruning page. Use offset/limit/query/reverse/detail for deliberate paging. For density, use density_candidates_only=true and include_pruning_estimates=true; rows hide anchors without density-valid positions and narrow positions to rewind_context-valid choices. include_non_recovery=true is diagnostic only; never pass recovery_eligible=false rows. Inspect ambiguous rows, then call rewind_context with an exact returned item_id and position."
+        description = "List exact Codex rewind anchors for routine noise-triggered hygiene — after genuinely noisy/unexpectedly large output, at any pressure including ok — or after recovery/density guidance or rewind-only/watch pressure. List once, then act on the returned rows via rewind_context in the same turn; do not call repeatedly — re-listing adds noise without surfacing better candidates. Do not call during ordinary startup/status/search turns or after bounded low-output searches when nothing noisy happened. Default output is a compact valid non-management page with exact item_id values, positions, summaries, filtered_total, and next_offset. Under managed density pressure, an omitted limit defaults to a one-anchor density/pruning page. Use offset/limit/query/reverse/detail for deliberate paging. For density, use density_candidates_only=true and include_pruning_estimates=true; rows hide anchors without density-valid positions and narrow positions to rewind_context-valid choices. include_non_recovery=true is diagnostic only; never pass recovery_eligible=false rows. Inspect ambiguous rows, then call rewind_context with an exact returned item_id and position."
     )]
     async fn list_rewind_anchors(
         &self,
@@ -11870,7 +11870,7 @@ mod tests {
     }
 
     #[test]
-    fn managed_ok_context_pressure_discourages_rewind_preparation() {
+    fn managed_ok_context_pressure_allows_noise_triggered_pruning() {
         let mut s = McpAppState::new(
             "none".to_string(),
             "none".to_string(),
@@ -11898,8 +11898,13 @@ mod tests {
         assert_eq!(pressure["normal_tools_allowed"], true);
         assert_eq!(pressure["required_action"], "continue");
         let message = pressure["message"].as_str().unwrap_or_default();
-        assert!(message.contains("no rewind preparation is needed"));
+        // Normal work continues, and noise-triggered pruning is routine at ok
+        // pressure — what needs a trigger is anchor browsing, not hygiene.
+        assert!(message.contains("normal work continues"));
         assert!(message.contains("genuinely noisy or unexpectedly large"));
+        assert!(message.contains("normal at this pressure"));
+        assert!(message.contains("without such a noisy trigger"));
+        assert!(!message.contains("no rewind preparation is needed"));
         assert!(!message.contains("list_rewind_anchors"));
     }
 
@@ -12414,10 +12419,19 @@ mod tests {
                 .find(|tool| tool["name"] == "list_rewind_anchors")
                 .and_then(|tool| tool["description"].as_str())
                 .expect("list_rewind_anchors description");
+            // Noise-triggered routine hygiene is the first listed use and is
+            // valid at any pressure; the startup/search prohibition targets
+            // no-noise situations, not low pressure.
+            assert!(list_description.contains("routine noise-triggered hygiene"));
+            assert!(list_description.contains("at any pressure including ok"));
+            assert!(list_description.contains("List once"));
+            assert!(list_description.contains("re-listing adds noise"));
             assert!(list_description
                 .contains("Do not call during ordinary startup/status/search turns"));
             assert!(list_description.contains("bounded low-output searches"));
+            assert!(list_description.contains("when nothing noisy happened"));
             assert!(list_description.contains("genuinely noisy/unexpectedly large"));
+            assert!(!list_description.contains("context_pressure.status is ok"));
             assert!(!list_description.contains("call_"));
 
             let rewind_description = managed["tools"]
@@ -12427,8 +12441,41 @@ mod tests {
                 .find(|tool| tool["name"] == "rewind_context")
                 .and_then(|tool| tool["description"].as_str())
                 .expect("rewind_context description");
-            assert!(rewind_description.contains("do not use for ordinary low-pressure"));
+            assert!(rewind_description.contains("routine noise-triggered hygiene"));
+            assert!(rewind_description.contains("at any pressure including ok"));
+            assert!(rewind_description.contains("crystallizing its durable facts in the primer itself"));
+            assert!(rewind_description.contains("rewind in the same turn"));
+            assert!(rewind_description
+                .contains("do not use during ordinary startup/search work when nothing noisy happened"));
+            assert!(!rewind_description.contains("ordinary low-pressure"));
         });
+    }
+
+    #[test]
+    fn manual_http_rewind_tool_descriptions_match_tool_attributes() {
+        // The rewind tools live in a non-router impl block, so the HTTP
+        // transport serves the manual definitions while the #[tool]
+        // attributes document the methods; the two copies must not drift.
+        let mut manual = Vec::new();
+        append_manual_http_tool_definitions(&mut manual, true, None);
+        for (name, attr) in [
+            ("rewind_context", IntendantServer::rewind_context_tool_attr()),
+            (
+                "list_rewind_anchors",
+                IntendantServer::list_rewind_anchors_tool_attr(),
+            ),
+        ] {
+            let manual_description = manual
+                .iter()
+                .find(|tool| tool["name"] == name)
+                .and_then(|tool| tool["description"].as_str())
+                .unwrap_or_else(|| panic!("missing manual HTTP definition for {name}"));
+            let attr_description = attr.description.as_deref().unwrap_or_default();
+            assert_eq!(
+                manual_description, attr_description,
+                "{name} manual HTTP description drifted from its #[tool] attribute"
+            );
+        }
     }
 
     #[test]

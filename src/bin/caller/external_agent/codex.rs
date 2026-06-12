@@ -52,7 +52,7 @@ Do not modify files, source, git state, permissions, configuration, or any other
 
 const MANAGED_CONTEXT_DEVELOPER_INSTRUCTIONS: &str = r#"You are running as Codex inside Intendant with managed_context=managed.
 
-Intendant, not Codex automatic compaction, owns long-task context density. This is active throughout the task, not only when the context window is nearly full.
+Intendant, not Codex automatic compaction, owns long-task context density. This is active throughout the task, not only when the context window is nearly full. The goal is a transcript that stays informationally dense and navigable end-to-end: avoid creating noise, and prune unavoidable noise at the moment it appears, so density holds throughout the window rather than only at the tail.
 
 Keep the live transcript informationally dense:
 - Prefer targeted reads and searches over dumping large files, logs, or generated artifacts.
@@ -62,12 +62,13 @@ Keep the live transcript informationally dense:
 - After a successful build, run dev servers through already-built binaries or quiet commands when possible. Avoid re-running build commands that stream known warnings only to launch a server; if a noisy command is unavoidable, preserve only the durable result and compact immediately.
 - While a long-running command/tool is still active, do not emit assistant status messages that only say you are still waiting/building/running and have no new output or errors, such as "No output yet", "Still active", or "Polling". Wait silently for material output, completion, an approval need, or a real decision; Intendant surfaces tool lifecycle separately.
 - A rewind can cancel the active long-running command. If the chosen anchor is before a server launch, assume the server may be gone; verify it with a small health check and relaunch tersely instead of preserving the old PID as if it survived.
-- After genuinely noisy or unexpectedly large tool output, failed exploration that added substantial low-value context, backend context status `watch`/`rewind_only`, or finishing a coherent subtask while near the density threshold, crystallize durable facts and consider exact-anchor managed-context maintenance before continuing broad ordinary-tool work.
-- Backend context status `watch`, or usage above the recommended density threshold but below `rewind_only_limit`, is not recovery. Normal tools remain allowed, including one already-running narrow validation/build/check. Do not begin another broad build, QA, exploration, or implementation loop while watch pressure persists; first perform exact-anchor density maintenance if it materially improves density, or give a concise no-rewind density handoff. At `ok` pressure, do not discover anchors solely for context hygiene.
-- Do not call list_rewind_anchors merely because managed_context=managed is enabled, during ordinary startup/status checks, or after bounded searches with compact output at low context pressure. Continue normal work in those cases.
-- Once one of those conditions makes a rewind necessary, use list_rewind_anchors to choose an exact current catalog item_id, inspect_rewind_anchor when the compact row is ambiguous, then call rewind_context with a dense carry-forward primer.
+- Pruning is triggered by noise, not gated by pressure. After genuinely noisy or unexpectedly large tool output, failed exploration that added substantial low-value context, or finishing a coherent subtask whose working detail is no longer needed — and whenever backend context status reaches `watch`/`rewind_only` as the safety net — crystallize the durable facts (in your reply or the primer) and prune with exact-anchor managed-context maintenance before continuing broad ordinary-tool work. Pruning a crystallized noisy output is normal at any pressure, including `ok`.
+- Rollback is a suffix cut, so every turn that passes after a noisy output makes pruning it more expensive: more completed work enters the discard span and must be carried by the primer. Prune at the cheap moment — immediately after crystallizing durable facts — instead of waiting for pressure. Routine pruning may happen many times in a long session; that is the intended working style, not an exceptional recovery.
+- Backend context status `watch`, or usage above the recommended density threshold but below `rewind_only_limit`, is not recovery. Normal tools remain allowed, including one already-running narrow validation/build/check. Do not begin another broad build, QA, exploration, or implementation loop while watch pressure persists; first perform exact-anchor density maintenance if it materially improves density, or give a concise no-rewind density handoff. These pressure bands are the safety net behind the noise-triggered habit, not the trigger to wait for.
+- Do not call list_rewind_anchors merely because managed_context=managed is enabled, during ordinary startup/status checks, or after bounded searches with compact output — when nothing noisy happened there is nothing to prune. Continue normal work in those cases.
+- When a noisy output, a finished subtask, or watch/rewind-only pressure calls for pruning, list once and act: call list_rewind_anchors, choose an exact item_id from the returned rows, use inspect_rewind_anchor only if the compact row is ambiguous, then call rewind_context in the same turn with a dense carry-forward primer. If a usable anchor catalog is already in view from earlier in the turn — including any instruction to first list anchors that you have already satisfied — do not list again: pick the best row you already have and call rewind_context now. Repeated listing is itself noise that raises pressure without surfacing better candidates.
 - Do not use recovery_candidates_only=false to look for newer rewind targets. Non-recovery rows require include_non_recovery=true, are diagnostic-only, and must not be passed to rewind_context when recovery_eligible=false or the requested position is not present in the default row's positions.
-- The primer must preserve user constraints, current objective, completed work, changed files, important command results, remaining decisions, and the substance of any prior managed primer that would otherwise be overwritten.
+- Treat the primer as a living index of the session, not a transcript dump: a structured, cumulative index with stable sections — objective and user constraints; decisions made; artifacts and file paths; verified results; next steps. A handful of dense lines under those headings is enough; the primer is where you crystallize durable facts, so compose it immediately from facts you already hold and never run extra tools to research primer content. Carry pointers for recoverable detail (file paths, command names, ids of earlier rewind records) rather than full content; discarded detail stays reachable via rewind_backout and the durable rewind records. Each new primer must carry forward the substance of any prior managed primer that would otherwise be overwritten, revising sections in place so the index grows sublinearly instead of re-inflating the window.
 - Never synthesize anchor ids, never use anchors from failed examples, and never target managed-context maintenance calls unless explicitly auditing those internals.
 
 Fission (full-context branch spawning), when fission tools are available:
@@ -11161,11 +11162,31 @@ error: build failed
         );
         assert!(developer_instructions
             .contains("After genuinely noisy or unexpectedly large tool output"));
-        assert!(developer_instructions.contains("At `ok` pressure"));
+        // Density-first policy: pruning is noise-triggered, never pressure-gated.
+        assert!(developer_instructions.contains("Pruning is triggered by noise, not gated by pressure"));
+        assert!(developer_instructions.contains("at any pressure, including `ok`"));
+        assert!(developer_instructions.contains("cheap moment"));
+        assert!(developer_instructions.contains("Rollback is a suffix cut"));
+        assert!(developer_instructions.contains("intended working style, not an exceptional recovery"));
+        assert!(developer_instructions.contains("safety net behind the noise-triggered habit"));
+        // Decisive maintenance: one listing, then act in the same turn.
+        assert!(developer_instructions.contains("list once and act"));
+        assert!(developer_instructions.contains("do not list again"));
+        assert!(developer_instructions.contains("call rewind_context now"));
+        // The primer is a living index carrying pointers, not full content.
+        assert!(developer_instructions.contains("living index"));
+        assert!(developer_instructions.contains("never run extra tools to research primer content"));
+        assert!(developer_instructions.contains("ids of earlier rewind records"));
+        assert!(developer_instructions.contains("rewind_backout"));
+        assert!(developer_instructions.contains("grows sublinearly"));
+        // No surviving sentence may gate hygiene on pressure.
+        assert!(!developer_instructions.contains("At `ok` pressure, do not discover anchors"));
+        assert!(!developer_instructions.contains("at low context pressure"));
         assert!(developer_instructions.contains(
             "Do not call list_rewind_anchors merely because managed_context=managed is enabled"
         ));
         assert!(developer_instructions.contains("bounded searches with compact output"));
+        assert!(developer_instructions.contains("when nothing noisy happened there is nothing to prune"));
         assert!(!developer_instructions
             .contains("failed exploration, broad research, or finishing a coherent subtask"));
         assert!(developer_instructions.contains("list_rewind_anchors"));
