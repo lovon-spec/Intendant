@@ -2,14 +2,15 @@
 name: polyglot-pipeline-fission-eval
 description: >
   Fission-shaped evaluation runner. Launches a managed Codex session on the
-  salestream ETL task (three independent components — a Python CSV→JSONL
-  normalizer, a Rust merge/dedupe tool, a bash+jq report generator — plus an
-  end-to-end Makefile pipeline), then scores the result behaviorally with
-  verify.sh (per-component partial credit + an integration bonus) and records
-  whether the model spontaneously used model-driven fission. The three work
-  streams own disjoint write scopes, so fission into chartered worktree
-  branches is a genuine wall-clock/context win — but it is never required and
-  never mentioned to the agent. Whether it fissions is the measurement.
+  salestream ETL task (four independent components — a Python CSV→JSONL
+  normalizer, a Python business-rule quarantine stage, a Rust merge/dedupe
+  tool, a bash+jq report generator — plus an end-to-end Makefile pipeline),
+  then scores the result behaviorally with verify.sh (per-component partial
+  credit + an integration bonus, max 5.0) and records whether the model
+  spontaneously used model-driven fission. The four work streams own disjoint
+  write scopes, so fission into chartered worktree branches is a genuine
+  wall-clock/context win — but it is never required and never mentioned to
+  the agent. Whether it fissions is the measurement.
 compatibility: >
   Requires OpenAI Codex auth in ~/.codex/auth.json, the patched Codex fork at
   /Users/vm/projects/codex-minimal-lineage, a managed-build intendant binary,
@@ -29,17 +30,18 @@ repo, **chooses** model-driven fission (`fission_spawn` into chartered,
 write-scoped git worktrees) — and score the work behaviorally either way. The
 constrained-window Terminal-Bench run measured 0 organic fission uses across
 133 trials because those tasks were single-stream; this task is built to give
-fission a real reason to fire (three independent work streams, disjoint write
-scopes) without ever asking for it.
+fission a real reason to fire (four independent work streams, disjoint write
+scopes, sized for ~30–60 min of serial work) without ever asking for it.
 
 ## What it measures
 
 - **Behavioral score** (`verify.sh` → JSON): `component_scores` for
-  `normalizer` / `dedup` / `report` (each `passed/total` over a held-back
-  battery generated at check time and compared to an independent oracle) plus
-  an `integration` bonus (the real `make pipeline` on fresh CSVs, Makefile
-  pinned by the grader). `total` is out of 4.0. Partial credit per component,
-  so a finished stream counts even if another is incomplete.
+  `normalizer` / `quarantine` / `dedup` / `report` (each `passed/total` over a
+  held-back battery generated at check time and compared to an independent
+  oracle, including per-component performance budgets) plus an `integration`
+  bonus (the real `make pipeline` on fresh CSVs, Makefile pinned by the
+  grader). `total` is out of 5.0. Partial credit per component, so a finished
+  stream counts even if another is incomplete.
 - **Did it fission?** Presence and shape of a fission group in the parent's
   `fission_ledger.json`: how many branches, their charters/write scopes,
   whether branches reached terminal status, and whether the parent imported
@@ -114,7 +116,7 @@ tree, so it is safe to run mid-flight for progress checks):
 
 ```bash
 "$SKILL_DIR"/verify.sh "$REPO" | tee "$REPO/score.json"
-# {task, seed, component_scores:{normalizer,dedup,report}, integration, total, max_total, details}
+# {task, seed, component_scores:{normalizer,quarantine,dedup,report}, integration, total, max_total, details}
 
 # Reproducible re-grade (same generated inputs):
 SEED=$(jq -r .seed "$REPO/score.json")
@@ -158,20 +160,21 @@ echo "artifacts in $OUT"
 ```
 
 Record: did a fission group appear? how many branches, with what write scopes
-(`normalizer/`, `dedup/`, `report/` are the natural disjoint scopes)? did
+(`normalizer/`, `quarantine/`, `dedup/`, `report/` are the natural disjoint
+scopes)? did
 branches reach terminal status and get imported/claimed? final `total` and the
 wall-clock to reach it.
 
 ## Expected outcomes (all valid data)
 
-- **No fission, serial solve:** one session implements all three components;
+- **No fission, serial solve:** one session implements all four components;
   `fission_ledger.json` absent or empty. Score reflects serial quality.
-- **Fission, parallel solve:** a `fission_spawn` group with 2-3 branches keyed
+- **Fission, parallel solve:** a `fission_spawn` group with 2-4 branches keyed
   to the disjoint component dirs; branches build/test their own component;
   parent imports + claims canonical and wires `make pipeline`. Capture the
   per-branch scores and the wall-clock advantage.
 - **Partial:** some components done, others stubbed — partial credit lands per
-  component; integration is 0 until all three wire together. This is the
+  component; integration is 0 until all four wire together. This is the
   common cheap-smoke cutoff outcome.
 
 ## Cleanup
