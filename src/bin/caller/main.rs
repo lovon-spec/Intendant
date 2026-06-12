@@ -1437,6 +1437,15 @@ struct DrainConfig<'a> {
     bus: &'a EventBus,
     session_id: Option<String>,
     alias_session_id: Option<String>,
+    /// The backend (Codex) thread id of THIS conversation, when the caller
+    /// holds the live `AgentThread`. Conversations are named inconsistently
+    /// across paths — the CLI external-agent loop uses `session_id` = thread
+    /// id with the Intendant session id as the alias, while the daemon's
+    /// persistent dispatch loop uses `session_id` = Intendant session id with
+    /// the thread id as the alias — so a thread action that targets this
+    /// conversation by either name resolves its `threadId` from this field
+    /// rather than guessing which of the two ids the backend understands.
+    backend_thread_id: Option<String>,
     autonomy: SharedAutonomy,
     session_log: &'a SharedSessionLog,
     project_root: &'a Path,
@@ -6541,8 +6550,20 @@ fn thread_action_params_for_target(
         .filter(|id| !id.is_empty())
         .or(config.session_id.as_deref());
     let thread_id = target.map(|target| {
-        if config.alias_session_id.as_deref() == Some(target) {
-            config.session_id.as_deref().unwrap_or(target)
+        let names_this_conversation = config.session_id.as_deref() == Some(target)
+            || config.alias_session_id.as_deref() == Some(target);
+        if names_this_conversation {
+            // The action targets this conversation (by either of its names);
+            // the backend thread id is authoritative when the caller supplied
+            // it. Without one, fall back to the legacy alias→session mapping
+            // (correct for paths where `session_id` is the thread id).
+            if let Some(backend_thread_id) = config.backend_thread_id.as_deref() {
+                backend_thread_id
+            } else if config.alias_session_id.as_deref() == Some(target) {
+                config.session_id.as_deref().unwrap_or(target)
+            } else {
+                target
+            }
         } else {
             target
         }
@@ -6955,6 +6976,7 @@ async fn apply_fission_spawn_action(
 ) -> Result<String, String> {
     let specs = fission_spawn_branch_specs_from_params(params)?;
     let parent_thread_id = thread_id_from_action_params(params)
+        .or_else(|| config.backend_thread_id.clone())
         .or_else(|| config.alias_session_id.clone())
         .or_else(|| config.session_id.clone())
         .ok_or_else(|| "fission_spawn requires a parent thread id".to_string())?;
@@ -8433,6 +8455,7 @@ async fn drain_external_child_turn(
         web_port: config.web_port,
         session_id: child_session_id.clone(),
         alias_session_id: None,
+        backend_thread_id: Some(child_thread_id.clone()),
         autonomy: config.autonomy.clone(),
         session_log: config.session_log,
         project_root: config.project_root,
@@ -9653,6 +9676,7 @@ async fn drain_external_agent_events(
                 web_port: config.web_port,
                 session_id: Some(child_thread_id.clone()),
                 alias_session_id: None,
+                backend_thread_id: Some(child_thread_id.clone()),
                 autonomy: config.autonomy.clone(),
                 session_log: config.session_log,
                 project_root: config.project_root,
@@ -12329,6 +12353,34 @@ fn should_start_idle_web_daemon(use_web: bool, flags: &CliFlags) -> bool {
             .unwrap_or(true)
 }
 
+/// Wire the fission branch lifecycle into a startup path: spawn the bus
+/// watcher that feeds branch session lifecycle/diff events into the durable
+/// fission ledger, and rehydrate routes for branches that were still running
+/// when the previous process exited. Every startup path that can host a
+/// managed Codex conversation (and therefore a `fission_spawn`) must call
+/// this, or spawned branches complete without their ledger statuses ever
+/// flipping.
+fn start_fission_lifecycle(
+    bus: &EventBus,
+    session_log: &SharedSessionLog,
+) -> tokio::task::JoinHandle<()> {
+    let watcher = fission_lifecycle::spawn_fission_lifecycle_watcher(bus.subscribe());
+    if let Some(home) = dirs::home_dir() {
+        match fission_lifecycle::rehydrate_from_logs(&home.join(".intendant").join("logs")) {
+            Ok(0) => {}
+            Ok(count) => slog(session_log, |l| {
+                l.info(&format!(
+                    "Rehydrated {count} fission branch route(s) from persisted ledgers"
+                ))
+            }),
+            Err(err) => slog(session_log, |l| {
+                l.warn(&format!("Fission branch route rehydration failed: {err}"))
+            }),
+        }
+    }
+    watcher
+}
+
 fn extract_json(text: &str) -> Option<&str> {
     // Try to find JSON in ```json code fences
     if let Some(start) = text.find("```json") {
@@ -13285,6 +13337,7 @@ mod tests {
             web_port: None,
             session_id: Some("wrapper-session".to_string()),
             alias_session_id: Some("codex-thread".to_string()),
+            backend_thread_id: Some("codex-thread".to_string()),
             autonomy,
             session_log: &session_log,
             project_root: dir.path(),
@@ -13380,6 +13433,7 @@ mod tests {
             web_port: None,
             session_id: Some("wrapper-session".to_string()),
             alias_session_id: Some("codex-thread".to_string()),
+            backend_thread_id: Some("codex-thread".to_string()),
             autonomy,
             session_log: &session_log,
             project_root: dir.path(),
@@ -13647,6 +13701,7 @@ mod tests {
             web_port: None,
             session_id: Some("thread-1".to_string()),
             alias_session_id: None,
+            backend_thread_id: None,
             autonomy,
             session_log: &session_log,
             project_root: dir.path(),
@@ -13786,6 +13841,7 @@ mod tests {
             web_port: None,
             session_id: Some("thread-1".to_string()),
             alias_session_id: None,
+            backend_thread_id: None,
             autonomy,
             session_log: &session_log,
             project_root: dir.path(),
@@ -13918,6 +13974,7 @@ mod tests {
             web_port: None,
             session_id: Some("thread-1".to_string()),
             alias_session_id: None,
+            backend_thread_id: None,
             autonomy,
             session_log: &session_log,
             project_root: dir.path(),
@@ -14068,6 +14125,7 @@ mod tests {
             web_port: None,
             session_id: Some("thread-1".to_string()),
             alias_session_id: None,
+            backend_thread_id: None,
             autonomy,
             session_log: &session_log,
             project_root: dir.path(),
@@ -14239,6 +14297,7 @@ mod tests {
             web_port: None,
             session_id: Some("thread-1".to_string()),
             alias_session_id: None,
+            backend_thread_id: None,
             autonomy,
             session_log: &session_log,
             project_root: dir.path(),
@@ -14391,6 +14450,7 @@ mod tests {
             web_port: None,
             session_id: Some("thread-1".to_string()),
             alias_session_id: None,
+            backend_thread_id: None,
             autonomy,
             session_log: &session_log,
             project_root: dir.path(),
@@ -14496,6 +14556,7 @@ mod tests {
             web_port: None,
             session_id: Some("thread-1".to_string()),
             alias_session_id: None,
+            backend_thread_id: None,
             autonomy,
             session_log: &session_log,
             project_root: dir.path(),
@@ -15180,6 +15241,7 @@ mod tests {
             web_port: None,
             session_id: Some("parent-thread".to_string()),
             alias_session_id: None,
+            backend_thread_id: None,
             autonomy,
             session_log: &session_log,
             project_root: dir.path(),
@@ -15248,6 +15310,7 @@ mod tests {
             web_port: None,
             session_id: Some("parent-thread".to_string()),
             alias_session_id: None,
+            backend_thread_id: None,
             autonomy,
             session_log: &session_log,
             project_root: dir.path(),
@@ -20522,6 +20585,7 @@ Also: {"source": "bare"}"#;
             web_port: None,
             session_id: Some("thread-1".to_string()),
             alias_session_id: None,
+            backend_thread_id: None,
             autonomy,
             session_log: &session_log,
             project_root: dir.path(),
@@ -21032,6 +21096,7 @@ Also: {"source": "bare"}"#;
             web_port: None,
             session_id: Some(session_id.to_string()),
             alias_session_id: None,
+            backend_thread_id: Some(session_id.to_string()),
             autonomy: autonomy::shared_autonomy(AutonomyState::default()),
             session_log,
             project_root,
@@ -24730,6 +24795,7 @@ async fn run_with_presence(
                         web_port,
                         session_id: session_log_id(&session_log),
                         alias_session_id: Some(thread.thread_id.clone()),
+                        backend_thread_id: Some(thread.thread_id.clone()),
                         autonomy: autonomy.clone(),
                         session_log: &session_log,
                         project_root: &project.root,
@@ -25061,6 +25127,9 @@ async fn run_with_presence(
                         alias_session_id: persistent_thread
                             .as_ref()
                             .map(|thread| thread.thread_id.clone()),
+                        backend_thread_id: persistent_thread
+                            .as_ref()
+                            .map(|thread| thread.thread_id.clone()),
                         autonomy: autonomy.clone(),
                         session_log: &session_log,
                         project_root: &project.root,
@@ -25102,6 +25171,9 @@ async fn run_with_presence(
                         web_port,
                         session_id: session_log_id(&session_log),
                         alias_session_id: persistent_thread
+                            .as_ref()
+                            .map(|thread| thread.thread_id.clone()),
+                        backend_thread_id: persistent_thread
                             .as_ref()
                             .map(|thread| thread.thread_id.clone()),
                         autonomy: autonomy.clone(),
@@ -25168,6 +25240,9 @@ async fn run_with_presence(
                         web_port,
                         session_id: local_session_id.clone(),
                         alias_session_id: persistent_thread
+                            .as_ref()
+                            .map(|thread| thread.thread_id.clone()),
+                        backend_thread_id: persistent_thread
                             .as_ref()
                             .map(|thread| thread.thread_id.clone()),
                         autonomy: autonomy.clone(),
@@ -25253,6 +25328,9 @@ async fn run_with_presence(
                                 web_port,
                                 session_id: session_log_id(&session_log),
                                 alias_session_id: None,
+                                backend_thread_id: persistent_thread
+                                    .as_ref()
+                                    .map(|thread| thread.thread_id.clone()),
                                 autonomy: autonomy.clone(),
                                 session_log: &session_log,
                                 project_root: &project.root,
@@ -25775,6 +25853,7 @@ async fn run_with_presence(
                     } else {
                         None
                     },
+                    backend_thread_id: Some(thread.thread_id.clone()),
                     autonomy: autonomy.clone(),
                     session_log: &session_log,
                     project_root: &project.root,
@@ -27120,6 +27199,7 @@ async fn run_external_agent_mode(
         } else {
             None
         },
+        backend_thread_id: Some(backend_session_id.clone()),
         autonomy: autonomy.clone(),
         session_log: &session_log,
         project_root: &project.root,
@@ -30997,24 +31077,7 @@ async fn main() -> Result<(), CallerError> {
             event::spawn_outbound_broadcaster(bus.subscribe(), outbound_tx.clone());
         let _session_log_writer =
             event::spawn_session_log_writer(bus.subscribe_session_log(), session_log.clone());
-        // Fission lifecycle: route branch session lifecycle/diff events into
-        // the durable fission ledger, and restore routes for branches that
-        // were still running when the previous daemon exited.
-        let _fission_lifecycle_watcher =
-            fission_lifecycle::spawn_fission_lifecycle_watcher(bus.subscribe());
-        if let Some(home) = dirs::home_dir() {
-            match fission_lifecycle::rehydrate_from_logs(&home.join(".intendant").join("logs")) {
-                Ok(0) => {}
-                Ok(count) => slog(&session_log, |l| {
-                    l.info(&format!(
-                        "Rehydrated {count} fission branch route(s) from persisted ledgers"
-                    ))
-                }),
-                Err(err) => slog(&session_log, |l| {
-                    l.warn(&format!("Fission branch route rehydration failed: {err}"))
-                }),
-            }
-        }
+        let _fission_lifecycle_watcher = start_fission_lifecycle(&bus, &session_log);
 
         let (shared_file_watcher, _watcher_handle, _round_snapshot_handle) = {
             let snapshot_dir = log_dir.join("file_snapshots");
@@ -31248,6 +31311,8 @@ async fn main() -> Result<(), CallerError> {
         // Wire session log writer: persists bus events that aren't logged inline.
         let _session_log_writer =
             event::spawn_session_log_writer(bus.subscribe_session_log(), session_log.clone());
+
+        let _fission_lifecycle_watcher = start_fission_lifecycle(&bus, &session_log);
 
         // File watcher: observes project directory for changes, emits FileChanged events.
         let (shared_file_watcher, _watcher_handle, _round_snapshot_handle) = {
@@ -31720,6 +31785,8 @@ async fn main() -> Result<(), CallerError> {
         // Wire session log writer: persists bus events that aren't logged inline.
         let _session_log_writer =
             event::spawn_session_log_writer(bus.subscribe_session_log(), session_log.clone());
+
+        let _fission_lifecycle_watcher = start_fission_lifecycle(&bus, &session_log);
 
         // File watcher: observes project directory for changes, emits FileChanged events.
         let (shared_file_watcher, _watcher_handle, _round_snapshot_handle) = {
@@ -32391,6 +32458,8 @@ async fn main() -> Result<(), CallerError> {
         // Wire session log writer: persists bus events that aren't logged inline.
         let _session_log_writer =
             event::spawn_session_log_writer(bus.subscribe_session_log(), session_log.clone());
+
+        let _fission_lifecycle_watcher = start_fission_lifecycle(&bus, &session_log);
 
         // File watcher: observes project directory for changes, emits FileChanged events.
         let (shared_file_watcher, _watcher_handle, _round_snapshot_handle) = {

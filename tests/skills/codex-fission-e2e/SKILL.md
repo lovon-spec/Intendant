@@ -110,11 +110,14 @@ mcp() { # mcp <session_id> <tool> '<json args>'
 
 Wait for the parent to finish step (2) (watch the dashboard Activity log, or
 poll until the ledger appears). The fission ledger lives in the **parent's**
-session log dir under `~/.intendant/logs/`:
+session log dir under `~/.intendant/logs/`, named by the `Session ID:` line
+the launch printed at startup — select it by that id, never by newest-mtime
+(other Intendant instances on this machine write ledgers too):
 
 ```bash
-LEDGER=$(ls -t ~/.intendant/logs/*/fission_ledger.json | head -1)
-LOG_DIR=$(dirname "$LEDGER")
+SID=<Session ID printed at launch>
+LOG_DIR=~/.intendant/logs/$SID
+LEDGER=$LOG_DIR/fission_ledger.json
 PARENT=$(jq -r '.groups[0].parent_session_id' "$LEDGER")   # Codex thread id
 GROUP=$(jq -r '.groups[0].group_id' "$LEDGER")
 ANCHOR=$(jq -r '.groups[0].anchor_item_id' "$LEDGER")
@@ -144,9 +147,11 @@ curl -s "$BASE/api/managed-context/fission?session_id=$PARENT" \
 git -C "$REPO" worktree list      # expect .intendant/worktrees/fission/<short8>-2
 
 # Branches are real sessions with injected charters: each branch rollout
-# contains the <fission_charter> developer message and the kickoff task.
-grep -rl '<fission_charter>' ~/.codex/sessions/$(date +%Y/%m/%d)/ | wc -l   # >= 2
-grep -rl 'Begin your fission charter' ~/.codex/sessions/$(date +%Y/%m/%d)/ | wc -l
+# contains the <fission_charter> developer message (which embeds this group's
+# id — scope by it, so reruns and other sessions from the same day don't
+# inflate the count) and the kickoff task.
+grep -rl "$GROUP" ~/.codex/sessions/$(date +%Y/%m/%d)/ | xargs grep -l '<fission_charter>' | wc -l   # == 2
+grep -rl "$GROUP" ~/.codex/sessions/$(date +%Y/%m/%d)/ | xargs grep -l 'Begin your fission charter' | wc -l   # == 2
 
 # get_status carries the same merged document (groups + ext charters).
 mcp "$PARENT" get_status '{}' | jq '.fission_ledger.ext.groups[0].branches[].charter'
@@ -175,6 +180,23 @@ branch_session_id=<EDITOR>, timeout_s=60; if the outcome is still_running,
 call it again. When terminal, call fission_control with op="import" for that
 branch, then claim_fission_canonical with group_id=<GROUP> and
 branch_session_id=<EDITOR>, and end your turn reporting what you imported.
+```
+
+Scripted equivalent of the dashboard input (same `ControlMsg::FollowUp` the
+dashboard sends, over the gateway WebSocket; `$SID` is the launch-printed
+Session ID and `$TEXT` the prompt above with `<GROUP>`/`<EDITOR>` filled in):
+
+```bash
+python3 - "$PORT" "$SID" "$TEXT" <<'EOF'
+import asyncio, json, sys, websockets
+port, sid, text = sys.argv[1], sys.argv[2], sys.argv[3]
+async def main():
+    async with websockets.connect(f"ws://127.0.0.1:{port}/ws") as ws:
+        await ws.send(json.dumps(
+            {"action": "follow_up", "session_id": sid, "text": text, "direct": True}))
+        await asyncio.sleep(2)
+asyncio.run(main())
+EOF
 ```
 
 The direct equivalents (same tools, same effect on the parent thread) for
