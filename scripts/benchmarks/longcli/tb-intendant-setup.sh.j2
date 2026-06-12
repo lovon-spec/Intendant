@@ -1,0 +1,34 @@
+#!/bin/bash
+# Setup script for the IntendantCodex tb agent (managed lane).
+# Installs the shared-library dependencies of the prebuilt codex fork and
+# intendant binaries (uploaded separately by the agent via docker cp).
+# Dependency chain ported from harbor_intendant_codex_agent.py (proven on the
+# 2026-05/06 suites): glibc image required; libssl3 has a t64 rename on
+# ubuntu-24.04 (noble); libvpx7 is jammy/bookworm-era — on noble it is absent,
+# so fall back to the jammy .deb (intendant links libvpx.so.7).
+#
+# NOTE: this script is *sourced* into the tmux agent session — no `set -e`,
+# no `exit` (either would kill or poison the session shell). The
+# AbstractInstalledAgent base detects failure from the sourced script's final
+# status, so the install is a single && chain.
+
+export DEBIAN_FRONTEND=noninteractive
+
+if ldd --version 2>&1 | grep -qi musl || [ -f /etc/alpine-release ]; then
+    echo "IntendantCodex requires a glibc Linux task image" >&2
+    false
+elif command -v apt-get >/dev/null 2>&1; then
+    apt-get update &&
+    apt-get install -y --no-install-recommends \
+        curl ripgrep ca-certificates libzstd1 zlib1g \
+        libpipewire-0.3-0 libxcb1 libxcb-shm0 libxcb-randr0 &&
+    (apt-get install -y --no-install-recommends libssl3 ||
+     apt-get install -y --no-install-recommends libssl3t64) &&
+    (apt-get install -y --no-install-recommends libvpx7 ||
+     (curl -fsSL -o /tmp/libvpx7.deb \
+        http://archive.ubuntu.com/ubuntu/pool/main/libv/libvpx/libvpx7_1.11.0-2ubuntu2.5_amd64.deb &&
+      apt-get install -y --no-install-recommends /tmp/libvpx7.deb))
+else
+    echo "IntendantCodex requires apt-get on a glibc image" >&2
+    false
+fi

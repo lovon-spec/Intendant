@@ -1,0 +1,38 @@
+#!/bin/bash
+# Setup script for the PersistentAuthCodex tb agent (vanilla lane).
+# Mirrors LongCLI/terminal-bench's stock codex-setup.sh.j2 (same nvm + npm
+# flow, pinned version) with one change: auth.json handling. The stock script
+# unconditionally writes $HOME/.codex/auth.json from $OPENAI_API_KEY; here the
+# API-key auth.json is written into $CODEX_HOME (the /agent-logs mount) and
+# ONLY when no real auth.json was uploaded by the agent (ChatGPT-token auth).
+#
+# NOTE: this script is *sourced* into the tmux agent session, so the nvm
+# environment it loads persists for the subsequent `codex exec` command.
+
+apt-get update
+apt-get install -y curl
+
+curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.2/install.sh | bash
+
+source "$HOME/.nvm/nvm.sh"
+
+nvm install 22
+npm -v
+
+npm install -g @openai/codex@{{ version }}
+
+# CODEX_HOME is exported by the agent's env setup (sourced before this
+# script); keep a fallback for manual debugging runs.
+export CODEX_HOME="${CODEX_HOME:-/agent-logs/codex-home}"
+mkdir -p "$CODEX_HOME"
+
+if [ ! -f "$CODEX_HOME/auth.json" ] && [ -n "${OPENAI_API_KEY:-}" ]; then
+cat <<EOF >"$CODEX_HOME/auth.json"
+{
+  "OPENAI_API_KEY": "${OPENAI_API_KEY}"
+}
+EOF
+chmod 600 "$CODEX_HOME/auth.json"
+fi
+
+codex --version
