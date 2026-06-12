@@ -1,0 +1,15 @@
+{
+  "task_name": "fixture-vanilla",
+  "trial_name": "fixture-vanilla__000",
+  "verifier_result": {
+    "rewards": {
+      "reward": 0.0
+    }
+  },
+  "agent_result": {
+    "n_input_tokens": 7300,
+    "n_cache_tokens": 0,
+    "n_output_tokens": 175,
+    "cost_usd": 0.002
+  }
+}

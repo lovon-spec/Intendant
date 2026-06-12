@@ -1,0 +1,26 @@
+{
+  "record_id": "rewind-fixture0001",
+  "created_at": "2026-06-01T00:01:22.000000000+00:00",
+  "session_id": "intendant",
+  "thread_id": "fixture-managed-thread",
+  "item_id": "call_2",
+  "position": "after",
+  "reason": "Discard speculative analysis after the deep probe.",
+  "primer": "Kept facts: magic_token_xyz123 found in sector 7 via probe --deep /app. foo.txt unchanged. Next step: validate the finding and wrap up.",
+  "preserve": [
+    "magic_token_xyz123 found in sector 7",
+    "probe --deep /app completed",
+    "remaining: validate finding"
+  ],
+  "discard": [
+    "speculative analysis"
+  ],
+  "artifacts": [],
+  "next_steps": [
+    "validate finding",
+    "wrap up"
+  ],
+  "source_rollout_path": "/tmp/fixture/rollout.jsonl",
+  "recovery_rollout_path": "/logs/fixture/recovery.jsonl",
+  "detached_fission_group_ids": []
+}

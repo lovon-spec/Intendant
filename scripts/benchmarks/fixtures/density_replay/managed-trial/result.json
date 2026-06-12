@@ -1,0 +1,15 @@
+{
+  "task_name": "fixture-managed",
+  "trial_name": "fixture-managed__000",
+  "verifier_result": {
+    "rewards": {
+      "reward": 1.0
+    }
+  },
+  "agent_result": {
+    "n_input_tokens": 31200,
+    "n_cache_tokens": 0,
+    "n_output_tokens": 560,
+    "cost_usd": 0.01
+  }
+}
