@@ -121,6 +121,24 @@ class IntendantCodex(Codex):
         remote_secrets_dir = self._REMOTE_CODEX_SECRETS_DIR.as_posix()
         remote_auth_path = (self._REMOTE_CODEX_SECRETS_DIR / "auth.json").as_posix()
         agent_dir = EnvironmentPaths.agent_dir.as_posix()
+        # Export verification (2026-06-12, checked against the Intendant
+        # source and the live managed-w40-p20 job): everything Intendant
+        # writes for benchmark analysis already lands inside Harbor's
+        # per-trial agent/ export, because `--log-file` below points
+        # Intendant's session-log directory at agent_dir/intendant
+        # (SessionLog::resolve_path uses the override verbatim, and
+        # run_external_agent_mode threads that same directory into
+        # DrainConfig.log_dir). Concretely:
+        #   * context-rewind records    -> agent/intendant/context_rewinds/*.json
+        #   * pre-rewind rollout copies -> agent/intendant/context_rewinds/
+        #     *-source-rollout.jsonl (context_rewind::recovery_rollout_path
+        #     keeps them next to their record)
+        #   * fission ledger            -> agent/intendant/fission_ledger.json
+        #     (fission_ledger::ledger_path; only written when fission is used)
+        # The Codex-native rollouts ($CODEX_HOME/sessions, including
+        # `"type":"compacted"` events) are NOT under agent_dir, so the
+        # cleanup block at the end of run() copies them to agent/sessions
+        # before $CODEX_HOME is deleted. No additional copy steps are needed.
         intendant_log_dir = (EnvironmentPaths.agent_dir / "intendant").as_posix()
 
         env: dict[str, str] = {
