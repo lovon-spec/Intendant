@@ -44,4 +44,8 @@ if command -v cargo >/dev/null && [ -f "$SCRATCH/dedup/Cargo.toml" ]; then
     || echo "warning: dedup failed to build" >&2
 fi
 
-exec python3 "$HERE/verify/grade.py" "$SCRATCH" "${SEED_ARG[@]}"
+# Guard the array expansion: bash 3.2 (macOS) errors on "${empty[@]}" under set -u.
+if [ "${#SEED_ARG[@]}" -gt 0 ]; then
+  exec python3 "$HERE/verify/grade.py" "$SCRATCH" "${SEED_ARG[@]}"
+fi
+exec python3 "$HERE/verify/grade.py" "$SCRATCH"
