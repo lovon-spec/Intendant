@@ -11162,11 +11162,31 @@ error: build failed
         );
         assert!(developer_instructions
             .contains("After genuinely noisy or unexpectedly large tool output"));
-        assert!(developer_instructions.contains("At `ok` pressure"));
+        // Density-first policy: pruning is noise-triggered, never pressure-gated.
+        assert!(developer_instructions.contains("Pruning is triggered by noise, not gated by pressure"));
+        assert!(developer_instructions.contains("at any pressure, including `ok`"));
+        assert!(developer_instructions.contains("cheap moment"));
+        assert!(developer_instructions.contains("Rollback is a suffix cut"));
+        assert!(developer_instructions.contains("intended working style, not an exceptional recovery"));
+        assert!(developer_instructions.contains("safety net behind the noise-triggered habit"));
+        // Decisive maintenance: one listing, then act in the same turn.
+        assert!(developer_instructions.contains("list once and act"));
+        assert!(developer_instructions.contains("do not list again"));
+        assert!(developer_instructions.contains("call rewind_context now"));
+        // The primer is a living index carrying pointers, not full content.
+        assert!(developer_instructions.contains("living index"));
+        assert!(developer_instructions.contains("never run extra tools to research primer content"));
+        assert!(developer_instructions.contains("ids of earlier rewind records"));
+        assert!(developer_instructions.contains("rewind_backout"));
+        assert!(developer_instructions.contains("grows sublinearly"));
+        // No surviving sentence may gate hygiene on pressure.
+        assert!(!developer_instructions.contains("At `ok` pressure, do not discover anchors"));
+        assert!(!developer_instructions.contains("at low context pressure"));
         assert!(developer_instructions.contains(
             "Do not call list_rewind_anchors merely because managed_context=managed is enabled"
         ));
         assert!(developer_instructions.contains("bounded searches with compact output"));
+        assert!(developer_instructions.contains("when nothing noisy happened there is nothing to prune"));
         assert!(!developer_instructions
             .contains("failed exploration, broad research, or finishing a coherent subtask"));
         assert!(developer_instructions.contains("list_rewind_anchors"));

@@ -11870,7 +11870,7 @@ mod tests {
     }
 
     #[test]
-    fn managed_ok_context_pressure_discourages_rewind_preparation() {
+    fn managed_ok_context_pressure_allows_noise_triggered_pruning() {
         let mut s = McpAppState::new(
             "none".to_string(),
             "none".to_string(),
@@ -11898,8 +11898,13 @@ mod tests {
         assert_eq!(pressure["normal_tools_allowed"], true);
         assert_eq!(pressure["required_action"], "continue");
         let message = pressure["message"].as_str().unwrap_or_default();
-        assert!(message.contains("no rewind preparation is needed"));
+        // Normal work continues, and noise-triggered pruning is routine at ok
+        // pressure — what needs a trigger is anchor browsing, not hygiene.
+        assert!(message.contains("normal work continues"));
         assert!(message.contains("genuinely noisy or unexpectedly large"));
+        assert!(message.contains("normal at this pressure"));
+        assert!(message.contains("without such a noisy trigger"));
+        assert!(!message.contains("no rewind preparation is needed"));
         assert!(!message.contains("list_rewind_anchors"));
     }
 
@@ -12414,10 +12419,19 @@ mod tests {
                 .find(|tool| tool["name"] == "list_rewind_anchors")
                 .and_then(|tool| tool["description"].as_str())
                 .expect("list_rewind_anchors description");
+            // Noise-triggered routine hygiene is the first listed use and is
+            // valid at any pressure; the startup/search prohibition targets
+            // no-noise situations, not low pressure.
+            assert!(list_description.contains("routine noise-triggered hygiene"));
+            assert!(list_description.contains("at any pressure including ok"));
+            assert!(list_description.contains("List once"));
+            assert!(list_description.contains("re-listing adds noise"));
             assert!(list_description
                 .contains("Do not call during ordinary startup/status/search turns"));
             assert!(list_description.contains("bounded low-output searches"));
+            assert!(list_description.contains("when nothing noisy happened"));
             assert!(list_description.contains("genuinely noisy/unexpectedly large"));
+            assert!(!list_description.contains("context_pressure.status is ok"));
             assert!(!list_description.contains("call_"));
 
             let rewind_description = managed["tools"]
@@ -12427,8 +12441,41 @@ mod tests {
                 .find(|tool| tool["name"] == "rewind_context")
                 .and_then(|tool| tool["description"].as_str())
                 .expect("rewind_context description");
-            assert!(rewind_description.contains("do not use for ordinary low-pressure"));
+            assert!(rewind_description.contains("routine noise-triggered hygiene"));
+            assert!(rewind_description.contains("at any pressure including ok"));
+            assert!(rewind_description.contains("crystallizing its durable facts in the primer itself"));
+            assert!(rewind_description.contains("rewind in the same turn"));
+            assert!(rewind_description
+                .contains("do not use during ordinary startup/search work when nothing noisy happened"));
+            assert!(!rewind_description.contains("ordinary low-pressure"));
         });
+    }
+
+    #[test]
+    fn manual_http_rewind_tool_descriptions_match_tool_attributes() {
+        // The rewind tools live in a non-router impl block, so the HTTP
+        // transport serves the manual definitions while the #[tool]
+        // attributes document the methods; the two copies must not drift.
+        let mut manual = Vec::new();
+        append_manual_http_tool_definitions(&mut manual, true, None);
+        for (name, attr) in [
+            ("rewind_context", IntendantServer::rewind_context_tool_attr()),
+            (
+                "list_rewind_anchors",
+                IntendantServer::list_rewind_anchors_tool_attr(),
+            ),
+        ] {
+            let manual_description = manual
+                .iter()
+                .find(|tool| tool["name"] == name)
+                .and_then(|tool| tool["description"].as_str())
+                .unwrap_or_else(|| panic!("missing manual HTTP definition for {name}"));
+            let attr_description = attr.description.as_deref().unwrap_or_default();
+            assert_eq!(
+                manual_description, attr_description,
+                "{name} manual HTTP description drifted from its #[tool] attribute"
+            );
+        }
     }
 
     #[test]
