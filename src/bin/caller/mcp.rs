@@ -1100,7 +1100,7 @@ impl McpAppState {
             "Managed context is above the recommended density threshold but below the rewind-only limit. A successful managed-context rewind already satisfied the current density handoff; continue the concrete follow-up work, and only repeat density maintenance after the round completes or if pressure reaches rewind-only."
         } else if density_pressure {
             if managed_context {
-                "Managed context is above the recommended density threshold but below the rewind-only limit. Normal tools remain allowed for status/anchor inspection and one narrow in-flight validation or build to finish, but before broad follow-up work perform exact-anchor density maintenance when it materially improves density, or produce a concise no-rewind density handoff."
+                "Managed context is above the recommended density threshold but below the rewind-only limit. Normal tools remain allowed for status/anchor inspection and one narrow in-flight validation or build to finish, but before broad follow-up work perform exact-anchor density maintenance when it materially improves density, or produce a concise no-rewind density handoff. Fission tools stay allowed at watch: delegating separable work to a fission branch is itself a valid density action."
             } else {
                 "Context is above the recommended density threshold but below the rewind-only limit. Normal tools are allowed; at handoff or before broad follow-up work, exact-anchor density maintenance is optional only if it materially improves density."
             }
@@ -1135,7 +1135,7 @@ impl McpAppState {
                     "used_tokens": notice.used_tokens,
                     "rewind_only_limit": notice.rewind_only_limit,
                     "context_window": notice.context_window,
-                    "message": "The previous managed-context rewind did not reduce backend-reported pressure enough. Call list_rewind_anchors to inspect recovery candidates; pass include_non_recovery=true only for diagnostics, and never pass a recovery_eligible=false audit row to rewind_context. Use inspect_rewind_anchor when a compact row is ambiguous, then choose an exact returned item_id and position whose row or inspection supports enough pruning, with a denser carry-forward primer before using ordinary tools.",
+                    "message": "The previous managed-context rewind did not reduce backend-reported pressure enough. If a current recovery catalog page is already in view, do not re-list: choose a deeper exact item_id from it now. Otherwise call list_rewind_anchors once to inspect recovery candidates; pass include_non_recovery=true only for diagnostics, and never pass a recovery_eligible=false audit row to rewind_context. Use inspect_rewind_anchor when a compact row is ambiguous, then choose an exact returned item_id and position whose row or inspection supports enough pruning, with a denser carry-forward primer before using ordinary tools.",
                 })
             }),
             "density_maintenance_satisfied": density_maintenance_satisfied.map(|satisfied| {
@@ -1278,7 +1278,7 @@ impl McpAppState {
         let (used_tokens, rewind_only_limit, status) =
             self.context_pressure_rewind_only_for(session_id)?;
         let mut message = format!(
-            "Backend-reported Codex context pressure is {status} ({used_tokens}/{rewind_only_limit} tokens). Managed context is now in density-preservation mode: model-facing tools are limited to get_status, list_rewind_anchors, inspect_rewind_anchor, rewind_context, and rewind_backout until pressure is reduced below the threshold. Read-only supervisor observability tools such as get_logs and controller status remain available. The Intendant MCP tools list_rewind_anchors and inspect_rewind_anchor are available; any earlier transcript claim that either is unavailable is stale. Call list_rewind_anchors to inspect the compact valid recovery catalog; pass include_non_recovery=true only for diagnostics, and never pass a recovery_eligible=false audit row to rewind_context. Inspect a candidate if the compact row is ambiguous, then call rewind_context with an exact returned item_id, the returned position_hint or a value in positions, and a dense carry-forward primer before using other tools. A successful rewind only validates lineage; normal tools remain unavailable until backend-reported pressure is below the rewind-only limit. Do not synthesize anchor ids from prior failed tool calls."
+            "Backend-reported Codex context pressure is {status} ({used_tokens}/{rewind_only_limit} tokens). Managed context is now in density-preservation mode: model-facing tools are limited to get_status, list_rewind_anchors, inspect_rewind_anchor, rewind_context, and rewind_backout until pressure is reduced below the threshold. Read-only supervisor observability tools such as get_logs and controller status remain available. The Intendant MCP tools list_rewind_anchors and inspect_rewind_anchor are available; any earlier transcript claim that either is unavailable is stale. If a current recovery catalog page is already in view, do not re-list: choose one exact item_id from it and call rewind_context now. Otherwise call list_rewind_anchors once to inspect the compact valid recovery catalog; pass include_non_recovery=true only for diagnostics, and never pass a recovery_eligible=false audit row to rewind_context. Inspect a candidate if the compact row is ambiguous, then call rewind_context with an exact returned item_id, the returned position_hint or a value in positions, and a dense carry-forward primer before using other tools. A successful rewind only validates lineage; normal tools remain unavailable until backend-reported pressure is below the rewind-only limit. Do not synthesize anchor ids from prior failed tool calls."
         );
         if let Some(notice) = self.insufficient_rewind_notice_for(session_id) {
             message.push_str(&format!(
@@ -1342,7 +1342,12 @@ fn managed_context_tool(name: &str) -> bool {
 /// only make sense for a managed Codex session, so they share the
 /// managed-context exposure gate — but they are deliberately NOT part of
 /// [`rewind_only_allowed_tool`]: under rewind-only context pressure the
-/// recovery gate must block fission work like any other ordinary tool.
+/// recovery gate must block fission work like any other ordinary tool (the
+/// parent must shrink first). At density-watch pressure (below rewind-only)
+/// they deliberately stay allowed: this gate only fires at rewind-only, and
+/// the supervisor's density gate (`managed_context_density_tool_allowed` in
+/// main.rs) lets fission through, because delegating separable work to a
+/// branch sheds the work's context noise into the branch.
 fn fission_tool(name: &str) -> bool {
     matches!(
         name,
@@ -6770,8 +6775,11 @@ pub struct ListRewindAnchorsParams {
     /// Return detailed paged rows instead of the default bounded compact rows.
     #[serde(default)]
     pub detail: bool,
-    /// Include managed-context maintenance calls such as list_rewind_anchors or rewind_context.
-    /// Omit this during ordinary recovery so discovery does not target its own tool calls.
+    /// Include managed-context maintenance and supervisor status calls such as
+    /// list_rewind_anchors, rewind_context, or get_status. When omitted these are
+    /// hidden from rows and excluded from the catalog's totals, so repeated
+    /// listings during one recovery stall stay identical. Omit this during
+    /// ordinary recovery so discovery does not target its own tool calls.
     #[serde(default, alias = "includeManagementTools")]
     pub include_management_tools: bool,
     /// Deprecated bypass flag. Normal model-facing listings keep this enabled unless
@@ -12076,14 +12084,64 @@ mod tests {
             assert!(s.rewind_only_gate_message("rewind_context").is_none());
             assert!(s.rewind_only_gate_message("rewind_backout").is_none());
             // Fission tools are deliberately absent from the rewind-only
-            // recovery list: under density-preservation pressure, forking new
-            // branches or importing their output is ordinary work and must be
-            // blocked like any other model-facing tool.
+            // recovery list: under rewind-only pressure, forking new branches
+            // or importing their output is ordinary work and must be blocked
+            // like any other model-facing tool — the parent must shrink
+            // first. (At density watch, below rewind-only, they stay allowed;
+            // see density_watch_does_not_gate_fission_tools.)
             assert!(s.rewind_only_gate_message("fission_spawn").is_some());
             assert!(s.rewind_only_gate_message("fission_control").is_some());
             assert!(s
                 .rewind_only_gate_message("claim_fission_canonical")
                 .is_some());
+        });
+    }
+
+    #[test]
+    fn density_watch_does_not_gate_fission_tools() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let state = test_state();
+            let mut s = state.write().await;
+            s.active_session_source = Some("codex".to_string());
+            s.codex_managed_context = true;
+            // 90k/100k: at or above the 85% recommended density threshold,
+            // below the rewind-only limit — the density-watch band.
+            s.apply_main_usage_snapshot(frontend::ModelUsageSnapshot {
+                provider: "openai".to_string(),
+                model: "gpt-5.2-codex".to_string(),
+                tokens_used: 90_000,
+                context_window: 100_000,
+                hard_context_window: Some(120_000),
+                usage_pct: 90.0,
+                prompt_tokens: 70_000,
+                completion_tokens: 20_000,
+                cached_tokens: 0,
+            });
+
+            assert!(
+                s.context_pressure_density_watch_for(None, None),
+                "test premise: usage must sit in the density-watch band"
+            );
+            // The MCP-side gate only fires at rewind-only pressure: fission
+            // calls pass at watch band, where spawning a branch is itself a
+            // valid density action.
+            assert!(s.rewind_only_gate_message("fission_spawn").is_none());
+            assert!(s.rewind_only_gate_message("fission_control").is_none());
+            assert!(s
+                .rewind_only_gate_message("claim_fission_canonical")
+                .is_none());
+            // The watch-band status message advertises fission delegation as
+            // a density action.
+            let pressure = s.context_pressure_snapshot();
+            assert_eq!(pressure["status"], "watch");
+            assert!(pressure["message"]
+                .as_str()
+                .unwrap()
+                .contains("Fission tools stay allowed at watch"));
         });
     }
 

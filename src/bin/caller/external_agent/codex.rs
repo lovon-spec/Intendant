@@ -73,7 +73,7 @@ Keep the live transcript informationally dense:
 
 Fission (full-context branch spawning), when fission tools are available:
 - When a coherent subtask is separable or parallelizable, prefer `fission_spawn` with a self-contained charter over a deep in-context detour. Branches fork from the last completed turn and do not see the current turn, so each charter must carry every fact, path, and constraint the branch needs.
-- Favor breadth over depth, before pressure builds: fission is ex-ante, rewind is ex-post, and fission tools are unavailable under rewind-only pressure.
+- Favor breadth over depth, before pressure builds: fission is ex-ante, rewind is ex-post. Fission tools stay available at `watch` pressure — delegating separable work to a branch is itself a valid density action, since the branch absorbs the work's context noise — but they are unavailable under rewind-only pressure.
 - After spawning, continue your own non-overlapping work; do not idle behind a branch.
 - Use `fission_control(op="wait")` only when genuinely blocked on a branch result. A `still_running` result is normal — keep working and re-check later.
 - Import branch results you need via `fission_control(op="import")`; detach or ignore branches you don't.
@@ -1405,6 +1405,14 @@ pub struct CodexAgent {
     /// Enables Intendant's managed-context protocol. Disabled for
     /// vanilla/fork-safe managed Codex.
     managed_context: bool,
+    /// The exact `developerInstructions` override the active thread was
+    /// started/resumed with (None when none was sent). The mid-session
+    /// `thread/resume` retry MUST re-send these bytes verbatim: the override
+    /// is not persisted in Codex config, so omitting it on an app-server
+    /// thread eviction would silently swap the developer block (a prompt-
+    /// cache prefix bust at maximum prompt size) and drop the managed-context
+    /// policy text. See the cache-prefix contract on `turn_start_params`.
+    thread_developer_instructions: Option<String>,
     web_port: Option<u16>,
     mcp_session_id: Option<String>,
     resume_session: Option<String>,
@@ -1578,10 +1586,6 @@ impl CodexAgent {
                 serde_json::Value::String(cwd.to_string_lossy().to_string()),
             );
         }
-    }
-
-    fn thread_lifecycle_params(&mut self) -> serde_json::Map<String, serde_json::Value> {
-        self.thread_lifecycle_params_with_developer_instructions(None)
     }
 
     fn thread_lifecycle_params_with_developer_instructions(
@@ -1918,6 +1922,7 @@ impl CodexAgent {
             network_access: opts.network_access,
             writable_roots: opts.writable_roots,
             managed_context: opts.managed_context,
+            thread_developer_instructions: None,
             web_port,
             mcp_session_id: None,
             resume_session: None,
@@ -2224,13 +2229,89 @@ impl CodexAgent {
         Some(actual_turn_id)
     }
 
-    async fn resume_thread_for_followup(&mut self, thread_id: &str) -> Result<(), CallerError> {
-        let mut params = self.thread_lifecycle_params();
+    /// Params for the mid-session `thread/resume` retry issued when
+    /// `turn/start` reports the thread is no longer loaded (app-server
+    /// eviction). Re-sends the cached `developerInstructions` override
+    /// byte-identically: the override is not in Codex config, so a bare
+    /// resume would rebuild the thread with the config-default developer
+    /// block — silently dropping the managed-context policy AND rewriting
+    /// the prompt prefix at maximum prompt size (cache-prefix contract on
+    /// `turn_start_params`).
+    fn followup_resume_params(
+        &mut self,
+        thread_id: &str,
+    ) -> serde_json::Map<String, serde_json::Value> {
+        let developer_instructions = self.thread_developer_instructions.clone();
+        let mut params =
+            self.thread_lifecycle_params_with_developer_instructions(developer_instructions);
         params.insert(
             "threadId".into(),
             serde_json::Value::String(thread_id.to_string()),
         );
         params.insert("excludeTurns".into(), serde_json::Value::Bool(true));
+        params
+    }
+
+    /// Per-turn `turn/start` params.
+    ///
+    /// ── Cache prefix contract (prompt-cache prefix stability) ─────────────
+    /// Every Codex turn re-sends the full request prefix (base instructions +
+    /// developer block + tool specs + persisted history) to the model API;
+    /// prompt caching only pays off when that prefix stays byte-stable
+    /// between turns — and the managed gate zone sits at maximum prompt size,
+    /// where a prefix miss is most expensive. Supervisor-side, the following
+    /// must hold:
+    ///
+    /// 1. Per-turn params here are append-only: `threadId` + `input`, plus a
+    ///    `serviceTier` override that is constant for the session (set at
+    ///    launch or by an explicit user `/fast` toggle; it parameterizes API
+    ///    routing, not prompt bytes). Do not add per-turn params that the
+    ///    fork folds into instructions, the developer block, or tool config —
+    ///    those rewrite content before the history suffix.
+    /// 2. The developer block is fixed at `thread/start`
+    ///    (`developerInstructions`, cached in
+    ///    `thread_developer_instructions`) and re-sent byte-identically by
+    ///    the mid-session `thread/resume` retry (`followup_resume_params`).
+    ///    The override is not persisted in Codex config, so a bare resume
+    ///    after an app-server thread eviction would swap the developer block
+    ///    for the config default — busting the prefix and silently dropping
+    ///    the managed-context policy.
+    /// 3. Everything the supervisor adds mid-session appends after the
+    ///    existing history: recovery kickstarts, density handoffs, and
+    ///    held-follow-up replays are new user messages; `turn/steer` items
+    ///    append into the active turn; primer injection
+    ///    (`thread/inject_items`) appends developer items; `turn/interrupt`
+    ///    mutates nothing supervisor-side (fork-side the abort marker is
+    ///    recorded as an appended history item).
+    /// 4. Settings churn (`thread/settings/update` with model / approval /
+    ///    permissions / cwd) is confined to session-resume setup before the
+    ///    first turn (`apply_resumed_thread_settings`); never issue it
+    ///    between turns of a live session.
+    ///
+    /// Known structural exception, fork-side and out of supervisor control:
+    /// the managed recovery turn swaps the request's tool surface (normal
+    /// specs ↔ the five rewind-only specs), which rewrites the tools block —
+    /// a full prefix miss on every gate entry/exit at maximum prompt size.
+    /// That fix belongs to the fork (a stable tool surface across recovery
+    /// turns); the supervisor side is deliberately kept append-only so the
+    /// fork fix is sufficient on its own.
+    fn turn_start_params(
+        &mut self,
+        thread_id: &str,
+        input: Vec<serde_json::Value>,
+    ) -> serde_json::Map<String, serde_json::Value> {
+        let mut params_obj = serde_json::Map::new();
+        params_obj.insert(
+            "threadId".into(),
+            serde_json::Value::String(thread_id.to_string()),
+        );
+        params_obj.insert("input".into(), serde_json::Value::Array(input));
+        self.insert_service_tier_override_consuming_clear(&mut params_obj);
+        params_obj
+    }
+
+    async fn resume_thread_for_followup(&mut self, thread_id: &str) -> Result<(), CallerError> {
+        let params = self.followup_resume_params(thread_id);
 
         let response = self
             .send_request("thread/resume", Some(serde_json::Value::Object(params)))
@@ -6632,6 +6713,10 @@ impl ExternalAgent for CodexAgent {
         let managed_developer_instructions = self
             .effective_managed_context_developer_instructions()
             .await;
+        // Cache the exact override for the lifetime of the thread: the
+        // mid-session `thread/resume` retry must re-send these bytes
+        // verbatim (cache-prefix contract on `turn_start_params`).
+        self.thread_developer_instructions = managed_developer_instructions.clone();
         let mut params = self
             .thread_lifecycle_params_with_developer_instructions(managed_developer_instructions);
 
@@ -6745,14 +6830,7 @@ impl ExternalAgent for CodexAgent {
                 }));
             }
         }
-        let mut params_obj = serde_json::Map::new();
-        params_obj.insert(
-            "threadId".into(),
-            serde_json::Value::String(thread.thread_id.clone()),
-        );
-        params_obj.insert("input".into(), serde_json::Value::Array(input));
-        self.insert_service_tier_override_consuming_clear(&mut params_obj);
-        let params = serde_json::Value::Object(params_obj);
+        let params = serde_json::Value::Object(self.turn_start_params(&thread.thread_id, input));
         self.turn_descendant_baseline =
             self.child.as_ref().and_then(|child| child.id()).map(|pid| {
                 crate::platform::process_descendants(pid)
@@ -11065,7 +11143,7 @@ error: build failed
         agent.model = Some("gpt-5.5".to_string());
         agent.working_dir = Some(PathBuf::from("/tmp/intendant-workspace"));
 
-        let params = agent.thread_lifecycle_params();
+        let params = agent.thread_lifecycle_params_with_developer_instructions(None);
 
         assert_eq!(params["model"], "gpt-5.5");
         assert_eq!(params["approvalPolicy"], "on-request");
@@ -11120,10 +11198,86 @@ error: build failed
         agent.approval_policy = "on-request".to_string();
         agent.sandbox = "danger-full-access".to_string();
 
-        let params = agent.thread_lifecycle_params();
+        let params = agent.thread_lifecycle_params_with_developer_instructions(None);
 
         assert_eq!(params["approvalPolicy"], "never");
         assert_eq!(params["sandbox"], "danger-full-access");
+    }
+
+    /// Cache-prefix contract: the mid-session `thread/resume` retry must
+    /// re-send the exact `developerInstructions` the thread was started
+    /// with. A bare resume (no override) would rebuild the thread with the
+    /// config-default developer block — dropping the managed-context policy
+    /// and busting the prompt-cache prefix at maximum prompt size.
+    #[test]
+    fn followup_resume_params_resend_thread_start_developer_instructions() {
+        let mut agent = test_agent();
+        let instructions =
+            managed_context_developer_instructions_for_project(Some("user base"), None);
+        agent.thread_developer_instructions = Some(instructions.clone());
+
+        let params = agent.followup_resume_params("thread-evicted");
+
+        assert_eq!(params["threadId"], "thread-evicted");
+        assert_eq!(params["excludeTurns"], true);
+        assert_eq!(
+            params["developerInstructions"].as_str(),
+            Some(instructions.as_str()),
+            "developerInstructions must be byte-identical to the thread-start override"
+        );
+
+        // A thread started without an override resumes without one too —
+        // re-introducing instructions the thread never had would be just as
+        // prefix-unstable as dropping them.
+        let mut vanilla = test_agent();
+        vanilla.thread_developer_instructions = None;
+        let params = vanilla.followup_resume_params("thread-evicted");
+        assert!(!params.contains_key("developerInstructions"));
+    }
+
+    /// Cache-prefix contract: per-turn `turn/start` params are append-only —
+    /// `threadId` + `input` plus a session-constant `serviceTier` override.
+    /// Consecutive turns must differ only in `input`; anything else added
+    /// here is prefix-relevant and trips this test on purpose.
+    #[test]
+    fn turn_start_params_are_append_only_across_turns() {
+        let mut agent = test_agent();
+        agent.service_tier = Some(CODEX_FAST_SERVICE_TIER.to_string());
+
+        let kickstart = vec![serde_json::json!({
+            "type": "text",
+            "text": "<managed_context_recovery>recover now</managed_context_recovery>",
+        })];
+        let replay = vec![serde_json::json!({
+            "type": "text",
+            "text": "<managed_context_rewind_followup_replay>user follow-up</managed_context_rewind_followup_replay>",
+        })];
+
+        let mut first = agent.turn_start_params("thread-1", kickstart);
+        let mut second = agent.turn_start_params("thread-1", replay);
+
+        for params in [&first, &second] {
+            let mut keys: Vec<&str> = params.keys().map(String::as_str).collect();
+            keys.sort_unstable();
+            assert_eq!(
+                keys,
+                vec!["input", "serviceTier", "threadId"],
+                "turn/start must carry no per-turn prefix-relevant params"
+            );
+        }
+
+        // Everything except the appended user input is byte-stable between
+        // turns (the kickstart flow replaces nothing it sent before).
+        first.remove("input");
+        second.remove("input");
+        assert_eq!(first, second);
+
+        // Without a tier override the surface is just threadId + input.
+        let mut plain = test_agent();
+        let params = plain.turn_start_params("thread-1", Vec::new());
+        let mut keys: Vec<&str> = params.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, vec!["input", "threadId"]);
     }
 
     #[test]
@@ -11131,7 +11285,7 @@ error: build failed
         let mut agent = test_agent();
         agent.managed_context = false;
 
-        let params = agent.thread_lifecycle_params();
+        let params = agent.thread_lifecycle_params_with_developer_instructions(None);
 
         assert!(params.get("developerInstructions").is_none());
     }
@@ -11223,6 +11377,8 @@ error: build failed
             "fission_spawn",
             "fork from the last completed turn and do not see the current turn",
             "fission is ex-ante, rewind is ex-post",
+            "stay available at `watch` pressure",
+            "valid density action",
             "unavailable under rewind-only pressure",
             "continue your own non-overlapping work",
             "fission_control(op=\"wait\")",

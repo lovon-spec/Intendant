@@ -2367,6 +2367,10 @@ struct ExternalContextRewindRequest {
     next_steps: Vec<String>,
     auto_resume: bool,
     require_density_improvement: bool,
+    /// Supervisor-chosen anchor + synthetic primer (surgical recovery after
+    /// the model exhausted its recovery step limit without rewinding).
+    /// Marked on the durable rewind record.
+    surgical: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2746,6 +2750,7 @@ fn external_context_rewind_request_from_action(
         next_steps: clean_context_rewind_list(params, "next_steps"),
         auto_resume: is_model_rewind,
         require_density_improvement: false,
+        surgical: false,
     }))
 }
 
@@ -3480,6 +3485,22 @@ struct ContextRewindAnchorCompactCatalog {
     recovery_candidates_only: bool,
     density_candidates_only: bool,
     pruning_estimates_included: bool,
+    /// True when this is a re-listing of the default page inside one
+    /// managed-context stall: the rows are unchanged, so the model should
+    /// commit instead of listing again.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    repeat_listing: Option<bool>,
+    /// True when the eligible catalog itself is empty: no anchor remains
+    /// that a rewind could legally target.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    no_eligible_anchors: Option<bool>,
+    /// Set with an empty page to say why it is empty
+    /// (`no_eligible_anchors`, `query_unmatched`, `offset_past_end`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    empty_page_reason: Option<&'static str>,
+    /// Plain-language direction for the repeat/empty cases above.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    notice: Option<String>,
     anchors: Vec<ContextRewindAnchorCompactEntry>,
 }
 
@@ -3614,10 +3635,21 @@ fn list_context_rewind_anchors_from_rollout(
             source_rollout_path.display()
         )
     })?;
-    let total = anchors.len();
+    let scanned_total = anchors.len();
+    let trailing_listing_calls = context_rewind_trailing_listing_calls(&anchors);
     if !include_management_tools {
         anchors.retain(|anchor| !context_rewind_anchor_is_management_tool(anchor));
     }
+    // Model-visible accounting must be idempotent across listing-only growth:
+    // when management calls are hidden from rows they are excluded from
+    // `total` too, so a recovery stall (where listings/status polls are the
+    // only thread growth) re-lists with stable counts instead of a catalog
+    // that grows by one per listing call.
+    let total = if include_management_tools {
+        scanned_total
+    } else {
+        anchors.len()
+    };
     if recovery_candidates_only {
         anchors.retain(|anchor| anchor.recovery_eligible != Some(false));
         for anchor in &mut anchors {
@@ -3671,7 +3703,7 @@ fn list_context_rewind_anchors_from_rollout(
             .collect::<Vec<_>>();
         let next_offset = (offset.saturating_add(page.len()) < filtered_total)
             .then_some(offset.saturating_add(page.len()));
-        let compact = ContextRewindAnchorCompactCatalog {
+        let mut compact = ContextRewindAnchorCompactCatalog {
             catalog_format: "compact_page",
             total,
             filtered_total,
@@ -3686,8 +3718,13 @@ fn list_context_rewind_anchors_from_rollout(
             recovery_candidates_only,
             density_candidates_only,
             pruning_estimates_included: include_pruning_estimates,
+            repeat_listing: None,
+            no_eligible_anchors: None,
+            empty_page_reason: None,
+            notice: None,
             anchors: page,
         };
+        annotate_compact_catalog_repeats_and_dead_ends(&mut compact, trailing_listing_calls, reverse);
         return serialize_context_rewind_anchor_compact_catalog(compact, filtered_total);
     }
     let mut page = anchors
@@ -3743,6 +3780,62 @@ fn context_rewind_anchor_use_compact_catalog(
         return true;
     }
     true
+}
+
+/// Annotates a compact catalog page with anti-stall guidance, addressing the
+/// two protocol dead-ends measured in the 2026-06-12 w40 bench (7 of 20
+/// managed misses ended re-listing offset 0 until the recovery step limit;
+/// 1 ended on a page with nothing valid to rewind to):
+/// - `repeat_listing`: the default page was re-requested inside one
+///   management-only stall, so the rows are unchanged and the model should
+///   commit to `rewind_context` instead of listing again.
+/// - empty pages say *why* they are empty and what to do instead of leaving
+///   a bare page that invites another listing: an exhausted eligible catalog
+///   fails loudly toward the supervisor's manual recovery path (or, for a
+///   density-only listing, says to skip maintenance and continue the task).
+fn annotate_compact_catalog_repeats_and_dead_ends(
+    compact: &mut ContextRewindAnchorCompactCatalog,
+    trailing_listing_calls: usize,
+    reverse: bool,
+) {
+    let default_page_view = compact.offset == 0 && compact.query.is_none() && !reverse;
+    // The scan normally already contains the in-flight listing call, so two
+    // or more trailing listings mean at least one completed prior listing.
+    let prior_listings = trailing_listing_calls.saturating_sub(1);
+    if default_page_view && prior_listings >= 1 && !compact.anchors.is_empty() {
+        compact.repeat_listing = Some(true);
+        compact.notice = Some(format!(
+            "repeat listing: this default page was already returned {prior_listings} time(s) in the current managed-context stall and is unchanged (management/status calls are excluded from rows and counts, so re-listing cannot surface new anchors). Do not call list_rewind_anchors again: choose one exact item_id from the rows above and call rewind_context now, or page exactly once with offset=next_offset if every visible row is unusable."
+        ));
+    }
+    if !compact.anchors.is_empty() {
+        return;
+    }
+    if compact.filtered_total == 0 {
+        if compact.query.is_some() {
+            compact.empty_page_reason = Some("query_unmatched");
+            compact.notice = Some(
+                "no eligible anchors match this query. Do not repeat the query: re-list once without a query to see the eligible catalog (an empty unqueried page means nothing is left to rewind to)."
+                    .to_string(),
+            );
+        } else {
+            compact.no_eligible_anchors = Some(true);
+            compact.empty_page_reason = Some("no_eligible_anchors");
+            compact.notice = Some(if compact.density_candidates_only {
+                "no eligible density anchors remain: every remaining thread item is managed-context management/status activity or has no density-valid position. There is nothing to prune — do not call list_rewind_anchors again and do not end the session over this; skip density maintenance and continue the task normally."
+                    .to_string()
+            } else {
+                "no eligible rewind anchors remain: every remaining thread item is managed-context management/status activity or is known to leave backend pressure at/above the rewind-only limit. Re-listing cannot surface new anchors — do not call list_rewind_anchors again. State plainly that managed-context recovery has no valid anchor and end the turn with a brief status message so the supervisor can take a manual recovery path (rewind_backout, thread restore, or operator intervention). include_non_recovery=true remains available for read-only diagnostics only."
+                    .to_string()
+            });
+        }
+    } else {
+        compact.empty_page_reason = Some("offset_past_end");
+        compact.notice = Some(format!(
+            "offset {} is past the end of the eligible catalog ({} anchors). Every eligible row has already been returned. Do not keep paging: choose an item_id from rows already in view and call rewind_context, or re-list from offset 0 only if those rows are no longer visible.",
+            compact.offset, compact.filtered_total
+        ));
+    }
 }
 
 fn serialize_context_rewind_anchor_compact_catalog(
@@ -4523,6 +4616,14 @@ fn context_rewind_anchor_matches_query(
         || anchor.last_line.to_string() == needle
 }
 
+/// Managed-context machinery and supervisor status/observability calls.
+/// These thread items are protocol churn, not substantive task milestones:
+/// they are hidden from the default anchor catalog and excluded from its
+/// accounting so a recovery stall (whose only thread growth is these calls)
+/// re-lists byte-identically instead of presenting a "growing" catalog, and
+/// so a status poll can never be the last "eligible" rewind candidate (the
+/// 2026-06-12 bench dead-end: a density handoff whose only returned row was a
+/// `get_status` anchor the handoff itself disallowed).
 fn context_rewind_anchor_is_management_tool(anchor: &ContextRewindAnchorCatalogEntry) -> bool {
     anchor.names.iter().any(|name| {
         matches!(
@@ -4535,8 +4636,35 @@ fn context_rewind_anchor_is_management_tool(anchor: &ContextRewindAnchorCatalogE
                 | "context_rewind_anchor_inspect"
                 | "context_rewind"
                 | "context_rewind_backout"
+                | "get_status"
+                | "get_logs"
+                | "get_pending_approval"
+                | "get_pending_input"
+                | "get_restart_status"
         )
     })
+}
+
+/// True when `anchor` is a `list_rewind_anchors` (or legacy alias) call.
+fn context_rewind_anchor_is_listing_call(anchor: &ContextRewindAnchorCatalogEntry) -> bool {
+    anchor
+        .names
+        .iter()
+        .any(|name| matches!(name.as_str(), "list_rewind_anchors" | "context_rewind_anchors"))
+}
+
+/// Number of `list_rewind_anchors` calls in the trailing management-only run
+/// of the catalog scan — i.e. in the current managed-context stall, since
+/// under rewind-only/density gating management tools are the only items the
+/// model can append. Includes the in-flight listing call when the backend has
+/// already persisted it.
+fn context_rewind_trailing_listing_calls(anchors: &[ContextRewindAnchorCatalogEntry]) -> usize {
+    anchors
+        .iter()
+        .rev()
+        .take_while(|anchor| context_rewind_anchor_is_management_tool(anchor))
+        .filter(|anchor| context_rewind_anchor_is_listing_call(anchor))
+        .count()
 }
 
 fn response_item_is_managed_context_recovery_kickstart(item: &serde_json::Value) -> bool {
@@ -5080,6 +5208,7 @@ async fn apply_external_context_rewind(
         used_tokens_at_rewind,
         context_window_at_rewind,
         pressure_band_at_rewind,
+        surgical: request.surgical,
     };
     // Perform the rollback BEFORE persisting the durable record. The recovery
     // rollout was copied above (copy-before-mutation), but the record itself is
@@ -5957,8 +6086,34 @@ fn managed_context_rewind_only_tool_allowed(tool_name: &str, preview: &str) -> b
             .is_some_and(|(_, name)| allowed_name(name))
 }
 
+/// Tools allowed to start while the managed-context density steer is active
+/// (watch band: at or above the recommended density threshold, below the
+/// rewind-only limit). Everything the rewind-only gate allows, plus the
+/// fission tools: spawning a branch at watch pressure is itself a density
+/// action — the work and its context noise land in the branch while the
+/// parent only carries the spawn call and an eventual import. Under
+/// rewind-only pressure the stricter
+/// [`managed_context_rewind_only_tool_allowed`] gate applies instead and
+/// fission stays blocked: the parent must shrink first.
 fn managed_context_density_tool_allowed(tool_name: &str, preview: &str) -> bool {
-    managed_context_rewind_only_tool_allowed(tool_name, preview)
+    fn fission_name(name: &str) -> bool {
+        matches!(
+            name.trim(),
+            "fission_spawn" | "fission_control" | "claim_fission_canonical"
+        )
+    }
+
+    if managed_context_rewind_only_tool_allowed(tool_name, preview) || fission_name(tool_name) {
+        return true;
+    }
+    if tool_name != "mcp" {
+        return false;
+    }
+    let preview = preview.trim();
+    fission_name(preview)
+        || preview
+            .rsplit_once(':')
+            .is_some_and(|(_, name)| fission_name(name))
 }
 
 fn shellish_command_tokens(command: &str) -> Vec<String> {
@@ -6182,7 +6337,7 @@ fn managed_context_recovery_kickstart_text(
         ""
     };
     format!(
-        "<managed_context_recovery>\nBackend-reported Codex context pressure is {status} ({used}/{limit} tokens{hard}), leaving too little room for a normal tool/result cycle. Do not continue normally. The Intendant MCP tools list_rewind_anchors and inspect_rewind_anchor are callable in this turn; any earlier transcript claim that either is unavailable is stale and incorrect. First call list_rewind_anchors without a query to inspect the first bounded compact page of valid non-management recovery anchors; use next_offset/offset, limit, query, or reverse to inspect other catalog ranges without dumping the whole catalog. The normal catalog hides anchors known to remain at/above the rewind-only limit or without enough normal-tool resume headroom; include_non_recovery=true is diagnostic-only and rows with recovery_eligible=false must not be passed to rewind_context. If a compact catalog row is ambiguous, call inspect_rewind_anchor for the candidate item_id before mutating the thread. Then call rewind_context with one exact returned item_id, the returned position_hint or a value in positions, and a dense carry-forward primer. A successful rewind only validates lineage; normal tools remain unavailable until backend-reported pressure has enough normal-tool headroom below the rewind-only limit. Do not synthesize anchor ids from prior failed tool calls. Do not use auto anchors or N-turn rewinds.{held}\n</managed_context_recovery>",
+        "<managed_context_recovery>\nBackend-reported Codex context pressure is {status} ({used}/{limit} tokens{hard}), leaving too little room for a normal tool/result cycle. Do not continue normally. The Intendant MCP tools list_rewind_anchors and inspect_rewind_anchor are callable in this turn; any earlier transcript claim that either is unavailable is stale and incorrect. If a recovery catalog page from this stall is already in view, do not list again: choose one exact item_id from it and call rewind_context now. Otherwise call list_rewind_anchors once without a query to inspect the first bounded compact page of valid non-management recovery anchors; use next_offset/offset, limit, query, or reverse to inspect other catalog ranges without dumping the whole catalog, and never re-request a page you can already see. The normal catalog hides anchors known to remain at/above the rewind-only limit or without enough normal-tool resume headroom; include_non_recovery=true is diagnostic-only and rows with recovery_eligible=false must not be passed to rewind_context. If a compact catalog row is ambiguous, call inspect_rewind_anchor for the candidate item_id before mutating the thread. Then call rewind_context with one exact returned item_id, the returned position_hint or a value in positions, and a dense carry-forward primer. If the catalog reports no_eligible_anchors, do not keep listing: state that recovery has no valid anchor and end the turn so the supervisor can recover manually. A successful rewind only validates lineage; normal tools remain unavailable until backend-reported pressure has enough normal-tool headroom below the rewind-only limit. Do not synthesize anchor ids from prior failed tool calls. Do not use auto anchors or N-turn rewinds.{held}\n</managed_context_recovery>",
         status = pressure.status,
         used = pressure.used_tokens,
         limit = pressure.rewind_only_limit,
@@ -6197,7 +6352,7 @@ fn managed_context_density_handoff_text(pressure: ManagedContextDensityPressure)
         .map(|hard| format!(" hard_limit={hard}"))
         .unwrap_or_default();
     format!(
-        "<managed_context_density_handoff>\nwatch {used}/{limit}; recommended_density_threshold={recommended}{hard}. Maintenance only. For a useful density rewind, call list_rewind_anchors with density_candidates_only=true, include_pruning_estimates=true, limit=1; inspect only if that row is ambiguous; then call rewind_context with one exact returned item_id, a returned position, and a dense primer. Density rows hide anchors without a density-valid position and narrow positions to choices expected below the threshold. If no exact anchor is clearly worthwhile, reply with a concise no-rewind handoff covering durable facts, changed files, verification, constraints, remaining decisions, and state that you are leaving context unchanged. Do not do broad ordinary-tool work. Do not use auto anchors, N-turn rewinds, synthesized ids, failed-example ids, or management-tool anchors.\n</managed_context_density_handoff>",
+        "<managed_context_density_handoff>\nwatch {used}/{limit}; recommended_density_threshold={recommended}{hard}. Maintenance only. For a useful density rewind, call list_rewind_anchors with density_candidates_only=true, include_pruning_estimates=true, limit=1; inspect only if that row is ambiguous; then call rewind_context with one exact returned item_id, a returned position, and a dense primer. Density rows hide anchors without a density-valid position and narrow positions to choices expected below the threshold. If no exact anchor is clearly worthwhile, reply with a concise no-rewind handoff covering durable facts, changed files, verification, constraints, remaining decisions, and state that you are leaving context unchanged. Do not do broad ordinary-tool work. Fission stays allowed: delegating separable work to a branch via fission_spawn is a valid density action. Do not use auto anchors, N-turn rewinds, synthesized ids, failed-example ids, or management-tool anchors.\n</managed_context_density_handoff>",
         used = pressure.used_tokens,
         limit = pressure.rewind_only_limit,
         recommended = pressure.recommended_rewind_limit,
@@ -6219,7 +6374,7 @@ fn managed_context_density_active_steer_text(
         "Allow the currently in-flight narrow validation/build/tool to finish and preserve its durable result, but do not start another broad build, QA, exploration, or implementation loop before density maintenance."
     };
     format!(
-        "<managed_context_density_steer>\nBackend-reported Codex context pressure is watch ({used}/{limit} tokens, recommended_density_threshold={recommended}{hard}). This steer is freshness-bound to the latest backend-reported context status; if a later status reports below recommended_density_threshold, this steer is stale and must be ignored. {in_flight} Normal tools are still allowed below rewind_only, but before broad follow-up work do exact-anchor density maintenance if a current catalog anchor can materially reduce pressure below the recommended density threshold, or give a concise no-rewind density handoff that crystallizes durable facts, changed files, validation results, constraints, and remaining decisions. Use list_rewind_anchors with density_candidates_only=true and include_pruning_estimates=true, and inspect_rewind_anchor only as needed; if rewinding, call rewind_context with one exact returned item_id, a valid returned position, and a dense carry-forward primer. Do not use auto anchors, N-turn rewinds, synthesized item ids, anchors from failed examples, or managed-context maintenance calls as rewind targets.\n</managed_context_density_steer>",
+        "<managed_context_density_steer>\nBackend-reported Codex context pressure is watch ({used}/{limit} tokens, recommended_density_threshold={recommended}{hard}). This steer is freshness-bound to the latest backend-reported context status; if a later status reports below recommended_density_threshold, this steer is stale and must be ignored. {in_flight} Normal tools are still allowed below rewind_only, but before broad follow-up work do exact-anchor density maintenance if a current catalog anchor can materially reduce pressure below the recommended density threshold, or give a concise no-rewind density handoff that crystallizes durable facts, changed files, validation results, constraints, and remaining decisions. Fission tools stay allowed at watch: delegating separable work to a fission branch is itself a valid density action. Use list_rewind_anchors with density_candidates_only=true and include_pruning_estimates=true, and inspect_rewind_anchor only as needed; if rewinding, call rewind_context with one exact returned item_id, a valid returned position, and a dense carry-forward primer. Do not use auto anchors, N-turn rewinds, synthesized item ids, anchors from failed examples, or managed-context maintenance calls as rewind targets.\n</managed_context_density_steer>",
         used = pressure.used_tokens,
         limit = pressure.rewind_only_limit,
         recommended = pressure.recommended_rewind_limit,
@@ -6259,8 +6414,206 @@ fn managed_context_backend_recovery_kickstart_text(
         .map(|hint| format!(" Codex recovery hint: {hint}"))
         .unwrap_or_default();
     format!(
-        "<managed_context_recovery>\nCodex reported backend recovery required before completing the turn: {message}.{hint} Do not continue normally. The Intendant MCP tools list_rewind_anchors and inspect_rewind_anchor are callable in this turn; any earlier transcript claim that either is unavailable is stale and incorrect. First call list_rewind_anchors without a query to inspect the first bounded compact page of valid non-management recovery anchors; use next_offset/offset, limit, query, or reverse to inspect other catalog ranges without dumping the whole catalog. The normal catalog hides anchors known to remain at/above the rewind-only limit or without enough normal-tool resume headroom; include_non_recovery=true is diagnostic-only and rows with recovery_eligible=false must not be passed to rewind_context. If a compact catalog row is ambiguous, call inspect_rewind_anchor for the candidate item_id before mutating the thread. Then call rewind_context with one exact returned item_id, the returned position_hint or a value in positions, and a dense carry-forward primer. A successful rewind only validates lineage; normal tools remain unavailable until backend-reported pressure has enough normal-tool headroom below the rewind-only limit. Do not synthesize anchor ids from prior failed tool calls. Do not use auto anchors or N-turn rewinds.\n</managed_context_recovery>"
+        "<managed_context_recovery>\nCodex reported backend recovery required before completing the turn: {message}.{hint} Do not continue normally. The Intendant MCP tools list_rewind_anchors and inspect_rewind_anchor are callable in this turn; any earlier transcript claim that either is unavailable is stale and incorrect. If a recovery catalog page from this stall is already in view, do not list again: choose one exact item_id from it and call rewind_context now. Otherwise call list_rewind_anchors once without a query to inspect the first bounded compact page of valid non-management recovery anchors; use next_offset/offset, limit, query, or reverse to inspect other catalog ranges without dumping the whole catalog, and never re-request a page you can already see. The normal catalog hides anchors known to remain at/above the rewind-only limit or without enough normal-tool resume headroom; include_non_recovery=true is diagnostic-only and rows with recovery_eligible=false must not be passed to rewind_context. If a compact catalog row is ambiguous, call inspect_rewind_anchor for the candidate item_id before mutating the thread. Then call rewind_context with one exact returned item_id, the returned position_hint or a value in positions, and a dense carry-forward primer. If the catalog reports no_eligible_anchors, do not keep listing: state that recovery has no valid anchor and end the turn so the supervisor can recover manually. A successful rewind only validates lineage; normal tools remain unavailable until backend-reported pressure has enough normal-tool headroom below the rewind-only limit. Do not synthesize anchor ids from prior failed tool calls. Do not use auto anchors or N-turn rewinds.\n</managed_context_recovery>"
     )
+}
+
+/// Cap on supervisor-forced surgical recoveries per session. Each one is a
+/// last-resort context amputation with a synthetic primer (no model-authored
+/// carry-forward), so repeated need signals a structural problem the loop
+/// must surface loudly instead of papering over forever.
+const MANAGED_CONTEXT_MAX_SURGICAL_RECOVERIES: u8 = 2;
+
+/// Reason recorded on the durable rewind record (and shown in the dashboard)
+/// for a supervisor-forced surgical recovery.
+const MANAGED_CONTEXT_SURGICAL_RECOVERY_REASON: &str =
+    "supervisor surgical recovery after step-limit exhaustion";
+
+/// Whether another supervisor-forced surgical recovery may run this session.
+/// Model rewinds do not consume this budget — only surgical ones — so a
+/// session where the model recovers on its own never triggers the backstop.
+fn managed_context_surgical_recovery_available(surgical_recoveries: u8) -> bool {
+    surgical_recoveries < MANAGED_CONTEXT_MAX_SURGICAL_RECOVERIES
+}
+
+/// First pruned rollout line for an (anchor, position) cut: `before` prunes
+/// from the anchor's first occurrence, `after` keeps the whole anchored group
+/// and prunes from the next line. Lower = deeper cut = more pruning.
+fn managed_context_surgical_cut_start_line(
+    anchor: &ContextRewindAnchorCatalogEntry,
+    position: external_agent::RollbackAnchorPosition,
+) -> usize {
+    match position {
+        external_agent::RollbackAnchorPosition::Before => anchor.first_line,
+        external_agent::RollbackAnchorPosition::After => anchor.last_line.saturating_add(1),
+    }
+}
+
+/// Supervisor-chosen anchor for a surgical recovery: the recovery-eligible
+/// (anchor, position) pair with maximum pruning — i.e. the earliest cut line
+/// — mirroring the model-visible default catalog (`list_rewind_anchors`):
+/// rows with `recovery_eligible == Some(false)` (insufficient headroom,
+/// prior-outcome veto, or inside the active recovery span) are excluded, and
+/// per-row positions come from `recovery_eligible_positions`. Rows with
+/// unknown eligibility (`None`, no backend usage coverage) are offered by the
+/// catalog too, but only as a fallback here — at `after` (never `before`, so
+/// an unknown first row cannot empty the thread) — and the apply path still
+/// validates restore headroom before mutating anything.
+fn managed_context_surgical_anchor_choice(
+    anchors: &[ContextRewindAnchorCatalogEntry],
+) -> Option<(String, external_agent::RollbackAnchorPosition)> {
+    let eligible = anchors
+        .iter()
+        .filter(|anchor| anchor.recovery_eligible == Some(true))
+        .flat_map(|anchor| {
+            anchor
+                .recovery_eligible_positions
+                .iter()
+                .flatten()
+                .filter_map(move |position| {
+                    external_agent::RollbackAnchorPosition::from_str(position)
+                        .map(|position| (anchor, position))
+                })
+        })
+        .min_by_key(|(anchor, position)| {
+            (
+                managed_context_surgical_cut_start_line(anchor, *position),
+                anchor.ordinal,
+            )
+        });
+    if let Some((anchor, position)) = eligible {
+        return Some((anchor.item_id.clone(), position));
+    }
+    anchors
+        .iter()
+        .filter(|anchor| {
+            anchor.recovery_eligible.is_none()
+                && !context_rewind_anchor_is_management_tool(anchor)
+        })
+        .map(|anchor| (anchor, external_agent::RollbackAnchorPosition::After))
+        .min_by_key(|(anchor, position)| {
+            (
+                managed_context_surgical_cut_start_line(anchor, *position),
+                anchor.ordinal,
+            )
+        })
+        .map(|(anchor, position)| (anchor.item_id.clone(), position))
+}
+
+/// Synthetic minimal primer for a supervisor-forced surgical recovery. The
+/// supervisor cannot summarize the pruned span (only the model could), so the
+/// primer states plainly what happened, restates the task, and points at the
+/// durable rewind records / raw logs to rebuild working state from
+/// (managed.md: "expose a manual/surgical recovery path that prunes just
+/// enough context to let the model author the next rewind").
+fn managed_context_surgical_primer(
+    task_statement: Option<&str>,
+    prior_rewind_record_ids: &[String],
+) -> String {
+    let mut out = String::from(
+        "This is an automatic surgical recovery: the model did not choose a rewind anchor within the managed-context recovery step limit, so Intendant rewound the thread to the deepest recovery-eligible anchor itself. The pruned span was NOT summarized; no model-authored carry-forward exists for it.",
+    );
+    out.push_str("\n\nTask:\n");
+    match task_statement.map(str::trim).filter(|task| !task.is_empty()) {
+        Some(task) => out.push_str(task),
+        None => out.push_str(
+            "(no task statement was available to the supervisor; recover it from the preserved history or the rewind records below)",
+        ),
+    }
+    out.push_str("\n\nRewind records so far (newest first): ");
+    if prior_rewind_record_ids.is_empty() {
+        out.push_str("none — this surgical record is the first rewind of the session.");
+    } else {
+        out.push_str(&prior_rewind_record_ids.join(", "));
+    }
+    out.push_str(
+        "\n\nRebuild any working state you need from those rewind records and the session's raw logs (rewind_backout inspect, get_logs), verify what is already done before redoing expensive steps, and continue the task from the preserved history.",
+    );
+    out
+}
+
+/// Resume follow-up after a successful surgical recovery: the held user
+/// follow-up when one is queued (managed.md: a held follow-up is delivered
+/// only after the rewind succeeds), else the rewind's automatic resume.
+fn managed_context_surgical_recovery_continuation(
+    pending_replays: &mut std::collections::VecDeque<FollowUpMessage>,
+    automatic_resume: Option<FollowUpMessage>,
+) -> FollowUpMessage {
+    pending_replays
+        .pop_front()
+        .map(managed_context_sanitize_queued_followup_replay)
+        .or(automatic_resume)
+        .unwrap_or_else(|| {
+            FollowUpMessage::text(
+                "<context_rewind_resumed>\nContinue from the model_context_rewind_primer that Intendant injected as developer context for the pruned span. Do not redo discarded work; continue with the next useful step.\n</context_rewind_resumed>"
+                    .to_string(),
+            )
+        })
+}
+
+/// Supervisor-forced surgical context rewind — the backstop behind the
+/// model-driven recovery flow. Ran when recovery kickstarts exhausted their
+/// retry budget without a rewind (the fork's recovery turn hits its 8-step
+/// limit and ends the turn while pressure is still rewind-only; the
+/// supervisor observes the turn completing — or recovery being re-reported —
+/// without a rewind). Instead of ending the session, the supervisor chooses
+/// the deepest recovery-eligible anchor from the existing catalog and applies
+/// the rewind itself with a synthetic minimal primer; the durable record is
+/// marked `surgical` with a distinct reason. Returns the follow-up to resume
+/// with (held user replay first, else the automatic resume).
+async fn attempt_supervisor_surgical_context_rewind(
+    agent: &mut Box<dyn external_agent::ExternalAgent>,
+    thread_id: &str,
+    config: &DrainConfig<'_>,
+    task_statement: Option<&str>,
+    pending_replays: &mut std::collections::VecDeque<FollowUpMessage>,
+) -> Result<FollowUpMessage, String> {
+    let snapshot = agent
+        .read_thread_snapshot(thread_id)
+        .await
+        .map_err(|e| format!("failed to read thread metadata before surgical rewind: {e}"))?;
+    let source_rollout_path = snapshot
+        .rollout_path
+        .ok_or_else(|| "thread metadata did not include a rollout path".to_string())?;
+    let anchors = scan_context_rewind_anchor_catalog(&source_rollout_path).map_err(|err| {
+        format!(
+            "failed to inspect rewind anchors in {}: {err}",
+            source_rollout_path.display()
+        )
+    })?;
+    let Some((item_id, position)) = managed_context_surgical_anchor_choice(&anchors) else {
+        return Err("no recovery-eligible anchor in the rewind catalog".to_string());
+    };
+    let prior_rewind_record_ids: Vec<String> = context_rewind::list_records(config.log_dir)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|record| record.thread_id == thread_id)
+        .map(|record| record.record_id)
+        .collect();
+    let request = ExternalContextRewindRequest {
+        session_id: config.session_id.clone(),
+        item_id,
+        position,
+        reason: Some(MANAGED_CONTEXT_SURGICAL_RECOVERY_REASON.to_string()),
+        primer: Some(managed_context_surgical_primer(
+            task_statement,
+            &prior_rewind_record_ids,
+        )),
+        preserve: Vec::new(),
+        discard: Vec::new(),
+        artifacts: Vec::new(),
+        next_steps: Vec::new(),
+        auto_resume: true,
+        require_density_improvement: false,
+        surgical: true,
+    };
+    let automatic_resume = apply_external_context_rewind(agent, thread_id, &request, config)
+        .await
+        .map_err(|e| format!("surgical rewind to {} failed: {e}", request.target_label()))?;
+    Ok(managed_context_surgical_recovery_continuation(
+        pending_replays,
+        automatic_resume,
+    ))
 }
 
 async fn emit_external_context_snapshot_if_changed(
@@ -13857,6 +14210,64 @@ mod tests {
     }
 
     #[test]
+    fn managed_context_density_tool_classifier_allows_fission_at_watch_only() {
+        // Watch band (density steer): fission tools may start — delegating
+        // separable work to a branch is itself a density action.
+        assert!(managed_context_density_tool_allowed("fission_spawn", ""));
+        assert!(managed_context_density_tool_allowed("fission_control", ""));
+        assert!(managed_context_density_tool_allowed(
+            "claim_fission_canonical",
+            ""
+        ));
+        assert!(managed_context_density_tool_allowed(
+            "mcp",
+            "intendant:fission_spawn"
+        ));
+        assert!(managed_context_density_tool_allowed(
+            "mcp",
+            "fission_control"
+        ));
+        assert!(managed_context_density_tool_allowed(
+            "mcp",
+            "intendant:claim_fission_canonical"
+        ));
+        // Everything the rewind-only gate allows stays allowed at watch...
+        assert!(managed_context_density_tool_allowed(
+            "mcp",
+            "intendant:rewind_context"
+        ));
+        assert!(managed_context_density_tool_allowed("get_status", ""));
+        // ...while broad ordinary tools stay blocked at watch.
+        assert!(!managed_context_density_tool_allowed(
+            "command",
+            "cargo build"
+        ));
+        assert!(!managed_context_density_tool_allowed(
+            "mcp",
+            "intendant:execute_cu_actions"
+        ));
+        // Rewind-only stays stricter: fission is blocked there with every
+        // other ordinary tool — the parent must shrink first.
+        assert!(!managed_context_rewind_only_tool_allowed("fission_spawn", ""));
+        assert!(!managed_context_rewind_only_tool_allowed(
+            "fission_control",
+            ""
+        ));
+        assert!(!managed_context_rewind_only_tool_allowed(
+            "claim_fission_canonical",
+            ""
+        ));
+        assert!(!managed_context_rewind_only_tool_allowed(
+            "mcp",
+            "intendant:fission_spawn"
+        ));
+        assert!(!managed_context_rewind_only_tool_allowed(
+            "mcp",
+            "intendant:claim_fission_canonical"
+        ));
+    }
+
+    #[test]
     fn managed_codex_dashboard_command_classifier_flags_foreground_launch() {
         assert!(managed_codex_foreground_dashboard_command(
             "command",
@@ -14020,6 +14431,21 @@ mod tests {
                 status: external_agent::ToolCompletionStatus::Success,
             })
             .unwrap();
+        // Fission tools are allowed at density watch but must STILL be
+        // blocked under rewind-only pressure: the parent must shrink first.
+        event_tx
+            .send(external_agent::AgentEvent::ToolStarted {
+                item_id: "fission-1".to_string(),
+                tool_name: "mcp".to_string(),
+                preview: "intendant:fission_spawn".to_string(),
+            })
+            .unwrap();
+        event_tx
+            .send(external_agent::AgentEvent::ToolCompleted {
+                item_id: "fission-1".to_string(),
+                status: external_agent::ToolCompletionStatus::Success,
+            })
+            .unwrap();
         event_tx
             .send(external_agent::AgentEvent::TurnCompleted { message: None })
             .unwrap();
@@ -14065,12 +14491,12 @@ mod tests {
         assert_eq!(interrupts.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert!(steers.lock().unwrap().is_empty());
 
-        let mut saw_block_log = false;
+        let mut blocked_logs = Vec::new();
         loop {
             match observed.try_recv() {
                 Ok(AppEvent::LogEntry { content, .. }) => {
                     if content.contains("Blocked Codex tool") {
-                        saw_block_log = true;
+                        blocked_logs.push(content.clone());
                     }
                     assert!(
                         !content.contains("git status output that must not leak"),
@@ -14091,7 +14517,17 @@ mod tests {
                 Err(tokio::sync::broadcast::error::TryRecvError::Closed) => break,
             }
         }
-        assert!(saw_block_log);
+        assert_eq!(
+            blocked_logs.len(),
+            2,
+            "expected the broad command AND the fission tool blocked: {blocked_logs:?}"
+        );
+        assert!(
+            blocked_logs
+                .iter()
+                .any(|content| content.contains("fission_spawn")),
+            "fission_spawn must stay blocked under rewind-only: {blocked_logs:?}"
+        );
     }
 
     #[tokio::test]
@@ -14463,6 +14899,22 @@ mod tests {
                 status: external_agent::ToolCompletionStatus::Success,
             })
             .unwrap();
+        // Fission tools are NOT broad ordinary work at watch pressure:
+        // spawning a branch is itself a density action, so the density gate
+        // must let it start even while the steer is active.
+        event_tx
+            .send(external_agent::AgentEvent::ToolStarted {
+                item_id: "fission-1".to_string(),
+                tool_name: "mcp".to_string(),
+                preview: "intendant:fission_spawn".to_string(),
+            })
+            .unwrap();
+        event_tx
+            .send(external_agent::AgentEvent::ToolCompleted {
+                item_id: "fission-1".to_string(),
+                status: external_agent::ToolCompletionStatus::Success,
+            })
+            .unwrap();
         event_tx
             .send(external_agent::AgentEvent::TurnCompleted { message: None })
             .unwrap();
@@ -14510,14 +14962,20 @@ mod tests {
         assert_eq!(steers.len(), 1);
         assert!(steers[0].contains("context pressure is watch"));
         assert!(steers[0].contains("No command/tool was active"));
+        assert!(steers[0].contains("Fission tools stay allowed at watch"));
 
         let mut blocked_count = 0usize;
         let mut saw_density_interrupt = false;
+        let mut saw_fission_started = false;
         loop {
             match observed.try_recv() {
                 Ok(AppEvent::LogEntry { content, .. }) => {
                     if content.contains("while managed context is in density watch") {
                         blocked_count += 1;
+                        assert!(
+                            !content.contains("fission_spawn"),
+                            "fission tool was blocked by the density gate: {content}"
+                        );
                     }
                     assert!(
                         !content.contains("sed output that must not leak")
@@ -14537,6 +14995,11 @@ mod tests {
                         "blocked density-watch command emitted AgentStarted: {commands_preview}"
                     );
                 }
+                Ok(AppEvent::AgentStarted {
+                    commands_preview, ..
+                }) if commands_preview.contains("fission_spawn") => {
+                    saw_fission_started = true;
+                }
                 Ok(AppEvent::AgentOutput { stdout, .. }) => {
                     panic!("blocked density-watch command output leaked: {stdout}");
                 }
@@ -14548,6 +15011,10 @@ mod tests {
         }
         assert_eq!(blocked_count, 2);
         assert!(saw_density_interrupt);
+        assert!(
+            saw_fission_started,
+            "fission_spawn should start under density watch"
+        );
     }
 
     #[tokio::test]
@@ -15021,6 +15488,64 @@ mod tests {
         }
     }
 
+    /// Cache-prefix contract (supervisor side): the recovery-kickstart flow
+    /// is append-only. Holding a user follow-up and sending a kickstart
+    /// instead must (a) preserve the held text byte-for-byte for the later
+    /// replay and (b) produce a kickstart that is a plain new user message —
+    /// never a user-turn edit (which rewrites earlier request content) and
+    /// never a mutation of anything already sent.
+    #[test]
+    fn managed_context_recovery_kickstart_flow_is_append_only() {
+        let snapshot = external_agent::AgentContextSnapshot {
+            source: "codex".to_string(),
+            label: "Codex resolved request payload".to_string(),
+            request_id: Some("req-1".to_string()),
+            request_index: Some(1),
+            rollout_path: None,
+            format: "openai.responses.resolved_request.v1".to_string(),
+            token_count: Some(258_400),
+            token_count_kind: Some(external_agent::AgentContextTokenCountKind::BackendReported),
+            context_window: Some(258_400),
+            hard_context_window: Some(272_000),
+            item_count: Some(458),
+            raw: serde_json::json!({}),
+        };
+        let original_text = "Implement the next milestone and run the tests.".to_string();
+        let followup = FollowUpMessage::text(original_text.clone());
+
+        let decision =
+            managed_context_preflight_decision(true, &followup, &snapshot).expect("decision");
+        let ManagedContextPreflightDecision::Recovery {
+            recovery_followup,
+            held_followup,
+            ..
+        } = decision
+        else {
+            panic!("expected recovery kickstart");
+        };
+
+        // Held replay text is byte-identical to what the user sent.
+        let held = held_followup.expect("non-trivial follow-up is held");
+        assert_eq!(held.text, original_text);
+
+        // The kickstart is a fresh appended user message: no user-turn edit
+        // (edits rewrite an earlier request message) and no reuse of the
+        // held follow-up's identity.
+        assert!(recovery_followup.managed_context_recovery_kickstart);
+        assert!(recovery_followup.edit_user_turn_index.is_none());
+        assert!(recovery_followup.edit_user_turn_revision.is_none());
+        assert!(recovery_followup.steer_id.is_none());
+        assert!(recovery_followup.attachments.is_empty());
+
+        // The eventual replay wraps the held text without altering it.
+        let replay = managed_context_sanitize_queued_followup_replay(held);
+        assert!(replay.text.contains(&original_text));
+        assert_eq!(
+            managed_context_canonical_followup_replay_text(&replay.text),
+            original_text
+        );
+    }
+
     #[test]
     fn managed_context_density_handoff_text_preserves_exact_anchor_policy() {
         let text = managed_context_density_handoff_text(ManagedContextDensityPressure {
@@ -15038,12 +15563,14 @@ mod tests {
         assert!(text.contains("narrow positions"));
         assert!(text.contains("concise no-rewind handoff"));
         assert!(text.contains("leaving context unchanged"));
+        assert!(text.contains("Fission stays allowed"));
+        assert!(text.contains("fission_spawn"));
         assert!(text.contains("Do not use auto anchors"));
         assert!(text.contains("N-turn rewinds"));
         assert!(!text.contains("call_"));
         assert!(!text.contains("rewind N"));
         assert!(
-            text.len() < 1_000,
+            text.len() < 1_100,
             "density maintenance prompt should stay tiny: {} bytes",
             text.len()
         );
@@ -15232,7 +15759,10 @@ mod tests {
         );
 
         assert!(text.contains("list_rewind_anchors and inspect_rewind_anchor are callable"));
-        assert!(text.contains("First call list_rewind_anchors without a query"));
+        assert!(text.contains("If a recovery catalog page from this stall is already in view"));
+        assert!(text.contains("call list_rewind_anchors once without a query"));
+        assert!(text.contains("never re-request a page you can already see"));
+        assert!(text.contains("no_eligible_anchors"));
         assert!(text.contains("stale and incorrect"));
         assert!(text.contains("Do not synthesize anchor ids"));
         assert!(text.contains("hard_limit=272000"));
@@ -15252,7 +15782,8 @@ mod tests {
         assert!(text.contains("Codex recovery hint: rewind context first"));
         assert!(text.contains("list_rewind_anchors"));
         assert!(text.contains("inspect_rewind_anchor"));
-        assert!(text.contains("First call list_rewind_anchors without a query"));
+        assert!(text.contains("If a recovery catalog page from this stall is already in view"));
+        assert!(text.contains("call list_rewind_anchors once without a query"));
         assert!(text.contains("rewind_context with one exact returned item_id"));
         assert!(text.contains("Do not synthesize anchor ids"));
         assert!(!text.contains("call_"));
@@ -15475,6 +16006,151 @@ mod tests {
         .expect("continuation");
 
         assert_eq!(continuation.text, "<context_rewind_resumed/>");
+    }
+
+    /// Catalog entry with surgical-test defaults; tests override the fields
+    /// the chooser actually reads (lines, ordinal, eligibility, names).
+    fn surgical_test_catalog_entry(
+        ordinal: usize,
+        item_id: &str,
+        first_line: usize,
+        last_line: usize,
+    ) -> ContextRewindAnchorCatalogEntry {
+        ContextRewindAnchorCatalogEntry {
+            ordinal,
+            item_id: item_id.to_string(),
+            first_line,
+            last_line,
+            first_item_type: "function_call".to_string(),
+            last_item_type: "function_call".to_string(),
+            last_item_is_model: true,
+            positions: vec!["before", "after"],
+            position_hint: "after",
+            names: Vec::new(),
+            roles: Vec::new(),
+            summary: String::new(),
+            backend_usage_at_or_after_anchor: None,
+            backend_usage_before_anchor: None,
+            rewind_only_limit_at_or_after_anchor: None,
+            recommended_rewind_limit_at_or_after_anchor: None,
+            prefix_estimated_tokens_before_anchor: None,
+            prefix_estimated_tokens_after_anchor: None,
+            approx_pruned_tokens_before: None,
+            approx_pruned_tokens_after: None,
+            prefix_tokens_after: None,
+            latest_rewind_usage_after_anchor: None,
+            latest_rewind_limit_after_anchor: None,
+            recovery_eligible: None,
+            recovery_eligible_positions: None,
+            density_eligible: None,
+            density_eligible_positions: None,
+            managed_context_recovery_start_line: None,
+        }
+    }
+
+    #[test]
+    fn managed_context_surgical_recovery_budget_caps_at_two_per_session() {
+        assert!(managed_context_surgical_recovery_available(0));
+        assert!(managed_context_surgical_recovery_available(1));
+        assert!(!managed_context_surgical_recovery_available(
+            MANAGED_CONTEXT_MAX_SURGICAL_RECOVERIES
+        ));
+        assert!(!managed_context_surgical_recovery_available(u8::MAX));
+    }
+
+    #[test]
+    fn managed_context_surgical_anchor_choice_picks_maximum_pruning() {
+        // Three anchors: the earliest is vetoed (recovery_eligible=false, e.g.
+        // a prior insufficient rewind), the middle is eligible at `after`, the
+        // latest is eligible at both positions. The chooser must take the
+        // earliest *eligible* cut — the middle anchor — not the vetoed one and
+        // not the deeper-ordinal one.
+        let mut vetoed = surgical_test_catalog_entry(0, "call_vetoed", 2, 2);
+        vetoed.recovery_eligible = Some(false);
+        let mut mid = surgical_test_catalog_entry(1, "call_mid", 5, 5);
+        mid.recovery_eligible = Some(true);
+        mid.recovery_eligible_positions = Some(vec!["after"]);
+        let mut late = surgical_test_catalog_entry(2, "call_late", 9, 9);
+        late.recovery_eligible = Some(true);
+        late.recovery_eligible_positions = Some(vec!["before", "after"]);
+
+        let (item_id, position) =
+            managed_context_surgical_anchor_choice(&[vetoed.clone(), mid.clone(), late.clone()])
+                .expect("choice");
+        assert_eq!(item_id, "call_mid");
+        assert_eq!(position, external_agent::RollbackAnchorPosition::After);
+
+        // A `before`-eligible cut at the same anchor prunes one line more
+        // than `after` at an earlier line: before@9 (cut line 9) loses to
+        // after@5 (cut line 6), but before@5 beats after@5.
+        let mut mid_before = mid.clone();
+        mid_before.recovery_eligible_positions = Some(vec!["before", "after"]);
+        let (item_id, position) =
+            managed_context_surgical_anchor_choice(&[mid_before, late.clone()]).expect("choice");
+        assert_eq!(item_id, "call_mid");
+        assert_eq!(position, external_agent::RollbackAnchorPosition::Before);
+
+        // No Some(true) anchors: unknown-eligibility anchors are the
+        // fallback, always at `after`, and management tools are skipped
+        // (mirroring the default catalog view).
+        let mut management = surgical_test_catalog_entry(0, "call_listing", 1, 1);
+        management.names = vec!["list_rewind_anchors".to_string()];
+        let unknown = surgical_test_catalog_entry(1, "call_unknown", 3, 3);
+        let (item_id, position) =
+            managed_context_surgical_anchor_choice(&[management, unknown, vetoed])
+                .expect("fallback choice");
+        assert_eq!(item_id, "call_unknown");
+        assert_eq!(position, external_agent::RollbackAnchorPosition::After);
+
+        // Nothing usable at all → no surgical rewind.
+        let mut only_vetoed = surgical_test_catalog_entry(0, "call_only", 1, 1);
+        only_vetoed.recovery_eligible = Some(false);
+        assert!(managed_context_surgical_anchor_choice(&[only_vetoed]).is_none());
+        assert!(managed_context_surgical_anchor_choice(&[]).is_none());
+    }
+
+    #[test]
+    fn managed_context_surgical_primer_lists_task_records_and_instruction() {
+        let primer = managed_context_surgical_primer(
+            Some("Refactor the parser and keep the CLI stable"),
+            &["rewind-aaa".to_string(), "rewind-bbb".to_string()],
+        );
+        assert!(primer.contains("automatic surgical recovery"));
+        assert!(primer.contains("recovery step limit"));
+        assert!(primer.contains("Task:\nRefactor the parser and keep the CLI stable"));
+        assert!(primer.contains("rewind-aaa, rewind-bbb"));
+        assert!(primer.contains("rewind records"));
+        assert!(primer.contains("continue the task"));
+
+        // Without a task statement or prior records the primer says so
+        // plainly instead of leaving empty sections.
+        let primer = managed_context_surgical_primer(None, &[]);
+        assert!(primer.contains("no task statement was available"));
+        assert!(primer.contains("none — this surgical record is the first rewind"));
+    }
+
+    #[test]
+    fn managed_context_surgical_recovery_continuation_prefers_held_replay() {
+        let mut pending = std::collections::VecDeque::new();
+        pending.push_back(FollowUpMessage::text("finish the held task".into()));
+        let automatic = FollowUpMessage::text("<context_rewind_resumed/>".into());
+
+        let continuation =
+            managed_context_surgical_recovery_continuation(&mut pending, Some(automatic.clone()));
+        assert!(continuation.text.contains("finish the held task"));
+        assert!(continuation
+            .text
+            .starts_with(MANAGED_CONTEXT_REWIND_FOLLOWUP_REPLAY_OPEN));
+        assert!(pending.is_empty());
+
+        // No held replay → the rewind's automatic resume.
+        let continuation = managed_context_surgical_recovery_continuation(&mut pending, Some(automatic));
+        assert_eq!(continuation.text, "<context_rewind_resumed/>");
+
+        // Defensive total fallback keeps the session moving even if the
+        // resume was somehow absent.
+        let continuation = managed_context_surgical_recovery_continuation(&mut pending, None);
+        assert!(continuation.text.contains("<context_rewind_resumed>"));
     }
 
     #[test]
@@ -15890,6 +16566,7 @@ mod tests {
             next_steps: Vec::new(),
             auto_resume: true,
             require_density_improvement: false,
+            surgical: false,
         };
 
         let primer = request
@@ -15948,6 +16625,7 @@ mod tests {
             next_steps: Vec::new(),
             auto_resume: true,
             require_density_improvement: false,
+            surgical: false,
         };
 
         let carried = context_rewind_pruned_prior_primer_facts(
@@ -16832,7 +17510,7 @@ mod tests {
                     "type": "response_item",
                     "payload": {
                         "type": "function_call",
-                        "name": "get_status",
+                        "name": "view_image",
                         "call_id": "call_near_soft",
                         "arguments": "{}"
                     }
@@ -17933,6 +18611,285 @@ mod tests {
         );
     }
 
+    fn rollout_call_lines(name: &str, call_id: &str, with_output: bool) -> Vec<String> {
+        let mut lines = vec![
+            serde_json::json!({
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call",
+                    "name": name,
+                    "call_id": call_id,
+                    "arguments": "{}"
+                }
+            })
+            .to_string(),
+        ];
+        if with_output {
+            lines.push(
+                serde_json::json!({
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call_output",
+                        "call_id": call_id,
+                        "output": format!("{name} output")
+                    }
+                })
+                .to_string(),
+            );
+        }
+        lines
+    }
+
+    /// Idempotence across listing-only growth: a recovery stall appends only
+    /// management calls (listings, status polls), and those must not change
+    /// the model-visible catalog accounting between two identical listings.
+    #[test]
+    fn context_rewind_anchor_catalog_is_idempotent_across_listing_churn() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rollout.jsonl");
+        let mut lines = Vec::new();
+        for idx in 0..6 {
+            lines.extend(rollout_call_lines(
+                "exec_command",
+                &format!("call_sub_{idx}"),
+                true,
+            ));
+        }
+        // First listing call of the stall (persisted before its output, like
+        // the live backend does for the in-flight call).
+        lines.extend(rollout_call_lines("list_rewind_anchors", "call_list_1", false));
+        std::fs::write(&path, lines.join("\n")).unwrap();
+
+        let first_raw = list_context_rewind_anchors_from_rollout(&path, &serde_json::json!({}))
+            .expect("first listing");
+        let first: serde_json::Value = serde_json::from_str(&first_raw).unwrap();
+
+        // The stall grows by the first listing's output, a status poll, and
+        // the second in-flight listing call — management churn only.
+        let mut lines = std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        lines.push(
+            serde_json::json!({
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call_output",
+                    "call_id": "call_list_1",
+                    "output": first_raw.clone()
+                }
+            })
+            .to_string(),
+        );
+        lines.extend(rollout_call_lines("get_status", "call_status_1", true));
+        lines.extend(rollout_call_lines("list_rewind_anchors", "call_list_2", false));
+        std::fs::write(&path, lines.join("\n")).unwrap();
+
+        let second_raw = list_context_rewind_anchors_from_rollout(&path, &serde_json::json!({}))
+            .expect("second listing");
+        let second: serde_json::Value = serde_json::from_str(&second_raw).unwrap();
+
+        assert_eq!(first["total"], second["total"], "total must not count management churn");
+        assert_eq!(second["total"].as_u64(), Some(6));
+        assert_eq!(first["filtered_total"], second["filtered_total"]);
+        assert_eq!(first["anchors"], second["anchors"], "page rows must be identical");
+        let ordinals = |catalog: &serde_json::Value| {
+            catalog["anchors"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|anchor| anchor["ordinal"].as_u64().unwrap())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ordinals(&first), ordinals(&second));
+        // The second listing is a repeat of an unchanged page and says so.
+        assert!(first.get("repeat_listing").is_none());
+        assert_eq!(second["repeat_listing"].as_bool(), Some(true));
+        let notice = second["notice"].as_str().unwrap_or_default();
+        assert!(notice.contains("Do not call list_rewind_anchors again"), "got: {notice}");
+        assert!(notice.contains("rewind_context"), "got: {notice}");
+    }
+
+    #[test]
+    fn supervisor_status_calls_are_management_anchors() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rollout.jsonl");
+        let mut lines = rollout_call_lines("exec_command", "call_sub", true);
+        lines.extend(rollout_call_lines("get_status", "call_status", true));
+        lines.extend(rollout_call_lines("get_logs", "call_logs", true));
+        std::fs::write(&path, lines.join("\n")).unwrap();
+
+        let raw = list_context_rewind_anchors_from_rollout(&path, &serde_json::json!({}))
+            .expect("default listing");
+        let catalog: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(catalog["total"].as_u64(), Some(1));
+        assert_eq!(catalog["filtered_total"].as_u64(), Some(1));
+        let ids = catalog["anchors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|anchor| anchor["item_id"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec!["call_sub"]);
+
+        let raw = list_context_rewind_anchors_from_rollout(
+            &path,
+            &serde_json::json!({ "include_management_tools": true, "detail": true }),
+        )
+        .expect("management listing");
+        let catalog: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(catalog["total"].as_u64(), Some(3));
+        assert_eq!(catalog["filtered_total"].as_u64(), Some(3));
+    }
+
+    #[test]
+    fn paging_and_queries_are_not_flagged_as_repeat_listings() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rollout.jsonl");
+        let mut lines = Vec::new();
+        for idx in 0..8 {
+            lines.extend(rollout_call_lines(
+                "exec_command",
+                &format!("call_sub_{idx}"),
+                true,
+            ));
+        }
+        lines.extend(rollout_call_lines("list_rewind_anchors", "call_list_1", true));
+        lines.extend(rollout_call_lines("list_rewind_anchors", "call_list_2", false));
+        std::fs::write(&path, lines.join("\n")).unwrap();
+
+        // Paging to the next offset is deliberate progress, not a repeat.
+        let raw = list_context_rewind_anchors_from_rollout(
+            &path,
+            &serde_json::json!({ "offset": 5, "limit": 5 }),
+        )
+        .expect("paged listing");
+        let catalog: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert!(catalog.get("repeat_listing").is_none(), "got: {catalog}");
+        assert!(catalog.get("notice").is_none(), "got: {catalog}");
+
+        // A focused query is a different view, not a repeat.
+        let raw = list_context_rewind_anchors_from_rollout(
+            &path,
+            &serde_json::json!({ "query": "call_sub_3" }),
+        )
+        .expect("query listing");
+        let catalog: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert!(catalog.get("repeat_listing").is_none(), "got: {catalog}");
+
+        // A reverse listing is a different view, not a repeat.
+        let raw = list_context_rewind_anchors_from_rollout(
+            &path,
+            &serde_json::json!({ "reverse": true }),
+        )
+        .expect("reverse listing");
+        let catalog: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert!(catalog.get("repeat_listing").is_none(), "got: {catalog}");
+
+        // The bare default view is the loop signature and is flagged.
+        let raw = list_context_rewind_anchors_from_rollout(&path, &serde_json::json!({}))
+            .expect("repeat listing");
+        let catalog: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(catalog["repeat_listing"].as_bool(), Some(true));
+    }
+
+    #[test]
+    fn substantive_progress_clears_repeat_listing_detection() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rollout.jsonl");
+        let mut lines = Vec::new();
+        lines.extend(rollout_call_lines("exec_command", "call_sub_0", true));
+        lines.extend(rollout_call_lines("list_rewind_anchors", "call_list_1", true));
+        // Substantive work after the earlier listing ends the stall.
+        lines.extend(rollout_call_lines("exec_command", "call_sub_1", true));
+        lines.extend(rollout_call_lines("list_rewind_anchors", "call_list_2", false));
+        std::fs::write(&path, lines.join("\n")).unwrap();
+
+        let raw = list_context_rewind_anchors_from_rollout(&path, &serde_json::json!({}))
+            .expect("listing after progress");
+        let catalog: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert!(catalog.get("repeat_listing").is_none(), "got: {catalog}");
+    }
+
+    /// The type-B dead-end from the 2026-06-12 bench: a thread whose only
+    /// remaining items are management/status calls must say plainly that
+    /// nothing is left to rewind to instead of returning a bare empty page.
+    #[test]
+    fn empty_eligible_catalog_reports_dead_end_plainly() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rollout.jsonl");
+        let mut lines = rollout_call_lines("get_status", "call_status", true);
+        lines.extend(rollout_call_lines("list_rewind_anchors", "call_list_1", false));
+        std::fs::write(&path, lines.join("\n")).unwrap();
+
+        let raw = list_context_rewind_anchors_from_rollout(&path, &serde_json::json!({}))
+            .expect("empty listing");
+        let catalog: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(catalog["filtered_total"].as_u64(), Some(0));
+        assert_eq!(catalog["anchors"].as_array().map(Vec::len), Some(0));
+        assert_eq!(catalog["no_eligible_anchors"].as_bool(), Some(true));
+        assert_eq!(
+            catalog["empty_page_reason"].as_str(),
+            Some("no_eligible_anchors")
+        );
+        let notice = catalog["notice"].as_str().unwrap_or_default();
+        assert!(notice.contains("no eligible rewind anchors remain"), "got: {notice}");
+        assert!(notice.contains("manual recovery path"), "got: {notice}");
+        assert!(notice.contains("do not call list_rewind_anchors again"), "got: {notice}");
+
+        // A density-only listing in the same state directs continuing the
+        // task instead of ending the session.
+        let raw = list_context_rewind_anchors_from_rollout(
+            &path,
+            &serde_json::json!({ "density_candidates_only": true, "limit": 1 }),
+        )
+        .expect("empty density listing");
+        let catalog: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(catalog["no_eligible_anchors"].as_bool(), Some(true));
+        let notice = catalog["notice"].as_str().unwrap_or_default();
+        assert!(notice.contains("skip density maintenance"), "got: {notice}");
+        assert!(notice.contains("continue the task"), "got: {notice}");
+    }
+
+    #[test]
+    fn empty_pages_distinguish_query_and_offset_dead_ends() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rollout.jsonl");
+        let mut lines = Vec::new();
+        for idx in 0..3 {
+            lines.extend(rollout_call_lines(
+                "exec_command",
+                &format!("call_sub_{idx}"),
+                true,
+            ));
+        }
+        std::fs::write(&path, lines.join("\n")).unwrap();
+
+        let raw = list_context_rewind_anchors_from_rollout(
+            &path,
+            &serde_json::json!({ "query": "no_such_item" }),
+        )
+        .expect("query listing");
+        let catalog: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(catalog["empty_page_reason"].as_str(), Some("query_unmatched"));
+        assert!(catalog.get("no_eligible_anchors").is_none());
+        let notice = catalog["notice"].as_str().unwrap_or_default();
+        assert!(notice.contains("re-list once without a query"), "got: {notice}");
+
+        let raw = list_context_rewind_anchors_from_rollout(
+            &path,
+            &serde_json::json!({ "offset": 13 }),
+        )
+        .expect("past-end listing");
+        let catalog: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(catalog["empty_page_reason"].as_str(), Some("offset_past_end"));
+        assert!(catalog.get("no_eligible_anchors").is_none());
+        let notice = catalog["notice"].as_str().unwrap_or_default();
+        assert!(notice.contains("past the end"), "got: {notice}");
+        assert!(notice.contains("Do not keep paging"), "got: {notice}");
+    }
+
     #[test]
     fn codex_thread_action_log_compacts_rewind_anchor_catalog() {
         let message = serde_json::json!({
@@ -18063,6 +19020,7 @@ mod tests {
                 used_tokens_at_rewind: None,
                 context_window_at_rewind: None,
                 pressure_band_at_rewind: None,
+                surgical: false,
             },
         )
         .unwrap();
@@ -22731,6 +23689,7 @@ Also: {"source": "bare"}"#;
             next_steps: Vec::new(),
             auto_resume: false,
             require_density_improvement: false,
+            surgical: false,
         };
         apply_external_context_rewind(&mut agent, "rewind-pressure-thread", &request, &config)
             .await
@@ -22741,6 +23700,200 @@ Also: {"source": "bare"}"#;
         assert_eq!(records[0].used_tokens_at_rewind, Some(13_993));
         assert_eq!(records[0].context_window_at_rewind, Some(38_000));
         assert_eq!(records[0].pressure_band_at_rewind.as_deref(), Some("ok"));
+        assert!(
+            !records[0].surgical,
+            "model rewinds must not be marked surgical"
+        );
+    }
+
+    /// Step-limit exhaustion backstop: the supervisor-forced surgical rewind
+    /// chooses the deepest recovery-eligible anchor from the catalog, applies
+    /// it with the synthetic primer, marks the durable record `surgical` with
+    /// the distinct reason, and resumes with the held follow-up first.
+    #[tokio::test]
+    async fn supervisor_surgical_rewind_uses_deepest_eligible_anchor_and_marks_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("logs");
+        std::fs::create_dir_all(&log_dir).unwrap();
+        let rollout = dir.path().join("rollout.jsonl");
+        write_fission_test_rollout(
+            &rollout,
+            &[
+                ("call_deep", "shell"),
+                ("call_mid", "shell"),
+                ("call_late", "shell"),
+            ],
+        );
+        // Trailing backend report with recovery headroom: every anchor is
+        // covered, so all three are recovery-eligible at `after` and the
+        // earliest cut (call_deep) is the maximum-pruning choice.
+        append_test_rollout_token_count(&rollout, 13_993, 38_000);
+
+        let bus = EventBus::new();
+        let session_log: SharedSessionLog = Arc::new(Mutex::new(
+            session_log::SessionLog::open(log_dir.clone()).unwrap(),
+        ));
+        let approval_registry: event::ApprovalRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let context_injection: event::ContextInjectionQueue = Arc::new(Mutex::new(Vec::new()));
+        let config = fission_test_drain_config(
+            &bus,
+            &session_log,
+            &approval_registry,
+            &context_injection,
+            dir.path(),
+            &log_dir,
+            "surgical-thread",
+        );
+
+        // A prior (model) rewind record of this thread: the synthetic primer
+        // must point at it so the model can rebuild state from records.
+        let mut prior = context_rewind::ContextRewindRecord {
+            record_id: "rewind-prior".to_string(),
+            created_at: "2026-06-12T00:00:00Z".to_string(),
+            session_id: Some("surgical-thread".to_string()),
+            thread_id: "surgical-thread".to_string(),
+            item_id: "call_old".to_string(),
+            position: "after".to_string(),
+            reason: Some("model rewind".to_string()),
+            primer: Some("earlier primer".to_string()),
+            preserve: Vec::new(),
+            discard: Vec::new(),
+            artifacts: Vec::new(),
+            next_steps: Vec::new(),
+            source_rollout_path: None,
+            recovery_rollout_path: None,
+            fission_snapshot: None,
+            lineage_ledger: None,
+            fission_ledger: None,
+            detached_fission_group_ids: Vec::new(),
+            used_tokens_at_rewind: None,
+            context_window_at_rewind: None,
+            pressure_band_at_rewind: None,
+            surgical: false,
+        };
+        context_rewind::persist_record(&log_dir, &prior).unwrap();
+        // A record from another thread must not leak into the primer.
+        prior.record_id = "rewind-other-thread".to_string();
+        prior.thread_id = "other-thread".to_string();
+        context_rewind::persist_record(&log_dir, &prior).unwrap();
+
+        let test_agent = FissionTestAgent::new(Some(rollout.clone()), "surgical-unused");
+        let rollbacks = test_agent.rollbacks.clone();
+        let injected = test_agent.injected.clone();
+        let mut agent: Box<dyn external_agent::ExternalAgent> = Box::new(test_agent);
+
+        let mut pending = std::collections::VecDeque::new();
+        pending.push_back(FollowUpMessage::text("finish the held user task".into()));
+
+        let continuation = attempt_supervisor_surgical_context_rewind(
+            &mut agent,
+            "surgical-thread",
+            &config,
+            Some("Ship the recovery backstop"),
+            &mut pending,
+        )
+        .await
+        .expect("surgical rewind succeeds");
+
+        // Deepest eligible anchor, applied via the normal rewind machinery.
+        assert_eq!(
+            rollbacks.lock().unwrap().as_slice(),
+            &[(
+                "surgical-thread".to_string(),
+                "call_deep".to_string(),
+                "after"
+            )]
+        );
+
+        // Durable record: marked surgical, distinct reason, synthetic primer
+        // carrying the task statement and prior record pointers (this
+        // thread's only).
+        let records = context_rewind::list_records(&log_dir).unwrap();
+        let record = records
+            .iter()
+            .find(|record| record.surgical)
+            .expect("surgical record persisted");
+        assert_eq!(
+            record.reason.as_deref(),
+            Some(MANAGED_CONTEXT_SURGICAL_RECOVERY_REASON)
+        );
+        assert_eq!(record.item_id, "call_deep");
+        assert_eq!(record.position, "after");
+        let primer = record.primer.as_deref().expect("synthetic primer");
+        assert!(primer.contains("automatic surgical recovery"));
+        assert!(primer.contains("Task:\nShip the recovery backstop"));
+        assert!(primer.contains("rewind-prior"));
+        assert!(!primer.contains("rewind-other-thread"));
+
+        // The primer was injected as developer context with the record id.
+        let injected = injected.lock().unwrap();
+        assert_eq!(injected.len(), 1);
+        assert_eq!(injected[0].0, "surgical-thread");
+        assert!(injected[0].1.starts_with("<model_context_rewind_primer>"));
+        assert!(injected[0].1.contains(MANAGED_CONTEXT_SURGICAL_RECOVERY_REASON));
+
+        // Held user follow-up resumes first (wrapped as a replay), not the
+        // generic auto-resume.
+        assert!(continuation.text.contains("finish the held user task"));
+        assert!(continuation
+            .text
+            .starts_with(MANAGED_CONTEXT_REWIND_FOLLOWUP_REPLAY_OPEN));
+        assert!(pending.is_empty());
+    }
+
+    #[tokio::test]
+    async fn supervisor_surgical_rewind_fails_cleanly_without_catalog_or_rollout() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("logs");
+        std::fs::create_dir_all(&log_dir).unwrap();
+
+        let bus = EventBus::new();
+        let session_log: SharedSessionLog = Arc::new(Mutex::new(
+            session_log::SessionLog::open(log_dir.clone()).unwrap(),
+        ));
+        let approval_registry: event::ApprovalRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let context_injection: event::ContextInjectionQueue = Arc::new(Mutex::new(Vec::new()));
+        let config = fission_test_drain_config(
+            &bus,
+            &session_log,
+            &approval_registry,
+            &context_injection,
+            dir.path(),
+            &log_dir,
+            "surgical-err-thread",
+        );
+
+        // No rollout path in the thread snapshot → loud error, no record.
+        let mut agent: Box<dyn external_agent::ExternalAgent> =
+            Box::new(FissionTestAgent::new(None, "surgical-unused"));
+        let mut pending = std::collections::VecDeque::new();
+        let err = attempt_supervisor_surgical_context_rewind(
+            &mut agent,
+            "surgical-err-thread",
+            &config,
+            None,
+            &mut pending,
+        )
+        .await
+        .expect_err("no rollout path must fail");
+        assert!(err.contains("rollout path"), "err: {err}");
+
+        // Empty catalog (rollout with no anchorable items) → loud error.
+        let rollout = dir.path().join("rollout-empty.jsonl");
+        std::fs::write(&rollout, "").unwrap();
+        let mut agent: Box<dyn external_agent::ExternalAgent> =
+            Box::new(FissionTestAgent::new(Some(rollout), "surgical-unused"));
+        let err = attempt_supervisor_surgical_context_rewind(
+            &mut agent,
+            "surgical-err-thread",
+            &config,
+            None,
+            &mut pending,
+        )
+        .await
+        .expect_err("empty catalog must fail");
+        assert!(err.contains("no recovery-eligible anchor"), "err: {err}");
+        assert!(context_rewind::list_records(&log_dir).unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -22827,6 +23980,7 @@ Also: {"source": "bare"}"#;
             next_steps: Vec::new(),
             auto_resume: false,
             require_density_improvement: false,
+            surgical: false,
         };
         apply_external_context_rewind(&mut agent, "rewind-thread", &request, &config)
             .await
@@ -22964,6 +24118,7 @@ Also: {"source": "bare"}"#;
             next_steps: Vec::new(),
             auto_resume: false,
             require_density_improvement: false,
+            surgical: false,
         };
         let err = apply_external_context_rewind(&mut agent, "rewind-thread-fail", &request, &config)
             .await
@@ -25182,6 +26337,7 @@ async fn run_with_presence(
         FollowUpMessage,
     > = std::collections::VecDeque::new();
     let mut persistent_managed_context_recovery_kickstarts_without_rewind = 0u8;
+    let mut persistent_managed_context_surgical_recoveries = 0u8;
     let mut startup_resume_session = resume_session;
     // Persisted per-session agent config for the startup resume, consumed by
     // the same agent build that consumes `startup_resume_session`.
@@ -26272,6 +27428,7 @@ async fn run_with_presence(
             if persistent_agent.is_none() {
                 persistent_pending_managed_context_replays.clear();
                 persistent_managed_context_recovery_kickstarts_without_rewind = 0;
+                persistent_managed_context_surgical_recoveries = 0;
                 let mut proj = match Project::from_root(project_root.clone()) {
                     Ok(p) => p,
                     Err(e) => {
@@ -26678,11 +27835,72 @@ async fn run_with_presence(
                                             );
                                             continue;
                                         }
-                                        let message = format!(
+                                        // Backstop: model-driven recovery
+                                        // exhausted its kickstart budget
+                                        // (step-limit exhaustion each time);
+                                        // surgical rewind instead of ending
+                                        // the managed conversation.
+                                        let mut surgical_failure = None;
+                                        if managed_context_surgical_recovery_available(
+                                            persistent_managed_context_surgical_recoveries,
+                                        ) {
+                                            match attempt_supervisor_surgical_context_rewind(
+                                                agent,
+                                                &thread.thread_id,
+                                                &drain_config,
+                                                (!task_text.trim().is_empty())
+                                                    .then_some(task_text.as_str()),
+                                                &mut persistent_pending_managed_context_replays,
+                                            )
+                                            .await
+                                            {
+                                                Ok(continuation) => {
+                                                    persistent_managed_context_surgical_recoveries =
+                                                        persistent_managed_context_surgical_recoveries
+                                                            .saturating_add(1);
+                                                    persistent_managed_context_recovery_kickstarts_without_rewind = 0;
+                                                    let content = format!(
+                                                        "Persistent managed-context recovery exhausted {} kickstarts without a rewind at {}/{} tokens; Intendant performed a surgical rewind ({} of {}) and is resuming the session.",
+                                                        MANAGED_CONTEXT_RECOVERY_MAX_KICKSTARTS_WITHOUT_REWIND,
+                                                        pressure.used_tokens,
+                                                        pressure.rewind_only_limit,
+                                                        persistent_managed_context_surgical_recoveries,
+                                                        MANAGED_CONTEXT_MAX_SURGICAL_RECOVERIES,
+                                                    );
+                                                    slog(&session_log, |l| l.warn(&content));
+                                                    bus.send(AppEvent::LogEntry {
+                                                        session_id: session_log_id(&session_log),
+                                                        level: "warn".to_string(),
+                                                        source: "Intendant".to_string(),
+                                                        content,
+                                                        turn: None,
+                                                    });
+                                                    bus.send(AppEvent::RoundComplete {
+                                                        session_id: session_log_id(&session_log),
+                                                        round: cumulative_stats.rounds,
+                                                        turns_in_round,
+                                                        native_message_count: None,
+                                                    });
+                                                    next_persistent_turn = Some(continuation);
+                                                    continue;
+                                                }
+                                                Err(e) => surgical_failure = Some(e),
+                                            }
+                                        }
+                                        let mut message = format!(
                                             "Managed-context recovery completed without rewind_context while context remains above the rewind-only threshold ({}/{} tokens); refusing to send normal follow-ups.",
                                             pressure.used_tokens,
                                             pressure.rewind_only_limit
                                         );
+                                        match surgical_failure {
+                                            Some(failure) => message.push_str(&format!(
+                                                " Supervisor surgical rewind also failed: {failure}"
+                                            )),
+                                            None => message.push_str(&format!(
+                                                " Supervisor surgical recovery budget ({} per session) is exhausted.",
+                                                MANAGED_CONTEXT_MAX_SURGICAL_RECOVERIES
+                                            )),
+                                        }
                                         slog(&session_log, |l| l.warn(&message));
                                         bus.send(AppEvent::RoundComplete {
                                             session_id: session_log_id(&session_log),
@@ -26943,6 +28161,60 @@ async fn run_with_presence(
                                         .managed_context_recovery_kickstart(),
                                 );
                                 continue;
+                            }
+                            // Backstop: kickstart budget exhausted while the
+                            // backend still reports recovery required (the
+                            // recovery turns hit their step limit without a
+                            // rewind). Surgical rewind instead of leaving the
+                            // thread stuck above the rewind-only threshold.
+                            if managed_context_surgical_recovery_available(
+                                persistent_managed_context_surgical_recoveries,
+                            ) {
+                                match attempt_supervisor_surgical_context_rewind(
+                                    agent,
+                                    &thread.thread_id,
+                                    &drain_config,
+                                    (!task_text.trim().is_empty()).then_some(task_text.as_str()),
+                                    &mut persistent_pending_managed_context_replays,
+                                )
+                                .await
+                                {
+                                    Ok(continuation) => {
+                                        persistent_managed_context_surgical_recoveries =
+                                            persistent_managed_context_surgical_recoveries
+                                                .saturating_add(1);
+                                        persistent_managed_context_recovery_kickstarts_without_rewind = 0;
+                                        let content = format!(
+                                            "Persistent managed Codex kept reporting backend recovery required after {} kickstarts without a rewind; Intendant performed a surgical rewind ({} of {}) and is resuming the session.",
+                                            MANAGED_CONTEXT_RECOVERY_MAX_KICKSTARTS_WITHOUT_REWIND,
+                                            persistent_managed_context_surgical_recoveries,
+                                            MANAGED_CONTEXT_MAX_SURGICAL_RECOVERIES,
+                                        );
+                                        slog(&session_log, |l| l.warn(&content));
+                                        bus.send(AppEvent::LogEntry {
+                                            session_id: session_log_id(&session_log),
+                                            level: "warn".to_string(),
+                                            source: "Intendant".to_string(),
+                                            content,
+                                            turn: None,
+                                        });
+                                        bus.send(AppEvent::RoundComplete {
+                                            session_id: session_log_id(&session_log),
+                                            round: cumulative_stats.rounds,
+                                            turns_in_round,
+                                            native_message_count: None,
+                                        });
+                                        next_persistent_turn = Some(continuation);
+                                        continue;
+                                    }
+                                    Err(e) => {
+                                        slog(&session_log, |l| {
+                                            l.warn(&format!(
+                                                "Supervisor surgical rewind failed after recovery-required exhaustion: {e}"
+                                            ))
+                                        });
+                                    }
+                                }
                             }
                         }
                         bus.send(AppEvent::RoundComplete {
@@ -27763,6 +29035,10 @@ async fn run_external_agent_mode(
         std::collections::VecDeque::new();
     let mut managed_context_recovery_kickstarts_without_rewind = 0u8;
     let mut managed_context_density_block_handoffs_without_relief = 0u8;
+    let mut managed_context_surgical_recoveries = 0u8;
+    // Task statement for surgical-recovery primers (the supervisor cannot
+    // summarize the pruned span; it restates the task instead).
+    let surgical_task_statement = (!task.trim().is_empty()).then(|| task.clone());
     let mut next_turn = if task.trim().is_empty() {
         None
     } else {
@@ -29204,11 +30480,82 @@ async fn run_external_agent_mode(
                                     );
                                     continue 'outer;
                                 } else {
-                                    let message = format!(
+                                    // Model-driven recovery exhausted its retry
+                                    // budget (the fork's recovery turn hit its
+                                    // step limit each time without rewinding).
+                                    // Backstop: supervisor-forced surgical
+                                    // rewind instead of session death.
+                                    let mut surgical_failure = None;
+                                    if managed_context_surgical_recovery_available(
+                                        managed_context_surgical_recoveries,
+                                    ) {
+                                        match attempt_supervisor_surgical_context_rewind(
+                                            &mut agent,
+                                            &thread.thread_id,
+                                            &drain_config,
+                                            surgical_task_statement.as_deref(),
+                                            &mut pending_managed_context_replays,
+                                        )
+                                        .await
+                                        {
+                                            Ok(continuation) => {
+                                                managed_context_surgical_recoveries =
+                                                    managed_context_surgical_recoveries
+                                                        .saturating_add(1);
+                                                managed_context_recovery_kickstarts_without_rewind =
+                                                    0;
+                                                let content = format!(
+                                                    "Managed-context recovery exhausted {} kickstarts without a rewind at {}/{} tokens; Intendant performed a surgical rewind ({} of {}) and is resuming the session.",
+                                                    MANAGED_CONTEXT_RECOVERY_MAX_KICKSTARTS_WITHOUT_REWIND,
+                                                    pressure.used_tokens,
+                                                    pressure.rewind_only_limit,
+                                                    managed_context_surgical_recoveries,
+                                                    MANAGED_CONTEXT_MAX_SURGICAL_RECOVERIES,
+                                                );
+                                                slog(&session_log, |l| l.warn(&content));
+                                                bus.send(AppEvent::LogEntry {
+                                                    session_id: live_session_id.clone(),
+                                                    level: "warn".to_string(),
+                                                    source: "Intendant".to_string(),
+                                                    content,
+                                                    turn: None,
+                                                });
+                                                record_external_round_inline(
+                                                    &session_log,
+                                                    persist_model_responses_inline,
+                                                    round,
+                                                    turns_in_round,
+                                                );
+                                                bus.send(AppEvent::RoundComplete {
+                                                    session_id: live_session_id.clone(),
+                                                    round,
+                                                    turns_in_round,
+                                                    native_message_count: None,
+                                                });
+                                                next_turn = Some(continuation);
+                                                continue 'outer;
+                                            }
+                                            Err(e) => surgical_failure = Some(e),
+                                        }
+                                    }
+                                    let mut message = format!(
                                         "Managed-context recovery completed without rewind_context while context remains above the rewind-only threshold ({}/{} tokens); refusing to send normal follow-ups.",
                                         pressure.used_tokens,
                                         pressure.rewind_only_limit
                                     );
+                                    match surgical_failure {
+                                        Some(failure) => {
+                                            message.push_str(&format!(
+                                                " Supervisor surgical rewind also failed: {failure}"
+                                            ));
+                                        }
+                                        None => {
+                                            message.push_str(&format!(
+                                                " Supervisor surgical recovery budget ({} per session) is exhausted.",
+                                                MANAGED_CONTEXT_MAX_SURGICAL_RECOVERIES
+                                            ));
+                                        }
+                                    }
                                     slog(&session_log, |l| l.warn(&message));
                                     record_external_round_inline(
                                         &session_log,
@@ -29563,10 +30910,71 @@ async fn run_external_agent_mode(
                         );
                         continue 'outer;
                     } else {
-                        let failure = format!(
+                        // Backstop: the model kept reporting recovery required
+                        // without rewinding (step-limit exhaustion ends those
+                        // turns); perform a surgical rewind before giving up.
+                        let mut surgical_failure = None;
+                        if managed_context_surgical_recovery_available(
+                            managed_context_surgical_recoveries,
+                        ) {
+                            match attempt_supervisor_surgical_context_rewind(
+                                &mut agent,
+                                &thread.thread_id,
+                                &drain_config,
+                                surgical_task_statement.as_deref(),
+                                &mut pending_managed_context_replays,
+                            )
+                            .await
+                            {
+                                Ok(continuation) => {
+                                    managed_context_surgical_recoveries =
+                                        managed_context_surgical_recoveries.saturating_add(1);
+                                    managed_context_recovery_kickstarts_without_rewind = 0;
+                                    let content = format!(
+                                        "Managed Codex kept reporting backend recovery required after {} kickstarts without a rewind; Intendant performed a surgical rewind ({} of {}) and is resuming the session.",
+                                        MANAGED_CONTEXT_RECOVERY_MAX_KICKSTARTS_WITHOUT_REWIND,
+                                        managed_context_surgical_recoveries,
+                                        MANAGED_CONTEXT_MAX_SURGICAL_RECOVERIES,
+                                    );
+                                    slog(&session_log, |l| l.warn(&content));
+                                    bus.send(AppEvent::LogEntry {
+                                        session_id: live_session_id.clone(),
+                                        level: "warn".to_string(),
+                                        source: "Intendant".to_string(),
+                                        content,
+                                        turn: None,
+                                    });
+                                    record_external_round_inline(
+                                        &session_log,
+                                        persist_model_responses_inline,
+                                        round,
+                                        turns_in_round,
+                                    );
+                                    bus.send(AppEvent::RoundComplete {
+                                        session_id: live_session_id.clone(),
+                                        round,
+                                        turns_in_round,
+                                        native_message_count: None,
+                                    });
+                                    next_turn = Some(continuation);
+                                    continue 'outer;
+                                }
+                                Err(e) => surgical_failure = Some(e),
+                            }
+                        }
+                        let mut failure = format!(
                             "Managed Codex still reports backend recovery required after {} recovery kickstarts without another successful rewind; refusing to mark the session complete.",
                             managed_context_recovery_kickstarts_without_rewind
                         );
+                        match surgical_failure {
+                            Some(surgical) => failure.push_str(&format!(
+                                " Supervisor surgical rewind also failed: {surgical}"
+                            )),
+                            None => failure.push_str(&format!(
+                                " Supervisor surgical recovery budget ({} per session) is exhausted.",
+                                MANAGED_CONTEXT_MAX_SURGICAL_RECOVERIES
+                            )),
+                        }
                         slog(&session_log, |l| l.warn(&failure));
                         record_external_round_inline(
                             &session_log,
@@ -29677,10 +31085,61 @@ async fn run_external_agent_mode(
                                     );
                                     continue 'outer;
                                 }
-                                let message = format!(
+                                // Backstop: surgical rewind before giving up
+                                // (same exhaustion as the TurnCompleted arm,
+                                // reached via the density-gate interrupt).
+                                let mut surgical_failure = None;
+                                if managed_context_surgical_recovery_available(
+                                    managed_context_surgical_recoveries,
+                                ) {
+                                    match attempt_supervisor_surgical_context_rewind(
+                                        &mut agent,
+                                        &thread.thread_id,
+                                        &drain_config,
+                                        surgical_task_statement.as_deref(),
+                                        &mut pending_managed_context_replays,
+                                    )
+                                    .await
+                                    {
+                                        Ok(continuation) => {
+                                            managed_context_surgical_recoveries =
+                                                managed_context_surgical_recoveries
+                                                    .saturating_add(1);
+                                            managed_context_recovery_kickstarts_without_rewind = 0;
+                                            let content = format!(
+                                                "Managed-context recovery exhausted its kickstart budget at {}/{} tokens; Intendant performed a surgical rewind ({} of {}) and is resuming the session.",
+                                                pressure.used_tokens,
+                                                pressure.rewind_only_limit,
+                                                managed_context_surgical_recoveries,
+                                                MANAGED_CONTEXT_MAX_SURGICAL_RECOVERIES,
+                                            );
+                                            slog(&session_log, |l| l.warn(&content));
+                                            bus.send(AppEvent::LogEntry {
+                                                session_id: live_session_id.clone(),
+                                                level: "warn".to_string(),
+                                                source: "Intendant".to_string(),
+                                                content,
+                                                turn: None,
+                                            });
+                                            next_turn = Some(continuation);
+                                            continue 'outer;
+                                        }
+                                        Err(e) => surgical_failure = Some(e),
+                                    }
+                                }
+                                let mut message = format!(
                                     "Managed-context density tool gate kept interrupting while context stayed above the rewind-only threshold ({}/{} tokens); refusing to continue without a rewind.",
                                     pressure.used_tokens, pressure.rewind_only_limit
                                 );
+                                match surgical_failure {
+                                    Some(failure) => message.push_str(&format!(
+                                        " Supervisor surgical rewind also failed: {failure}"
+                                    )),
+                                    None => message.push_str(&format!(
+                                        " Supervisor surgical recovery budget ({} per session) is exhausted.",
+                                        MANAGED_CONTEXT_MAX_SURGICAL_RECOVERIES
+                                    )),
+                                }
                                 slog(&session_log, |l| l.warn(&message));
                                 bus.send(AppEvent::LoopError(message));
                                 stats.terminal_outcome = Some(

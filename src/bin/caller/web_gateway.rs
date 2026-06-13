@@ -22229,6 +22229,7 @@ mod tests {
             used_tokens_at_rewind: None,
             context_window_at_rewind: None,
             pressure_band_at_rewind: None,
+            surgical: false,
         }
     }
 
@@ -22278,6 +22279,37 @@ mod tests {
             .map(|record| record["record_id"].as_str().unwrap())
             .collect();
         assert_eq!(ids, vec!["visible-by-session", "visible-by-thread"]);
+    }
+
+    #[test]
+    fn managed_context_records_response_passes_surgical_and_pressure_fields_through() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut record = managed_context_test_record(
+            "surgical-1",
+            Some("dashboard session"),
+            "thread-a",
+            "2026-06-12T00:00:00Z",
+        );
+        record.surgical = true;
+        record.used_tokens_at_rewind = Some(26_000);
+        record.context_window_at_rewind = Some(23_800);
+        record.pressure_band_at_rewind = Some("high".to_string());
+        crate::context_rewind::persist_record(dir.path(), &record).unwrap();
+
+        let response = managed_context_records_response(
+            "GET /api/managed-context/records?session_id=dashboard%20session HTTP/1.1",
+            dir.path(),
+        );
+        let body = response_json_body(&response);
+        // The Managed tab renders the SURGICAL badge and the pressure chip
+        // straight off these record fields: the endpoint must pass records
+        // through whole, not reshape them.
+        let served = &body["records"][0];
+        assert_eq!(served["record_id"], "surgical-1");
+        assert_eq!(served["surgical"], true);
+        assert_eq!(served["used_tokens_at_rewind"], 26_000);
+        assert_eq!(served["context_window_at_rewind"], 23_800);
+        assert_eq!(served["pressure_band_at_rewind"], "high");
     }
 
     #[test]

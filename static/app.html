@@ -21266,11 +21266,55 @@ function renderManagedContextRecords() {
       `<div class="managed-context-record-meta">` +
       `<span>${escapeHtml(record.created_at || '')}</span>` +
       `<span>${escapeHtml(record.position || 'after')} ${escapeHtml(record.item_id || '')}</span>` +
+      managedContextRecordBadgesHtml(record) +
       `</div>` +
       `<div class="managed-context-muted">${escapeHtml(compactSessionText(record.reason) || 'no reason')}</div>`;
     row.addEventListener('click', () => selectManagedContextRecord(record));
     host.appendChild(row);
   }
+}
+
+function managedContextPressureBandChipClass(band) {
+  // Mirrors the pressure-fill tones: red at/above the rewind-only limit,
+  // yellow in the density-watch band, green below the threshold.
+  switch (band) {
+    case 'critical': case 'high': return ' failed';
+    case 'watch': return ' blocked';
+    case 'ok': return ' completed';
+    default: return '';
+  }
+}
+
+function managedContextTokensCompact(value) {
+  // One decimal even above 10k ("26.0k/23.8k"): pressure-at-rewind pairs sit
+  // close to each other, and whole-k rounding can collapse used and limit
+  // into the same number.
+  const n = Number(value);
+  if (!Number.isFinite(n)) return '--';
+  return n >= 1000 ? `${(n / 1000).toFixed(1)}k` : Math.round(n).toString();
+}
+
+function managedContextRecordBadgesHtml(record) {
+  const badges = [];
+  if (record.surgical === true) {
+    badges.push(
+      '<span class="managed-context-status-chip failed" title="Supervisor backstop: Intendant chose the anchor and authored a synthetic primer after the model exhausted its recovery steps without rewinding">SURGICAL</span>'
+    );
+  }
+  const band = String(record.pressure_band_at_rewind || '').trim();
+  if (band) {
+    const used = record.used_tokens_at_rewind;
+    const windowAt = record.context_window_at_rewind;
+    const counts = used != null && windowAt != null
+      ? ` · ${managedContextTokensCompact(used)}/${managedContextTokensCompact(windowAt)}`
+      : '';
+    badges.push(
+      `<span class="managed-context-status-chip${managedContextPressureBandChipClass(band)}"` +
+      ` title="Backend-reported context pressure when this record was created (used/rewind-only limit)">` +
+      `${escapeHtml(band)}${counts}</span>`
+    );
+  }
+  return badges.join('');
 }
 
 function selectManagedContextRecord(record) {
