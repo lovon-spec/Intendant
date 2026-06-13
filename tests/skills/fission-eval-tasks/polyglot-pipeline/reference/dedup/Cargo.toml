@@ -1,0 +1,14 @@
+# Reference solution for the dedup component (agent-facing). Excluded from
+# agent visibility by the SKILL runner.
+[workspace]
+
+[package]
+name = "dedup"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+serde_json = "1"
+
+[profile.release]
+debug = false

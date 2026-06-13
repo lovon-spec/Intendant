@@ -1,0 +1,14 @@
+# Standalone crate: the empty [workspace] table keeps it out of any parent
+# cargo workspace (this skeleton lives inside the Intendant repo as a fixture).
+[workspace]
+
+[package]
+name = "dedup"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+serde_json = "1"
+
+[profile.release]
+debug = false
