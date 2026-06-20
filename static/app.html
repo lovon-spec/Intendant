@@ -23964,8 +23964,11 @@ function insertSessionWindowHistoryRecords(win, records, shouldFollow) {
   if (!win || !Array.isArray(records) || records.length === 0) return;
   const history = ensureSessionWindowHistory(win);
   const wasRenderingTail = sessionWindowIsRenderingTail(win, history.length);
+  const signatures = sessionWindowHistorySignatureSet(win, win.sessionId);
+  let inserted = 0;
   for (const record of records) {
     const item = prepareSessionWindowHistoryItem(record);
+    if (sessionWindowHistoryHasMatchingSignature(signatures, item, win.sessionId)) continue;
     stationTrackSessionWindowHistoryAnchor(item, win.sessionId);
     const recordTs = sessionWindowTranscriptTimestampMs(record.ts || record.timestamp || '');
     let index = history.length;
@@ -23979,7 +23982,10 @@ function insertSessionWindowHistoryRecords(win, records, shouldFollow) {
       }
     }
     history.splice(index, 0, item);
+    addSessionWindowHistorySignatures(signatures, item, win.sessionId);
+    inserted += 1;
   }
+  if (inserted === 0) return;
   if (shouldFollow || wasRenderingTail) {
     renderSessionWindowTail(win);
   } else {
@@ -24010,7 +24016,7 @@ function appendMissingRestoredSessionWindowEntries(win, entries, fallbackSession
     const signatures = sessionWindowTranscriptSignaturesForRecord(record, fallbackSessionId);
     if (signatures.length > 0 && signatures.some(signature => existing.has(signature))) continue;
     missing.push(record);
-    for (const signature of sessionWindowTranscriptSignaturesForRecord(record, fallbackSessionId, { includeText: false })) {
+    for (const signature of signatures) {
       existing.add(signature);
     }
   }
