@@ -23848,11 +23848,43 @@ function renderRestoredSessionWindowEntries(win, entries, fallbackSessionId) {
   return records.length;
 }
 
-function sessionWindowTranscriptSignatureParts(record = {}, fallbackSessionId = '') {
-  const sessionId = String(record.session_id || record.sessionId || fallbackSessionId || '').trim();
-  const content = String(record.content || record.summary || record.message || '')
+function sessionWindowTranscriptSignatureContent(value) {
+  return String(value || '')
     .trim()
     .replace(/\s+/g, ' ');
+}
+
+function sessionWindowTranscriptRenderedContentForRecord(record = {}) {
+  const raw = String(record.content || record.summary || record.message || '');
+  if (!raw) return '';
+  try {
+    const cnt = document.createElement('span');
+    cnt.className = 'log-content';
+    renderLogContentElement(cnt, record);
+    return sessionWindowTranscriptContentForElement(cnt);
+  } catch {
+    return '';
+  }
+}
+
+function sessionWindowTranscriptContentAliasesForRecord(record = {}) {
+  const aliases = [];
+  const seen = new Set();
+  const add = (value) => {
+    const content = sessionWindowTranscriptSignatureContent(value);
+    if (!content || seen.has(content)) return;
+    seen.add(content);
+    aliases.push(content);
+  };
+  add(record.content || record.summary || record.message || '');
+  add(sessionWindowTranscriptRenderedContentForRecord(record));
+  return aliases;
+}
+
+function sessionWindowTranscriptSignatureParts(record = {}, fallbackSessionId = '') {
+  const sessionId = String(record.session_id || record.sessionId || fallbackSessionId || '').trim();
+  const contentAliases = sessionWindowTranscriptContentAliasesForRecord(record);
+  const content = contentAliases[0] || '';
   if (!sessionId || !content) return null;
   return {
     sessionId,
@@ -23866,6 +23898,7 @@ function sessionWindowTranscriptSignatureParts(record = {}, fallbackSessionId = 
     userTurnRevision: record.user_turn_revision ?? record.userTurnRevision ?? '',
     replacementTurnIndex: record.replacement_for_user_turn_index ?? record.replacementForUserTurnIndex ?? '',
     content,
+    contentAliases,
   };
 }
 
@@ -23874,21 +23907,31 @@ function sessionWindowTranscriptSignaturesFromParts(parts, options = {}) {
   const signatures = [];
   if (parts.itemId) signatures.push(['item', parts.sessionId, parts.itemId].join('\u001f'));
   if (parts.outputId) signatures.push(['output', parts.sessionId, parts.kind, parts.outputId].join('\u001f'));
-  const canUseTextSignature = parts.level === 'model' || parts.level === 'detail' || parts.kind === 'agent_output';
-  const textParts = [
-    parts.sessionId,
-    parts.level,
-    parts.source,
-    parts.kind,
-    parts.userTurnIndex,
-    parts.userTurnRevision,
-    parts.replacementTurnIndex,
-    parts.content,
-  ];
-  if (canUseTextSignature && (options.includeText !== false || !parts.ts)) {
-    signatures.push(['text', ...textParts].join('\u001f'));
+  const hasUserTurn = String(parts.userTurnIndex || '').trim() !== '';
+  const isUserMessage = parts.source === 'user' || parts.level === 'user';
+  const canUseTextSignature = parts.level === 'model' ||
+    parts.level === 'detail' ||
+    parts.kind === 'agent_output' ||
+    (isUserMessage && hasUserTurn);
+  const contentAliases = Array.isArray(parts.contentAliases) && parts.contentAliases.length
+    ? parts.contentAliases
+    : [parts.content];
+  for (const content of contentAliases) {
+    const textParts = [
+      parts.sessionId,
+      parts.level,
+      parts.source,
+      parts.kind,
+      parts.userTurnIndex,
+      parts.userTurnRevision,
+      parts.replacementTurnIndex,
+      content,
+    ];
+    if (canUseTextSignature && (options.includeText !== false || !parts.ts)) {
+      signatures.push(['text', ...textParts].join('\u001f'));
+    }
+    if (parts.ts) signatures.push(['exact', parts.ts, ...textParts].join('\u001f'));
   }
-  if (parts.ts) signatures.push(['exact', parts.ts, ...textParts].join('\u001f'));
   return signatures;
 }
 
@@ -23899,9 +23942,23 @@ function sessionWindowTranscriptSignaturesForRecord(record = {}, fallbackSession
   );
 }
 
+function sessionWindowTranscriptContentForElement(element) {
+  if (!element) return '';
+  const clone = element.cloneNode(true);
+  clone.querySelectorAll?.('.log-state-badges').forEach(el => el.remove());
+  return clone.textContent || '';
+}
+
+function sessionWindowTranscriptContentForNode(node) {
+  if (!node) return '';
+  const contentEl = node.querySelector?.('.log-content');
+  if (!contentEl) return node.textContent || '';
+  return sessionWindowTranscriptContentForElement(contentEl);
+}
+
 function sessionWindowTranscriptSignaturesForNode(node, fallbackSessionId = '') {
   if (!node) return [];
-  const content = node.querySelector?.('.log-content')?.textContent || node.textContent || '';
+  const content = sessionWindowTranscriptContentForNode(node);
   const parts = sessionWindowTranscriptSignatureParts({
     session_id: node.dataset?.sessionId || fallbackSessionId,
     ts: node.querySelector?.('.log-ts')?.title || node.querySelector?.('.log-ts')?.textContent || '',
@@ -23962,6 +24019,7 @@ function sessionWindowTranscriptTimestampForHistoryItem(item) {
 
 function insertSessionWindowHistoryRecords(win, records, shouldFollow) {
   if (!win || !Array.isArray(records) || records.length === 0) return;
+  deduplicateSessionWindowHistory(win, shouldFollow);
   const history = ensureSessionWindowHistory(win);
   const wasRenderingTail = sessionWindowIsRenderingTail(win, history.length);
   const signatures = sessionWindowHistorySignatureSet(win, win.sessionId);
@@ -24005,6 +24063,10 @@ function appendMissingRestoredSessionWindowEntries(win, entries, fallbackSession
     appendSessionWindowHistoryBatch(win, records, true);
     return records.length;
   }
+  const removedDuplicates = deduplicateSessionWindowHistory(
+    win,
+    sessionWindowShouldFollowNextOutput(win)
+  );
   const existing = new Set();
   for (const item of ensureSessionWindowHistory(win)) {
     for (const signature of sessionWindowTranscriptSignaturesForHistoryItem(item, fallbackSessionId)) {
@@ -24020,9 +24082,9 @@ function appendMissingRestoredSessionWindowEntries(win, entries, fallbackSession
       existing.add(signature);
     }
   }
-  if (!missing.length) return 0;
+  if (!missing.length) return removedDuplicates;
   insertSessionWindowHistoryRecords(win, missing, sessionWindowShouldFollowNextOutput(win));
-  return missing.length;
+  return missing.length + removedDuplicates;
 }
 
 function externalSessionWindowSyncRecord(sessionId) {
@@ -25803,6 +25865,34 @@ function sessionWindowHistoryHasMatchingSignature(signatures, item, fallbackSess
   if (!signatures) return false;
   const itemSignatures = sessionWindowTranscriptSignaturesForHistoryItem(item, fallbackSessionId);
   return itemSignatures.length > 0 && itemSignatures.some(signature => signatures.has(signature));
+}
+
+function deduplicateSessionWindowHistory(win, shouldFollow = null) {
+  if (!win) return 0;
+  const history = ensureSessionWindowHistory(win);
+  if (history.length < 2) return 0;
+  const wasRenderingTail = sessionWindowIsRenderingTail(win, history.length);
+  const signatures = new Set();
+  const kept = [];
+  let removed = 0;
+  for (const item of history) {
+    if (sessionWindowHistoryHasMatchingSignature(signatures, item, win.sessionId)) {
+      removed += 1;
+      continue;
+    }
+    kept.push(item);
+    addSessionWindowHistorySignatures(signatures, item, win.sessionId);
+  }
+  if (removed === 0) return 0;
+  history.splice(0, history.length, ...kept);
+  const follow = shouldFollow === null ? wasRenderingTail : !!shouldFollow;
+  if (follow || wasRenderingTail) {
+    renderSessionWindowTail(win);
+  } else {
+    renderSessionWindowRange(win, Math.min(win.renderStart, sessionWindowTailStart(history.length)));
+  }
+  applySessionWindowOutputScroll(win, follow);
+  return removed;
 }
 
 function appendSessionWindowHistory(win, entry, shouldFollow) {
