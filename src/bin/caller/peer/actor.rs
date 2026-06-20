@@ -106,26 +106,28 @@ pub(crate) struct PeerActor {
     /// Identical semantics to how the registry applies it at
     /// [`crate::peer::PeerRegistry::add_peer_with_credentials`].
     pub via_urls: Vec<String>,
+    /// Optional operator display-label override, preserved across card
+    /// refreshes just like `via_urls`.
+    pub label_override: Option<String>,
 }
 
 impl PeerActor {
-    /// Re-apply the operator's via-URL override to a fresh card.
+    /// Re-apply operator overrides to a fresh card.
     /// Called every place we receive a card from outside (transport
     /// `connect()` return value, inbound `PeerEvent::Connected`) so
-    /// the override persists across reconnects instead of getting
+    /// overrides persist across reconnects instead of getting
     /// wiped on the first successful handshake.
-    ///
-    /// No-op when `via_urls` is empty — the peer's self-advertised
-    /// transports stand.
-    fn apply_via_override(&self, card: &mut AgentCard) {
-        if self.via_urls.is_empty() {
-            return;
+    fn apply_operator_overrides(&self, card: &mut AgentCard) {
+        if let Some(label) = &self.label_override {
+            card.label = label.clone();
         }
-        card.transports = self
-            .via_urls
-            .iter()
-            .map(|url| crate::peer::card::TransportSpec::IntendantWs { url: url.clone() })
-            .collect();
+        if !self.via_urls.is_empty() {
+            card.transports = self
+                .via_urls
+                .iter()
+                .map(|url| crate::peer::card::TransportSpec::IntendantWs { url: url.clone() })
+                .collect();
+        }
     }
 }
 
@@ -146,7 +148,7 @@ impl PeerActor {
                     // reverts to the peer's self-advertised URL —
                     // which is often unreachable from the browser in
                     // NAT / tunnel / overlay topologies.
-                    self.apply_via_override(&mut new_card);
+                    self.apply_operator_overrides(&mut new_card);
                     let card_arc = Arc::new(new_card.clone());
                     let _ = self.card_tx.send(card_arc);
                     let _ = self.connection_tx.send(ConnectionState::Connected);
@@ -307,12 +309,11 @@ impl PeerActor {
                 let _ = self.status_tx.send(*status);
             }
             PeerEvent::Connected { card } => {
-                // Same via-URL preservation as the transport-connect
-                // path above. Inbound Connected events happen when a
-                // peer re-announces itself mid-session; preserving
-                // the override keeps PeerSnapshot.ws_url stable.
+                // Same operator override preservation as the transport-connect
+                // path above. Inbound Connected events happen when a peer
+                // re-announces itself mid-session.
                 let mut patched = card.clone();
-                self.apply_via_override(&mut patched);
+                self.apply_operator_overrides(&mut patched);
                 let _ = self.card_tx.send(Arc::new(patched));
             }
             _ => {}

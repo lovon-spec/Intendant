@@ -406,10 +406,10 @@ the connecting daemon:
 3. On the daemon that should connect to it, paste the invite into
    **Join Invite**.
 
-Joining from the dashboard writes or updates `[[peer]]` in `intendant.toml`,
-stores the peer-issued client certificate/key in the local access cert store,
-and queues live registry registration so the daemon can connect without a
-restart.
+Joining from the dashboard writes or updates the local daemon's outbound
+`[[peer]]` entry in `intendant.toml`, stores the peer-issued client
+certificate/key in the local access cert store, and queues live registry
+registration so the daemon can connect without a restart.
 
 The same flow is available from the CLI for headless peers or terminals:
 
@@ -428,7 +428,8 @@ server certificate fingerprint. The invite contains the client private key, so
 treat it as a secret and paste it only to the daemon that should connect.
 
 `join` stores that peer-issued client identity under the local per-user access
-cert store and writes or updates a `[[peer]]` block in `intendant.toml` with:
+cert store and writes or updates an outbound `[[peer]]` block in
+`intendant.toml` with:
 
 - `card_url` — where to fetch the peer's Agent Card
 - `client_cert` / `client_key` — the peer-issued mTLS keycard this daemon presents
@@ -455,7 +456,7 @@ headless and should be approved from its own CLI/logs.
    public request to the target: requester label, public key, nonce, requested
    profile, and optional requester card URL.
 3. The target records a short-lived pending request and shows it in
-   **Incoming Requests**, `intendant peer requests`, and the daemon log.
+   **Inbound Access Requests**, `intendant peer requests`, and the daemon log.
 4. The target operator approves, denies, or approves with a downgraded profile:
 
    ```bash
@@ -473,9 +474,9 @@ headless and should be approved from its own CLI/logs.
    ```
 
    This installs the signed client certificate/key pair under the requester's
-   access cert store, writes or updates `[[peer]]`, pins the target server
-   fingerprint, and starts the live peer registration when the dashboard daemon
-   is running.
+   access cert store, writes or updates the requester's outbound `[[peer]]`,
+   pins the target server fingerprint, and starts the live peer registration
+   when the dashboard daemon is running.
 
 The unauthenticated public surface for this flow is intentionally tiny:
 `POST /api/peer-pairing/requests` creates a pending request and

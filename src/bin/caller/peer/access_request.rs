@@ -512,6 +512,7 @@ pub(crate) fn install_approved_identity(
                 card_url: result.card_url.clone(),
                 label,
                 bearer_token: None,
+                via_urls: Vec::new(),
                 client_cert: Some(cert_path.to_string_lossy().into_owned()),
                 client_key: Some(key_path.to_string_lossy().into_owned()),
                 pinned_fingerprints: pins,

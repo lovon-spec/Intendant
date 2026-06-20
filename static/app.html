@@ -1128,6 +1128,9 @@ html {
   line-height: 1.35;
   overflow-wrap: anywhere;
 }
+.daemon-role-summary {
+  color: var(--subtext1);
+}
 .daemon-access-request-actions {
   display: flex;
   gap: 6px;
@@ -1188,6 +1191,11 @@ html {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+.daemon-identity-role {
+  color: var(--text);
+  font-size: 11px;
+  font-weight: 700;
 }
 .daemon-identity-status.approved { color: var(--green); }
 .daemon-identity-status.revoked { color: var(--red); }
@@ -1256,6 +1264,18 @@ html {
 .daemon-add-row-via input {
   font-size: 11px;
   color: var(--subtext0);
+}
+.daemon-add-persist {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 6px;
+  color: var(--subtext0);
+  font-size: 11px;
+  font-weight: 600;
+}
+.daemon-add-persist input {
+  margin: 0;
 }
 .daemon-add-row input {
   flex: 1;
@@ -10173,12 +10193,12 @@ body.display-fullscreen-open {
               <div id="daemons-list" class="daemons-list"></div>
               <div class="daemon-pairing-grid">
                 <div class="daemon-pairing-panel daemon-add-wizard">
-                  <div class="daemon-pairing-title">Add Instance</div>
-                  <div class="daemon-pairing-mode-tabs" role="tablist" aria-label="Add instance mode">
-                    <button type="button" class="active" data-daemon-pairing-mode="request">Request</button>
+                  <div class="daemon-pairing-title">Outbound Connections</div>
+                  <div class="daemon-pairing-mode-tabs" role="tablist" aria-label="Connect daemon mode">
+                    <button type="button" class="active" data-daemon-pairing-mode="request">Request Access</button>
                     <button type="button" data-daemon-pairing-mode="join">Join Invite</button>
-                    <button type="button" data-daemon-pairing-mode="invite">Create Invite</button>
-                    <button type="button" data-daemon-pairing-mode="manual">Manual</button>
+                    <button type="button" data-daemon-pairing-mode="invite">Grant Invite</button>
+                    <button type="button" data-daemon-pairing-mode="manual">Manual Add</button>
                   </div>
 
                   <div class="daemon-pairing-pane active" data-daemon-pairing-pane="request">
@@ -10188,12 +10208,13 @@ body.display-fullscreen-open {
                     </div>
                     <div class="daemon-pairing-row">
                       <select id="daemon-request-profile">
-                        <option value="operator">Operator</option>
-                        <option value="read-only-display">Read-only display</option>
-                        <option value="task-runner">Task runner</option>
-                        <option value="stats">Stats</option>
-                        <option value="presence-only">Presence only</option>
-                        <option value="peer-daemon">Admin peer</option>
+                        <option value="operator" title="Display input, messages, tasks, and approvals.">Operator</option>
+                        <option value="read-only-display" title="Presence, stats, and display viewing. No input control.">Read-only display</option>
+                        <option value="shared-session-spectator" title="Presence, stats, and display viewing. No input control.">Spectator</option>
+                        <option value="task-runner" title="Presence, stats, messages, and task delegation.">Task runner</option>
+                        <option value="stats" title="Presence and usage statistics only.">Stats</option>
+                        <option value="presence-only" title="Basic presence only.">Presence only</option>
+                        <option value="peer-daemon" title="All peer operations, including settings, sessions, and runtime control.">Admin peer</option>
                       </select>
                       <button id="daemon-request-btn" type="button">Request</button>
                     </div>
@@ -10228,7 +10249,7 @@ body.display-fullscreen-open {
                       <button id="daemon-invite-copy-btn" type="button" disabled>Copy</button>
                       <span id="daemon-invite-status" class="daemon-pairing-status"></span>
                     </div>
-                    <div class="daemon-pairing-secret">Contains a client private key.</div>
+                    <div class="daemon-pairing-secret">Inbound grant: contains a client private key.</div>
                   </div>
 
                   <div class="daemon-pairing-pane" data-daemon-pairing-pane="manual">
@@ -10243,12 +10264,16 @@ body.display-fullscreen-open {
                     <div class="daemon-add-row daemon-add-row-via">
                       <input id="daemon-add-browser-tcp-via" type="text" placeholder="browser TCP URL" autocomplete="off">
                     </div>
+                    <label class="daemon-add-persist">
+                      <input id="daemon-add-persist" type="checkbox">
+                      <span>Save to intendant.toml</span>
+                    </label>
                     <span id="daemons-status" class="daemons-status"></span>
                   </div>
                 </div>
 
                 <div class="daemon-pairing-panel">
-                  <div class="daemon-pairing-title">Incoming Requests</div>
+                  <div class="daemon-pairing-title">Inbound Access Requests</div>
                   <div id="daemon-access-requests-list" class="daemons-list"></div>
                   <div class="daemon-pairing-actions">
                     <button id="daemon-access-requests-refresh-btn" type="button">Refresh</button>
@@ -10258,7 +10283,7 @@ body.display-fullscreen-open {
               </div>
 
               <div class="daemon-pairing-panel daemon-relationships-panel">
-                <div class="daemon-pairing-title">Trusted Relationships</div>
+                <div class="daemon-pairing-title">Inbound Access Grants</div>
                 <div id="daemon-peer-identities-list" class="daemons-list"></div>
                 <div class="daemon-pairing-actions">
                   <button id="daemon-peer-identities-refresh-btn" type="button">Refresh</button>
@@ -39632,18 +39657,66 @@ function setDaemonPairingStatus(id, msg, kind) {
 }
 
 const PEER_PROFILE_OPTIONS = [
-  ['operator', 'Operator'],
-  ['read-only-display', 'Read-only display'],
-  ['task-runner', 'Task runner'],
-  ['stats', 'Stats'],
-  ['presence-only', 'Presence only'],
-  ['peer-daemon', 'Admin peer'],
+  {
+    profile: 'operator',
+    label: 'Operator',
+    summary: 'Display input, messages, tasks, and approvals.',
+  },
+  {
+    profile: 'read-only-display',
+    label: 'Read-only display',
+    summary: 'Presence, stats, and display viewing. No input control.',
+  },
+  {
+    profile: 'shared-session-spectator',
+    label: 'Spectator',
+    summary: 'Presence, stats, and display viewing. No input control.',
+  },
+  {
+    profile: 'task-runner',
+    label: 'Task runner',
+    summary: 'Presence, stats, messages, and task delegation.',
+  },
+  {
+    profile: 'stats',
+    label: 'Stats',
+    summary: 'Presence and usage statistics only.',
+  },
+  {
+    profile: 'presence-only',
+    label: 'Presence only',
+    summary: 'Basic presence only.',
+  },
+  {
+    profile: 'peer-daemon',
+    label: 'Admin peer',
+    summary: 'All peer operations, including settings, sessions, and runtime control.',
+  },
 ];
+
+function peerProfileMeta(profile) {
+  const value = String(profile || 'presence-only').trim().toLowerCase();
+  const aliases = {
+    presence: 'presence-only',
+    'stats-only': 'stats',
+    'display-read-only': 'read-only-display',
+    spectator: 'shared-session-spectator',
+    admin: 'peer-daemon',
+    'admin-peer': 'peer-daemon',
+  };
+  const canonical = aliases[value] || value;
+  return PEER_PROFILE_OPTIONS.find(item => item.profile === canonical) || {
+    profile: canonical,
+    label: canonical || 'Presence only',
+    summary: 'Unknown profiles are treated as presence-only by this build.',
+  };
+}
 
 function renderPeerProfileOptions(selected) {
   const value = String(selected || 'operator').toLowerCase();
-  return PEER_PROFILE_OPTIONS.map(([profile, label]) => (
-    `<option value="${escapeHtml(profile)}" ${profile === value ? 'selected' : ''}>${escapeHtml(label)}</option>`
+  const selectedMeta = peerProfileMeta(value);
+  return PEER_PROFILE_OPTIONS.map(({ profile, label, summary }) => (
+    `<option value="${escapeHtml(profile)}" ${profile === selectedMeta.profile ? 'selected' : ''} title="${escapeHtml(summary)}">${escapeHtml(label)}</option>`
   )).join('');
 }
 
@@ -39693,7 +39766,7 @@ async function createDaemonInvite() {
     output.value = result.invite || '';
     if (copyBtn) copyBtn.disabled = !output.value;
     const target = result.card_url ? ` for ${result.card_url}` : '';
-    setDaemonPairingStatus('daemon-invite-status', `Invite ready${target}`, 'ok');
+    setDaemonPairingStatus('daemon-invite-status', `Inbound grant invite ready${target}`, 'ok');
     await loadPeerIdentities();
   } catch (e) {
     setDaemonPairingStatus('daemon-invite-status', `Request failed: ${e.message}`, 'error');
@@ -39745,7 +39818,7 @@ async function joinDaemonInvite() {
       setDaemonPairingStatus('daemon-join-status', `Failed: ${result.error || resp.status}`, 'error');
       return;
     }
-    const action = result.updated_existing ? 'Updated peer config' : 'Paired peer';
+    const action = result.updated_existing ? 'Updated outbound connection' : 'Saved outbound connection';
     setDaemonPairingStatus('daemon-join-status', `${action}; connecting in background`, 'ok');
     if (inviteInput) inviteInput.value = '';
     if (labelInput) labelInput.value = '';
@@ -39798,7 +39871,7 @@ async function requestDaemonAccess() {
     }
     if (requestIdInput) requestIdInput.value = result.request_id || '';
     if (codeEl) codeEl.textContent = result.code ? `Approval code ${result.code}` : '';
-    setDaemonPairingStatus('daemon-request-status', 'Waiting for approval on target daemon', 'ok');
+    setDaemonPairingStatus('daemon-request-status', 'Waiting for target approval', 'ok');
   } catch (e) {
     setDaemonPairingStatus('daemon-request-status', `Request failed: ${e.message}`, 'error');
   } finally {
@@ -39808,6 +39881,7 @@ async function requestDaemonAccess() {
 
 async function completeDaemonAccessRequest() {
   const requestIdInput = document.getElementById('daemon-request-id');
+  const labelInput = document.getElementById('daemon-request-label');
   const btn = document.getElementById('daemon-request-complete-btn');
   const requestId = requestIdInput ? requestIdInput.value.trim() : '';
   if (!requestId) {
@@ -39821,7 +39895,10 @@ async function completeDaemonAccessRequest() {
     const resp = await authedFetch('/api/peers/pairing/request-access/poll', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ request_id: requestId }),
+      body: JSON.stringify({
+        request_id: requestId,
+        ...(labelInput && labelInput.value.trim() ? { label: labelInput.value.trim() } : {}),
+      }),
     });
     const result = await resp.json().catch(() => ({}));
     if (!resp.ok) {
@@ -39830,7 +39907,7 @@ async function completeDaemonAccessRequest() {
     }
     const status = String(result.status || '').toLowerCase();
     if (status === 'approved' && result.card_url) {
-      const action = result.updated_existing ? 'Updated peer config' : 'Paired peer';
+      const action = result.updated_existing ? 'Updated outbound connection' : 'Saved outbound connection';
       setDaemonPairingStatus('daemon-request-status', `${action}; connecting in background`, 'ok');
       await refreshPeersFromApi();
       window.setTimeout(() => {
@@ -39894,19 +39971,21 @@ function renderPeerAccessRequests(requests) {
     const label = escapeHtml(req.requester_label || 'Unnamed daemon');
     const code = escapeHtml(req.code || '');
     const status = String(req.status || 'unknown').toLowerCase();
-    const profile = escapeHtml(req.approved_profile || req.requested_profile || 'peer-daemon');
+    const role = peerProfileMeta(req.approved_profile || req.requested_profile || 'peer-daemon');
     const source = req.source_hint ? `Source ${escapeHtml(req.source_hint)}` : '';
     const expires = req.expires_at_unix ? `Expires ${escapeHtml(accessRequestTimeLabel(req.expires_at_unix))}` : '';
     const timing = [source, expires].filter(Boolean).join(' - ');
     const pending = status === 'pending';
     const requestedProfile = req.approved_profile || req.requested_profile || 'operator';
+    const roleLabel = req.approved_profile ? 'Approved role' : 'Requested role';
     return `
       <div class="daemon-access-request-card">
         <div class="daemon-access-request-head">
           <span>${label}</span>
           <span class="daemon-access-request-code">${code}</span>
         </div>
-        <div class="daemon-access-request-meta">Status ${escapeHtml(status)} - Profile ${profile}</div>
+        <div class="daemon-access-request-meta">Status ${escapeHtml(status)} - ${roleLabel} ${escapeHtml(role.label)}</div>
+        <div class="daemon-access-request-meta daemon-role-summary">${escapeHtml(role.summary)}</div>
         ${timing ? `<div class="daemon-access-request-meta">${timing}</div>` : ''}
         ${pending ? `<div class="daemon-pairing-row"><select data-access-request-profile="${escapeHtml(requestId)}">${renderPeerProfileOptions(requestedProfile)}</select></div>` : ''}
         <div class="daemon-access-request-actions">
@@ -39947,7 +40026,7 @@ async function decidePeerAccessRequest(requestId, op) {
     }
     setDaemonPairingStatus(
       'daemon-access-requests-status',
-      op === 'approve' ? 'Approved request' : 'Denied request',
+      op === 'approve' ? 'Granted inbound access' : 'Denied inbound access',
       op === 'approve' ? 'ok' : ''
     );
     await loadPeerAccessRequests();
@@ -39979,7 +40058,7 @@ function renderPeerIdentities(identities) {
   const list = document.getElementById('daemon-peer-identities-list');
   if (!list) return;
   if (!identities.length) {
-    list.innerHTML = '<div class="daemon-access-request-meta">No trusted peer identities.</div>';
+    list.innerHTML = '<div class="daemon-access-request-meta">No inbound access grants.</div>';
     return;
   }
 
@@ -39987,7 +40066,7 @@ function renderPeerIdentities(identities) {
     const fingerprint = String(identity.fingerprint || '');
     const label = escapeHtml(identity.label || 'Unnamed daemon');
     const status = String(identity.status || 'unknown').toLowerCase();
-    const profile = escapeHtml(identity.profile || 'presence-only');
+    const role = peerProfileMeta(identity.profile || 'presence-only');
     const request = identity.request_id ? `Request ${escapeHtml(identity.request_id)}` : '';
     const card = identity.card_url ? escapeHtml(identity.card_url) : '';
     const active = status === 'approved';
@@ -39997,7 +40076,8 @@ function renderPeerIdentities(identities) {
           <span>${label}</span>
           <span class="daemon-identity-status ${escapeHtml(status)}">${escapeHtml(status)}</span>
         </div>
-        <div class="daemon-identity-profile">Profile ${profile}${request ? ` - ${request}` : ''}</div>
+        <div class="daemon-identity-role" title="Profile ${escapeHtml(identity.profile || 'presence-only')}">Role ${escapeHtml(role.label)}</div>
+        <div class="daemon-identity-profile">${escapeHtml(role.summary)}${request ? ` - ${request}` : ''}</div>
         ${card ? `<div class="daemon-identity-profile">${card}</div>` : ''}
         <div class="daemon-identity-fingerprint" title="${escapeHtml(fingerprint)}">${escapeHtml(fingerprint)}</div>
         <div class="daemon-identity-actions">
@@ -40027,7 +40107,7 @@ async function revokePeerIdentity(identity) {
       setDaemonPairingStatus('daemon-peer-identities-status', `Failed: ${result.error || resp.status}`, 'error');
       return;
     }
-    setDaemonPairingStatus('daemon-peer-identities-status', 'Revoked', 'ok');
+    setDaemonPairingStatus('daemon-peer-identities-status', 'Revoked inbound access', 'ok');
     await loadPeerIdentities();
   } catch (e) {
     setDaemonPairingStatus('daemon-peer-identities-status', `Request failed: ${e.message}`, 'error');
@@ -40039,6 +40119,7 @@ async function addDaemon() {
   const labelInput = document.getElementById('daemon-add-label');
   const viaInput = document.getElementById('daemon-add-via');
   const browserTcpViaInput = document.getElementById('daemon-add-browser-tcp-via');
+  const persistInput = document.getElementById('daemon-add-persist');
   const baseUrl = urlInput.value.trim();
   const userLabel = labelInput.value.trim();
   // Per-peer connecting-side override: replaces the card's transports
@@ -40054,6 +40135,7 @@ async function addDaemon() {
   const browserTcpViaUrl = browserTcpViaInput
     ? browserTcpViaInput.value.trim()
     : '';
+  const persist = !!(persistInput && persistInput.checked);
 
   if (!baseUrl) { setDaemonsStatus('URL is required', 'error'); return; }
   if (!/^https?:\/\//.test(baseUrl)) {
@@ -40083,6 +40165,8 @@ async function addDaemon() {
   // `#[default]` makes the field optional on the wire so older clients
   // continue to work without it.
   const body = { card_url: cardUrl };
+  if (userLabel) body.label = userLabel;
+  if (persist) body.persist = true;
   if (viaUrls.length > 0) body.via_urls = viaUrls;
   if (browserTcpViaUrl) body.browser_tcp_via_url = browserTcpViaUrl;
   try {
@@ -40093,13 +40177,21 @@ async function addDaemon() {
     });
     const result = await resp.json();
     if (!resp.ok) {
+      const errorText = result.error || String(resp.status);
+      if (/peer added for this run/i.test(errorText)) {
+        setDaemonsStatus(errorText, 'error');
+        return;
+      }
       const hint = baseUrl.startsWith('https://')
         ? 'Is the mTLS client cert for this daemon installed on this server?'
         : 'Is the remote daemon running and reachable?';
-      setDaemonsStatus(`Failed to add peer: ${result.error || resp.status}. ${hint}`, 'error');
+      setDaemonsStatus(`Failed to add outbound connection: ${errorText}. ${hint}`, 'error');
       return;
     }
-    setDaemonsStatus(`Added ${result.peer_id}`, 'ok');
+    setDaemonsStatus(
+      result.persisted ? `Added and saved ${result.peer_id}` : `Added for this run ${result.peer_id}`,
+      'ok'
+    );
   } catch (e) {
     setDaemonsStatus(`Request failed: ${e.message}`, 'error');
     return;
@@ -40112,6 +40204,7 @@ async function addDaemon() {
   labelInput.value = '';
   if (viaInput) viaInput.value = '';
   if (browserTcpViaInput) browserTcpViaInput.value = '';
+  if (persistInput) persistInput.checked = false;
 }
 
 async function removeDaemon(hostId) {

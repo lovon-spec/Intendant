@@ -280,14 +280,17 @@ system Chrome/Chromium apps require choosing `system_cdp` or setting
 The configuration panel for the current session. **Network → Daemons** is the
 dashboard entry point for peer relationships:
 
-- **Create Invite / Join Invite** handles the direct secret handoff flow.
+- **Grant Invite / Join Invite** handles the direct secret handoff flow.
 - **Request Access** lets this daemon ask another daemon for a peer-scoped mTLS
   identity without receiving a private-key-bearing invite.
-- **Incoming Requests** shows doorbell requests from other daemons and lets the
-  local operator approve or deny them.
+- **Inbound Access Requests** shows doorbell requests from other daemons and
+  lets the local operator approve or deny them.
+- **Inbound Access Grants** lists client identities this daemon will accept
+  from other daemons, including the granted role/profile.
 
-The panel keeps the older manual runtime URL add path for already-enrolled
-peers, tunnels, and local/debug daemons.
+The panel keeps the manual URL add path for already-enrolled peers, tunnels, and
+local/debug daemons. Manual additions are runtime-only unless **Save to
+intendant.toml** is checked.
 
 ## Late-join and session replay
 

@@ -18848,7 +18848,8 @@ pub fn spawn_web_gateway(
                                     let body_text =
                                         read_request_body(&mut stream, &header_text).await;
                                     if request_line.starts_with("POST") {
-                                        peers_add(registry, &body_text).await
+                                        peers_add(registry, project_root.as_deref(), &body_text)
+                                            .await
                                     } else {
                                         peers_remove(registry, &body_text).await
                                     }
@@ -19453,6 +19454,13 @@ struct PeerListResponse {
 #[derive(Deserialize)]
 struct AddPeerRequest {
     card_url: String,
+    /// Optional display label override for this peer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    label: Option<String>,
+    /// Persist this manual add into `intendant.toml` after the live
+    /// registration succeeds. Unchecked manual adds remain runtime-only.
+    #[serde(default)]
+    persist: bool,
     /// Optional connecting-side override for the peer's transport
     /// URLs. When non-empty, the card's `transports` field is
     /// replaced with one `IntendantWs` entry per URL. Lets the
@@ -19556,9 +19564,14 @@ fn peers_list_response_body(registry: &crate::peer::PeerRegistry) -> String {
         .unwrap_or_else(|_| "{\"peers\":[]}".to_string())
 }
 
-/// Handle a `POST /api/peers` body: parse, call
-/// `PeerRegistry::add_peer`, return `(status_code, body_json)`.
-async fn peers_add(registry: &crate::peer::PeerRegistry, body_text: &str) -> (u16, String) {
+/// Handle a `POST /api/peers` body: parse, call `PeerRegistry::add_peer`,
+/// optionally persist the peer in `intendant.toml`, and return
+/// `(status_code, body_json)`.
+async fn peers_add(
+    registry: &crate::peer::PeerRegistry,
+    project_root: Option<&Path>,
+    body_text: &str,
+) -> (u16, String) {
     let req: AddPeerRequest = match serde_json::from_str(body_text) {
         Ok(r) => r,
         Err(e) => {
@@ -19568,22 +19581,104 @@ async fn peers_add(registry: &crate::peer::PeerRegistry, body_text: &str) -> (u1
             );
         }
     };
+    let label_override = trimmed_nonempty(req.label.clone());
     match registry
-        .add_peer_with_credentials(
+        .add_peer_with_credentials_and_client_identity_and_label(
             &req.card_url,
-            req.via_urls,
-            req.bearer_token,
-            req.pinned_fingerprints,
-            req.browser_tcp_via_url,
+            req.via_urls.clone(),
+            req.bearer_token.clone(),
+            req.pinned_fingerprints.clone(),
+            req.browser_tcp_via_url.clone(),
+            None,
+            label_override.clone(),
         )
         .await
     {
-        Ok(peer_id) => (
-            200,
-            serde_json::json!({"peer_id": peer_id.as_str()}).to_string(),
-        ),
+        Ok(peer_id) => {
+            let mut persisted = false;
+            let mut config_path = None;
+            if req.persist {
+                let Some(project_root) = project_root else {
+                    return (
+                        500,
+                        serde_json::json!({
+                            "error": "peer added for this run, but project root is unavailable for persistence"
+                        })
+                        .to_string(),
+                    );
+                };
+                match persist_manual_peer(project_root, &req, label_override) {
+                    Ok(path) => {
+                        persisted = true;
+                        config_path = Some(path.to_string_lossy().into_owned());
+                    }
+                    Err(e) => {
+                        return (
+                            500,
+                            serde_json::json!({
+                                "error": format!("peer added for this run, but persistence failed: {e}")
+                            })
+                            .to_string(),
+                        );
+                    }
+                }
+            }
+            (
+                200,
+                serde_json::json!({
+                    "peer_id": peer_id.as_str(),
+                    "persisted": persisted,
+                    "config_path": config_path,
+                })
+                .to_string(),
+            )
+        }
         Err(e) => (502, serde_json::json!({"error": e.to_string()}).to_string()),
     }
+}
+
+fn trimmed_nonempty(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn persist_manual_peer(
+    project_root: &Path,
+    req: &AddPeerRequest,
+    label: Option<String>,
+) -> Result<PathBuf, crate::error::CallerError> {
+    let mut project = crate::project::Project::from_root(project_root.to_path_buf())?;
+    let existing = project
+        .config
+        .peers
+        .iter_mut()
+        .find(|peer| peer.card_url == req.card_url);
+    match existing {
+        Some(peer) => {
+            if label.is_some() {
+                peer.label = label;
+            }
+            peer.bearer_token = req.bearer_token.clone();
+            peer.via_urls = req.via_urls.clone();
+            peer.pinned_fingerprints = req.pinned_fingerprints.clone();
+            peer.browser_tcp_via_url = req.browser_tcp_via_url.clone();
+        }
+        None => {
+            project.config.peers.push(crate::project::PeerConfig {
+                card_url: req.card_url.clone(),
+                label,
+                bearer_token: req.bearer_token.clone(),
+                via_urls: req.via_urls.clone(),
+                client_cert: None,
+                client_key: None,
+                pinned_fingerprints: req.pinned_fingerprints.clone(),
+                browser_tcp_via_url: req.browser_tcp_via_url.clone(),
+            });
+        }
+    }
+    project.save_config()?;
+    Ok(project.root.join("intendant.toml"))
 }
 
 /// Handle `POST /api/peers/pairing/invite`: issue a peer-scoped mTLS
@@ -19828,6 +19923,7 @@ async fn peers_pairing_request_access_poll(
                 if let Some(registry) = registry {
                     let registry_for_task = registry.clone();
                     let card_url_for_task = install.card_url.clone();
+                    let label_override = trimmed_nonempty(req.label.clone());
                     let pinned_fingerprints = outcome
                         .server_cert_fingerprint
                         .clone()
@@ -19839,13 +19935,14 @@ async fn peers_pairing_request_access_poll(
                     };
                     tokio::spawn(async move {
                         if let Err(e) = registry_for_task
-                            .add_peer_with_credentials_and_client_identity(
+                            .add_peer_with_credentials_and_client_identity_and_label(
                                 &card_url_for_task,
                                 Vec::new(),
                                 None,
                                 pinned_fingerprints,
                                 None,
                                 Some(client_identity),
+                                label_override,
                             )
                             .await
                         {
@@ -20072,6 +20169,7 @@ async fn peers_pairing_join(
             );
         }
     };
+    let label_override = trimmed_nonempty(req.label.clone()).or_else(|| invite.label.clone());
     let pinned_fingerprints = invite
         .server_cert_fingerprint
         .clone()
@@ -20101,13 +20199,14 @@ async fn peers_pairing_join(
     };
     tokio::spawn(async move {
         if let Err(e) = registry_for_task
-            .add_peer_with_credentials_and_client_identity(
+            .add_peer_with_credentials_and_client_identity_and_label(
                 &card_url_for_task,
                 Vec::new(),
                 None,
                 pinned_fingerprints,
                 None,
                 Some(client_identity),
+                label_override,
             )
             .await
         {
@@ -31135,6 +31234,37 @@ mod tests {
         assert_eq!(status, 400);
         assert!(response.contains("invalid peer invite encoding"));
         assert!(!response.contains("Config error"));
+    }
+
+    #[test]
+    fn test_persist_manual_peer_writes_outbound_peer_config() {
+        let root = tempfile::TempDir::new().unwrap();
+        let req = AddPeerRequest {
+            card_url: "https://peer.example:8765/.well-known/agent-card.json".into(),
+            label: Some("Ignored Raw Label".into()),
+            persist: true,
+            via_urls: vec!["wss://tailnet-peer.example:8765/ws".into()],
+            bearer_token: Some("legacy-token".into()),
+            pinned_fingerprints: vec![
+                "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899".into(),
+            ],
+            browser_tcp_via_url: Some("wss://browser-peer.example:8765/ws".into()),
+        };
+
+        let path = persist_manual_peer(root.path(), &req, Some("Peer Display".into())).unwrap();
+
+        assert_eq!(path, root.path().join("intendant.toml"));
+        let project = crate::project::Project::from_root(root.path().to_path_buf()).unwrap();
+        assert_eq!(project.config.peers.len(), 1);
+        let peer = &project.config.peers[0];
+        assert_eq!(peer.card_url, req.card_url);
+        assert_eq!(peer.label.as_deref(), Some("Peer Display"));
+        assert_eq!(peer.via_urls, req.via_urls);
+        assert_eq!(peer.bearer_token, req.bearer_token);
+        assert_eq!(peer.pinned_fingerprints, req.pinned_fingerprints);
+        assert_eq!(peer.browser_tcp_via_url, req.browser_tcp_via_url);
+        assert!(peer.client_cert.is_none());
+        assert!(peer.client_key.is_none());
     }
 
     #[test]

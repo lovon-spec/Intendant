@@ -894,6 +894,9 @@ impl Default for ServerAuthConfig {
 /// `bearer_token` is an advanced compatibility credential this daemon
 /// sends when connecting out to legacy peers that still require
 /// `[server.auth] bearer_token`.
+/// `via_urls` are optional connecting-side transport overrides. When
+/// non-empty, the registry uses these WebSocket URLs instead of the peer's
+/// advertised transports.
 /// `client_cert` / `client_key` are the normal explicit mTLS path for
 /// daemon-to-daemon peers when the peer issued this daemon a client identity.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -925,6 +928,10 @@ pub struct PeerConfig {
     /// ```
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bearer_token: Option<String>,
+    /// Connecting-side transport URL overrides. When non-empty, these
+    /// replace the transports advertised by the peer's Agent Card.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub via_urls: Vec<String>,
     /// Peer-issued mTLS client certificate PEM presented when connecting to
     /// this peer over HTTPS/WSS. Must be paired with `client_key`.
     ///
@@ -989,8 +996,8 @@ pub struct PeerConfig {
     /// [[peer]]
     /// card_url = "http://localhost:8766/.well-known/agent-card.json"
     /// # Primary reaches the peer via this (loopback on the primary VM):
-    /// # — via_urls are CLI / dashboard-add-time only; this config
-    /// #   key is for the browser-side URL specifically.
+    /// via_urls = ["ws://localhost:8766/ws"]
+    /// # Browser reaches the peer through this non-loopback endpoint:
     /// browser_tcp_via_url = "ws://192.168.1.42:8766/ws"
     /// ```
     ///
@@ -1263,6 +1270,7 @@ card_url = "http://127.0.0.1:9000/.well-known/agent-card.json"
                     card_url: "http://a.local/.well-known/agent-card.json".into(),
                     label: Some("A".into()),
                     bearer_token: None,
+                    via_urls: Vec::new(),
                     client_cert: None,
                     client_key: None,
                     pinned_fingerprints: Vec::new(),
@@ -1272,6 +1280,7 @@ card_url = "http://127.0.0.1:9000/.well-known/agent-card.json"
                     card_url: "http://b.local/.well-known/agent-card.json".into(),
                     label: None,
                     bearer_token: Some("secret-for-b".into()),
+                    via_urls: vec!["ws://b-tunnel.local:19000/ws".into()],
                     client_cert: Some("/secrets/b-client.crt".into()),
                     client_key: Some("/secrets/b-client.key".into()),
                     pinned_fingerprints: vec![
@@ -1291,6 +1300,7 @@ card_url = "http://127.0.0.1:9000/.well-known/agent-card.json"
         assert_eq!(parsed.peers[1].card_url, original.peers[1].card_url);
         assert!(parsed.peers[1].label.is_none());
         assert_eq!(parsed.peers[1].bearer_token, original.peers[1].bearer_token);
+        assert_eq!(parsed.peers[1].via_urls, original.peers[1].via_urls);
         assert_eq!(parsed.peers[1].client_cert, original.peers[1].client_cert);
         assert_eq!(parsed.peers[1].client_key, original.peers[1].client_key);
         assert_eq!(

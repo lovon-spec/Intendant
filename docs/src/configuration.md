@@ -393,18 +393,19 @@ is required.
 | `card_url` | string | (required) | URL of the peer's Agent Card (`.../.well-known/agent-card.json`) |
 | `label` | string | from card | Display label override in the dashboard's Daemons panel |
 | `bearer_token` | string | none | Legacy/advanced outbound token for peers that still require `[server.auth] bearer_token` |
+| `via_urls` | array | `[]` | Connecting-side WebSocket URL overrides; when set, these replace the transports advertised by the peer's Agent Card |
 | `client_cert` | string | installed access client cert when present | Peer-issued client certificate PEM for outbound mTLS; must be paired with `client_key` |
 | `client_key` | string | installed access client key when present | Private key PEM for `client_cert`; must be paired with `client_cert` |
 | `pinned_fingerprints` | array | `[]` | Operator-pinned SHA-256 cert fingerprints; when set, replaces the card's `auth.transport` claim |
 | `browser_tcp_via_url` | string | from primary | Explicit URL the browser uses to reach this peer's HTTP port for WebRTC ICE-TCP |
 
-Manual runtime URL additions from the dashboard live only in the in-memory
-registry. Pairing flows are different: `intendant peer join <invite>` and
-`intendant peer complete <request-id>` write these fields plus
-`pinned_fingerprints` to `intendant.toml`. For independent mTLS daemons,
-configure `client_cert` / `client_key` with a client identity issued by the
-peer's access CA. The installed local access client cert fallback is only
-sufficient when the peer trusts the same issuing CA.
+Manual dashboard additions live only in the in-memory registry unless the
+operator checks **Save to intendant.toml**. Pairing flows are durable by default:
+`intendant peer join <invite>` and `intendant peer complete <request-id>` write
+these fields plus `pinned_fingerprints` to `intendant.toml`. For independent
+mTLS daemons, configure `client_cert` / `client_key` with a client identity
+issued by the peer's access CA. The installed local access client cert fallback
+is only sufficient when the peer trusts the same issuing CA.
 
 ### `mcp_servers`
 
@@ -542,6 +543,7 @@ advertised_transport = "none"
 
 # [[peer]]
 # card_url = "https://peer.example.com/.well-known/agent-card.json"
+# via_urls = ["wss://peer.tailnet.example:8765/ws"]
 # client_cert = "/etc/intendant/peers/peer-client.crt"
 # client_key = "/etc/intendant/peers/peer-client.key"
 # bearer_token = "legacy-token-if-the-peer-requires-one"

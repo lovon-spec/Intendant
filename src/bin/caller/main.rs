@@ -489,7 +489,9 @@ fn build_and_hydrate_peer_registry(
     for cfg in peer_configs {
         let registry_for_task = registry.clone();
         let card_url = cfg.card_url.clone();
+        let label = cfg.label.clone();
         let bearer_token = cfg.bearer_token.clone();
+        let via_urls = cfg.via_urls.clone();
         let pinned_fingerprints = cfg.pinned_fingerprints.clone();
         let browser_tcp_via_url = cfg.browser_tcp_via_url.clone();
         let explicit_client_identity = match peer_client_identity_from_config(cfg) {
@@ -503,11 +505,9 @@ fn build_and_hydrate_peer_registry(
             }
         };
         tokio::spawn(async move {
-            // Vec::new() for via_urls (could be threaded through
-            // PeerConfig later if config-driven via overrides become
-            // a need; per-peer dashboard adds already use the via_urls
-            // field on AddPeerRequest). pinned_fingerprints, when
-            // non-empty, replaces the card's auth.transport with
+            // via_urls, when non-empty, overrides the peer's self-advertised
+            // transports. pinned_fingerprints, when non-empty, replaces the
+            // card's auth.transport with
             // PinnedMutualTls — operator distrusts the card's claim
             // and pins against fingerprints they got out-of-band.
             // browser_tcp_via_url, when set, overrides the dashboard's
@@ -516,13 +516,14 @@ fn build_and_hydrate_peer_registry(
             // same URL (primary-side localhost tunnel, split
             // browser/primary machines, etc.).
             if let Err(e) = registry_for_task
-                .add_peer_with_credentials_and_client_identity(
+                .add_peer_with_credentials_and_client_identity_and_label(
                     &card_url,
-                    Vec::new(),
+                    via_urls,
                     bearer_token,
                     pinned_fingerprints,
                     browser_tcp_via_url,
                     explicit_client_identity,
+                    label,
                 )
                 .await
             {
@@ -13646,6 +13647,7 @@ mod tests {
             card_url: "https://peer.example/.well-known/agent-card.json".to_string(),
             label: None,
             bearer_token: None,
+            via_urls: Vec::new(),
             client_cert: client_cert.map(str::to_string),
             client_key: client_key.map(str::to_string),
             pinned_fingerprints: Vec::new(),

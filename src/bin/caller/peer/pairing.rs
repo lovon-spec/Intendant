@@ -519,7 +519,7 @@ pub(crate) fn create_invite_from_cert_dir(
     let label = options.label.unwrap_or_else(access::resolve_host_label);
     let client_name = options
         .client_name
-        .unwrap_or_else(|| "paired Intendant peer".to_string());
+        .unwrap_or_else(|| "Unnamed Intendant daemon".to_string());
     let card_url = match options.card_url {
         Some(url) => normalize_card_url(&url)?,
         None => default_card_url(cert_dir, options.port)?,
@@ -654,6 +654,7 @@ pub(crate) fn join_peer_invite(
                 card_url: invite.card_url.clone(),
                 label,
                 bearer_token: None,
+                via_urls: Vec::new(),
                 client_cert: Some(cert_path.to_string_lossy().into_owned()),
                 client_key: Some(key_path.to_string_lossy().into_owned()),
                 pinned_fingerprints: pins,
@@ -949,6 +950,7 @@ mod tests {
                     card_url: "https://peer.example/.well-known/agent-card.json".into(),
                     label: Some("Old".into()),
                     bearer_token: Some("legacy".into()),
+                    via_urls: Vec::new(),
                     client_cert: None,
                     client_key: None,
                     pinned_fingerprints: Vec::new(),

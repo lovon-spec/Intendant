@@ -277,6 +277,33 @@ impl PeerRegistry {
         browser_tcp_via_url: Option<String>,
         explicit_client_identity: Option<ClientIdentityPaths>,
     ) -> Result<PeerId, PeerError> {
+        self.add_peer_with_credentials_and_client_identity_and_label(
+            card_url,
+            via_urls,
+            bearer_token,
+            override_pinned_fingerprints,
+            browser_tcp_via_url,
+            explicit_client_identity,
+            None,
+        )
+        .await
+    }
+
+    /// Same as [`PeerRegistry::add_peer_with_credentials_and_client_identity`],
+    /// with an optional operator display-label override.
+    pub async fn add_peer_with_credentials_and_client_identity_and_label(
+        &self,
+        card_url: &str,
+        via_urls: Vec<String>,
+        bearer_token: Option<String>,
+        override_pinned_fingerprints: Vec<String>,
+        browser_tcp_via_url: Option<String>,
+        explicit_client_identity: Option<ClientIdentityPaths>,
+        label_override: Option<String>,
+    ) -> Result<PeerId, PeerError> {
+        let label_override = label_override
+            .map(|label| label.trim().to_string())
+            .filter(|label| !label.is_empty());
         let card_client_identity = if tls_client::url_uses_tls(card_url) {
             explicit_client_identity
                 .clone()
@@ -311,12 +338,16 @@ impl PeerRegistry {
                 server_cert_fingerprints: override_pinned_fingerprints,
             };
         }
+        if let Some(label) = &label_override {
+            card.label = label.clone();
+        }
         self.add_peer_with_card_and_auth_and_client_identity(
             card,
             via_urls,
             bearer_token,
             browser_tcp_via_url,
             explicit_client_identity,
+            label_override,
         )
         .await
     }
@@ -360,6 +391,7 @@ impl PeerRegistry {
             bearer_token,
             browser_tcp_via_url,
             None,
+            None,
         )
         .await
     }
@@ -371,6 +403,7 @@ impl PeerRegistry {
         bearer_token: Option<String>,
         browser_tcp_via_url: Option<String>,
         explicit_client_identity: Option<ClientIdentityPaths>,
+        label_override: Option<String>,
     ) -> Result<PeerId, PeerError> {
         if self.inner.peers.read().unwrap().contains_key(&card.id) {
             return Err(PeerError::Rejected {
@@ -418,6 +451,7 @@ impl PeerRegistry {
             card,
             via_urls,
             browser_tcp_via_url,
+            label_override,
             log_sink,
             move |events_tx| {
                 // Build one concrete transport per supported spec (each

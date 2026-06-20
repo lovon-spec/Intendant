@@ -490,11 +490,16 @@ pub struct PeerSnapshot {
 /// back and sends it as the `advertise_tcp_via_url` hint in the
 /// federated WebRTC offer. `None` falls back to `ws_url` — slice
 /// 3a.2 behavior.
+///
+/// `label_override` is operator-supplied display text for this peer. The actor
+/// reapplies it to every refreshed Agent Card so reconnects cannot revert the
+/// row to the peer's self-advertised label.
 pub fn spawn_peer<F>(
     id: PeerId,
     initial_card: AgentCard,
     via_urls: Vec<String>,
     browser_tcp_via_url: Option<String>,
+    label_override: Option<String>,
     log_sink: mpsc::Sender<TaggedPeerEvent>,
     build_transport: F,
 ) -> PeerHandle
@@ -523,6 +528,7 @@ where
         card_tx,
         seq: 0,
         via_urls,
+        label_override,
     };
 
     tokio::spawn(actor.run());
@@ -610,6 +616,7 @@ mod tests {
             initial_card.id.clone(),
             initial_card,
             Vec::new(),
+            None,
             None,
             log_tx,
             move |events_tx| Box::new(IntendantWsTransport::new(url_for_closure, events_tx)),
@@ -706,6 +713,7 @@ mod tests {
             initial_card,
             Vec::new(),
             Some(browser_url.clone()),
+            None,
             log_tx,
             move |events_tx| Box::new(IntendantWsTransport::new(url_for_closure, events_tx)),
         );
@@ -762,6 +770,7 @@ mod tests {
             initial_card.id.clone(),
             initial_card,
             Vec::new(),
+            None,
             None,
             log_tx,
             move |events_tx| Box::new(IntendantWsTransport::new(url_for_closure, events_tx)),
