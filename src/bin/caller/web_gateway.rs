@@ -96,6 +96,8 @@ static INTENDANT_SESSION_LIST_CACHE: OnceLock<
 
 const EXTERNAL_SESSION_SCAN_LIMIT: usize = 2_000;
 const EXTERNAL_SESSION_READ_LIMIT: u64 = 512 * 1024;
+const CODEX_SESSION_INDEX_TAIL_READ_LIMIT: u64 = 2 * 1024 * 1024;
+const SESSION_LIST_STREAM_QUICK_LIMIT: usize = 600;
 const CODEX_SESSION_LIST_PREFIX_READ_LIMIT: u64 = 8 * 1024 * 1024;
 const CODEX_SESSION_LIST_PREFIX_LINE_LIMIT: usize = 64;
 // Exact fork baselines are a synchronous `/api/sessions` refinement. The scanner
@@ -6614,6 +6616,64 @@ fn list_codex_sessions(home: &Path) -> Vec<serde_json::Value> {
     list_codex_sessions_with_limit(home, EXTERNAL_SESSION_SCAN_LIMIT)
 }
 
+fn read_codex_session_index_for_list(index_path: &Path) -> Option<String> {
+    read_text_tail(index_path, CODEX_SESSION_INDEX_TAIL_READ_LIMIT)
+}
+
+fn list_codex_index_skeleton_sessions_with_limit(
+    home: &Path,
+    limit: usize,
+) -> Vec<serde_json::Value> {
+    let codex = codex_dir(home);
+    let index_path = codex.join("session_index.jsonl");
+    let Some(contents) = read_codex_session_index_for_list(&index_path) else {
+        return Vec::new();
+    };
+    let mut rows: HashMap<String, serde_json::Value> = HashMap::new();
+    for line in contents.lines() {
+        let Ok(obj) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let Some(id) = value_str(&obj, "id") else {
+            continue;
+        };
+        let updated_at = value_str(&obj, "updated_at");
+        let name = codex_thread_display_name(value_str(&obj, "thread_name"));
+        rows.insert(
+            id.clone(),
+            external_session_json(
+                "codex",
+                "Codex",
+                id.clone(),
+                id,
+                None,
+                updated_at,
+                name,
+                None,
+                "Codex",
+                None,
+                0,
+                None,
+                None,
+                Some(index_path.to_string_lossy().to_string()),
+                file_size(&index_path),
+            ),
+        );
+    }
+    let deleted_external_sessions = read_deleted_external_sessions(home);
+    let mut rows = rows.into_values().collect::<Vec<_>>();
+    if !deleted_external_sessions.is_empty() {
+        rows.retain(|session| {
+            !session_matches_deleted_external(session, &deleted_external_sessions)
+        });
+    }
+    crate::session_names::apply_session_name_overlays(home, &mut rows);
+    crate::session_config::apply_overlays_to_sessions(home, &mut rows);
+    sort_sessions_newest_first(&mut rows);
+    rows.truncate(limit);
+    rows
+}
+
 fn list_codex_sessions_with_limit(home: &Path, scan_limit: usize) -> Vec<serde_json::Value> {
     let codex = codex_dir(home);
     let mut rows: HashMap<String, serde_json::Value> = HashMap::new();
@@ -6622,7 +6682,7 @@ fn list_codex_sessions_with_limit(home: &Path, scan_limit: usize) -> Vec<serde_j
     let mut usage_events_by_id: HashMap<String, Vec<CodexUsageEvent>> = HashMap::new();
     let mut path_by_id: HashMap<String, PathBuf> = HashMap::new();
     let index_path = codex.join("session_index.jsonl");
-    if let Ok(contents) = std::fs::read_to_string(&index_path) {
+    if let Some(contents) = read_codex_session_index_for_list(&index_path) {
         for line in contents.lines() {
             let Ok(obj) = serde_json::from_str::<serde_json::Value>(&line) else {
                 continue;
@@ -9588,6 +9648,133 @@ fn list_sessions_from_home_with_limit(home_path: &Path, limit: Option<usize>) ->
     list_sessions_from_home_impl(home_path, true, external_scan_limit, limit)
 }
 
+fn intendant_session_skeleton_from_dir(dir: &Path, session_id: &str) -> serde_json::Value {
+    let meta_path = dir.join("session_meta.json");
+    let mut name: Option<String> = None;
+    let mut task: Option<String> = None;
+    let mut created_at: Option<String> = None;
+    let mut project_root: Option<String> = None;
+    let mut status = "in_progress".to_string();
+    let mut role: Option<String> = None;
+    if let Ok(meta_str) = std::fs::read_to_string(&meta_path) {
+        if let Ok(meta) = serde_json::from_str::<serde_json::Value>(&meta_str) {
+            task = value_str(&meta, "task");
+            created_at = value_str(&meta, "created_at");
+            project_root = value_str(&meta, "project_root");
+            name = value_str(&meta, "name").map(|s| compact_text(&s, 180));
+            if let Some(value) = value_str(&meta, "status") {
+                status = value;
+            }
+            role = value_str(&meta, "role");
+        }
+    }
+    if status != "completed" && dir.join("summary.json").exists() {
+        status = "completed".to_string();
+    }
+    if created_at.is_none() {
+        created_at = mtime_secs_to_string(file_mtime_secs(dir));
+    }
+    let created_at = created_at.unwrap_or_default();
+    let updated_at = file_mtime_string(dir).unwrap_or_else(|| created_at.clone());
+    serde_json::json!({
+        "source": "intendant",
+        "source_label": "Intendant",
+        "session_id": session_id,
+        "resume_id": session_id,
+        "created_at": created_at,
+        "updated_at": updated_at,
+        "name": name,
+        "task": task,
+        "provider": null,
+        "model": null,
+        "turns": 0,
+        "status": status,
+        "total_tokens": 0,
+        "prompt_tokens": 0,
+        "completion_tokens": 0,
+        "cached_tokens": 0,
+        "cache_creation_tokens": 0,
+        "estimated_cost": 0.0,
+        "pricing_known": false,
+        "role": role,
+        "recordings": 0,
+        "recording_bytes": 0,
+        "annotations": 0,
+        "clips": 0,
+        "frames_bytes": 0,
+        "turns_bytes": 0,
+        "logs_bytes": 0,
+        "total_bytes": 0,
+        "cwd": project_root.clone(),
+        "project_root": project_root,
+        "path": dir.to_string_lossy().to_string(),
+        "can_delete": true,
+        "can_resume": true,
+        "partial": true,
+    })
+}
+
+fn list_intendant_skeleton_sessions_with_limit(
+    home_path: &Path,
+    limit: usize,
+) -> Vec<serde_json::Value> {
+    let logs_dir = home_path.join(".intendant").join("logs");
+    let Ok(entries) = std::fs::read_dir(&logs_dir) else {
+        return Vec::new();
+    };
+    let mut dirs = entries
+        .flatten()
+        .filter_map(|entry| {
+            let dir = entry.path();
+            if !dir.is_dir() {
+                return None;
+            }
+            let mtime = file_mtime_secs(&dir);
+            Some((dir, mtime))
+        })
+        .collect::<Vec<_>>();
+    dirs.sort_by(|a, b| b.1.cmp(&a.1));
+    dirs.truncate(limit);
+    dirs.into_iter()
+        .filter_map(|(dir, _)| {
+            let session_id = dir.file_name()?.to_string_lossy().to_string();
+            Some(intendant_session_skeleton_from_dir(&dir, &session_id))
+        })
+        .collect()
+}
+
+fn merge_quick_session_rows_with_wrapper_index(
+    home: &Path,
+    rows: &mut Vec<serde_json::Value>,
+) {
+    apply_external_wrapper_index_to_sessions(home, rows);
+    let wrapped_intendant_ids = rows
+        .iter()
+        .filter(|session| {
+            value_str(session, "source")
+                .map(|source| crate::session_names::normalize_source(&source))
+                .as_deref()
+                != Some("intendant")
+        })
+        .filter_map(|session| value_str(session, "intendant_session_id"))
+        .collect::<HashSet<_>>();
+    if wrapped_intendant_ids.is_empty() {
+        return;
+    }
+    rows.retain(|session| {
+        if value_str(session, "source")
+            .map(|source| crate::session_names::normalize_source(&source))
+            .as_deref()
+            != Some("intendant")
+        {
+            return true;
+        }
+        value_str(session, "session_id")
+            .map(|id| !wrapped_intendant_ids.contains(&id))
+            .unwrap_or(true)
+    });
+}
+
 fn list_sessions_for_deep_search_from_home(home_path: &Path) -> String {
     list_sessions_from_home_impl(home_path, false, usize::MAX, None)
 }
@@ -9705,6 +9892,96 @@ fn list_sessions_from_home_impl(
     }
 
     serde_json::to_string(&sessions).unwrap_or_else(|_| "[]".to_string())
+}
+
+fn send_session_stream_event(
+    tx: &tokio::sync::mpsc::Sender<String>,
+    event: serde_json::Value,
+) -> bool {
+    let mut line = event.to_string();
+    line.push('\n');
+    tx.blocking_send(line).is_ok()
+}
+
+fn send_session_stream_rows(
+    tx: &tokio::sync::mpsc::Sender<String>,
+    rows: Vec<serde_json::Value>,
+    partial: bool,
+) -> bool {
+    for mut row in rows {
+        if let Some(obj) = row.as_object_mut() {
+            obj.insert("partial".to_string(), serde_json::Value::Bool(partial));
+        }
+        if !send_session_stream_event(
+            tx,
+            serde_json::json!({
+                "type": "session",
+                "partial": partial,
+                "session": row,
+            }),
+        ) {
+            return false;
+        }
+    }
+    true
+}
+
+fn stream_sessions_from_request(request_line: &str, tx: tokio::sync::mpsc::Sender<String>) {
+    let requested_limit = session_list_limit_from_request(request_line);
+    let quick_limit = requested_limit
+        .unwrap_or(SESSION_LIST_LIMIT)
+        .min(SESSION_LIST_STREAM_QUICK_LIMIT);
+    let home = crate::platform::home_dir();
+    if !send_session_stream_event(
+        &tx,
+        serde_json::json!({
+            "type": "start",
+            "limit": requested_limit,
+            "quick_limit": quick_limit,
+        }),
+    ) {
+        return;
+    }
+
+    let mut quick_rows = Vec::new();
+    quick_rows.extend(list_intendant_skeleton_sessions_with_limit(&home, quick_limit));
+    quick_rows.extend(list_codex_index_skeleton_sessions_with_limit(
+        &home,
+        quick_limit,
+    ));
+    merge_quick_session_rows_with_wrapper_index(&home, &mut quick_rows);
+    sort_sessions_newest_first(&mut quick_rows);
+    truncate_sessions_preserving_sources_to(&mut quick_rows, quick_limit);
+    if !send_session_stream_rows(&tx, quick_rows, true) {
+        return;
+    }
+    if !send_session_stream_event(
+        &tx,
+        serde_json::json!({
+            "type": "phase",
+            "phase": "hydrating",
+        }),
+    ) {
+        return;
+    }
+
+    let body = requested_limit
+        .map(cached_list_sessions_with_limit)
+        .unwrap_or_else(cached_list_sessions);
+    let rows = serde_json::from_str::<Vec<serde_json::Value>>(&body).unwrap_or_default();
+    let _ = send_session_stream_event(
+        &tx,
+        serde_json::json!({
+            "type": "replace",
+            "sessions": rows,
+        }),
+    );
+    let _ = send_session_stream_event(
+        &tx,
+        serde_json::json!({
+            "type": "done",
+        }),
+    );
 }
 
 /// Handle `/api/session/current/changes[/{path}]` requests.
@@ -19194,6 +19471,27 @@ pub fn spawn_web_gateway(
                         let response = json_response("200 OK", body);
                         use tokio::io::AsyncWriteExt;
                         let _ = stream.write_all(response.as_bytes()).await;
+                    } else if request_line.contains("/api/sessions/stream") {
+                        let request_line_for_stream = request_line.to_string();
+                        let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(64);
+                        let stream_task = tokio::task::spawn_blocking(move || {
+                            stream_sessions_from_request(&request_line_for_stream, tx);
+                        });
+                        let response = "HTTP/1.1 200 OK\r\n\
+                             Content-Type: application/x-ndjson\r\n\
+                             Cache-Control: no-cache\r\n\
+                             Access-Control-Allow-Origin: *\r\n\
+                             Connection: close\r\n\
+                             \r\n";
+                        use tokio::io::AsyncWriteExt;
+                        if stream.write_all(response.as_bytes()).await.is_ok() {
+                            while let Some(line) = rx.recv().await {
+                                if stream.write_all(line.as_bytes()).await.is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                        let _ = stream_task.await;
                     } else if request_line.contains("/api/sessions/search") {
                         let body = if SESSION_SEARCH_IN_FLIGHT.swap(true, Ordering::SeqCst) {
                             serde_json::json!({
@@ -24486,6 +24784,7 @@ mod tests {
 
     #[test]
     fn list_codex_sessions_exposes_thread_name_separately_from_task() {
+        let _codex_home = EnvVarGuard::unset("CODEX_HOME");
         let home = tempfile::tempdir().unwrap();
         let codex_dir = home.path().join(".codex");
         let sessions_dir = codex_dir
@@ -24547,6 +24846,108 @@ mod tests {
         assert_eq!(
             session.get("task").and_then(|v| v.as_str()),
             Some("Fix activity replay")
+        );
+    }
+
+    #[test]
+    fn codex_index_skeleton_reads_bounded_tail() {
+        let _codex_home = EnvVarGuard::unset("CODEX_HOME");
+        let home = tempfile::tempdir().unwrap();
+        let codex_dir = home.path().join(".codex");
+        std::fs::create_dir_all(&codex_dir).unwrap();
+        let old_id = "019ef734-old-index-row";
+        let recent_id = "019ef734-recent-index-row";
+        let old_line = serde_json::json!({
+            "id": old_id,
+            "updated_at": "2026-06-24T01:00:00Z",
+            "thread_name": "Old index row"
+        })
+        .to_string();
+        let recent_line = serde_json::json!({
+            "id": recent_id,
+            "updated_at": "2026-06-24T02:00:00Z",
+            "thread_name": "Recent index row"
+        })
+        .to_string();
+        std::fs::write(
+            codex_dir.join("session_index.jsonl"),
+            format!(
+                "{old_line}\n{}\n{recent_line}\n",
+                "x".repeat(CODEX_SESSION_INDEX_TAIL_READ_LIMIT as usize + 16)
+            ),
+        )
+        .unwrap();
+
+        let rows = list_codex_index_skeleton_sessions_with_limit(home.path(), 10);
+        let ids = rows
+            .iter()
+            .filter_map(|row| value_str(row, "session_id"))
+            .collect::<Vec<_>>();
+        assert!(ids.contains(&recent_id.to_string()));
+        assert!(!ids.contains(&old_id.to_string()));
+    }
+
+    #[test]
+    fn quick_session_rows_use_external_wrapper_shape() {
+        let _codex_home = EnvVarGuard::unset("CODEX_HOME");
+        let home = tempfile::tempdir().unwrap();
+        let codex_dir = home.path().join(".codex");
+        std::fs::create_dir_all(&codex_dir).unwrap();
+        let backend_id = "019ef734-be3f-7882-b1f5-a8ed1dfe12be";
+        let wrapper_id = "wrapper-session-for-codex";
+        std::fs::write(
+            codex_dir.join("session_index.jsonl"),
+            serde_json::json!({
+                "id": backend_id,
+                "updated_at": "2026-06-24T02:00:00Z",
+                "thread_name": "Wrapped Codex row"
+            })
+            .to_string()
+                + "\n",
+        )
+        .unwrap();
+        let wrapper_dir = home
+            .path()
+            .join(".intendant")
+            .join("logs")
+            .join(wrapper_id);
+        std::fs::create_dir_all(&wrapper_dir).unwrap();
+        std::fs::write(
+            wrapper_dir.join("session_meta.json"),
+            serde_json::json!({
+                "session_id": wrapper_id,
+                "created_at": "2026-06-24T01:59:00",
+                "task": "Run through Intendant"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        crate::external_wrapper_index::upsert(
+            home.path(),
+            "codex",
+            backend_id,
+            wrapper_id,
+            &wrapper_dir,
+            None,
+        )
+        .unwrap();
+
+        let mut rows = list_intendant_skeleton_sessions_with_limit(home.path(), 10);
+        rows.extend(list_codex_index_skeleton_sessions_with_limit(
+            home.path(),
+            10,
+        ));
+        merge_quick_session_rows_with_wrapper_index(home.path(), &mut rows);
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(value_str(&rows[0], "source").as_deref(), Some("codex"));
+        assert_eq!(
+            value_str(&rows[0], "intendant_session_id").as_deref(),
+            Some(wrapper_id)
+        );
+        assert_eq!(
+            value_str(&rows[0], "session_id").as_deref(),
+            Some(backend_id)
         );
     }
 

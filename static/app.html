@@ -5498,6 +5498,26 @@ body.context-focus-active {
   right: 12px;
   top: 34px;
 }
+.sessions-load-more {
+  display: flex;
+  justify-content: center;
+  padding: 8px 0 2px;
+}
+.sessions-load-more button {
+  min-height: 28px;
+  border: 1px solid var(--surface1);
+  background: var(--surface0);
+  color: var(--subtext1);
+  border-radius: 4px;
+  padding: 4px 12px;
+  font-family: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+.sessions-load-more button:hover {
+  border-color: var(--blue);
+  color: var(--blue);
+}
 .sc-delete-btn,
 .sc-rename-btn {
   font-size: 11px;
@@ -11057,7 +11077,9 @@ const peerDisplayConnections = new Map(); // sessionKey -> PeerDisplayConnection
 // the lower dashboard sections finish registering their helpers.
 const sessionsListCache = new Map();
 const sessionsListInflight = new Map();
+const SESSION_LIST_INITIAL_LIMIT = 200;
 const SESSION_LIST_RECENT_LIMIT = 600;
+let sessionsRecentLimit = SESSION_LIST_INITIAL_LIMIT;
 
 function sessionListRequestLimit(options = {}) {
   if (options.limit === 'all' || options.limit === 'full' || options.full === true) return 'all';
@@ -11074,6 +11096,12 @@ function sessionListUrl(baseUrl, limit) {
   const prefix = baseUrl ? baseUrl.replace(/\/$/, '') : '';
   const value = limit === 'all' ? 'all' : String(limit);
   return `${prefix}/api/sessions?limit=${encodeURIComponent(value)}`;
+}
+
+function sessionListStreamUrl(baseUrl, limit) {
+  const prefix = baseUrl ? baseUrl.replace(/\/$/, '') : '';
+  const value = limit === 'all' ? 'all' : String(limit);
+  return `${prefix}/api/sessions/stream?limit=${encodeURIComponent(value)}`;
 }
 
 let worktreesLoaded = false;
@@ -41129,6 +41157,79 @@ function fetchSessionsForHost(hostId, options = {}) {
   return promise;
 }
 
+function sessionListRowKey(session) {
+  const source = normalizeAgentId(session?.source || session?.backend_source || session?.backendSource || '') || 'intendant';
+  const id = String(session?.session_id || session?.resume_id || session?.backend_session_id || session?.backendSessionId || '').trim();
+  return id ? `${source}\u001f${id}` : '';
+}
+
+function mergeSessionRows(existing, incoming) {
+  const rows = Array.isArray(existing) ? existing : [];
+  const byKey = new Map();
+  for (const row of rows) {
+    const key = sessionListRowKey(row);
+    if (key) byKey.set(key, row);
+  }
+  for (const row of incoming || []) {
+    const key = sessionListRowKey(row);
+    if (!key) continue;
+    byKey.set(key, {
+      ...(byKey.get(key) || {}),
+      ...row,
+    });
+  }
+  return Array.from(byKey.values());
+}
+
+async function streamSessionsForHost(hostId, options = {}, onEvent = {}) {
+  hostId = hostId || selfPeerId;
+  let baseUrl = '';
+  if (hostId !== selfPeerId) {
+    const d = daemons.find(x => x.host_id === hostId);
+    if (!d) throw new Error('Unknown daemon host');
+    baseUrl = d.url.replace(/\/$/, '');
+  }
+  const limit = sessionListRequestLimit(options);
+  const url = sessionListStreamUrl(baseUrl, limit);
+  const request = hostId === selfPeerId
+    ? authedFetch(url, { signal: options.signal })
+    : fetch(url, { signal: options.signal });
+  const response = await request;
+  if (!response.ok || !response.body) {
+    throw new Error(`/api/sessions/stream returned ${response.status}`);
+  }
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let finalSessions = null;
+  const handleLine = line => {
+    const trimmed = line.trim();
+    if (!trimmed) return;
+    const event = JSON.parse(trimmed);
+    if (event.type === 'session' && event.session) {
+      onEvent.sessions?.([event.session], !!event.partial);
+    } else if (event.type === 'replace' && Array.isArray(event.sessions)) {
+      finalSessions = event.sessions;
+      onEvent.replace?.(event.sessions);
+    } else if (event.type === 'phase') {
+      onEvent.phase?.(event.phase || '');
+    } else if (event.type === 'done') {
+      onEvent.done?.();
+    }
+  };
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split('\n');
+    buffer = lines.pop() || '';
+    for (const line of lines) handleLine(line);
+  }
+  buffer += decoder.decode();
+  if (buffer.trim()) handleLine(buffer);
+  return finalSessions;
+}
+
 function currentStatsHostKey() {
   return activeStatsHost || selfPeerId;
 }
@@ -43918,6 +44019,7 @@ let worktreesActivityClearTimeout = null;
 const pendingWorktreeRemovals = new Set();
 const SESSION_CARD_RENDER_LIMIT = 300;
 let _sessionsLoadToken = 0;
+let _sessionsStreamAbort = null;
 let _sessionDeepSearchToken = 0;
 let _sessionDeepSearchAbort = null;
 let _sessionDeepSearch = {
@@ -43955,7 +44057,10 @@ function applyLoadedSessions(sessions, aggEl) {
 function loadSessions(options = {}) {
   const listEl = document.getElementById('sessions-list');
   const aggEl = document.getElementById('sessions-aggregate');
-  const cached = sessionsListCache.get(sessionListCacheKey(selfPeerId));
+  const requestedLimit = options.limit ?? sessionsRecentLimit;
+  const cacheOptions = { limit: requestedLimit };
+  const cached = sessionsListCache.get(sessionListCacheKey(selfPeerId, cacheOptions));
+  const cacheKey = sessionListCacheKey(selfPeerId, cacheOptions);
   if (cached) {
     applyLoadedSessions(cached, aggEl);
   } else if (listEl) {
@@ -43963,19 +44068,84 @@ function loadSessions(options = {}) {
   }
 
   const token = ++_sessionsLoadToken;
-  return fetchSessionsForHost(selfPeerId, {
+  if (_sessionsStreamAbort) _sessionsStreamAbort.abort();
+  const controller = new AbortController();
+  _sessionsStreamAbort = controller;
+  let pendingRows = [];
+  let flushTimer = null;
+  const scheduleFlush = () => {
+    if (flushTimer) return;
+    flushTimer = setTimeout(() => {
+      flushTimer = null;
+      if (token !== _sessionsLoadToken || pendingRows.length === 0) return;
+      const next = mergeSessionRows(_cachedSessions, pendingRows);
+      pendingRows = [];
+      applyLoadedSessions(next, aggEl);
+    }, 50);
+  };
+  const clearPendingFlush = () => {
+    if (flushTimer) {
+      clearTimeout(flushTimer);
+      flushTimer = null;
+    }
+    pendingRows = [];
+  };
+
+  const loadJsonFallback = () => fetchSessionsForHost(selfPeerId, {
     force: options.force !== false,
-    limit: options.limit ?? SESSION_LIST_RECENT_LIMIT,
+    limit: requestedLimit,
   })
     .then(sessions => {
       if (token !== _sessionsLoadToken) return;
+      if (requestedLimit !== 'all') {
+        sessionsRecentLimit = Math.max(sessionsRecentLimit, sessionListRequestLimit({ limit: requestedLimit }));
+      }
       applyLoadedSessions(sessions, aggEl);
       return sessions;
-    })
-    .catch(() => {
-      if (!cached && listEl) {
-        listEl.innerHTML = '<div class="empty-state">Failed to load sessions</div>';
+    });
+
+  return streamSessionsForHost(selfPeerId, {
+    limit: requestedLimit,
+    signal: controller.signal,
+  }, {
+    sessions(rows) {
+      if (token !== _sessionsLoadToken) return;
+      pendingRows.push(...rows);
+      if (pendingRows.length >= 50) {
+        if (flushTimer) {
+          clearTimeout(flushTimer);
+          flushTimer = null;
+        }
+        const rowsToFlush = pendingRows;
+        pendingRows = [];
+        applyLoadedSessions(mergeSessionRows(_cachedSessions, rowsToFlush), aggEl);
+      } else {
+        scheduleFlush();
       }
+    },
+    replace(sessions) {
+      if (token !== _sessionsLoadToken) return;
+      clearPendingFlush();
+      sessionsListCache.set(cacheKey, sessions);
+      if (requestedLimit !== 'all') {
+        sessionsRecentLimit = Math.max(sessionsRecentLimit, sessionListRequestLimit({ limit: requestedLimit }));
+      }
+      applyLoadedSessions(sessions, aggEl);
+    },
+  })
+    .then(sessions => {
+      if (_sessionsStreamAbort === controller) _sessionsStreamAbort = null;
+      return sessions || _cachedSessions;
+    })
+    .catch(err => {
+      if (_sessionsStreamAbort === controller) _sessionsStreamAbort = null;
+      if (err?.name === 'AbortError') return;
+      clearPendingFlush();
+      return loadJsonFallback().catch(() => {
+        if (!cached && listEl) {
+          listEl.innerHTML = '<div class="empty-state">Failed to load sessions</div>';
+        }
+      });
     });
 }
 
@@ -44281,6 +44451,8 @@ function renderSessionsViews() {
       sortValue: document.getElementById('sort-sessions')?.value || 'updated-desc',
       deepSearchOnly: false,
       hideSubagents: !sessionsShowSubagents(),
+      canLoadMore: sessionsRecentLimit < SESSION_LIST_RECENT_LIMIT,
+      nextLimit: SESSION_LIST_RECENT_LIMIT,
     });
   } else if (activeSessionsSubtab === 'deep') {
     renderSessionsList(_cachedSessions, document.getElementById('sessions-deep-list'), {
@@ -45621,6 +45793,20 @@ function renderSessionsList(sessions, el, options = {}) {
       limitNotice.textContent = `Showing ${renderedCount.toLocaleString()} of ${matchedCount.toLocaleString()} matching sessions. Refine filters to narrow results.`;
       el.appendChild(limitNotice);
     }
+  }
+
+  if (!deepSearchOnly && options.canLoadMore && sessions.length >= SESSION_LIST_INITIAL_LIMIT) {
+    const row = document.createElement('div');
+    row.className = 'sessions-load-more';
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.textContent = `Load ${Number(options.nextLimit || SESSION_LIST_RECENT_LIMIT).toLocaleString()} recent sessions`;
+    btn.addEventListener('click', () => {
+      sessionsRecentLimit = Number(options.nextLimit || SESSION_LIST_RECENT_LIMIT);
+      loadSessions({ force: true, limit: sessionsRecentLimit });
+    });
+    row.appendChild(btn);
+    el.appendChild(row);
   }
 }
 
