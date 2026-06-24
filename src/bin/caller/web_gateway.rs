@@ -11273,6 +11273,365 @@ fn json_error(status: &str, message: impl AsRef<str>) -> String {
     )
 }
 
+fn html_response(status: &str, body: String) -> String {
+    format!(
+        "HTTP/1.1 {}\r\n\
+         Content-Type: text/html; charset=utf-8\r\n\
+         Content-Length: {}\r\n\
+         Cache-Control: no-cache\r\n\
+         Access-Control-Allow-Origin: *\r\n\
+         Connection: close\r\n\
+         \r\n\
+         {}",
+        status,
+        body.len(),
+        body
+    )
+}
+
+async fn connect_dashboard_offer_response(
+    dashboard_control: &Arc<crate::dashboard_control::DashboardControlRegistry>,
+    body_text: &str,
+) -> String {
+    let body = match serde_json::from_str::<serde_json::Value>(body_text) {
+        Ok(body) => body,
+        Err(e) => return json_error("400 Bad Request", format!("invalid JSON: {e}")),
+    };
+    let sdp = body
+        .get("sdp")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if sdp.trim().is_empty() {
+        return json_error("400 Bad Request", "missing sdp");
+    }
+    match dashboard_control.answer_offer(sdp.to_string()).await {
+        Ok(answer) => json_ok(serde_json::json!({
+            "ok": true,
+            "signaling": "connect-bootstrap-local",
+            "session_id": answer.session_id,
+            "sdp": answer.sdp,
+            "binding": answer.binding,
+        })),
+        Err(e) => json_error("500 Internal Server Error", e),
+    }
+}
+
+async fn connect_dashboard_ice_response(
+    dashboard_control: &Arc<crate::dashboard_control::DashboardControlRegistry>,
+    body_text: &str,
+) -> String {
+    let body = match serde_json::from_str::<serde_json::Value>(body_text) {
+        Ok(body) => body,
+        Err(e) => return json_error("400 Bad Request", format!("invalid JSON: {e}")),
+    };
+    let session_id = body
+        .get("session_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+    if session_id.is_empty() {
+        return json_error("400 Bad Request", "missing session_id");
+    }
+    let candidate = body
+        .get("candidate")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+    match dashboard_control.add_ice_candidate(session_id, &candidate).await {
+        Ok(true) => json_ok(serde_json::json!({ "ok": true })),
+        Ok(false) => json_error("404 Not Found", "dashboard control session not found"),
+        Err(e) => json_error("500 Internal Server Error", e),
+    }
+}
+
+async fn connect_dashboard_close_response(
+    dashboard_control: &Arc<crate::dashboard_control::DashboardControlRegistry>,
+    body_text: &str,
+) -> String {
+    let body = match serde_json::from_str::<serde_json::Value>(body_text) {
+        Ok(body) => body,
+        Err(e) => return json_error("400 Bad Request", format!("invalid JSON: {e}")),
+    };
+    let session_id = body
+        .get("session_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+    if session_id.is_empty() {
+        return json_error("400 Bad Request", "missing session_id");
+    }
+    dashboard_control.close(session_id).await;
+    json_ok(serde_json::json!({ "ok": true }))
+}
+
+fn connect_bootstrap_html() -> String {
+    r#"<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Intendant Connect Bootstrap</title>
+  <style>
+    :root { color-scheme: dark; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; background: #11111b; color: #cdd6f4; }
+    body { margin: 0; min-height: 100vh; display: grid; place-items: center; }
+    main { width: min(760px, calc(100vw - 32px)); }
+    h1 { font-size: 22px; margin: 0 0 16px; }
+    pre { white-space: pre-wrap; overflow-wrap: anywhere; padding: 16px; background: #181825; border: 1px solid #45475a; border-radius: 8px; }
+    .ok { color: #a6e3a1; }
+    .err { color: #f38ba8; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Intendant Connect Bootstrap</h1>
+    <pre id="status">starting</pre>
+  </main>
+  <script>
+(() => {
+  const statusEl = document.getElementById('status');
+  function paint(message, kind = '') {
+    statusEl.textContent = typeof message === 'string' ? message : JSON.stringify(message, null, 2);
+    statusEl.className = kind;
+  }
+
+  function abortError(message = 'dashboard control request aborted') {
+    try { return new DOMException(message, 'AbortError'); } catch {
+      const err = new Error(message);
+      err.name = 'AbortError';
+      return err;
+    }
+  }
+
+  function bytesToBase64Url(bytes) {
+    let binary = '';
+    for (const b of bytes) binary += String.fromCharCode(b);
+    return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
+  }
+
+  function base64UrlToBytes(value) {
+    const padded = String(value || '').replace(/-/g, '+').replace(/_/g, '/').padEnd(Math.ceil(String(value || '').length / 4) * 4, '=');
+    const binary = atob(padded);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    return bytes;
+  }
+
+  async function sha256B64u(text) {
+    const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(String(text)));
+    return bytesToBase64Url(new Uint8Array(digest));
+  }
+
+  function bindingPayload(binding) {
+    return [
+      binding.protocol || '',
+      binding.session_id || '',
+      binding.daemon_public_key || '',
+      String(binding.created_unix_ms || ''),
+      binding.offer_sha256 || '',
+      binding.answer_sha256 || '',
+    ].join('\n');
+  }
+
+  async function verifyEd25519(publicKeyBytes, signatureBytes, payloadBytes) {
+    let key;
+    try {
+      key = await crypto.subtle.importKey('raw', publicKeyBytes, { name: 'Ed25519' }, false, ['verify']);
+    } catch (firstErr) {
+      try {
+        key = await crypto.subtle.importKey('raw', publicKeyBytes, 'Ed25519', false, ['verify']);
+      } catch {
+        throw firstErr;
+      }
+    }
+    return crypto.subtle.verify({ name: 'Ed25519' }, key, signatureBytes, payloadBytes);
+  }
+
+  async function verifyBinding(binding, sessionId, offerSdp, answerSdp) {
+    if (!binding || typeof binding !== 'object') return { ok: false, error: 'missing binding' };
+    if (binding.protocol !== 'intendant-dashboard-control-v1') return { ok: false, error: 'unexpected protocol' };
+    if (String(binding.session_id || '') !== String(sessionId || '')) return { ok: false, error: 'session mismatch' };
+    if (!crypto?.subtle) return { ok: false, error: 'WebCrypto unavailable' };
+    if (binding.offer_sha256 !== await sha256B64u(offerSdp || '')) return { ok: false, error: 'offer hash mismatch' };
+    if (binding.answer_sha256 !== await sha256B64u(answerSdp || '')) return { ok: false, error: 'answer hash mismatch' };
+    const verified = await verifyEd25519(
+      base64UrlToBytes(binding.daemon_public_key || ''),
+      base64UrlToBytes(binding.signature || ''),
+      new TextEncoder().encode(bindingPayload(binding))
+    );
+    if (!verified) return { ok: false, error: 'signature invalid' };
+    return {
+      ok: true,
+      daemonPublicKey: binding.daemon_public_key,
+      createdUnixMs: Number(binding.created_unix_ms || 0),
+    };
+  }
+
+  const connect = {
+    pc: null,
+    channel: null,
+    sessionId: '',
+    binding: null,
+    verifiedBinding: null,
+    localOfferSdp: '',
+    pendingIce: [],
+    pending: new Map(),
+    seq: 0,
+    started: false,
+
+    async start() {
+      if (this.started) return this.status();
+      this.started = true;
+      this.pc = new RTCPeerConnection({});
+      this.channel = this.pc.createDataChannel('intendant-dashboard-control', { ordered: true });
+      this.channel.onopen = () => {
+        this.sendFrame({ t: 'hello', id: this.nextId() });
+        paint(this.status(), 'ok');
+      };
+      this.channel.onmessage = ev => this.handleMessage(ev.data);
+      this.channel.onclose = () => paint(this.status());
+      this.pc.onconnectionstatechange = () => paint(this.status(), this.pc.connectionState === 'failed' ? 'err' : '');
+      this.pc.onicecandidate = ev => {
+        if (!ev.candidate) return;
+        const candidate = ev.candidate.toJSON ? ev.candidate.toJSON() : ev.candidate;
+        if (!this.sessionId) {
+          this.pendingIce.push(candidate);
+          return;
+        }
+        this.sendIce(candidate).catch(err => console.warn('connect ice failed', err));
+      };
+      const offer = await this.pc.createOffer();
+      await this.pc.setLocalDescription(offer);
+      this.localOfferSdp = offer.sdp || '';
+      const answer = await fetch('/connect/dashboard/offer', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ sdp: this.localOfferSdp }),
+      }).then(async resp => {
+        const body = await resp.json().catch(() => ({}));
+        if (!resp.ok) throw new Error(body.error || `HTTP ${resp.status}`);
+        return body;
+      });
+      this.sessionId = String(answer.session_id || '');
+      this.binding = answer.binding || null;
+      const verified = await verifyBinding(this.binding, this.sessionId, this.localOfferSdp, answer.sdp || '');
+      if (!verified.ok) throw new Error(`binding rejected: ${verified.error || 'unknown'}`);
+      this.verifiedBinding = verified;
+      await this.pc.setRemoteDescription({ type: 'answer', sdp: answer.sdp });
+      for (const candidate of this.pendingIce.splice(0)) await this.sendIce(candidate);
+      paint(this.status(), 'ok');
+      return this.status();
+    },
+
+    async sendIce(candidate) {
+      await fetch('/connect/dashboard/ice', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ session_id: this.sessionId, candidate }),
+      });
+    },
+
+    handleMessage(data) {
+      let msg;
+      try { msg = JSON.parse(String(data)); } catch { return; }
+      if (msg.t === 'hello_ack') {
+        paint(this.status(), 'ok');
+        return;
+      }
+      if (msg.t !== 'pong' && msg.t !== 'response') return;
+      const pending = this.pending.get(msg.id);
+      if (!pending) return;
+      this.pending.delete(msg.id);
+      if (msg.cancelled) pending.reject(abortError(msg.error || 'dashboard control request cancelled'));
+      else if (msg.t === 'response' && msg.ok === false) pending.reject(new Error(msg.error || 'dashboard control request failed'));
+      else pending.resolve(msg.t === 'pong' ? msg : msg.result);
+    },
+
+    request(method, params = {}, options = {}) {
+      if (options.signal?.aborted) return Promise.reject(abortError());
+      if (!this.canUseRpc()) return Promise.reject(new Error('connect dashboard RPC is not connected'));
+      const id = this.nextId();
+      const promise = this.waitFor(id, options);
+      this.sendFrame({ t: 'request', id, method, params });
+      return promise;
+    },
+
+    waitFor(id, options = {}) {
+      return new Promise((resolve, reject) => {
+        let settled = false;
+        const signal = options.signal || null;
+        const fail = (err, cancel = false) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          if (signal && abortHandler) signal.removeEventListener('abort', abortHandler);
+          this.pending.delete(id);
+          if (cancel) this.sendFrame({ t: 'cancel', id });
+          reject(err);
+        };
+        const abortHandler = signal ? () => fail(abortError(), true) : null;
+        const timer = setTimeout(() => fail(new Error('connect dashboard request timed out'), true), 10000);
+        if (signal && abortHandler) signal.addEventListener('abort', abortHandler, { once: true });
+        this.pending.set(id, {
+          resolve: value => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timer);
+            if (signal && abortHandler) signal.removeEventListener('abort', abortHandler);
+            resolve(value);
+          },
+          reject: err => fail(err),
+        });
+      });
+    },
+
+    canUseRpc() {
+      return Boolean(this.verifiedBinding && this.pc?.connectionState === 'connected' && this.channel?.readyState === 'open');
+    },
+
+    sendFrame(frame) {
+      if (this.channel?.readyState === 'open') this.channel.send(JSON.stringify(frame));
+    },
+
+    status() {
+      return {
+        connected: this.pc?.connectionState === 'connected',
+        pcState: this.pc?.connectionState || '',
+        channelState: this.channel?.readyState || '',
+        sessionId: this.sessionId,
+        verifiedBinding: this.verifiedBinding,
+        pendingRequests: this.pending.size,
+      };
+    },
+
+    close() {
+      if (this.sessionId) {
+        fetch('/connect/dashboard/close', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ session_id: this.sessionId }),
+        }).catch(() => {});
+      }
+      try { this.channel?.close(); } catch {}
+      try { this.pc?.close(); } catch {}
+    },
+
+    nextId() {
+      this.seq += 1;
+      return `connect-${Date.now()}-${this.seq}`;
+    },
+  };
+
+  window.intendantConnectDashboard = connect;
+  connect.start().catch(err => {
+    console.error(err);
+    paint(err?.message || String(err), 'err');
+  });
+})();
+  </script>
+</body>
+</html>"#
+        .to_string()
+}
+
 fn request_query_param(request_line: &str, key: &str) -> Option<String> {
     let path = request_line.split_whitespace().nth(1)?;
     let query = path.split_once('?')?.1;
@@ -17622,6 +17981,7 @@ pub fn spawn_web_gateway(
                     if tls_client_cert_required
                         && !tls_client_cert_present
                         && !is_public_peer_access_request_path(request_line)
+                        && !is_public_connect_bootstrap_path(request_line)
                     {
                         use tokio::io::AsyncWriteExt;
                         let body = serde_json::json!({
@@ -17705,8 +18065,40 @@ pub fn spawn_web_gateway(
                         }
                     }
 
+                    if req_method == "GET" && req_path == "/connect/bootstrap" {
+                        use tokio::io::AsyncWriteExt;
+                        let body = connect_bootstrap_html();
+                        let response = html_response("200 OK", body);
+                        let _ = stream.write_all(response.as_bytes()).await;
+                    } else if req_method == "GET" && req_path == "/connect/status" {
+                        use tokio::io::AsyncWriteExt;
+                        let body = serde_json::json!({
+                            "ok": true,
+                            "transport": "webrtc-dashboard-control",
+                            "signaling": "connect-bootstrap-local",
+                            "mtls_required_for_dashboard": tls_client_cert_required,
+                        });
+                        let _ = stream.write_all(json_ok(body).as_bytes()).await;
+                    } else if req_method == "POST" && req_path == "/connect/dashboard/offer" {
+                        use tokio::io::AsyncWriteExt;
+                        let body_text = read_post_body(&header_text, &mut stream).await;
+                        let response =
+                            connect_dashboard_offer_response(&dashboard_control, &body_text).await;
+                        let _ = stream.write_all(response.as_bytes()).await;
+                    } else if req_method == "POST" && req_path == "/connect/dashboard/ice" {
+                        use tokio::io::AsyncWriteExt;
+                        let body_text = read_post_body(&header_text, &mut stream).await;
+                        let response =
+                            connect_dashboard_ice_response(&dashboard_control, &body_text).await;
+                        let _ = stream.write_all(response.as_bytes()).await;
+                    } else if req_method == "POST" && req_path == "/connect/dashboard/close" {
+                        use tokio::io::AsyncWriteExt;
+                        let body_text = read_post_body(&header_text, &mut stream).await;
+                        let response =
+                            connect_dashboard_close_response(&dashboard_control, &body_text).await;
+                        let _ = stream.write_all(response.as_bytes()).await;
                     // Route WASM binaries (need async write_all for large payloads)
-                    if let Some(asset) = static_asset_arm(
+                    } else if let Some(asset) = static_asset_arm(
                         req_method,
                         req_path,
                         &[
@@ -22178,6 +22570,21 @@ fn is_public_peer_access_request_path(request_line: &str) -> bool {
             .strip_prefix(crate::peer::access_request::PUBLIC_REQUEST_PATH)
             .map(|rest| rest.starts_with('/'))
             .unwrap_or(false)
+}
+
+fn is_public_connect_bootstrap_path(request_line: &str) -> bool {
+    let Some(path) = request_line.split_whitespace().nth(1) else {
+        return false;
+    };
+    let path = path.split('?').next().unwrap_or(path);
+    matches!(
+        path,
+        "/connect/bootstrap"
+            | "/connect/status"
+            | "/connect/dashboard/offer"
+            | "/connect/dashboard/ice"
+            | "/connect/dashboard/close"
+    )
 }
 
 fn peer_client_header_present(header_text: &str) -> bool {
@@ -31501,6 +31908,46 @@ mod tests {
         assert!(!is_public_peer_access_request_path(
             "GET /api/peers/pairing/requests HTTP/1.1"
         ));
+    }
+
+    #[test]
+    fn public_connect_bootstrap_path_is_narrow() {
+        assert!(is_public_connect_bootstrap_path(
+            "GET /connect/bootstrap HTTP/1.1"
+        ));
+        assert!(is_public_connect_bootstrap_path(
+            "GET /connect/status?poll=1 HTTP/1.1"
+        ));
+        assert!(is_public_connect_bootstrap_path(
+            "POST /connect/dashboard/offer HTTP/1.1"
+        ));
+        assert!(is_public_connect_bootstrap_path(
+            "POST /connect/dashboard/ice HTTP/1.1"
+        ));
+        assert!(is_public_connect_bootstrap_path(
+            "POST /connect/dashboard/close HTTP/1.1"
+        ));
+
+        assert!(!is_public_connect_bootstrap_path("GET / HTTP/1.1"));
+        assert!(!is_public_connect_bootstrap_path("GET /config HTTP/1.1"));
+        assert!(!is_public_connect_bootstrap_path(
+            "GET /connect/dashboard HTTP/1.1"
+        ));
+        assert!(!is_public_connect_bootstrap_path(
+            "GET /connect/dashboard/offers HTTP/1.1"
+        ));
+        assert!(!is_public_connect_bootstrap_path(
+            "POST /api/peers HTTP/1.1"
+        ));
+    }
+
+    #[test]
+    fn connect_bootstrap_html_exposes_debug_api() {
+        let html = connect_bootstrap_html();
+        assert!(html.contains("Intendant Connect Bootstrap"));
+        assert!(html.contains("window.intendantConnectDashboard"));
+        assert!(html.contains("/connect/dashboard/offer"));
+        assert!(html.contains("intendant-dashboard-control-v1"));
     }
 
     #[test]

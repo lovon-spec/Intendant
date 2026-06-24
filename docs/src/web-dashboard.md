@@ -475,6 +475,43 @@ Peer mTLS remains a separate trust boundary. The dashboard tunnel authenticates
 the browser-to-this-daemon control path; it does not grant or replace a
 daemon's peer-scoped client certificate for federation.
 
+### Connect-Style Local Bootstrap Slice
+
+The daemon also exposes a narrow, experimental Connect-style bootstrap surface
+for testing the public-origin signaling shape without changing the normal
+dashboard:
+
+| Endpoint | mTLS? | Purpose |
+|----------|-------|---------|
+| `GET /connect/bootstrap` | not required | Minimal HTML bootstrap page for WebRTC dashboard-control testing |
+| `GET /connect/status` | not required | JSON health/capability probe for the bootstrap surface |
+| `POST /connect/dashboard/offer` | not required | Browser SDP offer -> daemon SDP answer plus signed binding |
+| `POST /connect/dashboard/ice` | not required | Browser trickle ICE candidate for a control session |
+| `POST /connect/dashboard/close` | not required | Close a control session |
+
+Those paths are deliberately allowlisted one by one. They do **not** make `/`,
+`/config`, `/ws`, `/api/*`, assets, recordings, or the full dashboard available
+without the normal dashboard authentication. The bootstrap page exposes
+`window.intendantConnectDashboard` for tests and diagnostics; it verifies the
+same daemon-signed binding as the full dashboard control experiment, then uses
+the DataChannel RPC protocol directly.
+
+Run the focused browser check against a local daemon with:
+
+```bash
+PLAYWRIGHT_NODE_PATH=/path/to/node_modules \
+  node scripts/validate-connect-bootstrap.cjs --origin https://127.0.0.1:8766
+```
+
+The check intentionally uses no client certificate. It must see `/config`
+rejected with `401`, then prove that `/connect/bootstrap` can create a verified
+dashboard-control DataChannel and issue a few RPC requests over it.
+
+This slice is a local stand-in for a future hosted Intendant Connect service. It
+does not implement account login, passkeys, daemon claiming, or a durable daemon
+registry. Its job is to make the signaling boundary concrete and testable before
+moving the real SPA and hosted account UX onto that boundary.
+
 ### Design Target: Public Bootstrap with a Direct WebRTC Dashboard Tunnel
 
 The current dashboard access model is certificate-first: a remote browser

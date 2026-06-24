@@ -33112,7 +33112,7 @@ async fn main() -> Result<(), CallerError> {
             "[web_gateway] TLS enabled — dashboard is HTTPS/WSS-only on port {web_port} \
              (cleartext HTTP/WS connections are refused){}",
             if web_tls_client_cert_required {
-                "; mTLS client certificates are required except for peer access requests"
+                "; mTLS client certificates are required except for peer access and Connect bootstrap requests"
             } else {
                 ""
             }
