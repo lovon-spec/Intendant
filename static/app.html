@@ -5033,6 +5033,57 @@ body.context-focus-active {
   word-break: break-word;
   white-space: normal;
 }
+.session-detail-title .sd-lineage {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 5px;
+  color: var(--overlay1);
+  font-size: 11px;
+  min-width: 0;
+}
+.session-detail-title .sd-lineage-kind {
+  flex: 0 0 auto;
+  color: var(--mauve);
+  border: 1px solid color-mix(in srgb, var(--mauve) 45%, var(--surface1));
+  background: color-mix(in srgb, var(--mauve) 10%, transparent);
+  border-radius: 3px;
+  padding: 0 5px;
+  font-size: 9px;
+  line-height: 1.45;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-weight: 700;
+}
+.session-detail-title .sd-lineage-chip {
+  min-width: 0;
+  max-width: 260px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--subtext0);
+  border: 1px solid var(--surface1);
+  background: var(--surface0);
+  border-radius: 4px;
+  padding: 1px 6px;
+  font-family: inherit;
+  font-size: 11px;
+}
+.session-detail-title button.sd-lineage-chip {
+  cursor: pointer;
+}
+.session-detail-title button.sd-lineage-chip:hover {
+  color: var(--blue);
+  border-color: var(--blue);
+}
+.session-detail-title .sd-lineage-current {
+  color: var(--text);
+  border-color: color-mix(in srgb, var(--blue) 45%, var(--surface1));
+  background: color-mix(in srgb, var(--blue) 8%, transparent);
+}
+.session-detail-title .sd-lineage-separator {
+  color: var(--overlay0);
+}
 .session-detail-action-btn {
   flex: 0 1 auto;
   max-width: 100%;
@@ -5339,6 +5390,25 @@ body.context-focus-active {
   border-radius: 4px;
   background: color-mix(in srgb, var(--mauve) 15%, transparent);
   color: var(--mauve);
+}
+.session-card button.sc-role {
+  border: 0;
+  font-family: inherit;
+  cursor: pointer;
+}
+.session-card button.sc-role:hover {
+  background: color-mix(in srgb, var(--blue) 16%, transparent);
+  color: var(--blue);
+}
+.session-card .sc-lineage-chip {
+  max-width: 210px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.session-card .sc-lineage-children {
+  background: color-mix(in srgb, var(--green) 12%, transparent);
+  color: var(--green);
 }
 .session-card .sc-current-badge {
   flex: 0 0 auto;
@@ -43967,6 +44037,239 @@ function sessionRelationshipKindForRow(session, meta = null) {
   return '';
 }
 
+function sessionLineageParentId(session, meta = null) {
+  const rowMeta = meta || sessionConfigMetadata(session);
+  return compactSessionText(
+    rowMeta.parentId ||
+    rowMeta.parent_session_id ||
+    rowMeta.parentSessionId ||
+    session?.parent_session_id ||
+    session?.parentSessionId ||
+    session?.parent_id ||
+    session?.parentId
+  );
+}
+
+function sessionLineageIds(session, meta = null) {
+  const rowMeta = meta || sessionConfigMetadata(session);
+  return Array.from(new Set([
+    session?.session_id,
+    session?.resume_id,
+    session?.backend_session_id,
+    session?.backendSessionId,
+    session?.intendant_session_id,
+    session?.intendantSessionId,
+    rowMeta.session_id,
+    rowMeta.sessionId,
+    rowMeta.resume_id,
+    rowMeta.resumeId,
+    rowMeta.backendSessionId,
+    rowMeta.backend_session_id,
+    rowMeta.intendantSessionId,
+    rowMeta.intendant_session_id,
+  ].map(id => compactSessionText(id)).filter(Boolean)));
+}
+
+function sessionLineageSource(session, fallback = null) {
+  return normalizeAgentId(
+    session?.source ||
+    session?.backend_source ||
+    session?.backendSource ||
+    fallback?.source ||
+    fallback?.backend_source ||
+    fallback?.backendSource ||
+    'intendant'
+  ) || 'intendant';
+}
+
+function sessionLineageDisplayLabel(session, fallbackId = '') {
+  if (!session) return shortSessionId(fallbackId);
+  const meta = sessionConfigMetadata(session);
+  return compactSessionText(
+    session.name ||
+    session.display_name ||
+    session.thread_name ||
+    meta.name ||
+    session.task ||
+    meta.task
+  ) || shortSessionId(fallbackId || session.session_id || session.resume_id || meta.backendSessionId);
+}
+
+function sessionLineageRelationshipLabel(kind) {
+  if (kind === 'subagent') return 'subagent';
+  if (kind === 'side') return 'side';
+  if (kind === 'fork') return 'fork';
+  return kind || 'related';
+}
+
+function buildSessionLineageIndex(sessions) {
+  const byId = new Map();
+  const childrenByParentId = new Map();
+  const rows = Array.isArray(sessions) ? sessions : [];
+  for (const session of rows) {
+    if (!session || typeof session !== 'object') continue;
+    const meta = sessionConfigMetadata(session);
+    for (const id of sessionLineageIds(session, meta)) {
+      if (!byId.has(id)) byId.set(id, session);
+    }
+  }
+  for (const session of rows) {
+    if (!session || typeof session !== 'object') continue;
+    const meta = sessionConfigMetadata(session);
+    const parentId = sessionLineageParentId(session, meta);
+    if (!parentId) continue;
+    if (!childrenByParentId.has(parentId)) childrenByParentId.set(parentId, []);
+    childrenByParentId.get(parentId).push(session);
+  }
+  return { byId, childrenByParentId };
+}
+
+function sessionLineageParentForSession(index, session, meta = null) {
+  const parentId = sessionLineageParentId(session, meta);
+  if (!parentId) return { parentId: '', parent: null };
+  return {
+    parentId,
+    parent: index?.byId?.get(parentId) || findCachedSessionByAnyId(parentId) || null,
+  };
+}
+
+function sessionLineageChildrenForSession(index, session, meta = null) {
+  if (!index || !session) return [];
+  const selfIds = new Set(sessionLineageIds(session, meta));
+  const seen = new Set();
+  const children = [];
+  for (const id of selfIds) {
+    for (const child of index.childrenByParentId.get(id) || []) {
+      const childKey = sessionLineageIds(child)[0] || child.session_id || child.resume_id || '';
+      if (!childKey || selfIds.has(childKey) || seen.has(childKey)) continue;
+      seen.add(childKey);
+      children.push(child);
+    }
+  }
+  return children;
+}
+
+function sessionLineageOpenSession(sourceSession, targetSession, targetId, ev = null) {
+  if (ev) {
+    ev.preventDefault();
+    ev.stopPropagation();
+  }
+  const id = compactSessionText(targetId || targetSession?.session_id || targetSession?.resume_id);
+  if (!id) return;
+  const target = targetSession || {
+    session_id: id,
+    source: sessionLineageSource(sourceSession),
+    task: shortSessionId(id),
+  };
+  openSessionDetail(target);
+}
+
+function createSessionLineageListChip(sourceSession, targetSession, targetId, text, title) {
+  const chip = document.createElement(targetId ? 'button' : 'span');
+  chip.className = 'sc-role sc-lineage-chip';
+  chip.textContent = text;
+  chip.title = title || text;
+  if (targetId) {
+    chip.type = 'button';
+    chip.addEventListener('click', (ev) => sessionLineageOpenSession(sourceSession, targetSession, targetId, ev));
+  }
+  return chip;
+}
+
+function createSessionDetailLineageChip(sourceSession, targetSession, targetId, text, title, extraClass = '') {
+  const chip = document.createElement(targetId ? 'button' : 'span');
+  chip.className = `sd-lineage-chip${extraClass ? ` ${extraClass}` : ''}`;
+  chip.textContent = text;
+  chip.title = title || text;
+  if (targetId) {
+    chip.type = 'button';
+    chip.addEventListener('click', (ev) => sessionLineageOpenSession(sourceSession, targetSession, targetId, ev));
+  }
+  return chip;
+}
+
+function renderSessionDetailLineage(titleEl, session) {
+  if (!titleEl || !session) return;
+  const index = buildSessionLineageIndex(_cachedSessions);
+  const meta = sessionConfigMetadata(session);
+  const relationshipKind = sessionRelationshipKindForRow(session, meta);
+  const { parentId, parent } = sessionLineageParentForSession(index, session, meta);
+  const children = sessionLineageChildrenForSession(index, session, meta);
+  if (!relationshipKind && !parentId && children.length === 0) return;
+
+  const sessionId = compactSessionText(session.session_id || session.resume_id || meta.backendSessionId);
+  const line = document.createElement('div');
+  line.className = 'sd-lineage';
+
+  if (relationshipKind) {
+    const kindEl = document.createElement('span');
+    kindEl.className = 'sd-lineage-kind';
+    kindEl.textContent = sessionLineageRelationshipLabel(relationshipKind);
+    line.appendChild(kindEl);
+  }
+
+  const appendSeparator = () => {
+    const sep = document.createElement('span');
+    sep.className = 'sd-lineage-separator';
+    sep.textContent = '->';
+    line.appendChild(sep);
+  };
+
+  if (parentId) {
+    const parentLabel = sessionLineageDisplayLabel(parent, parentId);
+    line.appendChild(createSessionDetailLineageChip(
+      session,
+      parent,
+      parentId,
+      parentLabel,
+      `Parent session\n${parentLabel}\n${parentId}`
+    ));
+    appendSeparator();
+  }
+
+  line.appendChild(createSessionDetailLineageChip(
+    session,
+    null,
+    '',
+    'current',
+    `${sessionLineageDisplayLabel(session, sessionId)}${sessionId ? `\n${sessionId}` : ''}`,
+    'sd-lineage-current'
+  ));
+
+  if (children.length > 0) {
+    appendSeparator();
+    const visibleChildren = children.slice(0, 4);
+    for (const child of visibleChildren) {
+      const childId = sessionLineageIds(child)[0] || child.session_id || child.resume_id || '';
+      const childKind = sessionLineageRelationshipLabel(sessionRelationshipKindForRow(child));
+      const childLabel = sessionLineageDisplayLabel(child, childId);
+      line.appendChild(createSessionDetailLineageChip(
+        session,
+        child,
+        childId,
+        `${childKind} ${childLabel}`,
+        `${childKind} child session\n${childLabel}${childId ? `\n${childId}` : ''}`
+      ));
+    }
+    if (children.length > visibleChildren.length) {
+      const more = document.createElement('span');
+      more.className = 'sd-lineage-chip';
+      more.textContent = `+${children.length - visibleChildren.length} more`;
+      more.title = children
+        .slice(visibleChildren.length)
+        .map(child => {
+          const childId = sessionLineageIds(child)[0] || child.session_id || '';
+          const childKind = sessionLineageRelationshipLabel(sessionRelationshipKindForRow(child));
+          return `${childKind} ${sessionLineageDisplayLabel(child, childId)}${childId ? ` (${childId})` : ''}`;
+        })
+        .join('\n');
+      line.appendChild(more);
+    }
+  }
+
+  titleEl.appendChild(line);
+}
+
 function renderSessionsViews() {
   if (activeSessionsSubtab === 'recent') {
     renderSessionsList(_cachedSessions, document.getElementById('sessions-list'), {
@@ -44721,6 +45024,8 @@ function sessionSearchText(session, displayStatus, source, shortId, isCurrent) {
     session.role,
     session.relationship_kind,
     session.relationship,
+    session.parent_session_id,
+    session.parent_id,
     session.thread_source,
     session.agent_nickname,
     isCurrent ? 'current' : '',
@@ -44854,6 +45159,7 @@ function renderSessionsList(sessions, el, options = {}) {
   let matchedCount = 0;
   let renderedCount = 0;
   const fragment = document.createDocumentFragment();
+  const lineageIndex = buildSessionLineageIndex(sorted);
 
   for (const s of sorted) {
     const configMeta = sessionConfigMetadata(s);
@@ -44974,14 +45280,38 @@ function renderSessionsList(sessions, el, options = {}) {
     }
 
     if (relationshipKind) {
-      const relationEl = document.createElement('span');
-      relationEl.className = 'sc-role';
-      relationEl.textContent = relationshipKind === 'subagent' ? 'subagent' : relationshipKind;
       const nickname = compactSessionText(configMeta.agentNickname || s.agent_nickname || s.agentNickname);
-      relationEl.title = nickname
-        ? `${relationEl.textContent} ${nickname}`
-        : `${relationEl.textContent} session`;
+      const { parentId, parent } = sessionLineageParentForSession(lineageIndex, s, configMeta);
+      const parentLabel = sessionLineageDisplayLabel(parent, parentId);
+      const kindLabel = sessionLineageRelationshipLabel(relationshipKind);
+      const chipText = relationshipKind === 'subagent' && nickname
+        ? `${kindLabel} ${nickname}`
+        : parentId
+          ? `${kindLabel} of ${parentLabel}`
+          : kindLabel;
+      const titleParts = [
+        relationshipKind === 'subagent' && nickname ? `Subagent: ${nickname}` : `Relationship: ${kindLabel}`,
+        parentId ? `Parent: ${parentLabel} (${parentId})` : '',
+      ].filter(Boolean);
+      const relationEl = createSessionLineageListChip(s, parent, parentId, chipText, titleParts.join('\n') || `${kindLabel} session`);
       top.appendChild(relationEl);
+    }
+
+    const lineageChildren = sessionLineageChildrenForSession(lineageIndex, s, configMeta)
+      .filter(child => !hideSubagents || sessionRelationshipKindForRow(child) !== 'subagent');
+    if (lineageChildren.length > 0) {
+      const childrenEl = document.createElement('span');
+      childrenEl.className = 'sc-role sc-lineage-chip sc-lineage-children';
+      childrenEl.textContent = lineageChildren.length === 1 ? '1 child' : `${lineageChildren.length} children`;
+      childrenEl.title = lineageChildren
+        .slice(0, 8)
+        .map(child => {
+          const childKind = sessionLineageRelationshipLabel(sessionRelationshipKindForRow(child));
+          const childId = sessionLineageIds(child)[0] || child.session_id || '';
+          return `${childKind}: ${sessionLineageDisplayLabel(child, childId)}${childId ? ` (${childId})` : ''}`;
+        })
+        .join('\n') + (lineageChildren.length > 8 ? `\n+${lineageChildren.length - 8} more` : '');
+      top.appendChild(childrenEl);
     }
 
     if (isCurrent) {
@@ -46004,6 +46334,7 @@ function renderSessionDetailTitle(session) {
     subline.appendChild(subText);
     titleEl.appendChild(subline);
   }
+  renderSessionDetailLineage(titleEl, session);
 
   const renameBtn = document.getElementById('session-detail-rename');
   if (renameBtn) {

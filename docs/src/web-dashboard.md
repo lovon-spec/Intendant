@@ -237,7 +237,8 @@ A browser of past and current sessions. Four subtabs:
 
 - **Recent** — recent sessions with metadata (task, duration, status); click one
   to view its recordings and event log. Child sub-agent sessions are hidden by
-  default; enable **Show subagents** to include them.
+  default; enable **Show subagents** to include them. Fork and side sessions
+  stay visible with lineage chips that point back to their parent session.
 - **Deep Search** — search across session history.
 - **Worktrees** — the git worktrees in use by sub-agents.
 - **New Session** — start a fresh session from the dashboard.
