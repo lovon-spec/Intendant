@@ -252,6 +252,38 @@ async function main() {
           text: raw?.data_base64 ? atob(String(raw.data_base64)) : '',
         };
       };
+      const recordingFallbackPlayback = async () => {
+        if (typeof RecordingPlayer !== 'function') {
+          throw new Error('RecordingPlayer is not available on the dashboard page');
+        }
+        const wrap = document.createElement('div');
+        wrap.style.display = 'none';
+        const video = document.createElement('video');
+        const timeline = document.createElement('div');
+        const cursor = document.createElement('div');
+        const progress = document.createElement('div');
+        const timeLabel = document.createElement('span');
+        const playBtn = document.createElement('button');
+        wrap.append(video, timeline, cursor, progress, timeLabel, playBtn);
+        document.body.appendChild(wrap);
+        const player = new RecordingPlayer(video, timeline, cursor, progress, timeLabel, playBtn, '/recordings');
+        try {
+          player.streamName = recordingStreamName;
+          player.segments = [{ filename: 'seg_00000.mp4', start_secs: 0, end_secs: 1 }];
+          player.totalDuration = 1;
+          const before = ctl.status().completedByteStreams || 0;
+          await player._loadSegment(0, 0);
+          const after = ctl.status().completedByteStreams || 0;
+          return {
+            srcScheme: String(video.src || '').split(':', 1)[0],
+            objectUrl: Boolean(player._segmentObjectUrl),
+            byteStreamDelta: after - before,
+          };
+        } finally {
+          player.destroy();
+          wrap.remove();
+        }
+      };
       const terminal = async () => {
         const terminalId = `dashboard-terminal-local-${Date.now()}`;
         const token = 'dashboard_terminal_e2e_local';
@@ -386,6 +418,7 @@ async function main() {
         uploadRaw: await uploadRaw(uploaded),
         imagePreview: await imagePreview(),
         recordingAsset: await recordingAsset(),
+        recordingFallbackPlayback: await recordingFallbackPlayback(),
         terminal: await terminal(),
         tui: status.tui_frames_available ? await tui() : { skipped: true, subscribed: false, frameBytes: 0 },
         rejectedControlMsg: await labeled('api_control_msg rejected create_session', ctl.request('api_control_msg', {
@@ -529,6 +562,9 @@ async function main() {
     assert.strictEqual(result.recordingAsset?.range_start, 10);
     assert.strictEqual(result.recordingAsset?.range_end, 17);
     assert.strictEqual(result.recordingAsset?.resumable, true);
+    assert.strictEqual(result.recordingFallbackPlayback?.srcScheme, 'blob');
+    assert.strictEqual(result.recordingFallbackPlayback?.objectUrl, true);
+    assert(result.recordingFallbackPlayback?.byteStreamDelta >= 1, `recording fallback playback did not use a byte stream: ${JSON.stringify(result.recordingFallbackPlayback)}`);
     assert.strictEqual(result.terminal?.opened, true);
     assert.strictEqual(result.terminal?.sawToken, true);
     if (result.status.tui_frames_available) {
@@ -619,6 +655,8 @@ async function main() {
         imagePreviewByteStreamDelta: result.imagePreview.byteStreamDelta,
         recordingAssetBytes: result.recordingAsset.byteLength,
         recordingAssetText: result.recordingAsset.text,
+        recordingFallbackSrcScheme: result.recordingFallbackPlayback.srcScheme,
+        recordingFallbackByteStreamDelta: result.recordingFallbackPlayback.byteStreamDelta,
         terminalOutputBytes: result.terminal.outputBytes,
         tuiFrameBytes: result.tui.frameBytes,
         sessionReportStatus: result.sessionReport._httpStatus || 200,

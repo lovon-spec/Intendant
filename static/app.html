@@ -31966,6 +31966,8 @@ class RecordingPlayer {
     this._mseReady = false;
     this._mseAbort = null;
     this._mseGeneration = 0;
+    this._segmentObjectUrl = null;
+    this._segmentLoadGeneration = 0;
 
     // Bound handlers — stored so destroy() can remove them
     this._onEnded = () => this._onSegmentEnd();
@@ -32038,6 +32040,21 @@ class RecordingPlayer {
     const url = `${this.baseUrl}/${this.streamName}/${filename}`;
     const resp = await fetch(url, { cache: 'no-store', ...fetchOptions });
     return resp.arrayBuffer();
+  }
+
+  _revokeSegmentObjectUrl() {
+    if (!this._segmentObjectUrl) return;
+    try { URL.revokeObjectURL(this._segmentObjectUrl); } catch (_) {}
+    this._segmentObjectUrl = null;
+  }
+
+  _setVideoSrc(src, options = {}) {
+    const objectUrl = String(options.objectUrl || '').trim();
+    if (this._segmentObjectUrl && this._segmentObjectUrl !== objectUrl) {
+      this._revokeSegmentObjectUrl();
+    }
+    this._segmentObjectUrl = objectUrl || null;
+    this.video.src = src;
   }
 
   async load(streamName) {
@@ -32131,7 +32148,11 @@ class RecordingPlayer {
 
   play() {
     if (this.totalDuration === 0) return;
-    if (!this.useMSE && this.currentSegIdx < 0) this._loadSegment(0, 0);
+    if (!this.useMSE && this.currentSegIdx < 0) {
+      this._loadSegment(0, 0).catch(err => {
+        console.warn('[dashboard-control] recording segment load failed', err);
+      });
+    }
     this.video.play().catch(() => {});
     this.playing = true;
     this.playBtn.textContent = '\u23F8';
@@ -32157,8 +32178,9 @@ class RecordingPlayer {
     const seg = this.segments[idx];
     const offset = secs - seg.start_secs;
     if (idx !== this.currentSegIdx) {
-      this._loadSegment(idx, offset);
-      if (this.playing) this.video.play().catch(() => {});
+      this._loadSegment(idx, offset).catch(err => {
+        console.warn('[dashboard-control] recording segment load failed', err);
+      });
     } else {
       this.video.currentTime = offset;
     }
@@ -32199,12 +32221,10 @@ class RecordingPlayer {
           this.video.currentTime = offset;
         };
         this.video.addEventListener('loadeddata', onLoaded);
-        this.currentSegIdx = idx;
-        if (seg.filename.endsWith('.ts')) {
-          this.video.src = `${this.baseUrl}/${this.streamName}/playlist.m3u8`;
-        } else {
-          this.video.src = `${this.baseUrl}/${this.streamName}/${seg.filename}`;
-        }
+        this._loadSegment(idx, 0).catch(() => {
+          this.video.removeEventListener('loadeddata', onLoaded);
+          resolve();
+        });
       } else {
         this.video.addEventListener('seeked', onSeeked);
         this.video.currentTime = offset;
@@ -32229,25 +32249,41 @@ class RecordingPlayer {
     return this.segments.length > 0 ? this.segments.length - 1 : -1;
   }
 
-  _loadSegment(idx, offsetSecs) {
+  async _loadSegment(idx, offsetSecs) {
     if (idx < 0 || idx >= this.segments.length) return;
+    const generation = ++this._segmentLoadGeneration;
     this.currentSegIdx = idx;
     const seg = this.segments[idx];
     // Use server-side HLS playlist for .ts segments (Safari/WKWebView
     // requires HTTP-served m3u8, not blob URLs)
     if (seg.filename.endsWith('.ts')) {
-      this.video.src = `${this.baseUrl}/${this.streamName}/playlist.m3u8`;
+      this._setVideoSrc(`${this.baseUrl}/${this.streamName}/playlist.m3u8`);
     } else {
-      this.video.src = `${this.baseUrl}/${this.streamName}/${seg.filename}`;
+      try {
+        const buf = await this._fetchSegmentArrayBuffer(seg.filename);
+        if (generation !== this._segmentLoadGeneration) return;
+        if (buf && buf.byteLength > 0) {
+          const objectUrl = URL.createObjectURL(new Blob([buf], { type: 'video/mp4' }));
+          this._setVideoSrc(objectUrl, { objectUrl });
+        } else {
+          this._setVideoSrc(`${this.baseUrl}/${this.streamName}/${seg.filename}`);
+        }
+      } catch (err) {
+        if (generation !== this._segmentLoadGeneration) return;
+        console.warn('[dashboard-control] recording segment byte-stream fallback failed', err);
+        this._setVideoSrc(`${this.baseUrl}/${this.streamName}/${seg.filename}`);
+      }
     }
     this.video.currentTime = offsetSecs || 0;
+    if (this.playing) this.video.play().catch(() => {});
   }
 
   _onSegmentEnd() {
     if (this.useMSE) { this.pause(); return; }
     if (this.currentSegIdx + 1 < this.segments.length) {
-      this._loadSegment(this.currentSegIdx + 1, 0);
-      if (this.playing) this.video.play().catch(() => {});
+      this._loadSegment(this.currentSegIdx + 1, 0).catch(err => {
+        console.warn('[dashboard-control] recording segment load failed', err);
+      });
     } else {
       this.pause();
     }
@@ -32319,6 +32355,7 @@ class RecordingPlayer {
       URL.revokeObjectURL(this._msObjectUrl);
       this._msObjectUrl = null;
     }
+    this._revokeSegmentObjectUrl();
     this._mediaSource = null;
     this.useMSE = false;
     this._mseReady = false;
@@ -32332,6 +32369,7 @@ class RecordingPlayer {
   /** Load all fMP4 segments into MSE for instant seeking. */
   async _loadAllMSE() {
     const generation = ++this._mseGeneration;
+    this._revokeSegmentObjectUrl();
     const abortCtrl = new AbortController();
     this._mseAbort = abortCtrl;
     const signal = abortCtrl.signal;
@@ -32436,6 +32474,8 @@ class RecordingPlayer {
     }
   }
 }
+
+window.RecordingPlayer = RecordingPlayer;
 
 function fmtTime(secs) {
   const m = Math.floor(secs / 60);

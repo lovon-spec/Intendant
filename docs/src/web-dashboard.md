@@ -860,8 +860,10 @@ Live and per-session recording stream lists use `api_recordings` and
 and `api_session_recording_asset` for `segments`, `playlist.m3u8`, and validated
 `seg_*.mp4`/`seg_*.ts` filenames with optional `offset`/`length` ranges. The
 recording player uses these byte streams for segment lists and MP4 MSE buffers
-when the verified tunnel is available, while native video/HLS URL playback still
-uses HTTP because the browser media element needs a URL source.
+when the verified tunnel is available. The non-MSE MP4 fallback also reads the
+segment over the tunnel and assigns a local blob URL to the video element.
+HLS/`.ts` playlist playback still uses HTTP because Safari/WKWebView requires a
+served `m3u8` URL source.
 The Settings debug session-report download uses `api_session_report`, returning
 the same text-artifact zip as `/api/session/{id}/report` through bounded
 `byte_stream_*` frames. This is intentionally scoped to the diagnostic report;
@@ -921,10 +923,9 @@ available, or records the desired state as a pending per-display default for
 the next display session.
 
 The remaining migration work is mostly byte-stream and file-transfer heavy:
-generic downloads, native recording/HLS media URL playback, broader file
-transfer, and remaining non-allowlisted control mutations should move only after
-resumable stream/file-transfer semantics and per-action no-replay rules are
-settled.
+generic downloads, HLS/native playlist media playback, broader file transfer,
+and remaining non-allowlisted control mutations should move only after resumable
+stream/file-transfer semantics and per-action no-replay rules are settled.
 
 The dashboard status bar now exposes the selected control transport. Direct
 dashboard access shows the existing HTTP/mTLS path, while opt-in WebRTC control
@@ -1003,9 +1004,9 @@ Treat this as a staged target, not current behavior:
     diagnostics visual-marker toggles, recording/debug toggles, and browser
     workspace create/acquire/close/release.
     Standalone Shell terminal frames and WebTui frames also use the tunnel when
-    verified and advertised by the daemon. Generic downloads, native
-    recording/HLS URL playback, remaining non-allowlisted control commands, and
-    file transfer still wait for resumable stream/file-transfer semantics.
+    verified and advertised by the daemon. Generic downloads, HLS/native
+    playlist playback, remaining non-allowlisted control commands, and file
+    transfer still wait for resumable stream/file-transfer semantics.
 11. Keep direct mTLS dashboard access and peer daemon-to-daemon mTLS working
     throughout.
 
