@@ -284,6 +284,19 @@ async function main() {
           wrap.remove();
         }
       };
+      const diagnosticsVisualFreshness = async () => {
+        const sessionId = `validator-local-vf-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+        const body = '{"t":"session_start"}\n{"t":"summary","transitions":1}\n';
+        const response = await labeled('api_diagnostics_visual_freshness', ctl.request('api_diagnostics_visual_freshness', {
+          session_id: sessionId,
+          body,
+        }, { timeoutMs: 60000 }));
+        return {
+          ...response,
+          sessionId,
+          bodyLength: body.length,
+        };
+      };
       const terminal = async () => {
         const terminalId = `dashboard-terminal-local-${Date.now()}`;
         const token = 'dashboard_terminal_e2e_local';
@@ -419,6 +432,7 @@ async function main() {
         imagePreview: await imagePreview(),
         recordingAsset: await recordingAsset(),
         recordingFallbackPlayback: await recordingFallbackPlayback(),
+        diagnosticsVisualFreshness: await diagnosticsVisualFreshness(),
         terminal: await terminal(),
         tui: status.tui_frames_available ? await tui() : { skipped: true, subscribed: false, frameBytes: 0 },
         rejectedControlMsg: await labeled('api_control_msg rejected create_session', ctl.request('api_control_msg', {
@@ -532,6 +546,7 @@ async function main() {
     assert.strictEqual(result.finalStatus.apiControlMsgAvailable, true);
     assert.strictEqual(result.finalStatus.apiSessionControlMsgAvailable, true);
     assert.strictEqual(result.finalStatus.apiDashboardActionMsgAvailable, true);
+    assert.strictEqual(result.finalStatus.apiDiagnosticsVisualFreshnessAvailable, true);
     assert.strictEqual(result.finalStatus.apiSessionReportAvailable, true);
     assert.strictEqual(result.finalStatus.byteStreamsAvailable, true);
     assert.strictEqual(result.finalStatus.uploadFramesAvailable, true);
@@ -565,6 +580,17 @@ async function main() {
     assert.strictEqual(result.recordingFallbackPlayback?.srcScheme, 'blob');
     assert.strictEqual(result.recordingFallbackPlayback?.objectUrl, true);
     assert(result.recordingFallbackPlayback?.byteStreamDelta >= 1, `recording fallback playback did not use a byte stream: ${JSON.stringify(result.recordingFallbackPlayback)}`);
+    assert.strictEqual(result.status.api_diagnostics_visual_freshness_available, true);
+    assert.strictEqual(result.diagnosticsVisualFreshness?.ok, true);
+    assert.strictEqual(result.diagnosticsVisualFreshness?._httpStatus, 200);
+    assert.strictEqual(result.diagnosticsVisualFreshness?.written, result.diagnosticsVisualFreshness?.bodyLength);
+    fs.rmSync(path.join(
+      os.homedir(),
+      '.intendant',
+      'diagnostics',
+      'visual-freshness',
+      `${result.diagnosticsVisualFreshness.sessionId}.ndjson`
+    ), { force: true });
     assert.strictEqual(result.terminal?.opened, true);
     assert.strictEqual(result.terminal?.sawToken, true);
     if (result.status.tui_frames_available) {
@@ -639,6 +665,7 @@ async function main() {
         apiControlMsgAvailable: result.finalStatus.apiControlMsgAvailable,
         apiSessionControlMsgAvailable: result.finalStatus.apiSessionControlMsgAvailable,
         apiDashboardActionMsgAvailable: result.finalStatus.apiDashboardActionMsgAvailable,
+        apiDiagnosticsVisualFreshnessAvailable: result.finalStatus.apiDiagnosticsVisualFreshnessAvailable,
         apiSessionReportAvailable: result.finalStatus.apiSessionReportAvailable,
         byteStreamsAvailable: result.finalStatus.byteStreamsAvailable,
         uploadFramesAvailable: result.finalStatus.uploadFramesAvailable,
@@ -657,6 +684,7 @@ async function main() {
         recordingAssetText: result.recordingAsset.text,
         recordingFallbackSrcScheme: result.recordingFallbackPlayback.srcScheme,
         recordingFallbackByteStreamDelta: result.recordingFallbackPlayback.byteStreamDelta,
+        diagnosticsVisualFreshnessWritten: result.diagnosticsVisualFreshness.written,
         terminalOutputBytes: result.terminal.outputBytes,
         tuiFrameBytes: result.tui.frameBytes,
         sessionReportStatus: result.sessionReport._httpStatus || 200,

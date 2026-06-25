@@ -1239,6 +1239,19 @@ async function main() {
           wrap.remove();
         }
       };
+      const diagnosticsVisualFreshness = async () => {
+        const sessionId = `validator-rendezvous-vf-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+        const body = '{"t":"session_start"}\n{"t":"summary","transitions":1}\n';
+        const response = await labeled('api_diagnostics_visual_freshness', ctl.request('api_diagnostics_visual_freshness', {
+          session_id: sessionId,
+          body,
+        }, { timeoutMs: 60000 }));
+        return {
+          ...response,
+          sessionId,
+          bodyLength: body.length,
+        };
+      };
       const terminal = async () => {
         const terminalId = `dashboard-terminal-rendezvous-${Date.now()}`;
         const token = 'dashboard_terminal_e2e_rendezvous';
@@ -1380,6 +1393,7 @@ async function main() {
         imagePreview: await imagePreview(),
         recordingAsset: await recordingAsset(),
         recordingFallbackPlayback: await recordingFallbackPlayback(),
+        diagnosticsVisualFreshness: await diagnosticsVisualFreshness(),
         terminal: await terminal(),
         tui: status.tui_frames_available ? await tui() : { skipped: true, subscribed: false, frameBytes: 0 },
         sessionsStream: {
@@ -1507,6 +1521,11 @@ async function main() {
       result.status.api_dashboard_action_msg_available,
       true,
       'dashboard control status did not advertise dashboard action messages'
+    );
+    assert.strictEqual(
+      result.status.api_diagnostics_visual_freshness_available,
+      true,
+      'dashboard control status did not advertise diagnostics visual freshness uploads'
     );
     assert.strictEqual(
       result.status.api_agent_card_available,
@@ -1753,6 +1772,16 @@ async function main() {
       assert.strictEqual(result.recordingFallbackPlayback?.objectUrl, true);
       assert(result.recordingFallbackPlayback?.byteStreamDelta >= 1, `recording fallback playback did not use a byte stream: ${JSON.stringify(result.recordingFallbackPlayback)}`);
     }
+    assert.strictEqual(result.diagnosticsVisualFreshness?.ok, true);
+    assert.strictEqual(result.diagnosticsVisualFreshness?._httpStatus, 200);
+    assert.strictEqual(result.diagnosticsVisualFreshness?.written, result.diagnosticsVisualFreshness?.bodyLength);
+    fs.rmSync(path.join(
+      os.homedir(),
+      '.intendant',
+      'diagnostics',
+      'visual-freshness',
+      `${result.diagnosticsVisualFreshness.sessionId}.ndjson`
+    ), { force: true });
     assert.strictEqual(result.terminal?.opened, true);
     assert.strictEqual(result.terminal?.sawToken, true);
     if (result.status.tui_frames_available) {
@@ -1986,6 +2015,7 @@ async function main() {
         sessionControlAction: result.sessionControl.interrupt?.action,
         rejectedSessionControlStatus: result.sessionControl.rejectedSettingsAction?._httpStatus,
         apiDashboardActionMsgAvailable: result.status.api_dashboard_action_msg_available,
+        apiDiagnosticsVisualFreshnessAvailable: result.status.api_diagnostics_visual_freshness_available,
         dashboardActionAction: result.dashboardAction.closeWorkspace?.action,
         diagnosticsMarkerRegistryAvailable: result.dashboardAction.diagnosticsVisualMarker?.registry_available,
         diagnosticsMarkerActiveDisplayUpdated: result.dashboardAction.diagnosticsVisualMarker?.active_display_updated,
@@ -2010,6 +2040,7 @@ async function main() {
         recordingFallbackSrcScheme: result.recordingFallbackPlayback.srcScheme || null,
         recordingFallbackByteStreamDelta: result.recordingFallbackPlayback.byteStreamDelta || 0,
         recordingFallbackSkipped: Boolean(result.recordingFallbackPlayback.skipped),
+        diagnosticsVisualFreshnessWritten: result.diagnosticsVisualFreshness.written,
         terminalOutputBytes: result.terminal.outputBytes,
         tuiFrameBytes: result.tui.frameBytes,
         sessionReportStatus: result.sessionReport._httpStatus || 200,

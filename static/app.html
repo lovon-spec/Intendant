@@ -38284,6 +38284,7 @@ class DashboardControlTransport {
       apiControlMsgAvailable: this.lastStatus?.api_control_msg_available ?? null,
       apiSessionControlMsgAvailable: this.lastStatus?.api_session_control_msg_available ?? null,
       apiDashboardActionMsgAvailable: this.lastStatus?.api_dashboard_action_msg_available ?? null,
+      apiDiagnosticsVisualFreshnessAvailable: this.lastStatus?.api_diagnostics_visual_freshness_available ?? null,
       apiKeyStatusAvailable: this.lastStatus?.api_key_status_available ?? null,
       apiProjectRootAvailable: this.lastStatus?.api_project_root_available ?? null,
       apiDisplaysAvailable: this.lastStatus?.api_displays_available ?? null,
@@ -39540,6 +39541,38 @@ function peerCanShareDisplay(d) {
 // 8x4 tiles x 16 px = 128x64 px patch in the top-left; tile centers
 // sample at (col*16+8, row*16+8); luma threshold 128 splits the
 // limited-range 16/235 pair the peer writes.
+function dashboardVisualFreshnessRpcAvailable() {
+  return Boolean(
+    dashboardTransport &&
+    typeof dashboardTransport.canUseRpc === 'function' &&
+    dashboardTransport.canUseRpc() &&
+    dashboardControlTransport?.lastStatus?.api_diagnostics_visual_freshness_available === true
+  );
+}
+
+async function postVisualFreshnessDiagnostics(sessionId, ndjson) {
+  if (dashboardVisualFreshnessRpcAvailable()) {
+    const result = await dashboardTransport.request('api_diagnostics_visual_freshness', {
+      session_id: sessionId,
+      body: ndjson,
+    }, { timeoutMs: 10000 });
+    if (result?.ok === false || result?._httpOk === false) {
+      throw new Error(result?.error || `diagnostics upload failed (${result?._httpStatus || 'error'})`);
+    }
+    return result;
+  }
+  const url = `/api/diagnostics/visual-freshness?session_id=${encodeURIComponent(sessionId)}`;
+  const resp = await authedFetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-ndjson' },
+    body: ndjson,
+  });
+  if (!resp.ok) {
+    throw new Error(`${url} returned ${resp.status}`);
+  }
+  return resp.json().catch(() => ({}));
+}
+
 class VisualFreshnessSampler {
   constructor(videoEl, hostId, displayId) {
     this.videoEl = videoEl;
@@ -39713,8 +39746,8 @@ class VisualFreshnessSampler {
     this.records.push(record);
   }
 
-  _flush() {
-    if (this.stopped) return;
+  _flush(options = {}) {
+    if (this.stopped && !options.allowStopped) return;
     const summary = this._buildSummary();
     this._enqueue(summary);
     this._postBatch();
@@ -39747,16 +39780,8 @@ class VisualFreshnessSampler {
     if (this.records.length === 0) return;
     const ndjson = this.records.map(r => JSON.stringify(r)).join('\n') + '\n';
     this.records = [];
-    const url = `/api/diagnostics/visual-freshness?session_id=${encodeURIComponent(this.browserSessionId)}`;
-    // authedFetch carries the session bearer if one is configured;
-    // diagnostics endpoint is not auth-gated today but going through
-    // the same wrapper keeps headers consistent and dodges any future
-    // gate.
-    authedFetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-ndjson' },
-      body: ndjson,
-    }).catch(err => console.warn('[diag-vf] POST failed:', err));
+    postVisualFreshnessDiagnostics(this.browserSessionId, ndjson)
+      .catch(err => console.warn('[diag-vf] upload failed:', err));
   }
 
   stop() {
@@ -39772,7 +39797,7 @@ class VisualFreshnessSampler {
     });
     // Final summary gets emitted as part of _flush() called by the
     // session_end record's flush path.
-    this._flush();
+    this._flush({ allowStopped: true });
   }
 }
 
@@ -40876,8 +40901,8 @@ class CanvasFreshnessSampler {
     this.records.push(record);
   }
 
-  _flush() {
-    if (this.stopped) return;
+  _flush(options = {}) {
+    if (this.stopped && !options.allowStopped) return;
     this._enqueue(this._buildSummary());
     this._postBatch();
   }
@@ -40909,12 +40934,8 @@ class CanvasFreshnessSampler {
     if (this.records.length === 0) return;
     const ndjson = this.records.map((r) => JSON.stringify(r)).join('\n') + '\n';
     this.records = [];
-    const url = `/api/diagnostics/visual-freshness?session_id=${encodeURIComponent(this.browserSessionId)}`;
-    authedFetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-ndjson' },
-      body: ndjson,
-    }).catch((err) => console.warn('[diag-vf canvas] POST failed:', err));
+    postVisualFreshnessDiagnostics(this.browserSessionId, ndjson)
+      .catch((err) => console.warn('[diag-vf canvas] upload failed:', err));
   }
 
   stop() {
@@ -40928,7 +40949,7 @@ class CanvasFreshnessSampler {
       t: 'session_end',
       browser_ms: Math.round(performance.now() - this.startMs),
     });
-    this._flush();
+    this._flush({ allowStopped: true });
   }
 }
 

@@ -90,6 +90,7 @@ const CONTROL_FEATURES: &[&str] = &[
     "api_control_msg",
     "api_session_control_msg",
     "api_dashboard_action_msg",
+    "api_diagnostics_visual_freshness",
     "api_key_status",
     "api_api_keys_save",
     "api_voice_session",
@@ -1560,6 +1561,7 @@ fn control_frame_response(
                 | "api_control_msg"
                 | "api_session_control_msg"
                 | "api_dashboard_action_msg"
+                | "api_diagnostics_visual_freshness"
                 | "api_key_status"
                 | "api_api_keys_save"
                 | "api_voice_session"
@@ -2437,6 +2439,7 @@ fn status_response_frame(id: String, runtime: &ControlRuntime) -> serde_json::Va
         ("api_control_msg_available", true),
         ("api_session_control_msg_available", true),
         ("api_dashboard_action_msg_available", true),
+        ("api_diagnostics_visual_freshness_available", true),
         ("api_key_status_available", true),
         ("api_api_keys_save_available", true),
         ("api_voice_session_available", true),
@@ -2591,6 +2594,9 @@ async fn control_request_response(
         }
         "api_dashboard_action_msg" => {
             api_dashboard_action_msg_response(id, params.as_ref(), &runtime).await
+        }
+        "api_diagnostics_visual_freshness" => {
+            api_diagnostics_visual_freshness_response(id, params.as_ref()).await
         }
         "api_key_status" => json_body_response(
             id,
@@ -4854,6 +4860,47 @@ async fn api_dashboard_action_msg_response(
     })
 }
 
+async fn api_diagnostics_visual_freshness_response(
+    id: String,
+    params: Option<&serde_json::Value>,
+) -> serde_json::Value {
+    let params = params.cloned().unwrap_or_else(|| serde_json::json!({}));
+    let session_id = string_param(&params, &["session_id", "sessionId", "id"]);
+    if session_id.is_empty() {
+        return missing_param_response(id, "session_id");
+    }
+    let body = params
+        .get("body")
+        .or_else(|| params.get("ndjson"))
+        .and_then(|value| value.as_str())
+        .map(ToString::to_string)
+        .unwrap_or_default();
+    if body.is_empty() {
+        return missing_param_response(id, "body");
+    }
+
+    let result = tokio::task::spawn_blocking(move || {
+        crate::diagnostics::append_visual_freshness_record(&session_id, body.as_bytes())
+    })
+    .await;
+    let (status, body) = match result {
+        Ok(Ok(written)) => (
+            200,
+            serde_json::json!({"ok": true, "written": written}).to_string(),
+        ),
+        Ok(Err(e)) if e.kind() == std::io::ErrorKind::InvalidInput => {
+            (400, serde_json::json!({"error": e.to_string()}).to_string())
+        }
+        Ok(Err(e)) => (500, serde_json::json!({"error": e.to_string()}).to_string()),
+        Err(e) => (
+            500,
+            serde_json::json!({"error": format!("diagnostics append task failed: {e}")})
+                .to_string(),
+        ),
+    };
+    http_body_response(id, status, body, "diagnostics visual freshness")
+}
+
 fn dashboard_control_msg_from_params(
     id: String,
     params: Option<&serde_json::Value>,
@@ -6063,6 +6110,10 @@ mod tests {
         assert_eq!(status["result"]["api_control_msg_available"], true);
         assert_eq!(status["result"]["api_session_control_msg_available"], true);
         assert_eq!(status["result"]["api_dashboard_action_msg_available"], true);
+        assert_eq!(
+            status["result"]["api_diagnostics_visual_freshness_available"],
+            true
+        );
         assert_eq!(status["result"]["api_key_status_available"], true);
         assert_eq!(status["result"]["api_api_keys_save_available"], true);
         assert_eq!(status["result"]["api_voice_session_available"], true);
@@ -6398,6 +6449,34 @@ mod tests {
             .as_str()
             .unwrap_or("")
             .contains("not available over dashboard action WebRTC"));
+    }
+
+    #[tokio::test]
+    async fn api_diagnostics_visual_freshness_appends_ndjson_batch() {
+        let session_id = format!("dashboard-control-test-vf-{}", std::process::id());
+        if let Some(path) = crate::diagnostics::visual_freshness_path(&session_id) {
+            let _ = std::fs::remove_file(&path);
+        }
+        let ndjson = "{\"t\":\"session_start\"}\n{\"t\":\"summary\"}\n";
+        let response = api_diagnostics_visual_freshness_response(
+            "diag-vf".to_string(),
+            Some(&serde_json::json!({
+                "session_id": session_id.clone(),
+                "body": ndjson,
+            })),
+        )
+        .await;
+        assert_eq!(response["t"], "response");
+        assert_eq!(response["ok"], true);
+        assert_eq!(response["result"]["ok"], true);
+        assert_eq!(response["result"]["_httpStatus"], 200);
+        assert_eq!(response["result"]["written"], ndjson.len());
+
+        let path =
+            crate::diagnostics::visual_freshness_path(&session_id).expect("diagnostics path");
+        let written = std::fs::read_to_string(&path).expect("diagnostics transcript");
+        assert_eq!(written, ndjson);
+        let _ = std::fs::remove_file(path);
     }
 
     #[tokio::test]

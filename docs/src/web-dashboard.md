@@ -468,9 +468,10 @@ the tunnel.
 Current tunneled mutations include
 active-session rollback/redo/prune, session-data deletion, staged upload
 deletion, settings save, API-key save, peer add/remove, peer access-request
-pairing, peer message/task/approval actions, eligible-peer lookup, worktree
-scan/remove, dashboard managed-context MCP tool calls, coordinator routing, and
-dashboard session-control and dashboard-action controls.
+pairing, peer message/task/approval actions, eligible-peer lookup,
+visual-freshness diagnostics NDJSON appends, worktree scan/remove, dashboard
+managed-context MCP tool calls, coordinator routing, and dashboard
+session-control and dashboard-action controls.
 Allowlisted settings-style `ControlMsg`s, such as autonomy, approval-rule,
 external-agent, Codex, Gemini, and verbosity settings, can also dispatch over
 the DataChannel when it is verified. Display input authority uses dedicated
@@ -491,7 +492,9 @@ debug toggles, and browser workspace create/acquire/close/release. It has its
 own allowlist and the same no-replay fallback rule as the other mutation RPCs.
 Mutation fallbacks are deliberately conservative: if a connected WebRTC RPC
 fails after it may have reached the daemon, the dashboard surfaces the error
-instead of repeating the write over HTTP.
+instead of repeating the write over HTTP. The visual-freshness sampler follows
+the same rule for NDJSON appends; it uses the legacy HTTP endpoint only when no
+verified DataChannel path is available.
 
 The tunnel mirrors HTTP JSON response semantics. Application errors travel as
 successful transport frames with `_httpStatus`/`_httpOk` metadata so existing UI
@@ -502,10 +505,9 @@ browser-side promise.
 Several paths intentionally stay outside this JSON tunnel:
 
 - static assets and WASM bundles;
-- frames, native recording video/HLS URL playback, and broad file-transfer bytes;
+- frames, HLS/native playlist media playback, and broad file-transfer bytes;
 - general filesystem mutations and file content transfer;
 - generic MCP-over-HTTP for external clients;
-- diagnostics NDJSON uploads;
 - non-allowlisted `ControlMsg` mutations;
 - display WebRTC media channels and peer-display signaling;
 - daemon-to-daemon federation authentication.
@@ -1004,9 +1006,11 @@ Treat this as a staged target, not current behavior:
     diagnostics visual-marker toggles, recording/debug toggles, and browser
     workspace create/acquire/close/release.
     Standalone Shell terminal frames and WebTui frames also use the tunnel when
-    verified and advertised by the daemon. Generic downloads, HLS/native
-    playlist playback, remaining non-allowlisted control commands, and file
-    transfer still wait for resumable stream/file-transfer semantics.
+    verified and advertised by the daemon. Visual-freshness diagnostics NDJSON
+    appends use the tunnel when verified and fall back to HTTP only when the
+    tunnel is unavailable. Generic downloads, HLS/native playlist playback,
+    remaining non-allowlisted control commands, and file transfer still wait
+    for resumable stream/file-transfer semantics.
 11. Keep direct mTLS dashboard access and peer daemon-to-daemon mTLS working
     throughout.
 
