@@ -2,6 +2,8 @@
 'use strict';
 
 const assert = require('assert');
+const fs = require('fs');
+const os = require('os');
 const path = require('path');
 const { spawn } = require('child_process');
 const { httpStatus, launchBrowser } = require('./lib/browser-automation.cjs');
@@ -44,6 +46,20 @@ function wait(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+function createRecordingFixture(label) {
+  const streamName = `dashboard_control_${label}_${process.pid}_${Date.now()}`;
+  const dir = path.join(os.homedir(), '.intendant', 'recordings', streamName);
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, 'segments.csv'), 'seg_00000.mp4,0,1.25\n');
+  fs.writeFileSync(path.join(dir, 'seg_00000.mp4'), 'recording segment e2e local');
+  return { streamName, dir };
+}
+
+function removeRecordingFixture(fixture) {
+  if (!fixture?.dir) return;
+  fs.rmSync(fixture.dir, { recursive: true, force: true });
+}
+
 async function waitFor(predicate, timeoutMs, label) {
   const deadline = Date.now() + timeoutMs;
   let last;
@@ -82,6 +98,7 @@ async function main() {
   const options = parseArgs(process.argv);
   const origin = `http://127.0.0.1:${options.daemonPort}`;
   const daemonLogs = [];
+  const recordingFixture = createRecordingFixture('local');
   const daemon = spawn(options.dashboardBinary, [
     '--no-tui',
     '--no-tls',
@@ -128,8 +145,10 @@ async function main() {
     await page.waitForFunction(() => Boolean(window.intendantDashboardControl));
 
     const connected = await waitForDashboardControl(page);
+    await page.evaluate(`window.__intendantRecordingStreamName = ${JSON.stringify(recordingFixture.streamName)}`);
     const result = await page.evaluate(async () => {
       const ctl = window.intendantDashboardControl;
+      const recordingStreamName = window.__intendantRecordingStreamName;
       const labeled = async (label, promise) => {
         try {
           return await promise;
@@ -167,6 +186,27 @@ async function main() {
           id: uploadResult.id,
           offset: 10,
           length: 6,
+        }, { timeoutMs: 60000 }));
+        if (raw?.bytes instanceof Uint8Array) {
+          const { bytes, ...rest } = raw;
+          return {
+            ...rest,
+            byteLength: bytes.byteLength,
+            text: new TextDecoder().decode(bytes),
+          };
+        }
+        return {
+          ...(raw || {}),
+          byteLength: raw?.data_base64 ? atob(String(raw.data_base64)).length : 0,
+          text: raw?.data_base64 ? atob(String(raw.data_base64)) : '',
+        };
+      };
+      const recordingAsset = async () => {
+        const raw = await labeled('api_recording_asset segment', ctl.requestBytes('api_recording_asset', {
+          stream_name: recordingStreamName,
+          asset: 'seg_00000.mp4',
+          offset: 10,
+          length: 7,
         }, { timeoutMs: 60000 }));
         if (raw?.bytes instanceof Uint8Array) {
           const { bytes, ...rest } = raw;
@@ -254,6 +294,7 @@ async function main() {
         sessionReport: await sessionReport(),
         upload: uploaded,
         uploadRaw: await uploadRaw(uploaded),
+        recordingAsset: await recordingAsset(),
         terminal: await terminal(),
         rejectedControlMsg: await labeled('api_control_msg rejected create_session', ctl.request('api_control_msg', {
           message: { action: 'create_session', task: 'noop' },
@@ -369,6 +410,7 @@ async function main() {
     assert.strictEqual(result.finalStatus.terminalFramesAvailable, true);
     assert.strictEqual(result.finalStatus.apiSessionCurrentUploadAvailable, true);
     assert.strictEqual(result.finalStatus.apiSessionCurrentUploadRawAvailable, true);
+    assert.strictEqual(result.finalStatus.apiRecordingAssetAvailable, true);
     assert.strictEqual(result.upload?._httpStatus, 200);
     assert.strictEqual(result.upload?._httpOk, true);
     assert.strictEqual(result.upload?.name, 'dashboard-upload-local.txt');
@@ -381,6 +423,13 @@ async function main() {
     assert.strictEqual(result.uploadRaw?.range_start, 10);
     assert.strictEqual(result.uploadRaw?.range_end, 16);
     assert.strictEqual(result.uploadRaw?.resumable, true);
+    assert.strictEqual(result.recordingAsset?.ok, true);
+    assert.strictEqual(result.recordingAsset?.byteLength, 7);
+    assert.strictEqual(result.recordingAsset?.text, 'segment');
+    assert.strictEqual(result.recordingAsset?.content_type, 'video/mp4');
+    assert.strictEqual(result.recordingAsset?.range_start, 10);
+    assert.strictEqual(result.recordingAsset?.range_end, 17);
+    assert.strictEqual(result.recordingAsset?.resumable, true);
     assert.strictEqual(result.terminal?.opened, true);
     assert.strictEqual(result.terminal?.sawToken, true);
     if (result.sessionReport?.ok === true) {
@@ -450,10 +499,13 @@ async function main() {
         terminalFramesAvailable: result.finalStatus.terminalFramesAvailable,
         apiSessionCurrentUploadAvailable: result.finalStatus.apiSessionCurrentUploadAvailable,
         apiSessionCurrentUploadRawAvailable: result.finalStatus.apiSessionCurrentUploadRawAvailable,
+        apiRecordingAssetAvailable: result.finalStatus.apiRecordingAssetAvailable,
         uploadStatus: result.upload._httpStatus,
         uploadSize: result.upload.size,
         uploadRawBytes: result.uploadRaw.byteLength,
         uploadRawText: result.uploadRaw.text,
+        recordingAssetBytes: result.recordingAsset.byteLength,
+        recordingAssetText: result.recordingAsset.text,
         terminalOutputBytes: result.terminal.outputBytes,
         sessionReportStatus: result.sessionReport._httpStatus || 200,
         sessionReportSize: result.sessionReport.byteLength || result.sessionReport.size || 0,
@@ -472,6 +524,7 @@ async function main() {
     if (!daemon.killed) daemon.kill('SIGINT');
     await Promise.race([daemonExit, wait(5000)]);
     if (daemon.exitCode === null) daemon.kill('SIGKILL');
+    removeRecordingFixture(recordingFixture);
     if (daemonLogs.length && daemon.exitCode && daemon.exitCode !== 0 && daemon.exitCode !== 130) {
       console.error(daemonLogs.join('').slice(-4000));
     }

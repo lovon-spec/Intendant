@@ -31910,13 +31910,69 @@ class RecordingPlayer {
     playBtn.addEventListener('click', this._onPlayClick);
   }
 
+  _assetRpcTarget() {
+    if (!dashboardTransport?.canUseRpc?.()) return null;
+    if (dashboardControlTransport?.lastStatus?.byte_streams_available !== true) return null;
+    if (this.baseUrl === '/recordings') {
+      if (dashboardControlTransport?.lastStatus?.api_recording_asset_available !== true) return null;
+      return { method: 'api_recording_asset', params: {} };
+    }
+    const match = String(this.baseUrl || '').match(/^\/api\/session\/([^/]+)\/recordings$/);
+    if (!match) return null;
+    if (dashboardControlTransport?.lastStatus?.api_session_recording_asset_available !== true) return null;
+    return {
+      method: 'api_session_recording_asset',
+      params: { session_id: decodeURIComponent(match[1]) },
+    };
+  }
+
+  async _requestAssetBytes(asset, options = {}) {
+    const target = this._assetRpcTarget();
+    if (!target || !this.streamName) return null;
+    const result = await dashboardTransport.requestBytes(target.method, {
+      ...target.params,
+      stream_name: this.streamName,
+      asset,
+    }, { timeoutMs: options.timeoutMs || 120000 });
+    if (result?.ok === false || result?._httpOk === false) {
+      throw new Error(result.error || `Recording asset failed (${result._httpStatus || 'error'})`);
+    }
+    if (result?.bytes instanceof Uint8Array) return result.bytes;
+    if (result?.data_base64) return dashboardControlBase64ToBytes(result.data_base64);
+    return null;
+  }
+
+  async _loadSegmentsList() {
+    try {
+      const bytes = await this._requestAssetBytes('segments', { timeoutMs: 60000 });
+      if (bytes) return JSON.parse(new TextDecoder().decode(bytes));
+    } catch (err) {
+      console.warn('[dashboard-control] recording segments RPC failed', err);
+    }
+    const resp = await fetch(`${this.baseUrl}/${this.streamName}/segments`);
+    return resp.json();
+  }
+
+  async _fetchSegmentArrayBuffer(filename, fetchOptions = {}) {
+    if (String(filename || '').endsWith('.mp4')) {
+      try {
+        const bytes = await this._requestAssetBytes(filename, { timeoutMs: 120000 });
+        if (bytes) return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+      } catch (err) {
+        console.warn('[dashboard-control] recording segment RPC failed', err);
+      }
+    }
+    const url = `${this.baseUrl}/${this.streamName}/${filename}`;
+    const resp = await fetch(url, { cache: 'no-store', ...fetchOptions });
+    return resp.arrayBuffer();
+  }
+
   async load(streamName) {
     this.streamName = streamName;
     this.useMSE = false;
     this._mseReady = false;
     try {
-      const resp = await fetch(`${this.baseUrl}/${streamName}/segments`);
-      this.segments = await resp.json();
+      this.segments = await this._loadSegmentsList();
     } catch { this.segments = []; }
     this.totalDuration = this.segments.length > 0
       ? this.segments[this.segments.length - 1].end_secs
@@ -31939,8 +31995,7 @@ class RecordingPlayer {
     if (!this.streamName) return;
     const oldLen = this.segments.length;
     try {
-      const resp = await fetch(`${this.baseUrl}/${this.streamName}/segments`);
-      this.segments = await resp.json();
+      this.segments = await this._loadSegmentsList();
     } catch { return; }
     const newTotal = this.segments.length > 0
       ? this.segments[this.segments.length - 1].end_secs
@@ -31988,9 +32043,7 @@ class RecordingPlayer {
     for (let i = fromIdx; i < this.segments.length; i++) {
       try {
         const seg = this.segments[i];
-        const url = `${this.baseUrl}/${this.streamName}/${seg.filename}`;
-        const resp = await fetch(url, { cache: 'no-store' });
-        const buf = await resp.arrayBuffer();
+        const buf = await this._fetchSegmentArrayBuffer(seg.filename);
         const mediaData = extractMp4Boxes(buf, ['moof', 'mdat']);
         if (mediaData.byteLength === 0) continue;
         sb.timestampOffset = seg.start_secs;
@@ -32244,9 +32297,7 @@ class RecordingPlayer {
 
       const fetchSeg = async (i) => {
         const seg = this.segments[i];
-        const url = `${this.baseUrl}/${this.streamName}/${seg.filename}`;
-        const resp = await fetch(url, { signal, cache: 'no-store' });
-        buffers[i] = await resp.arrayBuffer();
+        buffers[i] = await this._fetchSegmentArrayBuffer(seg.filename, { signal });
         loaded++;
         if (barEl) {
           barEl.style.width = (loaded / total * 100) + '%';
@@ -38018,7 +38069,9 @@ class DashboardControlTransport {
       apiProjectRootAvailable: this.lastStatus?.api_project_root_available ?? null,
       apiDisplaysAvailable: this.lastStatus?.api_displays_available ?? null,
       apiRecordingsAvailable: this.lastStatus?.api_recordings_available ?? null,
+      apiRecordingAssetAvailable: this.lastStatus?.api_recording_asset_available ?? null,
       apiSessionRecordingsAvailable: this.lastStatus?.api_session_recordings_available ?? null,
+      apiSessionRecordingAssetAvailable: this.lastStatus?.api_session_recording_asset_available ?? null,
       apiWorktreesAvailable: this.lastStatus?.api_worktrees_available ?? null,
       apiWorktreesScanAvailable: this.lastStatus?.api_worktrees_scan_available ?? null,
       apiWorktreesRemoveAvailable: this.lastStatus?.api_worktrees_remove_available ?? null,

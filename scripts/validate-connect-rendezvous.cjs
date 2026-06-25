@@ -3,7 +3,9 @@
 
 const assert = require('assert');
 const crypto = require('crypto');
+const fs = require('fs');
 const http = require('http');
+const os = require('os');
 const path = require('path');
 const { spawn } = require('child_process');
 const { httpStatus, launchBrowser } = require('./lib/browser-automation.cjs');
@@ -924,6 +926,20 @@ function wait(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+function createRecordingFixture(label) {
+  const streamName = `dashboard_control_${label}_${process.pid}_${Date.now()}`;
+  const dir = path.join(os.homedir(), '.intendant', 'recordings', streamName);
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, 'segments.csv'), 'seg_00000.mp4,0,1.25\n');
+  fs.writeFileSync(path.join(dir, 'seg_00000.mp4'), 'recording segment e2e rendezvous');
+  return { streamName, dir };
+}
+
+function removeRecordingFixture(fixture) {
+  if (!fixture?.dir) return;
+  fs.rmSync(fixture.dir, { recursive: true, force: true });
+}
+
 async function waitFor(predicate, timeoutMs, label) {
   const deadline = Date.now() + timeoutMs;
   let last;
@@ -968,6 +984,7 @@ async function main() {
   });
 
   const daemonLogs = [];
+  const recordingFixture = createRecordingFixture('rendezvous');
   const daemon = spawn(options.dashboardBinary, ['--no-tui', '--web', String(options.daemonPort)], {
     cwd: options.repoRoot,
     env: {
@@ -1008,8 +1025,10 @@ async function main() {
     await page.waitForFunction(() => Boolean(window.intendantPublicConnectDashboard));
     const connected = await waitForBrowserConnect(page);
 
+    await page.evaluate(`window.__intendantRecordingStreamName = ${JSON.stringify(recordingFixture.streamName)}`);
     const result = await page.evaluate(async () => {
       const ctl = window.intendantPublicConnectDashboard;
+      const recordingStreamName = window.__intendantRecordingStreamName;
       const labeled = async (label, promise) => {
         try {
           return await promise;
@@ -1121,6 +1140,27 @@ async function main() {
           text: raw?.data_base64 ? atob(String(raw.data_base64)) : '',
         };
       };
+      const recordingAsset = async () => {
+        const raw = await labeled('api_recording_asset segment', ctl.requestBytes('api_recording_asset', {
+          stream_name: recordingStreamName,
+          asset: 'seg_00000.mp4',
+          offset: 10,
+          length: 7,
+        }, { timeoutMs: 60000 }));
+        if (raw?.bytes instanceof Uint8Array) {
+          const { bytes, ...rest } = raw;
+          return {
+            ...rest,
+            byteLength: bytes.byteLength,
+            text: new TextDecoder().decode(bytes),
+          };
+        }
+        return {
+          ...(raw || {}),
+          byteLength: raw?.data_base64 ? atob(String(raw.data_base64)).length : 0,
+          text: raw?.data_base64 ? atob(String(raw.data_base64)) : '',
+        };
+      };
       const terminal = async () => {
         const terminalId = `dashboard-terminal-rendezvous-${Date.now()}`;
         const token = 'dashboard_terminal_e2e_rendezvous';
@@ -1199,6 +1239,7 @@ async function main() {
         sessionReport: await sessionReport(),
         upload: uploaded,
         uploadRaw: await uploadRaw(uploaded),
+        recordingAsset: await recordingAsset(),
         terminal: await terminal(),
         sessionsStream: {
           result: streamResult,
@@ -1269,7 +1310,7 @@ async function main() {
         appError: await ctl.request('api_peer_eligible', { capabilities: [] }),
         finalStatus: ctl.status(),
       };
-    }, { timeoutMs: 180000 });
+    });
     assert(result.status && result.status.session_id, 'status RPC did not return a session id');
     assert.strictEqual(
       result.status.response_credit_enabled,
@@ -1315,6 +1356,11 @@ async function main() {
       result.status.api_session_current_upload_raw_available,
       true,
       'dashboard control status did not advertise upload raw byte streams'
+    );
+    assert.strictEqual(
+      result.status.api_recording_asset_available,
+      true,
+      'dashboard control status did not advertise recording asset byte streams'
     );
     assert.strictEqual(
       result.status.api_dashboard_action_msg_available,
@@ -1531,6 +1577,13 @@ async function main() {
     assert.strictEqual(result.uploadRaw?.range_start, 10);
     assert.strictEqual(result.uploadRaw?.range_end, 16);
     assert.strictEqual(result.uploadRaw?.resumable, true);
+    assert.strictEqual(result.recordingAsset?.ok, true);
+    assert.strictEqual(result.recordingAsset?.byteLength, 7);
+    assert.strictEqual(result.recordingAsset?.text, 'segment');
+    assert.strictEqual(result.recordingAsset?.content_type, 'video/mp4');
+    assert.strictEqual(result.recordingAsset?.range_start, 10);
+    assert.strictEqual(result.recordingAsset?.range_end, 17);
+    assert.strictEqual(result.recordingAsset?.resumable, true);
     assert.strictEqual(result.terminal?.opened, true);
     assert.strictEqual(result.terminal?.sawToken, true);
     assert.strictEqual(
@@ -1766,10 +1819,13 @@ async function main() {
         terminalFramesAvailable: result.status.terminal_frames_available,
         apiSessionCurrentUploadAvailable: result.status.api_session_current_upload_available,
         apiSessionCurrentUploadRawAvailable: result.status.api_session_current_upload_raw_available,
+        apiRecordingAssetAvailable: result.status.api_recording_asset_available,
         uploadStatus: result.upload._httpStatus,
         uploadSize: result.upload.size,
         uploadRawBytes: result.uploadRaw.byteLength,
         uploadRawText: result.uploadRaw.text,
+        recordingAssetBytes: result.recordingAsset.byteLength,
+        recordingAssetText: result.recordingAsset.text,
         terminalOutputBytes: result.terminal.outputBytes,
         sessionReportStatus: result.sessionReport._httpStatus || 200,
         sessionReportSize: result.sessionReport.byteLength || result.sessionReport.size || 0,
@@ -1826,6 +1882,7 @@ async function main() {
     if (!daemon.killed) daemon.kill('SIGINT');
     await Promise.race([daemonExit, wait(5000)]);
     await new Promise(resolve => rendezvous.close(resolve));
+    removeRecordingFixture(recordingFixture);
   }
 }
 

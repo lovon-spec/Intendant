@@ -461,7 +461,8 @@ active-session timeline history, active-session changes/diffs, lazy exact
 context-snapshot loads, filesystem picker stat/list/mkdir operations, deep
 session search, settings, API-key status, server-side voice-session token
 minting, project root, display enumeration, recording metadata, worktree
-inventory, bounded session-report zip downloads, and peer state.
+inventory, scoped recording asset byte streams, bounded session-report zip
+downloads, and peer state.
 Managed-context history reads for records, anchors, and fission groups also use
 the tunnel.
 Current tunneled mutations include
@@ -497,7 +498,7 @@ browser-side promise.
 Several paths intentionally stay outside this JSON tunnel:
 
 - static assets and WASM bundles;
-- frames, recordings, raw upload preview/download bytes, and broad file-transfer bytes;
+- frames, native recording video/HLS URL playback, and broad file-transfer bytes;
 - general filesystem mutations and file content transfer;
 - generic MCP-over-HTTP for external clients;
 - diagnostics NDJSON uploads;
@@ -845,8 +846,12 @@ rule as other writes.
 Active-session change list/detail reads use `api_session_current_changes`,
 preserving the existing path validation and `_httpStatus`/`_httpOk` metadata.
 Live and per-session recording stream lists use `api_recordings` and
-`api_session_recordings`; HLS playlists and media segments remain on HTTP until
-the tunnel has resumable byte-stream semantics.
+`api_session_recordings`. Scoped recording asset reads use `api_recording_asset`
+and `api_session_recording_asset` for `segments`, `playlist.m3u8`, and validated
+`seg_*.mp4`/`seg_*.ts` filenames with optional `offset`/`length` ranges. The
+recording player uses these byte streams for segment lists and MP4 MSE buffers
+when the verified tunnel is available, while native video/HLS URL playback still
+uses HTTP because the browser media element needs a URL source.
 The Settings debug session-report download uses `api_session_report`, returning
 the same text-artifact zip as `/api/session/{id}/report` through bounded
 `byte_stream_*` frames. This is intentionally scoped to the diagnostic report;
@@ -901,10 +906,10 @@ before a verified DataChannel request is attempted, then surface RPC failures
 instead of duplicating a potentially state-changing action.
 
 The remaining migration work is mostly byte-stream and file-transfer heavy:
-generic downloads, recording media, the TUI terminal mirror, broader file
-transfer, and remaining non-allowlisted control mutations should move only after
-resumable stream/file-transfer semantics and per-action no-replay rules are
-settled.
+generic downloads, native recording/HLS media URL playback, the TUI terminal
+mirror, broader file transfer, and remaining non-allowlisted control mutations
+should move only after resumable stream/file-transfer semantics and per-action
+no-replay rules are settled.
 
 The dashboard status bar now exposes the selected control transport. Direct
 dashboard access shows the existing HTTP/mTLS path, while opt-in WebRTC control
@@ -967,7 +972,8 @@ Treat this as a staged target, not current behavior:
     active-session command-output loads, active-session timeline operations,
     active-session changes/diffs, lazy context-snapshot exact-loads, session-data
     deletion, staged upload deletion, bounded task uploads, recording metadata,
-    session-report zip downloads, bounded byte-stream artifact transfer,
+    scoped recording asset byte streams, session-report zip downloads,
+    bounded byte-stream artifact transfer,
     worktree inventory, filesystem picker stat/list/mkdir operations,
     local Agent Card reads, and local session hydration now use the tunnel,
     oversized JSON responses now use credit-windowed chunked response framing,
@@ -981,9 +987,9 @@ Treat this as a staged target, not current behavior:
     now covers Codex/Gemini thread actions, display take/release/grant/revoke,
     recording/debug toggles, and browser workspace create/acquire/close/release.
     Standalone Shell terminal frames also use the tunnel when verified. Generic
-    downloads, recording media, the TUI terminal mirror, remaining non-allowlisted
-    control commands, and file transfer still wait for resumable stream/file-transfer
-    semantics.
+    downloads, native recording/HLS URL playback, the TUI terminal mirror,
+    remaining non-allowlisted control commands, and file transfer still wait for
+    resumable stream/file-transfer semantics.
 11. Keep direct mTLS dashboard access and peer daemon-to-daemon mTLS working
     throughout.
 

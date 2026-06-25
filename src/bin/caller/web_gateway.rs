@@ -3770,7 +3770,7 @@ mod host_header_tests {
 /// for each session (newest first, capped at 100).
 /// Return session detail: replayed log entries + metadata for a single session.
 /// Resolve a session directory by exact ID or prefix match.
-fn session_lookup_id_is_safe(session_id: &str) -> bool {
+pub(crate) fn session_lookup_id_is_safe(session_id: &str) -> bool {
     !session_id.is_empty()
         && session_id.trim() == session_id
         && session_id != "."
@@ -3829,7 +3829,7 @@ fn resolve_session_dir_from_listed_external_row(home: &Path, session_id: &str) -
     None
 }
 
-fn resolve_session_dir(session_id: &str) -> Option<PathBuf> {
+pub(crate) fn resolve_session_dir(session_id: &str) -> Option<PathBuf> {
     resolve_session_dir_from_home(&crate::platform::home_dir(), session_id)
 }
 
@@ -4048,7 +4048,7 @@ pub(crate) fn session_recordings_list_response_body(session_id: &str) -> (&'stat
     ("200 OK", body)
 }
 
-fn recording_playlist_m3u8(segments: &[crate::recording::SegmentInfo]) -> String {
+pub(crate) fn recording_playlist_m3u8(segments: &[crate::recording::SegmentInfo]) -> String {
     let mut m3u8 = String::from("#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-MEDIA-SEQUENCE:0\n");
     let max_dur = segments
         .iter()
