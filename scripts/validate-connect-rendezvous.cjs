@@ -351,6 +351,7 @@ function publicBootstrapHtml() {
     byteStreams: new Map(),
     completedChunkedResponses: 0,
     completedByteStreams: 0,
+    lastStatus: null,
     seq: 0,
     async start() {
       this.pc = new RTCPeerConnection({});
@@ -746,6 +747,12 @@ function publicBootstrapHtml() {
       const id = this.nextId();
       const promise = this.waitFor(id, options);
       this.sendFrame({ t: 'request', id, method, params });
+      if (method === 'status') {
+        return promise.then(status => {
+          if (status && typeof status === 'object') this.lastStatus = status;
+          return status;
+        });
+      }
       return promise;
     },
     requestBytes(method, params = {}, options = {}) {
@@ -903,6 +910,66 @@ function publicBootstrapHtml() {
         pendingByteStreams: this.byteStreams.size,
         completedChunkedResponses: this.completedChunkedResponses,
         completedByteStreams: this.completedByteStreams,
+        apiAgentCardAvailable: this.lastStatus?.api_agent_card_available ?? null,
+        apiCachedBootstrapEventsAvailable: this.lastStatus?.api_cached_bootstrap_events_available ?? null,
+        apiBrowserWorkspaceSnapshotAvailable: this.lastStatus?.api_browser_workspace_snapshot_available ?? null,
+        apiStateSnapshotAvailable: this.lastStatus?.api_state_snapshot_available ?? null,
+        apiDisplayBootstrapAvailable: this.lastStatus?.api_display_bootstrap_available ?? null,
+        apiDisplayInputAuthorityAvailable: this.lastStatus?.api_display_input_authority_available ?? null,
+        apiSessionLogReplayAvailable: this.lastStatus?.api_session_log_replay_available ?? null,
+        apiExternalSessionActivityReplayAvailable: this.lastStatus?.api_external_session_activity_replay_available ?? null,
+        apiDashboardBootstrapAvailable: this.lastStatus?.api_dashboard_bootstrap_available ?? null,
+        apiPeersAvailable: this.lastStatus?.api_peers_available ?? null,
+        apiSessionsAvailable: this.lastStatus?.api_sessions_available ?? null,
+        apiSessionsStreamAvailable: this.lastStatus?.api_sessions_stream_available ?? null,
+        byteStreamsAvailable: this.lastStatus?.byte_streams_available ?? null,
+        uploadFramesAvailable: this.lastStatus?.upload_frames_available ?? null,
+        terminalFramesAvailable: this.lastStatus?.terminal_frames_available ?? null,
+        tuiFramesAvailable: this.lastStatus?.tui_frames_available ?? null,
+        apiSessionDetailAvailable: this.lastStatus?.api_session_detail_available ?? null,
+        apiSessionReportAvailable: this.lastStatus?.api_session_report_available ?? null,
+        apiSessionDeleteAvailable: this.lastStatus?.api_session_delete_available ?? null,
+        apiSessionCurrentAgentOutputAvailable: this.lastStatus?.api_session_current_agent_output_available ?? null,
+        apiSessionCurrentHistoryAvailable: this.lastStatus?.api_session_current_history_available ?? null,
+        apiSessionCurrentRollbackAvailable: this.lastStatus?.api_session_current_rollback_available ?? null,
+        apiSessionCurrentRedoAvailable: this.lastStatus?.api_session_current_redo_available ?? null,
+        apiSessionCurrentPruneAvailable: this.lastStatus?.api_session_current_prune_available ?? null,
+        apiSessionCurrentChangesAvailable: this.lastStatus?.api_session_current_changes_available ?? null,
+        apiSessionContextSnapshotAvailable: this.lastStatus?.api_session_context_snapshot_available ?? null,
+        apiSessionCurrentUploadAvailable: this.lastStatus?.api_session_current_upload_available ?? null,
+        apiSessionCurrentUploadsAvailable: this.lastStatus?.api_session_current_uploads_available ?? null,
+        apiSessionCurrentUploadRawAvailable: this.lastStatus?.api_session_current_upload_raw_available ?? null,
+        apiSessionCurrentUploadDeleteAvailable: this.lastStatus?.api_session_current_upload_delete_available ?? null,
+        apiFsStatAvailable: this.lastStatus?.api_fs_stat_available ?? null,
+        apiFsListAvailable: this.lastStatus?.api_fs_list_available ?? null,
+        apiFsMkdirAvailable: this.lastStatus?.api_fs_mkdir_available ?? null,
+        apiFsReadAvailable: this.lastStatus?.api_fs_read_available ?? null,
+        apiSessionsSearchAvailable: this.lastStatus?.api_sessions_search_available ?? null,
+        apiSettingsAvailable: this.lastStatus?.api_settings_available ?? null,
+        apiSettingsSaveAvailable: this.lastStatus?.api_settings_save_available ?? null,
+        apiControlMsgAvailable: this.lastStatus?.api_control_msg_available ?? null,
+        apiSessionControlMsgAvailable: this.lastStatus?.api_session_control_msg_available ?? null,
+        apiDashboardActionMsgAvailable: this.lastStatus?.api_dashboard_action_msg_available ?? null,
+        apiDiagnosticsVisualFreshnessAvailable: this.lastStatus?.api_diagnostics_visual_freshness_available ?? null,
+        apiKeyStatusAvailable: this.lastStatus?.api_key_status_available ?? null,
+        apiApiKeysSaveAvailable: this.lastStatus?.api_api_keys_save_available ?? null,
+        apiVoiceSessionAvailable: this.lastStatus?.api_voice_session_available ?? null,
+        apiProjectRootAvailable: this.lastStatus?.api_project_root_available ?? null,
+        apiDisplaysAvailable: this.lastStatus?.api_displays_available ?? null,
+        apiRecordingsAvailable: this.lastStatus?.api_recordings_available ?? null,
+        apiRecordingAssetAvailable: this.lastStatus?.api_recording_asset_available ?? null,
+        apiSessionRecordingsAvailable: this.lastStatus?.api_session_recordings_available ?? null,
+        apiSessionRecordingAssetAvailable: this.lastStatus?.api_session_recording_asset_available ?? null,
+        apiSessionFrameAssetAvailable: this.lastStatus?.api_session_frame_asset_available ?? null,
+        apiWorktreesAvailable: this.lastStatus?.api_worktrees_available ?? null,
+        apiWorktreesScanAvailable: this.lastStatus?.api_worktrees_scan_available ?? null,
+        apiWorktreesRemoveAvailable: this.lastStatus?.api_worktrees_remove_available ?? null,
+        apiManagedContextAvailable: this.lastStatus?.api_managed_context_available ?? null,
+        apiMcpToolCallAvailable: this.lastStatus?.api_mcp_tool_call_available ?? null,
+        apiPeerMutationsAvailable: this.lastStatus?.api_peer_mutations_available ?? null,
+        apiPeerPairingAvailable: this.lastStatus?.api_peer_pairing_available ?? null,
+        apiPeerWebRtcSignalAvailable: this.lastStatus?.api_peer_webrtc_signal_available ?? null,
+        apiCoordinatorAvailable: this.lastStatus?.api_coordinator_available ?? null,
       };
     },
     close() {
@@ -2201,6 +2268,32 @@ async function main() {
     assert.strictEqual(result.filesystemRead?.range_end, 20);
     assert.strictEqual(result.filesystemRead?.total_size, filesystemFixture.text.length);
     assert.strictEqual(result.filesystemRead?.resumable, true);
+    assert.strictEqual(result.finalStatus.apiSessionDetailAvailable, result.status.api_session_detail_available);
+    assert.strictEqual(result.finalStatus.apiSessionReportAvailable, result.status.api_session_report_available);
+    assert.strictEqual(result.finalStatus.apiSessionDeleteAvailable, result.status.api_session_delete_available);
+    assert.strictEqual(result.finalStatus.apiSessionCurrentAgentOutputAvailable, result.status.api_session_current_agent_output_available);
+    assert.strictEqual(result.finalStatus.apiSessionCurrentHistoryAvailable, result.status.api_session_current_history_available);
+    assert.strictEqual(result.finalStatus.apiSessionCurrentRollbackAvailable, result.status.api_session_current_rollback_available);
+    assert.strictEqual(result.finalStatus.apiSessionCurrentRedoAvailable, result.status.api_session_current_redo_available);
+    assert.strictEqual(result.finalStatus.apiSessionCurrentPruneAvailable, result.status.api_session_current_prune_available);
+    assert.strictEqual(result.finalStatus.apiSessionCurrentChangesAvailable, result.status.api_session_current_changes_available);
+    assert.strictEqual(result.finalStatus.apiSessionContextSnapshotAvailable, result.status.api_session_context_snapshot_available);
+    assert.strictEqual(result.finalStatus.apiSessionCurrentUploadsAvailable, result.status.api_session_current_uploads_available);
+    assert.strictEqual(result.finalStatus.apiSessionCurrentUploadAvailable, result.status.api_session_current_upload_available);
+    assert.strictEqual(result.finalStatus.apiSessionCurrentUploadRawAvailable, result.status.api_session_current_upload_raw_available);
+    assert.strictEqual(result.finalStatus.apiSessionCurrentUploadDeleteAvailable, result.status.api_session_current_upload_delete_available);
+    assert.strictEqual(result.finalStatus.apiFsStatAvailable, result.status.api_fs_stat_available);
+    assert.strictEqual(result.finalStatus.apiFsListAvailable, result.status.api_fs_list_available);
+    assert.strictEqual(result.finalStatus.apiFsMkdirAvailable, result.status.api_fs_mkdir_available);
+    assert.strictEqual(result.finalStatus.apiFsReadAvailable, result.status.api_fs_read_available);
+    assert.strictEqual(result.finalStatus.apiSettingsAvailable, result.status.api_settings_available);
+    assert.strictEqual(result.finalStatus.apiSettingsSaveAvailable, result.status.api_settings_save_available);
+    assert.strictEqual(result.finalStatus.apiKeyStatusAvailable, result.status.api_key_status_available);
+    assert.strictEqual(result.finalStatus.apiApiKeysSaveAvailable, result.status.api_api_keys_save_available);
+    assert.strictEqual(result.finalStatus.apiVoiceSessionAvailable, result.status.api_voice_session_available);
+    assert.strictEqual(result.finalStatus.apiProjectRootAvailable, result.status.api_project_root_available);
+    assert.strictEqual(result.finalStatus.apiDisplaysAvailable, result.status.api_displays_available);
+    assert.strictEqual(result.finalStatus.apiCoordinatorAvailable, result.status.api_coordinator_available);
     assert(result.appError && result.appError._httpStatus === 400, 'application error metadata was not preserved');
     assert(
       result.finalStatus.completedChunkedResponses > result.largeSessions.completedChunkedResponsesBefore,
@@ -2260,7 +2353,17 @@ async function main() {
         apiSessionCurrentUploadRawAvailable: result.status.api_session_current_upload_raw_available,
         apiRecordingAssetAvailable: result.status.api_recording_asset_available,
         apiSessionFrameAssetAvailable: result.status.api_session_frame_asset_available,
+        apiSessionDeleteDebugAvailable: result.finalStatus.apiSessionDeleteAvailable,
+        apiSessionContextSnapshotDebugAvailable: result.finalStatus.apiSessionContextSnapshotAvailable,
+        apiSessionCurrentUploadDeleteDebugAvailable: result.finalStatus.apiSessionCurrentUploadDeleteAvailable,
+        apiFsStatDebugAvailable: result.finalStatus.apiFsStatAvailable,
+        apiFsListDebugAvailable: result.finalStatus.apiFsListAvailable,
+        apiFsMkdirDebugAvailable: result.finalStatus.apiFsMkdirAvailable,
         apiFsReadAvailable: result.status.api_fs_read_available,
+        apiSettingsSaveDebugAvailable: result.finalStatus.apiSettingsSaveAvailable,
+        apiApiKeysSaveDebugAvailable: result.finalStatus.apiApiKeysSaveAvailable,
+        apiVoiceSessionDebugAvailable: result.finalStatus.apiVoiceSessionAvailable,
+        apiCoordinatorDebugAvailable: result.finalStatus.apiCoordinatorAvailable,
         uploadStatus: result.upload._httpStatus,
         uploadListCount: result.uploadList.length,
         uploadSize: result.upload.size,

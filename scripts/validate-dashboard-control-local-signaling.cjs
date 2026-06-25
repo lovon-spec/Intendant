@@ -727,7 +727,17 @@ async function main() {
     assert.strictEqual(result.finalStatus.apiPeerMutationsAvailable, true);
     assert.strictEqual(result.finalStatus.apiPeerPairingAvailable, true);
     assert.strictEqual(result.finalStatus.apiPeerWebRtcSignalAvailable, true);
+    assert.strictEqual(result.finalStatus.apiCoordinatorAvailable, result.status.api_coordinator_available);
+    assert.strictEqual(result.finalStatus.apiSessionDetailAvailable, true);
     assert.strictEqual(result.finalStatus.apiSessionReportAvailable, true);
+    assert.strictEqual(result.finalStatus.apiSessionDeleteAvailable, result.status.api_session_delete_available);
+    assert.strictEqual(result.finalStatus.apiSessionCurrentAgentOutputAvailable, result.status.api_session_current_agent_output_available);
+    assert.strictEqual(result.finalStatus.apiSessionCurrentHistoryAvailable, result.status.api_session_current_history_available);
+    assert.strictEqual(result.finalStatus.apiSessionCurrentRollbackAvailable, result.status.api_session_current_rollback_available);
+    assert.strictEqual(result.finalStatus.apiSessionCurrentRedoAvailable, result.status.api_session_current_redo_available);
+    assert.strictEqual(result.finalStatus.apiSessionCurrentPruneAvailable, result.status.api_session_current_prune_available);
+    assert.strictEqual(result.finalStatus.apiSessionCurrentChangesAvailable, result.status.api_session_current_changes_available);
+    assert.strictEqual(result.finalStatus.apiSessionContextSnapshotAvailable, result.status.api_session_context_snapshot_available);
     assert.strictEqual(result.finalStatus.byteStreamsAvailable, true);
     assert.strictEqual(result.finalStatus.uploadFramesAvailable, true);
     assert.strictEqual(result.finalStatus.terminalFramesAvailable, true);
@@ -735,9 +745,20 @@ async function main() {
     assert.strictEqual(result.finalStatus.apiSessionCurrentUploadsAvailable, true);
     assert.strictEqual(result.finalStatus.apiSessionCurrentUploadAvailable, true);
     assert.strictEqual(result.finalStatus.apiSessionCurrentUploadRawAvailable, true);
+    assert.strictEqual(result.finalStatus.apiSessionCurrentUploadDeleteAvailable, result.status.api_session_current_upload_delete_available);
     assert.strictEqual(result.finalStatus.apiRecordingAssetAvailable, true);
     assert.strictEqual(result.finalStatus.apiSessionFrameAssetAvailable, true);
+    assert.strictEqual(result.finalStatus.apiFsStatAvailable, result.status.api_fs_stat_available);
+    assert.strictEqual(result.finalStatus.apiFsListAvailable, result.status.api_fs_list_available);
+    assert.strictEqual(result.finalStatus.apiFsMkdirAvailable, result.status.api_fs_mkdir_available);
     assert.strictEqual(result.finalStatus.apiFsReadAvailable, true);
+    assert.strictEqual(result.finalStatus.apiSettingsAvailable, result.status.api_settings_available);
+    assert.strictEqual(result.finalStatus.apiSettingsSaveAvailable, result.status.api_settings_save_available);
+    assert.strictEqual(result.finalStatus.apiKeyStatusAvailable, result.status.api_key_status_available);
+    assert.strictEqual(result.finalStatus.apiApiKeysSaveAvailable, result.status.api_api_keys_save_available);
+    assert.strictEqual(result.finalStatus.apiVoiceSessionAvailable, result.status.api_voice_session_available);
+    assert.strictEqual(result.finalStatus.apiProjectRootAvailable, result.status.api_project_root_available);
+    assert.strictEqual(result.finalStatus.apiDisplaysAvailable, result.status.api_displays_available);
     assert.strictEqual(result.upload?._httpStatus, 200);
     assert.strictEqual(result.upload?._httpOk, true);
     assert.strictEqual(result.upload?.name, 'dashboard-upload-local.txt');
@@ -890,7 +911,11 @@ async function main() {
         apiPeerMutationsAvailable: result.finalStatus.apiPeerMutationsAvailable,
         apiPeerPairingAvailable: result.finalStatus.apiPeerPairingAvailable,
         apiPeerWebRtcSignalAvailable: result.finalStatus.apiPeerWebRtcSignalAvailable,
+        apiCoordinatorAvailable: result.finalStatus.apiCoordinatorAvailable,
+        apiSessionDetailAvailable: result.finalStatus.apiSessionDetailAvailable,
         apiSessionReportAvailable: result.finalStatus.apiSessionReportAvailable,
+        apiSessionDeleteAvailable: result.finalStatus.apiSessionDeleteAvailable,
+        apiSessionContextSnapshotAvailable: result.finalStatus.apiSessionContextSnapshotAvailable,
         byteStreamsAvailable: result.finalStatus.byteStreamsAvailable,
         uploadFramesAvailable: result.finalStatus.uploadFramesAvailable,
         terminalFramesAvailable: result.finalStatus.terminalFramesAvailable,
@@ -898,9 +923,16 @@ async function main() {
         apiSessionCurrentUploadsAvailable: result.finalStatus.apiSessionCurrentUploadsAvailable,
         apiSessionCurrentUploadAvailable: result.finalStatus.apiSessionCurrentUploadAvailable,
         apiSessionCurrentUploadRawAvailable: result.finalStatus.apiSessionCurrentUploadRawAvailable,
+        apiSessionCurrentUploadDeleteAvailable: result.finalStatus.apiSessionCurrentUploadDeleteAvailable,
         apiRecordingAssetAvailable: result.finalStatus.apiRecordingAssetAvailable,
         apiSessionFrameAssetAvailable: result.finalStatus.apiSessionFrameAssetAvailable,
+        apiFsStatAvailable: result.finalStatus.apiFsStatAvailable,
+        apiFsListAvailable: result.finalStatus.apiFsListAvailable,
+        apiFsMkdirAvailable: result.finalStatus.apiFsMkdirAvailable,
         apiFsReadAvailable: result.finalStatus.apiFsReadAvailable,
+        apiSettingsSaveAvailable: result.finalStatus.apiSettingsSaveAvailable,
+        apiApiKeysSaveAvailable: result.finalStatus.apiApiKeysSaveAvailable,
+        apiVoiceSessionAvailable: result.finalStatus.apiVoiceSessionAvailable,
         uploadStatus: result.upload._httpStatus,
         uploadListCount: result.uploads.length,
         uploadSize: result.upload.size,
