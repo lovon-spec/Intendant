@@ -24557,7 +24557,7 @@ async function hydrateSessionWindowIfEmpty(sessionId) {
   try {
     let record = sessionWindowHydrationRecord(sid);
     if (!record) {
-      const resp = await fetch(`/api/sessions?ids=${encodeURIComponent(sid)}`, { cache: 'no-store' });
+      const resp = await dashboardJsonFetch('api_sessions', { ids: [sid] }, () => fetch(`/api/sessions?ids=${encodeURIComponent(sid)}`, { cache: 'no-store' }), 'api_sessions_ids');
       if (resp.ok) {
         const sessions = await resp.json();
         cacheSessionWindowMetadata(sessions);

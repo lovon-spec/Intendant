@@ -810,10 +810,19 @@ async function main() {
         },
       });
       const afterLargeStreamChunks = ctl.status().completedChunkedResponses || 0;
+      const sessions = await ctl.request('api_sessions', { limit: 2 });
+      const firstSessionId = Array.isArray(sessions)
+        ? String(sessions[0]?.session_id || '').trim()
+        : '';
+      const sessionsById = firstSessionId
+        ? await ctl.request('api_sessions', { ids: [firstSessionId] })
+        : [];
       return {
         status: await ctl.request('status'),
         config: await ctl.request('config'),
-        sessions: await ctl.request('api_sessions', { limit: 2 }),
+        sessions,
+        sessionsById,
+        sessionsByIdTarget: firstSessionId,
         sessionsStream: {
           result: streamResult,
           eventTypes: streamEvents.map(event => event.type),
@@ -861,6 +870,13 @@ async function main() {
     );
     assert(result.config && typeof result.config === 'object', 'config RPC did not return an object');
     assert(Array.isArray(result.sessions), 'api_sessions did not return an array');
+    assert(Array.isArray(result.sessionsById), 'api_sessions ids did not return an array');
+    if (result.sessionsByIdTarget) {
+      assert(
+        result.sessionsById.some(session => session?.session_id === result.sessionsByIdTarget),
+        'api_sessions ids did not return the requested session'
+      );
+    }
     assert(result.sessionsStream.eventTypes.includes('start'), 'api_sessions_stream missed start event');
     assert(result.sessionsStream.eventTypes.includes('replace'), 'api_sessions_stream missed replace event');
     assert(result.sessionsStream.eventTypes.includes('done'), 'api_sessions_stream missed done event');
@@ -954,6 +970,7 @@ async function main() {
         controlSessionId: result.status.session_id,
         responseCredit: result.status.response_credit_enabled,
         sessionCount: result.sessions.length,
+        sessionByIdCount: result.sessionsById.length,
         streamEventCount: result.sessionsStream.eventCount,
         streamReplaceCount: result.sessionsStream.replaceCount,
         largeStreamEventCount: result.largeSessionsStream.eventCount,

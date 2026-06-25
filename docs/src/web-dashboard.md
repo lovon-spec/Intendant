@@ -548,10 +548,11 @@ The validator starts a local rendezvous HTTP origin, launches a fresh daemon
 child with Connect env vars, verifies that
 `https://127.0.0.1:<daemon-port>/config` still rejects a certless request with
 `401`, then loads the browser from the rendezvous origin and drives `status`,
-`config`, `api_sessions`, streamed `api_sessions_stream` hydration, a chunked
-large `api_sessions_stream` event, a chunked large `api_sessions` response,
-active-session command-output lookup, active-session timeline lookup/validation,
-and application error RPCs over the verified DataChannel.
+`config`, `api_sessions`, id-filtered `api_sessions`, streamed
+`api_sessions_stream` hydration, a chunked large `api_sessions_stream` event, a
+chunked large `api_sessions` response, active-session command-output lookup,
+active-session timeline lookup/validation, and application error RPCs over the
+verified DataChannel.
 
 This still is not consumer Connect. It has no account, passkey, daemon claim,
 grant issuance, revocation, audit log, or hosted public HTTPS. It is the
