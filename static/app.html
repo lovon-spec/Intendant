@@ -36715,6 +36715,9 @@ window.intendantDashboardControl = {
   sessionLogReplay(options = {}) {
     return dashboardTransport.request('api_session_log_replay', {}, options);
   },
+  dashboardBootstrap(options = {}) {
+    return dashboardTransport.request('api_dashboard_bootstrap', {}, options);
+  },
   peers() {
     return dashboardTransport.request('api_peers');
   },
@@ -37410,6 +37413,7 @@ class DashboardControlTransport {
       apiBrowserWorkspaceSnapshotAvailable: this.lastStatus?.api_browser_workspace_snapshot_available ?? null,
       apiStateSnapshotAvailable: this.lastStatus?.api_state_snapshot_available ?? null,
       apiSessionLogReplayAvailable: this.lastStatus?.api_session_log_replay_available ?? null,
+      apiDashboardBootstrapAvailable: this.lastStatus?.api_dashboard_bootstrap_available ?? null,
       apiPeersAvailable: this.lastStatus?.api_peers_available ?? null,
       apiSessionsAvailable: this.lastStatus?.api_sessions_available ?? null,
       apiSessionsStreamAvailable: this.lastStatus?.api_sessions_stream_available ?? null,

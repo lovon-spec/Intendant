@@ -49,6 +49,7 @@ const CONTROL_FEATURES: &[&str] = &[
     "api_browser_workspace_snapshot",
     "api_state_snapshot",
     "api_session_log_replay",
+    "api_dashboard_bootstrap",
     "status",
     "events",
     "response_chunks",
@@ -1200,6 +1201,7 @@ fn control_frame_response(
                 | "api_browser_workspace_snapshot"
                 | "api_state_snapshot"
                 | "api_session_log_replay"
+                | "api_dashboard_bootstrap"
                 | "api_worktrees"
                 | "api_worktrees_scan"
                 | "api_worktrees_remove"
@@ -1382,6 +1384,7 @@ fn status_response_frame(id: String, runtime: &ControlRuntime) -> serde_json::Va
         ("api_browser_workspace_snapshot_available", true),
         ("api_state_snapshot_available", true),
         ("api_session_log_replay_available", true),
+        ("api_dashboard_bootstrap_available", true),
         ("api_sessions_available", true),
         ("api_sessions_stream_available", true),
         ("api_session_detail_available", true),
@@ -1547,6 +1550,7 @@ async fn control_request_response(
         "api_browser_workspace_snapshot" => api_browser_workspace_snapshot_response(id).await,
         "api_state_snapshot" => api_state_snapshot_response(id, &runtime).await,
         "api_session_log_replay" => api_session_log_replay_response(id, &runtime).await,
+        "api_dashboard_bootstrap" => api_dashboard_bootstrap_response(id, &runtime).await,
         "api_worktrees" => api_worktrees_response(id, &runtime).await,
         "api_worktrees_scan" => api_worktrees_scan_response(id, &runtime).await,
         "api_worktrees_remove" => {
@@ -2296,6 +2300,56 @@ async fn api_session_log_replay_response(
         "ok": true,
         "result": replay,
     })
+}
+
+async fn api_dashboard_bootstrap_response(
+    id: String,
+    runtime: &ControlRuntime,
+) -> serde_json::Value {
+    let mut frames = Vec::new();
+    if let Some(frame) =
+        response_result(api_state_snapshot_response("bootstrap-state".into(), runtime).await)
+    {
+        frames.push(frame);
+    }
+    if let Some(result) = response_result(cached_bootstrap_events_response_frame(
+        "bootstrap-cached".into(),
+        &runtime.bootstrap_caches,
+    )) {
+        if let Some(events) = result.get("events").and_then(|value| value.as_array()) {
+            frames.extend(events.iter().cloned());
+        }
+    }
+    if let Some(frame) =
+        response_result(api_browser_workspace_snapshot_response("bootstrap-browser".into()).await)
+    {
+        frames.push(frame);
+    }
+    if let Some(frame) =
+        response_result(api_session_log_replay_response("bootstrap-replay".into(), runtime).await)
+    {
+        frames.push(frame);
+    }
+    let frame_count = frames.len();
+
+    serde_json::json!({
+        "t": "response",
+        "id": id,
+        "ok": true,
+        "result": {
+            "frames": frames,
+            "frame_count": frame_count,
+            "omitted": [
+                "display_ready",
+                "display_input_authority_state",
+                "external_session_activity_replay"
+            ],
+        },
+    })
+}
+
+fn response_result(response: serde_json::Value) -> Option<serde_json::Value> {
+    response.get("result").cloned()
 }
 
 fn control_replay_session_id_from_dir(log_dir: &std::path::Path) -> Option<String> {
@@ -3624,6 +3678,7 @@ mod tests {
         );
         assert_eq!(status["result"]["api_state_snapshot_available"], true);
         assert_eq!(status["result"]["api_session_log_replay_available"], true);
+        assert_eq!(status["result"]["api_dashboard_bootstrap_available"], true);
         assert_eq!(status["result"]["api_sessions_available"], true);
         assert_eq!(status["result"]["api_sessions_stream_available"], true);
         assert_eq!(status["result"]["api_session_detail_available"], true);
@@ -4090,6 +4145,27 @@ mod tests {
         assert_eq!(replay["result"]["t"], "log_replay");
         assert_eq!(replay["result"]["available"], false);
         assert_eq!(replay["result"]["entries"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn dashboard_bootstrap_rpc_returns_ordered_bootstrap_frames() {
+        let rt = runtime();
+        let bootstrap = api_dashboard_bootstrap_response("boot1".to_string(), &rt).await;
+        assert_eq!(bootstrap["t"], "response");
+        assert_eq!(bootstrap["id"], "boot1");
+        assert_eq!(bootstrap["ok"], true);
+        let frames = bootstrap["result"]["frames"].as_array().unwrap();
+        assert_eq!(bootstrap["result"]["frame_count"], frames.len());
+        assert_eq!(frames[0]["t"], "state_snapshot");
+        assert_eq!(frames[1]["t"], "browser_workspace_snapshot");
+        assert_eq!(frames[2]["t"], "log_replay");
+        assert!(
+            bootstrap["result"]["omitted"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|value| value.as_str() == Some("display_ready"))
+        );
     }
 
     #[tokio::test]

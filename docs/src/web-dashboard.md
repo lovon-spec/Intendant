@@ -776,6 +776,11 @@ can move off the primary WebSocket.
 used by late WebSocket joiners. When no active session log exists it returns an
 empty replay with `available: false`; external attached-session transcript replay
 is still separate and has not moved onto this RPC.
+`api_dashboard_bootstrap` composes the DataChannel-safe bootstrap pieces into an
+ordered `frames` array: state snapshot, cached dashboard events, browser
+workspace snapshot, and capped session log replay. It explicitly omits display
+ready/authority frames and external attached-session transcript replay until
+those paths have DataChannel-aware identity and stream handling.
 Lazy command-output expansion for finalized log command groups uses
 `api_session_current_agent_output`, preserving the same `_httpStatus`/`_httpOk`
 metadata as the existing HTTP endpoint.
