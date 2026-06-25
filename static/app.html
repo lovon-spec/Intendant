@@ -38322,6 +38322,7 @@ class DashboardControlTransport {
       apiRecordingAssetAvailable: this.lastStatus?.api_recording_asset_available ?? null,
       apiSessionRecordingsAvailable: this.lastStatus?.api_session_recordings_available ?? null,
       apiSessionRecordingAssetAvailable: this.lastStatus?.api_session_recording_asset_available ?? null,
+      apiSessionFrameAssetAvailable: this.lastStatus?.api_session_frame_asset_available ?? null,
       apiWorktreesAvailable: this.lastStatus?.api_worktrees_available ?? null,
       apiWorktreesScanAvailable: this.lastStatus?.api_worktrees_scan_available ?? null,
       apiWorktreesRemoveAvailable: this.lastStatus?.api_worktrees_remove_available ?? null,
@@ -49349,6 +49350,7 @@ function openSessionDetail(sessionOrId, taskArg) {
   sessionDetailLogView = null;
 
   // Reset sections
+  revokeSessionFrameObjectUrls();
   document.getElementById('sd-recordings').style.display = 'none';
   document.getElementById('sd-frames').style.display = 'none';
   document.getElementById('session-detail-frames').innerHTML = '';
@@ -49387,6 +49389,7 @@ function openSessionDetail(sessionOrId, taskArg) {
 function closeSessionDetail() {
   // Clean up session recording player
   if (sessionRecPlayer) { sessionRecPlayer.destroy(); sessionRecPlayer = null; }
+  revokeSessionFrameObjectUrls();
   document.getElementById('session-detail-recordings').innerHTML = '';
   document.getElementById('session-detail-frames').innerHTML = '';
   document.getElementById('sd-recordings').style.display = 'none';
@@ -49403,6 +49406,41 @@ window.loadSessions = loadSessions;
 
 // ── Session Recording Replay ──
 let sessionRecPlayer = null;
+const sessionFrameObjectUrls = new Set();
+
+function revokeSessionFrameObjectUrls() {
+  for (const url of sessionFrameObjectUrls) {
+    try { URL.revokeObjectURL(url); } catch (_) {}
+  }
+  sessionFrameObjectUrls.clear();
+}
+
+function dashboardSessionFrameAssetRpcAvailable() {
+  return Boolean(
+    dashboardTransport?.canUseRpc?.() &&
+    dashboardControlTransport?.lastStatus?.byte_streams_available === true &&
+    dashboardControlTransport?.lastStatus?.api_session_frame_asset_available === true
+  );
+}
+
+async function sessionFrameAssetObjectUrl(sessionId, filename) {
+  if (!dashboardSessionFrameAssetRpcAvailable()) return null;
+  try {
+    const raw = await dashboardTransport.requestBytes('api_session_frame_asset', {
+      session_id: sessionId,
+      filename,
+    }, { timeoutMs: 60000 });
+    if (!raw || raw._httpOk === false || raw.ok === false) return null;
+    if (!(raw.bytes instanceof Uint8Array)) return null;
+    const contentType = raw.content_type || raw.contentType || 'application/octet-stream';
+    const url = URL.createObjectURL(new Blob([raw.bytes], { type: contentType }));
+    sessionFrameObjectUrls.add(url);
+    return url;
+  } catch (err) {
+    console.warn('session frame asset RPC failed; using HTTP image fallback', err);
+    return null;
+  }
+}
 
 async function loadSessionRecordings(sessionId) {
   const container = document.getElementById('session-detail-recordings');
@@ -49502,6 +49540,8 @@ async function loadSessionRecordings(sessionId) {
 function renderSessionFrames(sessionId, frames) {
   const section = document.getElementById('sd-frames');
   const container = document.getElementById('session-detail-frames');
+  revokeSessionFrameObjectUrls();
+  container.innerHTML = '';
   section.style.display = '';
 
   // Group frames by category
@@ -49531,9 +49571,21 @@ function renderSessionFrames(sessionId, frames) {
     const thumb = document.createElement('div');
     thumb.className = 'sd-frame-thumb';
     const img = document.createElement('img');
+    const fallbackSrc = `/api/session/${encodeURIComponent(sessionId)}/frames/${encodeURIComponent(name)}`;
     img.loading = 'lazy';
-    img.src = `/api/session/${sessionId}/frames/${name}`;
+    img.src = fallbackSrc;
+    img.dataset.fallbackSrc = fallbackSrc;
     img.alt = name;
+    sessionFrameAssetObjectUrl(sessionId, name).then(url => {
+      if (!url) return;
+      if (!img.isConnected) {
+        URL.revokeObjectURL(url);
+        sessionFrameObjectUrls.delete(url);
+        return;
+      }
+      img.dataset.objectUrl = url;
+      img.src = url;
+    });
     thumb.appendChild(img);
     const label = document.createElement('div');
     label.className = 'frame-label';
@@ -49543,7 +49595,7 @@ function renderSessionFrames(sessionId, frames) {
       const lb = document.createElement('div');
       lb.className = 'sd-frame-lightbox';
       const full = document.createElement('img');
-      full.src = img.src;
+      full.src = img.src || fallbackSrc;
       lb.appendChild(full);
       lb.addEventListener('click', () => lb.remove());
       document.body.appendChild(lb);
@@ -49590,6 +49642,10 @@ function renderSessionFrames(sessionId, frames) {
     ));
   }
 }
+window.intendantSessionFrameRenderer = {
+  render: renderSessionFrames,
+  revokeObjectUrls: revokeSessionFrameObjectUrls,
+};
 
 const SESSION_DETAIL_RENDER_LIMIT = 600;
 const SESSION_DETAIL_SCROLL_CHUNK = 300;

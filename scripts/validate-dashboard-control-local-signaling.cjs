@@ -11,6 +11,7 @@ const { httpStatus, launchBrowser } = require('./lib/browser-automation.cjs');
 const DEFAULT_DAEMON_PORT = 8877;
 const START_TIMEOUT_MS = 30000;
 const CONNECT_TIMEOUT_MS = 30000;
+const FRAME_FIXTURE_PNG_BASE64 = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=';
 
 function parseArgs(argv) {
   const repoRoot = path.resolve(__dirname, '..');
@@ -60,6 +61,21 @@ function removeRecordingFixture(fixture) {
   fs.rmSync(fixture.dir, { recursive: true, force: true });
 }
 
+function createSessionFrameFixture(label) {
+  const sessionId = `dashboard-control-frame-${label}-${process.pid}-${Date.now()}`;
+  const filename = 'ann-dashboard-frame.png';
+  const dir = path.join(os.homedir(), '.intendant', 'logs', sessionId);
+  const framesDir = path.join(dir, 'frames');
+  fs.mkdirSync(framesDir, { recursive: true });
+  fs.writeFileSync(path.join(framesDir, filename), Buffer.from(FRAME_FIXTURE_PNG_BASE64, 'base64'));
+  return { sessionId, filename, dir };
+}
+
+function removeSessionFrameFixture(fixture) {
+  if (!fixture?.dir) return;
+  fs.rmSync(fixture.dir, { recursive: true, force: true });
+}
+
 async function waitFor(predicate, timeoutMs, label) {
   const deadline = Date.now() + timeoutMs;
   let last;
@@ -99,6 +115,7 @@ async function main() {
   const origin = `http://127.0.0.1:${options.daemonPort}`;
   const daemonLogs = [];
   const recordingFixture = createRecordingFixture('local');
+  const sessionFrameFixture = createSessionFrameFixture('local');
   const daemon = spawn(options.dashboardBinary, [
     '--no-tui',
     '--no-tls',
@@ -146,9 +163,14 @@ async function main() {
 
     const connected = await waitForDashboardControl(page);
     await page.evaluate(`window.__intendantRecordingStreamName = ${JSON.stringify(recordingFixture.streamName)}`);
+    await page.evaluate(`window.__intendantSessionFrameFixture = ${JSON.stringify({
+      sessionId: sessionFrameFixture.sessionId,
+      filename: sessionFrameFixture.filename,
+    })}`);
     const result = await page.evaluate(async () => {
       const ctl = window.intendantDashboardControl;
       const recordingStreamName = window.__intendantRecordingStreamName;
+      const sessionFrameFixture = window.__intendantSessionFrameFixture;
       const labeled = async (label, promise) => {
         try {
           return await promise;
@@ -250,6 +272,55 @@ async function main() {
           ...(raw || {}),
           byteLength: raw?.data_base64 ? atob(String(raw.data_base64)).length : 0,
           text: raw?.data_base64 ? atob(String(raw.data_base64)) : '',
+        };
+      };
+      const sessionFrameAsset = async () => {
+        const raw = await labeled('api_session_frame_asset image', ctl.requestBytes('api_session_frame_asset', {
+          session_id: sessionFrameFixture.sessionId,
+          filename: sessionFrameFixture.filename,
+          offset: 0,
+          length: 8,
+        }, { timeoutMs: 60000 }));
+        if (raw?.bytes instanceof Uint8Array) {
+          const { bytes, ...rest } = raw;
+          return {
+            ...rest,
+            byteLength: bytes.byteLength,
+            firstBytes: Array.from(bytes),
+          };
+        }
+        const text = raw?.data_base64 ? atob(String(raw.data_base64)) : '';
+        return {
+          ...(raw || {}),
+          byteLength: text.length,
+          firstBytes: Array.from(text, ch => ch.charCodeAt(0)),
+        };
+      };
+      const sessionFramePreview = async () => {
+        if (typeof window.intendantSessionFrameRenderer?.render !== 'function') {
+          throw new Error('renderSessionFrames is not available on the dashboard page');
+        }
+        const before = ctl.status().completedByteStreams || 0;
+        window.intendantSessionFrameRenderer.render(
+          sessionFrameFixture.sessionId,
+          [sessionFrameFixture.filename]
+        );
+        const deadline = performance.now() + 60000;
+        let img = null;
+        while (performance.now() < deadline) {
+          img = document.querySelector('#session-detail-frames .sd-frame-thumb img');
+          if (img && String(img.src || '').startsWith('blob:')) break;
+          await new Promise(resolve => setTimeout(resolve, 50));
+        }
+        const after = ctl.status().completedByteStreams || 0;
+        const previewUrl = String(img?.src || '');
+        window.intendantSessionFrameRenderer?.revokeObjectUrls?.();
+        const framesEl = document.getElementById('session-detail-frames');
+        if (framesEl) framesEl.innerHTML = '';
+        return {
+          ok: previewUrl.startsWith('blob:'),
+          previewScheme: previewUrl.split(':', 1)[0],
+          byteStreamDelta: after - before,
         };
       };
       const recordingFallbackPlayback = async () => {
@@ -432,6 +503,8 @@ async function main() {
         uploadRaw: await uploadRaw(uploaded),
         imagePreview: await imagePreview(),
         recordingAsset: await recordingAsset(),
+        sessionFrameAsset: await sessionFrameAsset(),
+        sessionFramePreview: await sessionFramePreview(),
         recordingFallbackPlayback: await recordingFallbackPlayback(),
         diagnosticsVisualFreshness: await diagnosticsVisualFreshness(),
         terminal: await terminal(),
@@ -564,6 +637,7 @@ async function main() {
     assert.strictEqual(result.finalStatus.apiSessionCurrentUploadAvailable, true);
     assert.strictEqual(result.finalStatus.apiSessionCurrentUploadRawAvailable, true);
     assert.strictEqual(result.finalStatus.apiRecordingAssetAvailable, true);
+    assert.strictEqual(result.finalStatus.apiSessionFrameAssetAvailable, true);
     assert.strictEqual(result.upload?._httpStatus, 200);
     assert.strictEqual(result.upload?._httpOk, true);
     assert.strictEqual(result.upload?.name, 'dashboard-upload-local.txt');
@@ -591,6 +665,18 @@ async function main() {
     assert.strictEqual(result.recordingAsset?.range_start, 10);
     assert.strictEqual(result.recordingAsset?.range_end, 17);
     assert.strictEqual(result.recordingAsset?.resumable, true);
+    assert.strictEqual(result.sessionFrameAsset?.ok, true);
+    assert.strictEqual(result.sessionFrameAsset?.content_type, 'image/png');
+    assert.strictEqual(result.sessionFrameAsset?.filename, sessionFrameFixture.filename);
+    assert.strictEqual(result.sessionFrameAsset?.session_id, sessionFrameFixture.sessionId);
+    assert.strictEqual(result.sessionFrameAsset?.byteLength, 8);
+    assert.deepStrictEqual(result.sessionFrameAsset?.firstBytes, [137, 80, 78, 71, 13, 10, 26, 10]);
+    assert.strictEqual(result.sessionFrameAsset?.range_start, 0);
+    assert.strictEqual(result.sessionFrameAsset?.range_end, 8);
+    assert.strictEqual(result.sessionFrameAsset?.resumable, true);
+    assert.strictEqual(result.sessionFramePreview?.ok, true);
+    assert.strictEqual(result.sessionFramePreview?.previewScheme, 'blob');
+    assert(result.sessionFramePreview?.byteStreamDelta >= 1, `session frame preview did not use a byte stream: ${JSON.stringify(result.sessionFramePreview)}`);
     assert.strictEqual(result.recordingFallbackPlayback?.srcScheme, 'blob');
     assert.strictEqual(result.recordingFallbackPlayback?.objectUrl, true);
     assert(result.recordingFallbackPlayback?.byteStreamDelta >= 1, `recording fallback playback did not use a byte stream: ${JSON.stringify(result.recordingFallbackPlayback)}`);
@@ -693,6 +779,7 @@ async function main() {
         apiSessionCurrentUploadAvailable: result.finalStatus.apiSessionCurrentUploadAvailable,
         apiSessionCurrentUploadRawAvailable: result.finalStatus.apiSessionCurrentUploadRawAvailable,
         apiRecordingAssetAvailable: result.finalStatus.apiRecordingAssetAvailable,
+        apiSessionFrameAssetAvailable: result.finalStatus.apiSessionFrameAssetAvailable,
         uploadStatus: result.upload._httpStatus,
         uploadListCount: result.uploads.length,
         uploadSize: result.upload.size,
@@ -702,6 +789,9 @@ async function main() {
         imagePreviewByteStreamDelta: result.imagePreview.byteStreamDelta,
         recordingAssetBytes: result.recordingAsset.byteLength,
         recordingAssetText: result.recordingAsset.text,
+        sessionFrameAssetBytes: result.sessionFrameAsset.byteLength,
+        sessionFramePreviewScheme: result.sessionFramePreview.previewScheme,
+        sessionFramePreviewByteStreamDelta: result.sessionFramePreview.byteStreamDelta,
         recordingFallbackSrcScheme: result.recordingFallbackPlayback.srcScheme,
         recordingFallbackByteStreamDelta: result.recordingFallbackPlayback.byteStreamDelta,
         diagnosticsVisualFreshnessWritten: result.diagnosticsVisualFreshness.written,
@@ -728,6 +818,7 @@ async function main() {
     await Promise.race([daemonExit, wait(5000)]);
     if (daemon.exitCode === null) daemon.kill('SIGKILL');
     removeRecordingFixture(recordingFixture);
+    removeSessionFrameFixture(sessionFrameFixture);
     if (daemonLogs.length && daemon.exitCode && daemon.exitCode !== 0 && daemon.exitCode !== 130) {
       console.error(daemonLogs.join('').slice(-4000));
     }

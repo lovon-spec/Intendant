@@ -101,6 +101,7 @@ const CONTROL_FEATURES: &[&str] = &[
     "api_recording_asset",
     "api_session_recordings",
     "api_session_recording_asset",
+    "api_session_frame_asset",
     "api_worktrees",
     "api_worktrees_scan",
     "api_worktrees_remove",
@@ -1574,6 +1575,7 @@ fn control_frame_response(
                 | "api_recording_asset"
                 | "api_session_recordings"
                 | "api_session_recording_asset"
+                | "api_session_frame_asset"
                 | "api_browser_workspace_snapshot"
                 | "api_state_snapshot"
                 | "api_display_bootstrap"
@@ -2454,6 +2456,7 @@ fn status_response_frame(id: String, runtime: &ControlRuntime) -> serde_json::Va
         ("api_recording_asset_available", true),
         ("api_session_recordings_available", true),
         ("api_session_recording_asset_available", true),
+        ("api_session_frame_asset_available", true),
         ("api_worktrees_available", true),
         ("api_worktrees_scan_available", true),
         ("api_worktrees_remove_available", true),
@@ -2503,6 +2506,9 @@ fn spawn_control_request(
             }
             "api_session_recording_asset" => {
                 api_session_recording_asset_task_response(id.clone(), params.as_ref()).await
+            }
+            "api_session_frame_asset" => {
+                api_session_frame_asset_task_response(id.clone(), params.as_ref()).await
             }
             _ => {
                 let frame =
@@ -4094,6 +4100,182 @@ fn recording_asset_error_task_response(
     ControlTaskResponse {
         id: id.clone(),
         frame: http_body_response(id, status, body.to_string(), "recording asset"),
+        byte_stream: None,
+        done: true,
+    }
+}
+
+async fn api_session_frame_asset_task_response(
+    id: String,
+    params: Option<&serde_json::Value>,
+) -> ControlTaskResponse {
+    let params = params.cloned().unwrap_or_else(|| serde_json::json!({}));
+    let session_id = string_param(&params, &["session_id", "sessionId", "id"]);
+    if !crate::web_gateway::session_lookup_id_is_safe(&session_id) {
+        return session_frame_asset_error_task_response(
+            id,
+            400,
+            serde_json::json!({ "ok": false, "error": "invalid session id" }),
+        );
+    }
+    let Some(filename) = optional_string_param(&params, &["filename", "frame", "asset", "name"])
+    else {
+        return session_frame_asset_error_task_response(
+            id,
+            400,
+            serde_json::json!({ "ok": false, "error": "missing frame filename" }),
+        );
+    };
+    if !session_frame_filename_is_safe(&filename) {
+        return session_frame_asset_error_task_response(
+            id,
+            400,
+            serde_json::json!({ "ok": false, "error": "invalid frame filename" }),
+        );
+    }
+    let offset = match optional_u64_param(&params, &["offset", "start"]) {
+        Ok(value) => value.unwrap_or(0),
+        Err(error) => {
+            return session_frame_asset_error_task_response(
+                id,
+                400,
+                serde_json::json!({ "ok": false, "error": error }),
+            );
+        }
+    };
+    let length = match optional_u64_param(&params, &["length", "limit"]) {
+        Ok(value) => value,
+        Err(error) => {
+            return session_frame_asset_error_task_response(
+                id,
+                400,
+                serde_json::json!({ "ok": false, "error": error }),
+            );
+        }
+    };
+
+    let Some(session_dir) = crate::web_gateway::resolve_session_dir(&session_id) else {
+        return session_frame_asset_error_task_response(
+            id,
+            404,
+            serde_json::json!({ "ok": false, "error": "session not found" }),
+        );
+    };
+    let path = session_dir.join("frames").join(&filename);
+    if !path.exists() {
+        return session_frame_asset_error_task_response(
+            id,
+            404,
+            serde_json::json!({ "ok": false, "error": "frame not found" }),
+        );
+    }
+    let content_type = if filename.ends_with(".png") {
+        "image/png"
+    } else {
+        "image/jpeg"
+    };
+    let read_result =
+        tokio::task::spawn_blocking(move || read_frame_asset_file_range(&path, offset, length))
+            .await;
+    let (bytes, total_size, end) = match read_result {
+        Ok(Ok(value)) => value,
+        Ok(Err((status, body))) => {
+            return session_frame_asset_error_task_response(id, status, body)
+        }
+        Err(e) => {
+            return ControlTaskResponse {
+                id: id.clone(),
+                frame: serde_json::json!({
+                    "t": "response",
+                    "id": id,
+                    "ok": false,
+                    "error": format!("session frame task failed: {e}"),
+                }),
+                byte_stream: None,
+                done: true,
+            };
+        }
+    };
+    let size = bytes.len();
+    ControlTaskResponse {
+        id: id.clone(),
+        frame: serde_json::Value::Null,
+        byte_stream: Some(ControlByteStream {
+            id: id.clone(),
+            stream_id: format!("{id}:session-frame:{session_id}:{filename}"),
+            content_type: content_type.to_string(),
+            filename: Some(filename.clone()),
+            bytes,
+            result: serde_json::json!({
+                "ok": true,
+                "session_id": session_id,
+                "filename": filename,
+                "content_type": content_type,
+                "size": size,
+                "total_size": total_size,
+                "offset": offset,
+                "range_start": offset,
+                "range_end": end,
+                "resumable": true,
+            }),
+        }),
+        done: true,
+    }
+}
+
+fn session_frame_filename_is_safe(filename: &str) -> bool {
+    (filename.ends_with(".jpg") || filename.ends_with(".png"))
+        && filename.len() < 80
+        && !filename.is_empty()
+        && filename.trim() == filename
+        && !filename.contains("..")
+        && !filename.contains('/')
+        && !filename.contains('\\')
+}
+
+fn read_frame_asset_file_range(
+    path: &std::path::Path,
+    offset: u64,
+    length: Option<u64>,
+) -> Result<(Vec<u8>, u64, u64), (u16, serde_json::Value)> {
+    let metadata = std::fs::metadata(path).map_err(|e| {
+        (
+            500,
+            serde_json::json!({ "ok": false, "error": format!("stat session frame: {e}") }),
+        )
+    })?;
+    let total_size = metadata.len();
+    let (start, transfer_len, end) = recording_asset_range(total_size, offset, length)?;
+    let mut file = std::fs::File::open(path).map_err(|e| {
+        (
+            500,
+            serde_json::json!({ "ok": false, "error": format!("open session frame: {e}") }),
+        )
+    })?;
+    file.seek(std::io::SeekFrom::Start(start)).map_err(|e| {
+        (
+            500,
+            serde_json::json!({ "ok": false, "error": format!("seek session frame: {e}") }),
+        )
+    })?;
+    let mut bytes = vec![0u8; transfer_len];
+    file.read_exact(&mut bytes).map_err(|e| {
+        (
+            500,
+            serde_json::json!({ "ok": false, "error": format!("read session frame: {e}") }),
+        )
+    })?;
+    Ok((bytes, total_size, end))
+}
+
+fn session_frame_asset_error_task_response(
+    id: String,
+    status: u16,
+    body: serde_json::Value,
+) -> ControlTaskResponse {
+    ControlTaskResponse {
+        id: id.clone(),
+        frame: http_body_response(id, status, body.to_string(), "session frame asset"),
         byte_stream: None,
         done: true,
     }
@@ -7575,6 +7757,68 @@ mod tests {
                 "asset": "../seg_00000.mp4",
             })),
             &rt,
+        )
+        .await;
+        assert!(invalid.done);
+        assert!(invalid.byte_stream.is_none());
+        assert_eq!(invalid.frame["result"]["_httpStatus"], 400);
+        assert_eq!(invalid.frame["result"]["_httpOk"], false);
+    }
+
+    #[tokio::test]
+    async fn session_frame_asset_rpc_streams_validated_frame_ranges() {
+        let session_id = format!(
+            "dashboard-frame-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let session_dir = crate::platform::home_dir()
+            .join(".intendant")
+            .join("logs")
+            .join(&session_id);
+        let frames_dir = session_dir.join("frames");
+        std::fs::create_dir_all(&frames_dir).unwrap();
+        let frame_bytes = b"dashboard frame bytes";
+        std::fs::write(frames_dir.join("ann-test.png"), frame_bytes).unwrap();
+
+        let response = api_session_frame_asset_task_response(
+            "frame-asset1".to_string(),
+            Some(&serde_json::json!({
+                "session_id": &session_id,
+                "filename": "ann-test.png",
+                "offset": 10,
+                "length": 5,
+            })),
+        )
+        .await;
+        let _ = std::fs::remove_dir_all(&session_dir);
+
+        assert!(response.done);
+        assert!(response.byte_stream.is_some());
+        let stream = response.byte_stream.unwrap();
+        assert_eq!(stream.content_type, "image/png");
+        assert_eq!(stream.filename.as_deref(), Some("ann-test.png"));
+        assert_eq!(stream.bytes, b"frame");
+        assert_eq!(
+            stream.stream_id,
+            format!("frame-asset1:session-frame:{session_id}:ann-test.png")
+        );
+        assert_eq!(stream.result["session_id"], session_id);
+        assert_eq!(stream.result["filename"], "ann-test.png");
+        assert_eq!(stream.result["size"], 5);
+        assert_eq!(stream.result["total_size"], frame_bytes.len());
+        assert_eq!(stream.result["range_start"], 10);
+        assert_eq!(stream.result["range_end"], 15);
+        assert_eq!(stream.result["resumable"], true);
+
+        let invalid = api_session_frame_asset_task_response(
+            "frame-asset2".to_string(),
+            Some(&serde_json::json!({
+                "session_id": "current",
+                "filename": "../ann-test.png",
+            })),
         )
         .await;
         assert!(invalid.done);

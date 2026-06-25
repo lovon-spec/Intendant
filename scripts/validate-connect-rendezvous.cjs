@@ -15,6 +15,7 @@ const DEFAULT_RENDEZVOUS_PORT = 9876;
 const DEFAULT_DAEMON_ID = 'connect-e2e-daemon';
 const START_TIMEOUT_MS = 30000;
 const CONNECT_TIMEOUT_MS = 30000;
+const FRAME_FIXTURE_PNG_BASE64 = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=';
 
 function parseArgs(argv) {
   const repoRoot = path.resolve(__dirname, '..');
@@ -951,6 +952,21 @@ function removeRecordingFixture(fixture) {
   fs.rmSync(fixture.dir, { recursive: true, force: true });
 }
 
+function createSessionFrameFixture(label) {
+  const sessionId = `dashboard-control-frame-${label}-${process.pid}-${Date.now()}`;
+  const filename = 'ann-dashboard-frame.png';
+  const dir = path.join(os.homedir(), '.intendant', 'logs', sessionId);
+  const framesDir = path.join(dir, 'frames');
+  fs.mkdirSync(framesDir, { recursive: true });
+  fs.writeFileSync(path.join(framesDir, filename), Buffer.from(FRAME_FIXTURE_PNG_BASE64, 'base64'));
+  return { sessionId, filename, dir };
+}
+
+function removeSessionFrameFixture(fixture) {
+  if (!fixture?.dir) return;
+  fs.rmSync(fixture.dir, { recursive: true, force: true });
+}
+
 async function waitFor(predicate, timeoutMs, label) {
   const deadline = Date.now() + timeoutMs;
   let last;
@@ -996,6 +1012,7 @@ async function main() {
 
   const daemonLogs = [];
   const recordingFixture = createRecordingFixture('rendezvous');
+  const sessionFrameFixture = createSessionFrameFixture('rendezvous');
   const daemon = spawn(options.dashboardBinary, ['--no-tui', '--web', String(options.daemonPort)], {
     cwd: options.repoRoot,
     env: {
@@ -1037,9 +1054,14 @@ async function main() {
     const connected = await waitForBrowserConnect(page);
 
     await page.evaluate(`window.__intendantRecordingStreamName = ${JSON.stringify(recordingFixture.streamName)}`);
+    await page.evaluate(`window.__intendantSessionFrameFixture = ${JSON.stringify({
+      sessionId: sessionFrameFixture.sessionId,
+      filename: sessionFrameFixture.filename,
+    })}`);
     const result = await page.evaluate(async () => {
       const ctl = window.intendantPublicConnectDashboard;
       const recordingStreamName = window.__intendantRecordingStreamName;
+      const sessionFrameFixture = window.__intendantSessionFrameFixture;
       const labeled = async (label, promise) => {
         try {
           return await promise;
@@ -1205,6 +1227,28 @@ async function main() {
           ...(raw || {}),
           byteLength: raw?.data_base64 ? atob(String(raw.data_base64)).length : 0,
           text: raw?.data_base64 ? atob(String(raw.data_base64)) : '',
+        };
+      };
+      const sessionFrameAsset = async () => {
+        const raw = await labeled('api_session_frame_asset image', ctl.requestBytes('api_session_frame_asset', {
+          session_id: sessionFrameFixture.sessionId,
+          filename: sessionFrameFixture.filename,
+          offset: 0,
+          length: 8,
+        }, { timeoutMs: 60000 }));
+        if (raw?.bytes instanceof Uint8Array) {
+          const { bytes, ...rest } = raw;
+          return {
+            ...rest,
+            byteLength: bytes.byteLength,
+            firstBytes: Array.from(bytes),
+          };
+        }
+        const text = raw?.data_base64 ? atob(String(raw.data_base64)) : '';
+        return {
+          ...(raw || {}),
+          byteLength: text.length,
+          firstBytes: Array.from(text, ch => ch.charCodeAt(0)),
         };
       };
       const recordingFallbackPlayback = async () => {
@@ -1399,6 +1443,7 @@ async function main() {
         uploadRaw: await uploadRaw(uploaded),
         imagePreview: await imagePreview(),
         recordingAsset: await recordingAsset(),
+        sessionFrameAsset: await sessionFrameAsset(),
         recordingFallbackPlayback: await recordingFallbackPlayback(),
         diagnosticsVisualFreshness: await diagnosticsVisualFreshness(),
         terminal: await terminal(),
@@ -1528,6 +1573,11 @@ async function main() {
       result.status.api_recording_asset_available,
       true,
       'dashboard control status did not advertise recording asset byte streams'
+    );
+    assert.strictEqual(
+      result.status.api_session_frame_asset_available,
+      true,
+      'dashboard control status did not advertise session frame asset byte streams'
     );
     assert.strictEqual(
       result.status.api_dashboard_action_msg_available,
@@ -1794,6 +1844,15 @@ async function main() {
     assert.strictEqual(result.recordingAsset?.range_start, 10);
     assert.strictEqual(result.recordingAsset?.range_end, 17);
     assert.strictEqual(result.recordingAsset?.resumable, true);
+    assert.strictEqual(result.sessionFrameAsset?.ok, true);
+    assert.strictEqual(result.sessionFrameAsset?.content_type, 'image/png');
+    assert.strictEqual(result.sessionFrameAsset?.filename, sessionFrameFixture.filename);
+    assert.strictEqual(result.sessionFrameAsset?.session_id, sessionFrameFixture.sessionId);
+    assert.strictEqual(result.sessionFrameAsset?.byteLength, 8);
+    assert.deepStrictEqual(result.sessionFrameAsset?.firstBytes, [137, 80, 78, 71, 13, 10, 26, 10]);
+    assert.strictEqual(result.sessionFrameAsset?.range_start, 0);
+    assert.strictEqual(result.sessionFrameAsset?.range_end, 8);
+    assert.strictEqual(result.sessionFrameAsset?.resumable, true);
     if (result.recordingFallbackPlayback?.skipped) {
       assert.strictEqual(result.recordingFallbackPlayback.reason, 'RecordingPlayer unavailable on rendezvous emulator');
     } else {
@@ -2060,6 +2119,7 @@ async function main() {
         apiSessionCurrentUploadAvailable: result.status.api_session_current_upload_available,
         apiSessionCurrentUploadRawAvailable: result.status.api_session_current_upload_raw_available,
         apiRecordingAssetAvailable: result.status.api_recording_asset_available,
+        apiSessionFrameAssetAvailable: result.status.api_session_frame_asset_available,
         uploadStatus: result.upload._httpStatus,
         uploadListCount: result.uploadList.length,
         uploadSize: result.upload.size,
@@ -2070,6 +2130,8 @@ async function main() {
         imagePreviewSkipped: Boolean(result.imagePreview.skipped),
         recordingAssetBytes: result.recordingAsset.byteLength,
         recordingAssetText: result.recordingAsset.text,
+        sessionFrameAssetBytes: result.sessionFrameAsset.byteLength,
+        sessionFrameAssetSignature: result.sessionFrameAsset.firstBytes,
         recordingFallbackSrcScheme: result.recordingFallbackPlayback.srcScheme || null,
         recordingFallbackByteStreamDelta: result.recordingFallbackPlayback.byteStreamDelta || 0,
         recordingFallbackSkipped: Boolean(result.recordingFallbackPlayback.skipped),
@@ -2132,6 +2194,7 @@ async function main() {
     await Promise.race([daemonExit, wait(5000)]);
     await new Promise(resolve => rendezvous.close(resolve));
     removeRecordingFixture(recordingFixture);
+    removeSessionFrameFixture(sessionFrameFixture);
   }
 }
 

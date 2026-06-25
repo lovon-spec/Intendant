@@ -462,7 +462,8 @@ context-snapshot loads, filesystem picker stat/list/mkdir operations, deep
 session search, settings, API-key status, server-side voice-session token
 minting, project root, display enumeration, recording metadata, worktree
 inventory, staged-upload descriptors, scoped recording asset byte streams,
-bounded session-report zip downloads, and peer state.
+archived session frame image byte streams, bounded session-report zip downloads,
+and peer state.
 Managed-context history reads for records, anchors, and fission groups also use
 the tunnel.
 Current tunneled mutations include
@@ -506,7 +507,7 @@ browser-side promise.
 Several paths intentionally stay outside this JSON tunnel:
 
 - static assets and WASM bundles;
-- frames, HLS/native playlist media playback, and broad file-transfer bytes;
+- HLS/native playlist media playback and broad file-transfer bytes;
 - general filesystem mutations and file content transfer;
 - generic MCP-over-HTTP for external clients;
 - non-allowlisted `ControlMsg` mutations;
@@ -868,6 +869,11 @@ and `api_session_recording_asset` for `segments`, `playlist.m3u8`, and validated
 recording player uses these byte streams for segment lists and MP4 MSE buffers
 when the verified tunnel is available. The non-MSE MP4 fallback also reads the
 segment over the tunnel and assigns a local blob URL to the video element.
+Archived session frame images use `api_session_frame_asset` for validated `.jpg`
+and `.png` filenames under a resolved session's `frames/` directory. The session
+detail gallery renders returned bytes through browser blob URLs when the verified
+tunnel advertises byte streams, falling back to the existing HTTP image URL when
+the tunnel is unavailable or a tunneled image read fails.
 HLS/`.ts` playlist playback still uses HTTP because Safari/WKWebView requires a
 served `m3u8` URL source.
 The Settings debug session-report download uses `api_session_report`, returning
@@ -1002,7 +1008,8 @@ Treat this as a staged target, not current behavior:
     active-session command-output loads, active-session timeline operations,
     active-session changes/diffs, lazy context-snapshot exact-loads, session-data
     deletion, staged upload list/delete operations, bounded task uploads,
-    recording metadata, scoped recording asset byte streams, session-report zip downloads,
+    recording metadata, scoped recording asset byte streams, archived session
+    frame image byte streams, session-report zip downloads,
     bounded byte-stream artifact transfer,
     worktree inventory, filesystem picker stat/list/mkdir operations,
     local Agent Card reads, and local session hydration now use the tunnel,
