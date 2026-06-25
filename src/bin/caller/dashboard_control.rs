@@ -60,6 +60,7 @@ const CONTROL_FEATURES: &[&str] = &[
     "api_session_current_changes",
     "api_fs_stat",
     "api_fs_list",
+    "api_fs_mkdir",
     "api_sessions_search",
     "api_settings",
     "api_settings_save",
@@ -1059,50 +1060,7 @@ fn control_frame_response(
         "request" => {
             let method = parsed.get("method").and_then(|v| v.as_str()).unwrap_or("");
             match method {
-                "status" => Some(serde_json::json!({
-                    "t": "response",
-                    "id": id,
-                    "ok": true,
-                    "result": {
-                        "protocol": CONTROL_PROTOCOL_VERSION,
-                        "session_id": runtime.session_id,
-                        "daemon_public_key": runtime.daemon_public_key,
-                        "created_unix_ms": runtime.created_unix_ms,
-                        "features": CONTROL_FEATURES,
-                        "transport": "webrtc-datachannel",
-                        "events_subscribed": runtime.events_subscribed,
-                        "events_sent": runtime.events_sent,
-                        "response_credit_enabled": runtime.response_credit_enabled,
-                        "api_peers_available": runtime.peer_registry.is_some(),
-                        "api_sessions_available": true,
-                        "api_sessions_stream_available": true,
-                        "api_session_detail_available": true,
-                        "api_session_current_agent_output_available": true,
-                        "api_session_current_history_available": true,
-                        "api_session_current_rollback_available": true,
-                        "api_session_current_redo_available": true,
-                        "api_session_current_prune_available": true,
-                        "api_session_current_changes_available": true,
-                        "api_fs_stat_available": true,
-                        "api_fs_list_available": true,
-                        "api_sessions_search_available": true,
-                        "api_settings_available": true,
-                        "api_settings_save_available": runtime.project_root.is_some(),
-                        "api_key_status_available": true,
-                        "api_api_keys_save_available": true,
-                        "api_project_root_available": true,
-                        "api_displays_available": true,
-                        "api_recordings_available": true,
-                        "api_session_recordings_available": true,
-                        "api_worktrees_available": true,
-                        "api_worktrees_scan_available": true,
-                        "api_worktrees_remove_available": true,
-                        "api_managed_context_available": true,
-                        "api_peer_mutations_available": runtime.peer_registry.is_some(),
-                        "api_peer_pairing_available": true,
-                        "api_coordinator_available": runtime.peer_registry.is_some(),
-                    },
-                })),
+                "status" => Some(status_response_frame(id, runtime)),
                 "api_peers" => match runtime.peer_registry.as_ref() {
                     Some(registry) => {
                         let result = serde_json::from_str::<serde_json::Value>(
@@ -1171,6 +1129,7 @@ fn control_frame_response(
                 | "api_session_current_changes"
                 | "api_fs_stat"
                 | "api_fs_list"
+                | "api_fs_mkdir"
                 | "api_sessions_search"
                 | "api_settings"
                 | "api_settings_save"
@@ -1248,6 +1207,74 @@ fn control_frame_response(
             "error": format!("unknown frame type: {t}"),
         })),
     }
+}
+
+fn status_response_frame(id: String, runtime: &ControlRuntime) -> serde_json::Value {
+    let mut result = serde_json::Map::new();
+    result.insert("protocol".to_string(), serde_json::json!(CONTROL_PROTOCOL_VERSION));
+    result.insert("session_id".to_string(), serde_json::json!(runtime.session_id));
+    result.insert(
+        "daemon_public_key".to_string(),
+        serde_json::json!(runtime.daemon_public_key),
+    );
+    result.insert(
+        "created_unix_ms".to_string(),
+        serde_json::json!(runtime.created_unix_ms),
+    );
+    result.insert("features".to_string(), serde_json::json!(CONTROL_FEATURES));
+    result.insert("transport".to_string(), serde_json::json!("webrtc-datachannel"));
+    result.insert(
+        "events_subscribed".to_string(),
+        serde_json::json!(runtime.events_subscribed),
+    );
+    result.insert("events_sent".to_string(), serde_json::json!(runtime.events_sent));
+    result.insert(
+        "response_credit_enabled".to_string(),
+        serde_json::json!(runtime.response_credit_enabled),
+    );
+
+    let peer_registry_available = runtime.peer_registry.is_some();
+    let capabilities = [
+        ("api_peers_available", peer_registry_available),
+        ("api_sessions_available", true),
+        ("api_sessions_stream_available", true),
+        ("api_session_detail_available", true),
+        ("api_session_current_agent_output_available", true),
+        ("api_session_current_history_available", true),
+        ("api_session_current_rollback_available", true),
+        ("api_session_current_redo_available", true),
+        ("api_session_current_prune_available", true),
+        ("api_session_current_changes_available", true),
+        ("api_fs_stat_available", true),
+        ("api_fs_list_available", true),
+        ("api_fs_mkdir_available", true),
+        ("api_sessions_search_available", true),
+        ("api_settings_available", true),
+        ("api_settings_save_available", runtime.project_root.is_some()),
+        ("api_key_status_available", true),
+        ("api_api_keys_save_available", true),
+        ("api_project_root_available", true),
+        ("api_displays_available", true),
+        ("api_recordings_available", true),
+        ("api_session_recordings_available", true),
+        ("api_worktrees_available", true),
+        ("api_worktrees_scan_available", true),
+        ("api_worktrees_remove_available", true),
+        ("api_managed_context_available", true),
+        ("api_peer_mutations_available", peer_registry_available),
+        ("api_peer_pairing_available", true),
+        ("api_coordinator_available", peer_registry_available),
+    ];
+    for (name, available) in capabilities {
+        result.insert(name.to_string(), serde_json::json!(available));
+    }
+
+    serde_json::json!({
+        "t": "response",
+        "id": id,
+        "ok": true,
+        "result": serde_json::Value::Object(result),
+    })
 }
 
 fn spawn_control_request(
@@ -1338,6 +1365,7 @@ async fn control_request_response(
         },
         "api_fs_stat" => api_fs_stat_response(id, params.as_ref()).await,
         "api_fs_list" => api_fs_list_response(id, params.as_ref()).await,
+        "api_fs_mkdir" => api_fs_mkdir_response(id, params.as_ref()).await,
         "api_sessions_search" => api_sessions_search_response(id, params.as_ref(), cancel).await,
         "api_settings" => api_settings_response(id, &runtime).await,
         "api_settings_save" => api_settings_save_response(id, params.as_ref(), &runtime).await,
@@ -1778,6 +1806,16 @@ async fn api_fs_list_response(id: String, params: Option<&serde_json::Value>) ->
             "error": format!("filesystem list task failed: {e}"),
         }),
     }
+}
+
+async fn api_fs_mkdir_response(
+    id: String,
+    params: Option<&serde_json::Value>,
+) -> serde_json::Value {
+    let params = params.cloned().unwrap_or_else(|| serde_json::json!({}));
+    let path = string_param(&params, &["path"]);
+    let (status_line, body) = crate::web_gateway::dashboard_fs_mkdir_response_body(&path);
+    http_body_response(id, status_line_code(&status_line), body, "filesystem mkdir")
 }
 
 async fn api_sessions_search_response(
@@ -2776,6 +2814,7 @@ mod tests {
         );
         assert_eq!(status["result"]["api_fs_stat_available"], true);
         assert_eq!(status["result"]["api_fs_list_available"], true);
+        assert_eq!(status["result"]["api_fs_mkdir_available"], true);
         assert_eq!(status["result"]["api_sessions_search_available"], true);
         assert_eq!(status["result"]["api_settings_available"], true);
         assert_eq!(status["result"]["api_settings_save_available"], false);
@@ -3025,12 +3064,15 @@ mod tests {
             ("api_fs_stat", dir.path().to_string_lossy().to_string()),
             ("api_fs_list", dir.path().to_string_lossy().to_string()),
             ("api_fs_stat", "relative/path".to_string()),
+            ("api_fs_mkdir", dir.path().to_string_lossy().to_string()),
+            ("api_fs_mkdir", "relative/path".to_string()),
         ]
         .into_iter()
         .enumerate()
         {
             let id = format!("fs{idx}");
             let is_list = method == "api_fs_list";
+            let is_mkdir = method == "api_fs_mkdir";
             let is_bad_path = path == "relative/path";
             let frame = serde_json::json!({
                 "t": "request",
@@ -3050,7 +3092,19 @@ mod tests {
             assert_eq!(response.frame["t"], "response");
             assert_eq!(response.frame["ok"], true);
 
-            if is_list {
+            if is_mkdir && is_bad_path {
+                assert_eq!(response.frame["result"]["_httpStatus"], 400);
+                assert_eq!(response.frame["result"]["_httpOk"], false);
+                assert!(response.frame["result"]["error"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("path must be absolute"));
+            } else if is_mkdir {
+                assert_eq!(response.frame["result"]["ok"], true);
+                assert_eq!(response.frame["result"]["already_exists"], true);
+                assert_eq!(response.frame["result"]["_httpStatus"], 200);
+                assert_eq!(response.frame["result"]["_httpOk"], true);
+            } else if is_list {
                 assert!(response.frame["result"]["entries"].is_array());
                 assert_eq!(response.frame["result"]["_httpStatus"], 200);
                 assert_eq!(response.frame["result"]["_httpOk"], true);

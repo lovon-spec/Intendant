@@ -37257,6 +37257,7 @@ class DashboardControlTransport {
       apiSessionCurrentRedoAvailable: this.lastStatus?.api_session_current_redo_available ?? null,
       apiSessionCurrentPruneAvailable: this.lastStatus?.api_session_current_prune_available ?? null,
       apiSessionCurrentChangesAvailable: this.lastStatus?.api_session_current_changes_available ?? null,
+      apiFsMkdirAvailable: this.lastStatus?.api_fs_mkdir_available ?? null,
       apiSessionsSearchAvailable: this.lastStatus?.api_sessions_search_available ?? null,
       apiSettingsAvailable: this.lastStatus?.api_settings_available ?? null,
       apiKeyStatusAvailable: this.lastStatus?.api_key_status_available ?? null,
@@ -37312,6 +37313,7 @@ function dashboardControlRequestTimeoutMs(method) {
     case 'api_worktrees':
     case 'api_worktrees_scan':
     case 'api_worktrees_remove':
+    case 'api_fs_mkdir':
     case 'api_managed_context_records':
     case 'api_managed_context_anchors':
     case 'api_managed_context_fission':
@@ -44506,11 +44508,13 @@ async function ensureNewSessionProjectDirectory(projectRoot) {
   }
 
   setNewSessionProjectStatus('warn', 'Creating directory on this host...');
-  const resp = await authedFetch('/api/fs/mkdir', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ path: projectRoot }),
-  });
+  const resp = await dashboardJsonFetch('api_fs_mkdir', { path: projectRoot }, () => (
+    authedFetch('/api/fs/mkdir', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path: projectRoot }),
+    })
+  ), 'api_fs_mkdir', { fallbackAfterRpcFailure: false });
   const data = await resp.json().catch(() => ({}));
   if (!resp.ok) {
     setNewSessionProjectStatus('error', data.error || `Create failed (${resp.status})`);
@@ -44833,11 +44837,13 @@ async function createPickerDirectory() {
   const path = document.getElementById('fs-picker-path')?.value.trim() || '';
   if (!path) return;
   setFsPickerStatus('', 'Creating directory...');
-  const resp = await authedFetch('/api/fs/mkdir', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ path }),
-  });
+  const resp = await dashboardJsonFetch('api_fs_mkdir', { path }, () => (
+    authedFetch('/api/fs/mkdir', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path }),
+    })
+  ), 'api_fs_mkdir', { fallbackAfterRpcFailure: false });
   const data = await resp.json().catch(() => ({}));
   if (!resp.ok) {
     setFsPickerStatus('error', data.error || `Create failed (${resp.status})`);

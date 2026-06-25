@@ -870,6 +870,8 @@ async function main() {
           statHome: await ctl.request('api_fs_stat', { path: '~' }),
           listHome: await ctl.request('api_fs_list', { path: '~' }),
           badRelative: await ctl.request('api_fs_stat', { path: 'relative/path' }),
+          mkdirHome: await ctl.request('api_fs_mkdir', { path: '~' }),
+          mkdirBadRelative: await ctl.request('api_fs_mkdir', { path: 'relative/path' }),
         },
         appError: await ctl.request('api_peer_eligible', { capabilities: [] }),
         finalStatus: ctl.status(),
@@ -1041,6 +1043,11 @@ async function main() {
       true,
       'dashboard control status did not advertise filesystem list'
     );
+    assert.strictEqual(
+      result.status.api_fs_mkdir_available,
+      true,
+      'dashboard control status did not advertise filesystem mkdir'
+    );
     assert(
       result.filesystem?.statHome &&
         result.filesystem.statHome._httpStatus === 200 &&
@@ -1059,6 +1066,18 @@ async function main() {
         result.filesystem.badRelative._httpStatus === 400 &&
         result.filesystem.badRelative._httpOk === false,
       'filesystem stat RPC did not preserve bad path status'
+    );
+    assert(
+      result.filesystem?.mkdirHome &&
+        result.filesystem.mkdirHome._httpStatus === 200 &&
+        result.filesystem.mkdirHome.ok === true,
+      'filesystem mkdir RPC did not return existing-home status'
+    );
+    assert(
+      result.filesystem?.mkdirBadRelative &&
+        result.filesystem.mkdirBadRelative._httpStatus === 400 &&
+        result.filesystem.mkdirBadRelative._httpOk === false,
+      'filesystem mkdir RPC did not preserve bad path status'
     );
     assert(result.appError && result.appError._httpStatus === 400, 'application error metadata was not preserved');
     assert(

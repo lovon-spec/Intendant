@@ -449,7 +449,7 @@ When enabled with
 DataChannel and fall back to HTTP through the browser-side `DashboardTransport`
 boundary. Current tunneled reads include sessions, session detail, lazy
 command-output loads for the active session, active-session timeline history,
-active-session changes/diffs, filesystem picker stat/list reads, deep session
+active-session changes/diffs, filesystem picker stat/list/mkdir operations, deep session
 search, settings, API-key status, project root, display enumeration, recording
 metadata, worktree inventory, and peer state. Managed-context history reads for
 records, anchors, and fission groups also use the tunnel.
@@ -471,7 +471,7 @@ Several paths intentionally stay outside this JSON tunnel:
 
 - static assets and WASM bundles;
 - frames, recordings, and file uploads;
-- filesystem mutations such as mkdir;
+- general filesystem mutations and file content transfer;
 - MCP-over-HTTP;
 - diagnostics NDJSON uploads;
 - display WebRTC media/control channels and peer-display signaling;
@@ -734,9 +734,9 @@ the tunnel has resumable byte-stream semantics.
 Worktree cached inventory reads, explicit scans, and guarded removals use
 `api_worktrees`, `api_worktrees_scan`, and `api_worktrees_remove`; removal uses
 the same no-replay fallback rule as other writes.
-The filesystem picker's read-only path checks and directory listings use
-`api_fs_stat` and `api_fs_list`; mkdir remains on HTTP until the tunnel has a
-broader filesystem mutation model.
+The filesystem picker's path checks, directory listings, and mkdir operation use
+`api_fs_stat`, `api_fs_list`, and `api_fs_mkdir`; mkdir uses the same no-replay
+fallback rule as other writes.
 
 The first production APIs should be small and high value: `/config`, the main
 event stream, local session list hydration, peer access-request
@@ -804,7 +804,7 @@ Treat this as a staged target, not current behavior:
 10. Gradually migrate larger API surfaces. Managed-context history reads,
     active-session command-output loads, active-session timeline operations,
     active-session changes/diffs, recording metadata, worktree inventory,
-    filesystem picker stat/list reads, and local session hydration now use the
+    filesystem picker stat/list/mkdir operations, and local session hydration now use the
     tunnel, oversized JSON responses now use credit-windowed chunked response
     framing, and the sessions stream uses explicit
     `stream_start`/`stream_event`/`stream_end` frames. Uploads, downloads,

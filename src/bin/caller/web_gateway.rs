@@ -13659,6 +13659,16 @@ fn mkdir_dashboard_fs_path(raw: &str) -> Result<serde_json::Value, (String, Stri
     }))
 }
 
+pub(crate) fn dashboard_fs_mkdir_response_body(raw: &str) -> (String, String) {
+    match mkdir_dashboard_fs_path(raw) {
+        Ok(body) => ("200 OK".to_string(), body.to_string()),
+        Err((status, message)) => (
+            status,
+            serde_json::json!({ "error": message }).to_string(),
+        ),
+    }
+}
+
 /// Extract the `Content-Type` request header value, or a generic default.
 fn content_type_header(header_text: &str) -> String {
     header_text
