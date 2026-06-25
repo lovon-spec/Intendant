@@ -450,6 +450,9 @@ The handshake is bound to the daemon identity:
 - the daemon answers with SDP plus a signed binding over the offer hash, answer
   hash, session id, timestamp, and daemon Ed25519 public key;
 - the browser verifies that binding with WebCrypto before using the channel.
+- in Connect-rendezvous mode, the browser also requires the answer to carry the
+  daemon public key registered for the selected daemon id and rejects the tunnel
+  if that advertised key differs from the key inside the signed binding.
 
 When enabled with
 `localStorage.intendant_dashboard_transport = "webrtc-control"` (or
@@ -704,6 +707,14 @@ daemon signs the SDP offer hash, SDP answer hash, WebRTC control session id,
 timestamp, and daemon Ed25519 public key, and the browser verifies the signature
 with WebCrypto before using the channel. A public bootstrap service should keep
 that daemon identity binding and add account/device grants around it.
+
+The local Connect-rendezvous emulator now also models the registry side of that
+identity check: the daemon registers its public key for a daemon id, the browser
+offer answer carries that registered key, and the public-origin dashboard accepts
+the DataChannel only when the signed binding key matches the registered key. This
+does not solve account ownership, grant issuance, revocation, or clone recovery;
+it only prevents the browser from treating an arbitrary valid daemon signature as
+the claimed daemon.
 
 This makes the security boundary explicit: Intendant Connect is in the trusted
 computing base for consumer dashboard access. A compromised Connect service or
@@ -1055,11 +1066,14 @@ Treat this as a staged target, not current behavior:
 4. Add daemon outbound signaling to Intendant Connect. The local emulator now
    exercises this shape without hosted auth.
 5. Add a signaling rendezvous API keyed by browser session and daemon id. The
-   local emulator implements the minimal offer/answer/ICE/close subset.
+   local emulator implements the minimal offer/answer/ICE/close subset and
+   exposes the daemon public key registered for the selected daemon id.
 6. Let a locally running daemon register/poll that rendezvous while it is online.
    The daemon now has a disabled-by-default outbound polling client.
 7. Reuse the existing daemon binding and DataChannel RPC frame format. This is
-   shared by the direct local bootstrap and rendezvous-emulator slices.
+   shared by the direct local bootstrap and rendezvous-emulator slices; the
+   rendezvous browser path now rejects answers whose signed binding key does not
+   match the rendezvous-advertised daemon key.
 8. Add visible transport status: disconnected, mTLS HTTP fallback, WebRTC direct,
    WebRTC relayed, failed verification, or application-proxied. The dashboard
    now shows mTLS/HTTP, checking, verified WebRTC, TURN-relay, and failed states

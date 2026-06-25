@@ -37770,6 +37770,7 @@ class DashboardControlTransport {
     this.sessionId = '';
     this.binding = null;
     this.verifiedBinding = null;
+    this.claimedDaemonPublicKey = '';
     this.localOfferSdp = '';
     this.lastStatus = null;
     this.lastError = '';
@@ -37834,6 +37835,14 @@ class DashboardControlTransport {
   async handleAnswer(answer) {
     this.sessionId = String(answer.session_id || '');
     this.binding = answer.binding || null;
+    const claimedDaemonPublicKey = String(answer.daemon_public_key || '');
+    if (this.signalingMode === 'connect-rendezvous' && !claimedDaemonPublicKey) {
+      this.lastError = 'Connect answer missing daemon public key';
+      dashboardSetControlLastError(this.lastError);
+      dashboardUpdateTransportStatus();
+      this.close();
+      throw new Error('dashboard control binding rejected: Connect answer missing daemon public key');
+    }
     const verification = await verifyDashboardControlBinding(
       this.binding,
       this.sessionId,
@@ -37847,7 +37856,15 @@ class DashboardControlTransport {
       this.close();
       throw new Error(`dashboard control binding rejected: ${verification.error || 'unknown'}`);
     }
+    if (claimedDaemonPublicKey && String(verification.daemonPublicKey || '') !== claimedDaemonPublicKey) {
+      this.lastError = 'Connect daemon public key mismatch';
+      dashboardSetControlLastError(this.lastError);
+      dashboardUpdateTransportStatus();
+      this.close();
+      throw new Error('dashboard control binding rejected: Connect daemon public key mismatch');
+    }
     this.verifiedBinding = verification;
+    this.claimedDaemonPublicKey = claimedDaemonPublicKey || String(verification.daemonPublicKey || '');
     await this.pc.setRemoteDescription({ type: 'answer', sdp: answer.sdp });
     for (const candidate of this.pendingIce.splice(0)) {
       this.sendIce(candidate).catch(err => console.warn('[dashboard-control] queued ICE signal failed', err));
@@ -38719,6 +38736,7 @@ class DashboardControlTransport {
       channelState: this.channel?.readyState || '',
       sessionId: this.sessionId,
       verifiedBinding: this.verifiedBinding,
+      claimedDaemonPublicKey: this.claimedDaemonPublicKey,
       signalingMode: this.signalingMode,
       iceRoute: this.iceRoute,
       iceCandidatePair: this.iceCandidatePair,

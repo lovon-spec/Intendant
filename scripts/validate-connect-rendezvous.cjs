@@ -166,10 +166,12 @@ function createRendezvousServer(staticRoot, options = {}) {
       }
       if (req.method === 'GET' && url.pathname === '/api/status') {
         const daemonId = url.searchParams.get('daemon_id') || '';
+        const daemon = daemons.get(daemonId) || null;
         return sendJson(res, 200, {
           ok: true,
           daemon_id: daemonId,
-          registered: daemons.has(daemonId),
+          registered: Boolean(daemon),
+          daemon_public_key: daemon?.daemonPublicKey || '',
           queued: (events.get(daemonId) || []).length,
           pending_offers: Array.from(pendingOffers.values()).filter(p => p.daemonId === daemonId).length,
           daemon_auth_required: Boolean(authToken),
@@ -215,6 +217,13 @@ function createRendezvousServer(staticRoot, options = {}) {
         const body = await readJson(req);
         const offer = pendingOffers.get(String(body.request_id || ''));
         if (!offer) return sendJson(res, 404, { error: 'offer not found' });
+        const daemon = daemons.get(offer.daemonId);
+        if (!daemon) {
+          pendingOffers.delete(offer.id);
+          clearTimeout(offer.timer);
+          sendJson(offer.res, 410, { error: 'daemon registration expired' });
+          return sendJson(res, 410, { error: 'daemon registration expired' });
+        }
         pendingOffers.delete(offer.id);
         clearTimeout(offer.timer);
         sendJson(offer.res, 200, {
@@ -222,6 +231,7 @@ function createRendezvousServer(staticRoot, options = {}) {
           session_id: body.session_id,
           sdp: body.sdp,
           binding: body.binding,
+          daemon_public_key: daemon.daemonPublicKey,
         });
         return sendJson(res, 200, { ok: true });
       }
@@ -411,6 +421,7 @@ function publicBootstrapHtml() {
     channel: null,
     sessionId: '',
     verifiedBinding: null,
+    claimedDaemonPublicKey: '',
     pendingIce: [],
     pending: new Map(),
     chunkedResponses: new Map(),
@@ -447,9 +458,17 @@ function publicBootstrapHtml() {
         return body;
       });
       this.sessionId = String(answer.session_id || '');
+      const claimedDaemonPublicKey = String(answer.daemon_public_key || '');
+      if (!claimedDaemonPublicKey) {
+        throw new Error('rendezvous answer missing daemon_public_key');
+      }
       const verified = await verifyBinding(answer.binding, this.sessionId, offerSdp, answer.sdp || '');
       if (!verified.ok) throw new Error('binding rejected: ' + (verified.error || 'unknown'));
+      if (String(verified.daemonPublicKey || '') !== claimedDaemonPublicKey) {
+        throw new Error('binding rejected: daemon public key mismatch');
+      }
       this.verifiedBinding = verified;
+      this.claimedDaemonPublicKey = claimedDaemonPublicKey;
       await this.pc.setRemoteDescription({ type: 'answer', sdp: answer.sdp });
       for (const candidate of this.pendingIce.splice(0)) await this.sendIce(candidate);
       paint(this.status());
@@ -972,6 +991,7 @@ function publicBootstrapHtml() {
         channelState: this.channel?.readyState || '',
         sessionId: this.sessionId,
         verifiedBinding: this.verifiedBinding,
+        claimedDaemonPublicKey: this.claimedDaemonPublicKey,
         pendingRequests: this.pending.size,
         pendingChunkedResponses: this.chunkedResponses.size,
         pendingByteStreams: this.byteStreams.size,
@@ -1200,11 +1220,15 @@ async function main() {
     await waitFor(() => daemonLogs.join('').includes(`Web TUI: https://0.0.0.0:${options.daemonPort}`), START_TIMEOUT_MS, 'daemon web startup');
     const daemonNoAuthStatus = await httpStatus(`http://127.0.0.1:${options.rendezvousPort}/api/daemon/next?daemon_id=${encodeURIComponent(options.daemonId)}&timeout_ms=1`);
     assert.strictEqual(daemonNoAuthStatus, 401, `/api/daemon/next without bearer returned ${daemonNoAuthStatus}`);
-    await waitFor(async () => {
+    const registeredStatus = await waitFor(async () => {
       const status = await fetchJson(`http://127.0.0.1:${options.rendezvousPort}/api/status?daemon_id=${encodeURIComponent(options.daemonId)}`);
       assert.strictEqual(status.daemon_auth_required, true, 'rendezvous status did not advertise daemon auth requirement');
       return status.registered ? status : null;
     }, START_TIMEOUT_MS, 'daemon rendezvous registration');
+    assert(
+      registeredStatus.daemon_public_key,
+      `rendezvous registration did not expose daemon public key: ${JSON.stringify(registeredStatus)}`
+    );
 
     const certlessConfigStatus = await httpStatus(`https://127.0.0.1:${options.daemonPort}/config`, {
       ignoreHTTPSErrors: true,
@@ -1223,6 +1247,16 @@ async function main() {
     assert.strictEqual(response.status(), 200, `public bootstrap returned ${response.status()}`);
     await page.waitForFunction(() => Boolean(window.intendantPublicConnectDashboard));
     const connected = await waitForBrowserConnect(page);
+    assert.strictEqual(
+      connected.claimedDaemonPublicKey,
+      registeredStatus.daemon_public_key,
+      `public bootstrap did not use registered daemon key: ${JSON.stringify(connected)}`
+    );
+    assert.strictEqual(
+      connected.verifiedBinding.daemonPublicKey,
+      registeredStatus.daemon_public_key,
+      `public bootstrap binding did not match registered daemon key: ${JSON.stringify(connected)}`
+    );
 
     await page.evaluate(`window.__intendantRecordingStreamName = ${JSON.stringify(recordingFixture.streamName)}`);
     await page.evaluate(`window.__intendantHlsRecordingStreamName = ${JSON.stringify(hlsRecordingFixture.streamName)}`);
@@ -2743,6 +2777,21 @@ async function main() {
       appResult.status.signalingMode,
       'connect-rendezvous',
       `real SPA debug status did not keep Connect signaling: ${JSON.stringify(appResult.status)}`
+    );
+    assert.strictEqual(
+      appConnected.claimedDaemonPublicKey,
+      registeredStatus.daemon_public_key,
+      `real SPA did not use registered daemon key: ${JSON.stringify(appConnected)}`
+    );
+    assert.strictEqual(
+      appConnected.verifiedBinding.daemonPublicKey,
+      registeredStatus.daemon_public_key,
+      `real SPA binding did not match registered daemon key: ${JSON.stringify(appConnected)}`
+    );
+    assert.strictEqual(
+      appResult.status.claimedDaemonPublicKey,
+      registeredStatus.daemon_public_key,
+      `real SPA debug status did not expose registered daemon key: ${JSON.stringify(appResult.status)}`
     );
     assert(appResult.agentCardId, 'real SPA Connect mode did not fetch agent card over DataChannel');
     assert(
