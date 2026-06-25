@@ -11806,12 +11806,15 @@ fn connect_bootstrap_html() -> String {
   </main>
   <script>
 (() => {
-  const statusEl = document.getElementById('status');
-  const MAX_CHUNKED_RESPONSE_BYTES = 128 * 1024 * 1024;
-  function paint(message, kind = '') {
-    statusEl.textContent = typeof message === 'string' ? message : JSON.stringify(message, null, 2);
-    statusEl.className = kind;
-  }
+	  const statusEl = document.getElementById('status');
+	  const MAX_CHUNKED_RESPONSE_BYTES = 128 * 1024 * 1024;
+	  const MAX_BYTE_STREAM_BYTES = 128 * 1024 * 1024;
+	  const UPLOAD_CHUNK_BYTES = 16 * 1024;
+	  const UPLOAD_BUFFER_HIGH_BYTES = 1024 * 1024;
+	  function paint(message, kind = '') {
+	    statusEl.textContent = typeof message === 'string' ? message : JSON.stringify(message, null, 2);
+	    statusEl.className = kind;
+	  }
 
   function abortError(message = 'dashboard control request aborted') {
     try { return new DOMException(message, 'AbortError'); } catch {
@@ -11835,12 +11838,18 @@ fn connect_bootstrap_html() -> String {
     return bytes;
   }
 
-  function base64ToBytes(value) {
-    const binary = atob(String(value || ''));
-    const bytes = new Uint8Array(binary.length);
-    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-    return bytes;
-  }
+	  function base64ToBytes(value) {
+	    const binary = atob(String(value || ''));
+	    const bytes = new Uint8Array(binary.length);
+	    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+	    return bytes;
+	  }
+
+	  function bytesToBase64(bytes) {
+	    let binary = '';
+	    for (let i = 0; i < bytes.byteLength; i++) binary += String.fromCharCode(bytes[i]);
+	    return btoa(binary);
+	  }
 
   async function sha256B64u(text) {
     const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(String(text)));
@@ -11899,22 +11908,24 @@ fn connect_bootstrap_html() -> String {
     binding: null,
     verifiedBinding: null,
     localOfferSdp: '',
-    pendingIce: [],
-    pending: new Map(),
-    chunkedResponses: new Map(),
-    completedChunkedResponses: 0,
-    seq: 0,
-    started: false,
+	    pendingIce: [],
+	    pending: new Map(),
+	    chunkedResponses: new Map(),
+	    byteStreams: new Map(),
+	    completedChunkedResponses: 0,
+	    completedByteStreams: 0,
+	    seq: 0,
+	    started: false,
 
     async start() {
       if (this.started) return this.status();
       this.started = true;
-      this.pc = new RTCPeerConnection({});
-      this.channel = this.pc.createDataChannel('intendant-dashboard-control', { ordered: true });
-      this.channel.onopen = () => {
-        this.sendFrame({ t: 'hello', id: this.nextId(), features: ['response_credit'] });
-        paint(this.status(), 'ok');
-      };
+	      this.pc = new RTCPeerConnection({});
+	      this.channel = this.pc.createDataChannel('intendant-dashboard-control', { ordered: true });
+	      this.channel.onopen = () => {
+	        this.sendFrame({ t: 'hello', id: this.nextId(), features: ['response_credit', 'byte_streams', 'upload_frames'] });
+	        paint(this.status(), 'ok');
+	      };
       this.channel.onmessage = ev => this.handleMessage(ev.data);
       this.channel.onclose = () => paint(this.status());
       this.pc.onconnectionstatechange = () => paint(this.status(), this.pc.connectionState === 'failed' ? 'err' : '');
@@ -11977,11 +11988,23 @@ fn connect_bootstrap_html() -> String {
         this.handleResponseChunk(msg);
         return;
       }
-      if (msg.t === 'response_end') {
-        this.handleResponseEnd(msg);
-        return;
-      }
-      if (msg.t !== 'pong' && msg.t !== 'response') return;
+	      if (msg.t === 'response_end') {
+	        this.handleResponseEnd(msg);
+	        return;
+	      }
+	      if (msg.t === 'byte_stream_start') {
+	        this.handleByteStreamStart(msg);
+	        return;
+	      }
+	      if (msg.t === 'byte_stream_chunk') {
+	        this.handleByteStreamChunk(msg);
+	        return;
+	      }
+	      if (msg.t === 'byte_stream_end') {
+	        this.handleByteStreamEnd(msg);
+	        return;
+	      }
+	      if (msg.t !== 'pong' && msg.t !== 'response') return;
       const pending = this.pending.get(msg.id);
       if (!pending) return;
       this.pending.delete(msg.id);
@@ -12102,17 +12125,216 @@ fn connect_bootstrap_html() -> String {
         this.pending.delete(id);
         pending.reject(new Error(message));
       }
-      paint(this.status(), 'err');
-    },
+	      paint(this.status(), 'err');
+	    },
 
-    request(method, params = {}, options = {}) {
-      if (options.signal?.aborted) return Promise.reject(abortError());
-      if (!this.canUseRpc()) return Promise.reject(new Error('connect dashboard RPC is not connected'));
-      const id = this.nextId();
-      const promise = this.waitFor(id, options);
-      this.sendFrame({ t: 'request', id, method, params });
-      return promise;
-    },
+	    handleByteStreamStart(msg) {
+	      const id = String(msg.id || '');
+	      const streamId = String(msg.stream_id || id);
+	      if (!id || !streamId || !this.pending.has(id)) return;
+	      const totalBytes = Number(msg.total_bytes);
+	      const expectedChunks = Number(msg.chunks);
+	      if (
+	        msg.encoding !== 'base64' ||
+	        !Number.isSafeInteger(totalBytes) ||
+	        totalBytes < 0 ||
+	        totalBytes > MAX_BYTE_STREAM_BYTES ||
+	        !Number.isSafeInteger(expectedChunks) ||
+	        expectedChunks < 0
+	      ) {
+	        this.rejectByteStream(streamId, 'invalid connect dashboard byte stream header', id);
+	        return;
+	      }
+	      this.byteStreams.set(streamId, {
+	        id,
+	        streamId,
+	        totalBytes,
+	        expectedChunks,
+	        receivedBytes: 0,
+	        chunks: new Map(),
+	        ended: false,
+	        result: null,
+	        contentType: String(msg.content_type || 'application/octet-stream'),
+	        filename: msg.filename ? String(msg.filename) : '',
+	      });
+	      paint(this.status(), 'ok');
+	    },
+
+	    handleByteStreamChunk(msg) {
+	      const id = String(msg.id || '');
+	      const streamId = String(msg.stream_id || id);
+	      const state = this.byteStreams.get(streamId);
+	      if (!state) return;
+	      const seq = Number(msg.seq);
+	      if (!Number.isSafeInteger(seq) || seq < 0 || seq >= state.expectedChunks) {
+	        this.rejectByteStream(streamId, 'invalid connect dashboard byte stream chunk sequence');
+	        return;
+	      }
+	      if (state.chunks.has(seq)) return;
+	      let bytes;
+	      try {
+	        bytes = base64ToBytes(msg.data);
+	      } catch {
+	        this.rejectByteStream(streamId, 'invalid connect dashboard byte stream encoding');
+	        return;
+	      }
+	      state.chunks.set(seq, bytes);
+	      state.receivedBytes += bytes.byteLength;
+	      if (state.receivedBytes > state.totalBytes) {
+	        this.rejectByteStream(streamId, 'connect dashboard byte stream exceeded declared size');
+	        return;
+	      }
+	      const completed = this.maybeCompleteByteStream(streamId);
+	      if (!completed && this.byteStreams.has(streamId)) {
+	        this.sendChunkCredit(id, 1, streamId === id ? null : streamId);
+	      }
+	      paint(this.status(), 'ok');
+	    },
+
+	    handleByteStreamEnd(msg) {
+	      const id = String(msg.id || '');
+	      const streamId = String(msg.stream_id || id);
+	      const state = this.byteStreams.get(streamId);
+	      if (!state) return;
+	      if (msg.ok === false) {
+	        this.rejectByteStream(streamId, msg.error || 'connect dashboard byte stream failed');
+	        return;
+	      }
+	      const finalChunks = Number(msg.chunks);
+	      if (!Number.isSafeInteger(finalChunks) || finalChunks !== state.expectedChunks) {
+	        this.rejectByteStream(streamId, 'invalid connect dashboard byte stream footer');
+	        return;
+	      }
+	      state.ended = true;
+	      state.result = msg.result || null;
+	      this.maybeCompleteByteStream(streamId);
+	      paint(this.status(), 'ok');
+	    },
+
+	    maybeCompleteByteStream(streamId) {
+	      const state = this.byteStreams.get(streamId);
+	      if (!state || !state.ended || state.chunks.size !== state.expectedChunks) return false;
+	      const merged = new Uint8Array(state.totalBytes);
+	      let offset = 0;
+	      for (let seq = 0; seq < state.expectedChunks; seq++) {
+	        const chunk = state.chunks.get(seq);
+	        if (!chunk) {
+	          this.rejectByteStream(streamId, 'connect dashboard byte stream missed a chunk');
+	          return false;
+	        }
+	        merged.set(chunk, offset);
+	        offset += chunk.byteLength;
+	      }
+	      if (offset !== state.totalBytes) {
+	        this.rejectByteStream(streamId, 'connect dashboard byte stream size mismatch');
+	        return false;
+	      }
+	      this.byteStreams.delete(streamId);
+	      const pending = this.pending.get(state.id);
+	      if (!pending) return true;
+	      const result = state.result && typeof state.result === 'object' && !Array.isArray(state.result)
+	        ? { ...state.result }
+	        : {};
+	      result.ok = result.ok !== false;
+	      result.bytes = merged;
+	      result.size = state.totalBytes;
+	      result.content_type = result.content_type || state.contentType;
+	      result.filename = result.filename || state.filename;
+	      result.stream_id = state.streamId;
+	      this.completedByteStreams += 1;
+	      this.pending.delete(state.id);
+	      this.chunkedResponses.delete(state.id);
+	      pending.resolve(result);
+	      paint(this.status(), 'ok');
+	      return true;
+	    },
+
+	    rejectByteStream(streamId, message, requestId = '') {
+	      const state = this.byteStreams.get(streamId);
+	      const id = state?.id || requestId || streamId;
+	      this.byteStreams.delete(streamId);
+	      const pending = this.pending.get(id);
+	      if (pending) {
+	        this.pending.delete(id);
+	        pending.reject(new Error(message));
+	      }
+	      paint(this.status(), 'err');
+	    },
+
+	    request(method, params = {}, options = {}) {
+	      if (options.signal?.aborted) return Promise.reject(abortError());
+	      if (!this.canUseRpc()) return Promise.reject(new Error('connect dashboard RPC is not connected'));
+	      const id = this.nextId();
+	      const promise = this.waitFor(id, options);
+	      this.sendFrame({ t: 'request', id, method, params });
+	      return promise;
+	    },
+
+	    requestBytes(method, params = {}, options = {}) {
+	      if (options.signal?.aborted) return Promise.reject(abortError());
+	      if (!this.canUseRpc()) return Promise.reject(new Error('connect dashboard byte stream is not connected'));
+	      const id = this.nextId();
+	      const promise = this.waitFor(id, options);
+	      this.sendFrame({ t: 'request', id, method, params, bytes: true });
+	      return promise;
+	    },
+
+	    async uploadBytes(method, params = {}, bytes, options = {}) {
+	      if (options.signal?.aborted) return Promise.reject(abortError());
+	      if (!this.canUseRpc()) return Promise.reject(new Error('connect dashboard upload is not connected'));
+	      const id = this.nextId();
+	      const totalBytes = Number(bytes?.size ?? bytes?.byteLength ?? bytes?.length ?? 0);
+	      const chunkSize = options.chunkBytes || UPLOAD_CHUNK_BYTES;
+	      const chunks = Math.ceil(totalBytes / chunkSize);
+	      const promise = this.waitFor(id, options);
+	      this.sendFrame({
+	        t: 'upload_start',
+	        id,
+	        method,
+	        params,
+	        encoding: 'base64',
+	        total_bytes: totalBytes,
+	        chunks,
+	      });
+	      try {
+	        for (let seq = 0, offset = 0; offset < totalBytes; seq += 1, offset += chunkSize) {
+	          if (options.signal?.aborted) throw abortError();
+	          if (!this.pending.has(id)) break;
+	          const end = Math.min(offset + chunkSize, totalBytes);
+	          let chunk;
+	          if (bytes instanceof Blob) {
+	            chunk = new Uint8Array(await bytes.slice(offset, end).arrayBuffer());
+	          } else if (bytes instanceof Uint8Array) {
+	            chunk = bytes.subarray(offset, end);
+	          } else {
+	            chunk = new Uint8Array(bytes.slice(offset, end));
+	          }
+	          this.sendFrame({
+	            t: 'upload_chunk',
+	            id,
+	            seq,
+	            data: bytesToBase64(chunk),
+	          });
+	          await this.waitForBufferedAmountLow(options.signal);
+	        }
+	        if (this.pending.has(id)) this.sendFrame({ t: 'upload_end', id, chunks });
+	      } catch (err) {
+	        if (this.pending.has(id)) this.sendFrame({ t: 'cancel', id });
+	        throw err;
+	      }
+	      return promise;
+	    },
+
+	    async waitForBufferedAmountLow(signal = null) {
+	      while (
+	        this.channel &&
+	        this.channel.readyState === 'open' &&
+	        this.channel.bufferedAmount > UPLOAD_BUFFER_HIGH_BYTES
+	      ) {
+	        if (signal?.aborted) throw abortError();
+	        await new Promise(resolve => setTimeout(resolve, 10));
+	      }
+	    },
 
     waitFor(id, options = {}) {
       return new Promise((resolve, reject) => {
@@ -12123,24 +12345,26 @@ fn connect_bootstrap_html() -> String {
           settled = true;
           clearTimeout(timer);
           if (signal && abortHandler) signal.removeEventListener('abort', abortHandler);
-          this.pending.delete(id);
-          this.chunkedResponses.delete(id);
-          if (cancel) this.sendFrame({ t: 'cancel', id });
-          reject(err);
-        };
+	          this.pending.delete(id);
+	          this.chunkedResponses.delete(id);
+	          this.deleteByteStreamsForRequest(id);
+	          if (cancel) this.sendFrame({ t: 'cancel', id });
+	          reject(err);
+	        };
         const abortHandler = signal ? () => fail(abortError(), true) : null;
         const timeoutMs = Number.isFinite(Number(options.timeoutMs)) ? Number(options.timeoutMs) : 10000;
         const timer = setTimeout(() => fail(new Error('connect dashboard request timed out'), true), timeoutMs);
         if (signal && abortHandler) signal.addEventListener('abort', abortHandler, { once: true });
         this.pending.set(id, {
-          resolve: value => {
-            if (settled) return;
-            settled = true;
-            clearTimeout(timer);
-            if (signal && abortHandler) signal.removeEventListener('abort', abortHandler);
-            this.chunkedResponses.delete(id);
-            resolve(value);
-          },
+	          resolve: value => {
+	            if (settled) return;
+	            settled = true;
+	            clearTimeout(timer);
+	            if (signal && abortHandler) signal.removeEventListener('abort', abortHandler);
+	            this.chunkedResponses.delete(id);
+	            this.deleteByteStreamsForRequest(id);
+	            resolve(value);
+	          },
           reject: err => fail(err),
         });
       });
@@ -12154,9 +12378,17 @@ fn connect_bootstrap_html() -> String {
       if (this.channel?.readyState === 'open') this.channel.send(JSON.stringify(frame));
     },
 
-    sendChunkCredit(id, chunks) {
-      this.sendFrame({ t: 'credit', id, chunks });
-    },
+	    sendChunkCredit(id, chunks, chunkId = null) {
+	      const frame = { t: 'credit', id, chunks };
+	      if (chunkId) frame.chunk_id = chunkId;
+	      this.sendFrame(frame);
+	    },
+
+	    deleteByteStreamsForRequest(id) {
+	      for (const [streamId, state] of this.byteStreams) {
+	        if (streamId === id || state?.id === id) this.byteStreams.delete(streamId);
+	      }
+	    },
 
     status() {
       return {
@@ -12164,12 +12396,14 @@ fn connect_bootstrap_html() -> String {
         pcState: this.pc?.connectionState || '',
         channelState: this.channel?.readyState || '',
         sessionId: this.sessionId,
-        verifiedBinding: this.verifiedBinding,
-        pendingRequests: this.pending.size,
-        pendingChunkedResponses: this.chunkedResponses.size,
-        completedChunkedResponses: this.completedChunkedResponses,
-      };
-    },
+	        verifiedBinding: this.verifiedBinding,
+	        pendingRequests: this.pending.size,
+	        pendingChunkedResponses: this.chunkedResponses.size,
+	        pendingByteStreams: this.byteStreams.size,
+	        completedChunkedResponses: this.completedChunkedResponses,
+	        completedByteStreams: this.completedByteStreams,
+	      };
+	    },
 
     close() {
       if (this.sessionId) {
@@ -12178,9 +12412,10 @@ fn connect_bootstrap_html() -> String {
           headers: { 'content-type': 'application/json' },
           body: JSON.stringify({ session_id: this.sessionId }),
         }).catch(() => {});
-      }
-      this.chunkedResponses.clear();
-      try { this.channel?.close(); } catch {}
+	      }
+	      this.chunkedResponses.clear();
+	      this.byteStreams.clear();
+	      try { this.channel?.close(); } catch {}
       try { this.pc?.close(); } catch {}
     },
 
