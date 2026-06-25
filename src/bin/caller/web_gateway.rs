@@ -14971,20 +14971,6 @@ pub fn spawn_web_gateway(
     // dashboard explicitly triggers refreshes instead of doing it on
     // every GET. Shared by HTTP and the dashboard WebRTC control tunnel.
     let worktree_inventory_cache: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
-    let dashboard_control = Arc::new(crate::dashboard_control::DashboardControlRegistry::new(
-        config.clone(),
-        broadcast_tx.clone(),
-        bus.clone(),
-        peer_registry.clone(),
-        mcp_server.clone(),
-        shared_session.clone(),
-        project_root.clone(),
-        worktree_inventory_cache.clone(),
-    ));
-    let _connect_rendezvous_handle = crate::connect_rendezvous::spawn_connect_rendezvous_client(
-        config.connect.clone(),
-        dashboard_control.clone(),
-    );
 
     // Build the local Agent Card from live runtime state so
     // `/.well-known/agent-card.json` can serve it. The transport URLs
@@ -15006,6 +14992,23 @@ pub fn spawn_web_gateway(
     );
     let agent_card = build_local_agent_card(advertise_urls, local_card_auth);
     let agent_card_json = serde_json::to_string(&agent_card).unwrap_or_else(|_| "{}".to_string());
+    let agent_card_value =
+        serde_json::to_value(&agent_card).unwrap_or_else(|_| serde_json::json!({}));
+    let dashboard_control = Arc::new(crate::dashboard_control::DashboardControlRegistry::new(
+        config.clone(),
+        broadcast_tx.clone(),
+        bus.clone(),
+        peer_registry.clone(),
+        mcp_server.clone(),
+        shared_session.clone(),
+        project_root.clone(),
+        worktree_inventory_cache.clone(),
+        agent_card_value,
+    ));
+    let _connect_rendezvous_handle = crate::connect_rendezvous::spawn_connect_rendezvous_client(
+        config.connect.clone(),
+        dashboard_control.clone(),
+    );
 
     // Pre-build ICE config for WebRTC display sessions from the gateway config.
     let ice_config = crate::display::IceConfig {

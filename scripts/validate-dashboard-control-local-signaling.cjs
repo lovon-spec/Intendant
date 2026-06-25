@@ -132,6 +132,7 @@ async function main() {
       const ctl = window.intendantDashboardControl;
       return {
         status: await ctl.request('status', {}, { timeoutMs: 60000 }),
+        agentCard: await ctl.agentCard({ timeoutMs: 60000 }),
         sessions: await ctl.request('api_sessions', { limit: 2 }, { timeoutMs: 60000 }),
         rejectedControlMsg: await ctl.request('api_control_msg', {
           message: { action: 'create_session', task: 'noop' },
@@ -141,8 +142,11 @@ async function main() {
     });
 
     assert(result.status && result.status.session_id, 'status RPC did not return a session id');
+    assert(result.agentCard && result.agentCard.id, 'api_agent_card did not return an id');
+    assert(result.agentCard.label, 'api_agent_card did not return a label');
     assert(Array.isArray(result.sessions), 'api_sessions did not return an array');
     assert.strictEqual(result.finalStatus.signalingMode, 'local-http');
+    assert.strictEqual(result.finalStatus.apiAgentCardAvailable, true);
     assert.strictEqual(result.finalStatus.apiControlMsgAvailable, true);
     assert.strictEqual(result.rejectedControlMsg?._httpStatus, 400);
     assert.strictEqual(result.rejectedControlMsg?._httpOk, false);
@@ -157,7 +161,9 @@ async function main() {
       connected,
       rpc: {
         controlSessionId: result.status.session_id,
+        agentCardId: result.agentCard.id,
         sessionCount: result.sessions.length,
+        apiAgentCardAvailable: result.finalStatus.apiAgentCardAvailable,
         apiControlMsgAvailable: result.finalStatus.apiControlMsgAvailable,
         rejectedControlStatus: result.rejectedControlMsg._httpStatus,
         signalingMode: result.finalStatus.signalingMode,

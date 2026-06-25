@@ -44,6 +44,7 @@ const CONTROL_RESPONSE_MAX_CREDIT_GRANT: usize = 64;
 const CONTROL_FEATURES: &[&str] = &[
     "ping",
     "config",
+    "api_agent_card",
     "status",
     "events",
     "response_chunks",
@@ -111,6 +112,7 @@ pub struct DashboardControlRegistry {
     shared_session: crate::web_gateway::SharedActiveSession,
     project_root: Option<PathBuf>,
     worktree_inventory_cache: Arc<std::sync::Mutex<Option<String>>>,
+    agent_card: serde_json::Value,
     identity: Mutex<Option<Arc<DaemonIdentity>>>,
     peers: Mutex<HashMap<String, DashboardControlPeer>>,
 }
@@ -125,6 +127,7 @@ impl DashboardControlRegistry {
         shared_session: crate::web_gateway::SharedActiveSession,
         project_root: Option<PathBuf>,
         worktree_inventory_cache: Arc<std::sync::Mutex<Option<String>>>,
+        agent_card: serde_json::Value,
     ) -> Self {
         Self {
             config,
@@ -135,6 +138,7 @@ impl DashboardControlRegistry {
             shared_session,
             project_root,
             worktree_inventory_cache,
+            agent_card,
             identity: Mutex::new(None),
             peers: Mutex::new(HashMap::new()),
         }
@@ -154,6 +158,7 @@ impl DashboardControlRegistry {
             self.shared_session.clone(),
             self.project_root.clone(),
             self.worktree_inventory_cache.clone(),
+            self.agent_card.clone(),
             identity,
         )
         .await
@@ -269,6 +274,7 @@ impl DashboardControlPeer {
         shared_session: crate::web_gateway::SharedActiveSession,
         project_root: Option<PathBuf>,
         worktree_inventory_cache: Arc<std::sync::Mutex<Option<String>>>,
+        agent_card: serde_json::Value,
         identity: Arc<DaemonIdentity>,
     ) -> Result<(Self, String, DashboardControlBinding), CallerError> {
         let mut setting_engine = SettingEngine::default();
@@ -340,6 +346,7 @@ impl DashboardControlPeer {
             shared_session,
             project_root,
             worktree_inventory_cache,
+            agent_card,
         };
         let (command_tx, command_rx) = mpsc::channel(COMMAND_CHANNEL);
         let shutdown = CancellationToken::new();
@@ -403,6 +410,7 @@ struct ControlRuntime {
     shared_session: crate::web_gateway::SharedActiveSession,
     project_root: Option<PathBuf>,
     worktree_inventory_cache: Arc<std::sync::Mutex<Option<String>>>,
+    agent_card: serde_json::Value,
 }
 
 enum ControlCommand {
@@ -1123,6 +1131,12 @@ fn control_frame_response(
                     "ok": true,
                     "result": runtime.config,
                 })),
+                "api_agent_card" => Some(serde_json::json!({
+                    "t": "response",
+                    "id": id,
+                    "ok": true,
+                    "result": runtime.agent_card,
+                })),
                 "api_sessions_stream" => {
                     spawn_control_stream(
                         id,
@@ -1256,6 +1270,7 @@ fn status_response_frame(id: String, runtime: &ControlRuntime) -> serde_json::Va
     let peer_registry_available = runtime.peer_registry.is_some();
     let capabilities = [
         ("api_peers_available", peer_registry_available),
+        ("api_agent_card_available", true),
         ("api_sessions_available", true),
         ("api_sessions_stream_available", true),
         ("api_session_detail_available", true),
@@ -3225,6 +3240,10 @@ mod tests {
             events_sent: 0,
             response_credit_enabled: false,
             config: serde_json::json!({"provider":"openai"}),
+            agent_card: serde_json::json!({
+                "id": "intendant:test-daemon",
+                "label": "test-daemon",
+            }),
             bus: crate::event::EventBus::new(),
             peer_registry: None,
             mcp_server: None,
@@ -3290,6 +3309,19 @@ mod tests {
         assert_eq!(config["ok"], true);
         assert_eq!(config["result"]["provider"], "openai");
 
+        let card = control_frame_response(
+            r#"{"t":"request","id":"c1","method":"api_agent_card"}"#,
+            &mut rt,
+            &tx,
+            &mut pending,
+            &mut outbound,
+        )
+        .unwrap();
+        assert_eq!(card["t"], "response");
+        assert_eq!(card["ok"], true);
+        assert_eq!(card["result"]["id"], "intendant:test-daemon");
+        assert_eq!(card["result"]["label"], "test-daemon");
+
         let status = control_frame_response(
             r#"{"t":"request","id":"s1","method":"status"}"#,
             &mut rt,
@@ -3306,6 +3338,7 @@ mod tests {
         assert_eq!(status["result"]["events_subscribed"], false);
         assert_eq!(status["result"]["response_credit_enabled"], false);
         assert_eq!(status["result"]["api_peers_available"], false);
+        assert_eq!(status["result"]["api_agent_card_available"], true);
         assert_eq!(status["result"]["api_sessions_available"], true);
         assert_eq!(status["result"]["api_sessions_stream_available"], true);
         assert_eq!(status["result"]["api_session_detail_available"], true);

@@ -36700,6 +36700,9 @@ window.intendantDashboardControl = {
   request(method, params = {}, options = {}) {
     return dashboardTransport.request(method, params, options);
   },
+  agentCard(options = {}) {
+    return dashboardTransport.request('api_agent_card', {}, options);
+  },
   peers() {
     return dashboardTransport.request('api_peers');
   },
@@ -37390,6 +37393,7 @@ class DashboardControlTransport {
       iceCandidatePair: this.iceCandidatePair,
       lastError: this.lastError,
       eventsActive: dashboardControlEventsActive,
+      apiAgentCardAvailable: this.lastStatus?.api_agent_card_available ?? null,
       apiPeersAvailable: this.lastStatus?.api_peers_available ?? null,
       apiSessionsAvailable: this.lastStatus?.api_sessions_available ?? null,
       apiSessionsStreamAvailable: this.lastStatus?.api_sessions_stream_available ?? null,

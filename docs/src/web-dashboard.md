@@ -452,12 +452,13 @@ When enabled with
 `localStorage.intendant_dashboard_transport = "webrtc-control"` (or
 `window.intendantDashboardControl.enable()`), dashboard JSON reads prefer the
 DataChannel and fall back to HTTP through the browser-side `DashboardTransport`
-boundary. Current tunneled reads include sessions, session detail, lazy
-command-output loads for the active session, active-session timeline history,
-active-session changes/diffs, lazy exact context-snapshot loads, filesystem
-picker stat/list/mkdir operations, deep session search, settings, API-key
-status, server-side voice-session token minting, project root, display
-enumeration, recording metadata, worktree inventory, and peer state.
+boundary. Current tunneled reads include the local Agent Card identity, sessions,
+session detail, lazy command-output loads for the active session,
+active-session timeline history, active-session changes/diffs, lazy exact
+context-snapshot loads, filesystem picker stat/list/mkdir operations, deep
+session search, settings, API-key status, server-side voice-session token
+minting, project root, display enumeration, recording metadata, worktree
+inventory, and peer state.
 Managed-context history reads for records, anchors, and fission groups also use
 the tunnel.
 Current tunneled mutations include
@@ -749,6 +750,9 @@ the existing `/api/sessions/stream` NDJSON event shape (`start`, partial
 `session`, `phase`, final `replace`, `done`). When the verified DataChannel is
 connected, local dashboard session hydration uses that stream and falls back to
 the HTTP stream on safe errors. Peer session lists still use direct peer HTTP.
+The local daemon identity is available as `api_agent_card`, returning the same
+Agent Card shape served by `/.well-known/agent-card.json`; the HTTP endpoint
+remains the unauthenticated discovery surface.
 Lazy command-output expansion for finalized log command groups uses
 `api_session_current_agent_output`, preserving the same `_httpStatus`/`_httpOk`
 metadata as the existing HTTP endpoint.
@@ -853,9 +857,9 @@ Treat this as a staged target, not current behavior:
     active-session command-output loads, active-session timeline operations,
     active-session changes/diffs, lazy context-snapshot exact-loads, session-data
     deletion, staged upload deletion, recording metadata, worktree inventory,
-    filesystem picker stat/list/mkdir operations, and local session hydration now
-    use the tunnel, oversized JSON responses now use credit-windowed chunked
-    response framing, and the sessions stream uses explicit
+    filesystem picker stat/list/mkdir operations, local Agent Card reads, and
+    local session hydration now use the tunnel, oversized JSON responses now use
+    credit-windowed chunked response framing, and the sessions stream uses explicit
     `stream_start`/`stream_event`/`stream_end` frames. Allowlisted settings
     `ControlMsg` dispatch now uses the tunnel when verified. Uploads, downloads,
     recording media, terminals, non-allowlisted control commands, and file
