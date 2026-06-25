@@ -940,6 +940,13 @@ function publicBootstrapHtml() {
         apiSessionCurrentUploadsAvailable: this.lastStatus?.api_session_current_uploads_available ?? null,
         apiSessionCurrentUploadRawAvailable: this.lastStatus?.api_session_current_upload_raw_available ?? null,
         apiSessionCurrentUploadDeleteAvailable: this.lastStatus?.api_session_current_upload_delete_available ?? null,
+        apiMediaEditorAvailable: this.lastStatus?.api_media_editor_available ?? null,
+        apiMediaAnnotationAttachAvailable: this.lastStatus?.api_media_annotation_attach_available ?? null,
+        apiMediaAnnotationSubmitAvailable: this.lastStatus?.api_media_annotation_submit_available ?? null,
+        apiMediaClipStartAvailable: this.lastStatus?.api_media_clip_start_available ?? null,
+        apiMediaClipFrameAvailable: this.lastStatus?.api_media_clip_frame_available ?? null,
+        apiMediaClipEndAvailable: this.lastStatus?.api_media_clip_end_available ?? null,
+        apiMediaClipCancelAvailable: this.lastStatus?.api_media_clip_cancel_available ?? null,
         apiFsStatAvailable: this.lastStatus?.api_fs_stat_available ?? null,
         apiFsListAvailable: this.lastStatus?.api_fs_list_available ?? null,
         apiFsMkdirAvailable: this.lastStatus?.api_fs_mkdir_available ?? null,
@@ -1273,6 +1280,31 @@ async function main() {
           byteLength: raw?.data_base64 ? atob(String(raw.data_base64)).length : 0,
           text: raw?.data_base64 ? atob(String(raw.data_base64)) : '',
         };
+      };
+      const mediaTransfer = async () => {
+        const annotation = await labeled('api_media_annotation_submit', ctl.uploadBytes('api_media_annotation_submit', {
+          frame_id: 'e2e-rendezvous-ann-1',
+          stream: 'annotation',
+          note: 'rendezvous media protocol e2e',
+          inject: false,
+        }, new TextEncoder().encode('jpeg annotation rendezvous'), { timeoutMs: 60000 }));
+        const start = await labeled('api_media_clip_start', ctl.request('api_media_clip_start', {
+          clip_id: 'e2e-rendezvous-clip-1',
+          stream: 'recording',
+          fps: 2,
+          total_frames: 1,
+          inject: false,
+        }, { timeoutMs: 60000 }));
+        const frame = await labeled('api_media_clip_frame', ctl.uploadBytes('api_media_clip_frame', {
+          clip_id: 'e2e-rendezvous-clip-1',
+          frame_id: 'e2e-rendezvous-clip-1-f000',
+          frame_index: 0,
+        }, new TextEncoder().encode('jpeg clip frame rendezvous'), { timeoutMs: 60000 }));
+        const end = await labeled('api_media_clip_end', ctl.request('api_media_clip_end', {
+          clip_id: 'e2e-rendezvous-clip-1',
+          frames_sent: 1,
+        }, { timeoutMs: 60000 }));
+        return { annotation, start, frame, end };
       };
       const imagePreview = async () => {
         const input = document.getElementById('upload-file-input');
@@ -1621,6 +1653,7 @@ async function main() {
         upload: uploaded,
         uploadList: await ctl.request('api_session_current_uploads', {}, { timeoutMs: 60000 }),
         uploadRaw: await uploadRaw(uploaded),
+        mediaTransfer: await mediaTransfer(),
         imagePreview: await imagePreview(),
         recordingAsset: await recordingAsset(),
         recordingHlsAssets: await recordingHlsAssets(),
@@ -1751,6 +1784,41 @@ async function main() {
       result.status.api_session_current_upload_raw_available,
       true,
       'dashboard control status did not advertise upload raw byte streams'
+    );
+    assert.strictEqual(
+      result.status.api_media_editor_available,
+      true,
+      'dashboard control status did not advertise media editor transfer'
+    );
+    assert.strictEqual(
+      result.status.api_media_annotation_attach_available,
+      true,
+      'dashboard control status did not advertise media annotation attach'
+    );
+    assert.strictEqual(
+      result.status.api_media_annotation_submit_available,
+      true,
+      'dashboard control status did not advertise media annotation submit'
+    );
+    assert.strictEqual(
+      result.status.api_media_clip_start_available,
+      true,
+      'dashboard control status did not advertise media clip start'
+    );
+    assert.strictEqual(
+      result.status.api_media_clip_frame_available,
+      true,
+      'dashboard control status did not advertise media clip frame upload'
+    );
+    assert.strictEqual(
+      result.status.api_media_clip_end_available,
+      true,
+      'dashboard control status did not advertise media clip end'
+    );
+    assert.strictEqual(
+      result.status.api_media_clip_cancel_available,
+      true,
+      'dashboard control status did not advertise media clip cancel'
     );
     assert.strictEqual(
       result.status.api_recording_asset_available,
@@ -2052,6 +2120,18 @@ async function main() {
     assert.strictEqual(result.uploadRaw?.range_start, 10);
     assert.strictEqual(result.uploadRaw?.range_end, 16);
     assert.strictEqual(result.uploadRaw?.resumable, true);
+    assert.strictEqual(result.mediaTransfer?.annotation?._httpStatus, 200);
+    assert.strictEqual(result.mediaTransfer?.annotation?._httpOk, true);
+    assert.strictEqual(result.mediaTransfer?.annotation?.t, 'annotation_saved');
+    assert.strictEqual(result.mediaTransfer?.annotation?.frame_id, 'e2e-rendezvous-ann-1');
+    assert.strictEqual(result.mediaTransfer?.start?._httpStatus, 200);
+    assert.strictEqual(result.mediaTransfer?.start?.t, 'media_clip_started');
+    assert.strictEqual(result.mediaTransfer?.frame?._httpStatus, 200);
+    assert.strictEqual(result.mediaTransfer?.frame?.t, 'media_clip_frame_saved');
+    assert.strictEqual(result.mediaTransfer?.frame?.frames_received, 1);
+    assert.strictEqual(result.mediaTransfer?.end?._httpStatus, 200);
+    assert.strictEqual(result.mediaTransfer?.end?.t, 'clip_saved');
+    assert.strictEqual(result.mediaTransfer?.end?.frames_registered, 1);
     if (result.imagePreview?.skipped) {
       assert.strictEqual(result.imagePreview.reason, 'upload file input unavailable on rendezvous emulator');
     } else {
@@ -2326,6 +2406,13 @@ async function main() {
     assert.strictEqual(result.finalStatus.apiSessionCurrentUploadAvailable, result.status.api_session_current_upload_available);
     assert.strictEqual(result.finalStatus.apiSessionCurrentUploadRawAvailable, result.status.api_session_current_upload_raw_available);
     assert.strictEqual(result.finalStatus.apiSessionCurrentUploadDeleteAvailable, result.status.api_session_current_upload_delete_available);
+    assert.strictEqual(result.finalStatus.apiMediaEditorAvailable, result.status.api_media_editor_available);
+    assert.strictEqual(result.finalStatus.apiMediaAnnotationAttachAvailable, result.status.api_media_annotation_attach_available);
+    assert.strictEqual(result.finalStatus.apiMediaAnnotationSubmitAvailable, result.status.api_media_annotation_submit_available);
+    assert.strictEqual(result.finalStatus.apiMediaClipStartAvailable, result.status.api_media_clip_start_available);
+    assert.strictEqual(result.finalStatus.apiMediaClipFrameAvailable, result.status.api_media_clip_frame_available);
+    assert.strictEqual(result.finalStatus.apiMediaClipEndAvailable, result.status.api_media_clip_end_available);
+    assert.strictEqual(result.finalStatus.apiMediaClipCancelAvailable, result.status.api_media_clip_cancel_available);
     assert.strictEqual(result.finalStatus.apiFsStatAvailable, result.status.api_fs_stat_available);
     assert.strictEqual(result.finalStatus.apiFsListAvailable, result.status.api_fs_list_available);
     assert.strictEqual(result.finalStatus.apiFsMkdirAvailable, result.status.api_fs_mkdir_available);

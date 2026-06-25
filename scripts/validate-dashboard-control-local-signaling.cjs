@@ -254,6 +254,31 @@ async function main() {
           text: raw?.data_base64 ? atob(String(raw.data_base64)) : '',
         };
       };
+      const mediaTransfer = async () => {
+        const annotation = await labeled('api_media_annotation_submit', ctl.uploadBytes('api_media_annotation_submit', {
+          frame_id: 'e2e-local-ann-1',
+          stream: 'annotation',
+          note: 'local media protocol e2e',
+          inject: false,
+        }, new TextEncoder().encode('jpeg annotation local'), { timeoutMs: 60000 }));
+        const start = await labeled('api_media_clip_start', ctl.request('api_media_clip_start', {
+          clip_id: 'e2e-local-clip-1',
+          stream: 'recording',
+          fps: 2,
+          total_frames: 1,
+          inject: false,
+        }, { timeoutMs: 60000 }));
+        const frame = await labeled('api_media_clip_frame', ctl.uploadBytes('api_media_clip_frame', {
+          clip_id: 'e2e-local-clip-1',
+          frame_id: 'e2e-local-clip-1-f000',
+          frame_index: 0,
+        }, new TextEncoder().encode('jpeg clip frame local'), { timeoutMs: 60000 }));
+        const end = await labeled('api_media_clip_end', ctl.request('api_media_clip_end', {
+          clip_id: 'e2e-local-clip-1',
+          frames_sent: 1,
+        }, { timeoutMs: 60000 }));
+        return { annotation, start, frame, end };
+      };
       const imagePreview = async () => {
         const input = document.getElementById('upload-file-input');
         if (!input) throw new Error('upload file input is not available on the dashboard page');
@@ -616,6 +641,7 @@ async function main() {
         upload: uploaded,
         uploads: await ctl.request('api_session_current_uploads', {}, { timeoutMs: 60000 }),
         uploadRaw: await uploadRaw(uploaded),
+        mediaTransfer: await mediaTransfer(),
         imagePreview: await imagePreview(),
         recordingAsset: await recordingAsset(),
         sessionFrameAsset: await sessionFrameAsset(),
@@ -790,6 +816,13 @@ async function main() {
     assert.strictEqual(result.finalStatus.apiSessionCurrentUploadAvailable, true);
     assert.strictEqual(result.finalStatus.apiSessionCurrentUploadRawAvailable, true);
     assert.strictEqual(result.finalStatus.apiSessionCurrentUploadDeleteAvailable, result.status.api_session_current_upload_delete_available);
+    assert.strictEqual(result.finalStatus.apiMediaEditorAvailable, true);
+    assert.strictEqual(result.finalStatus.apiMediaAnnotationAttachAvailable, true);
+    assert.strictEqual(result.finalStatus.apiMediaAnnotationSubmitAvailable, true);
+    assert.strictEqual(result.finalStatus.apiMediaClipStartAvailable, true);
+    assert.strictEqual(result.finalStatus.apiMediaClipFrameAvailable, true);
+    assert.strictEqual(result.finalStatus.apiMediaClipEndAvailable, true);
+    assert.strictEqual(result.finalStatus.apiMediaClipCancelAvailable, true);
     assert.strictEqual(result.finalStatus.apiRecordingAssetAvailable, true);
     assert.strictEqual(result.finalStatus.apiSessionFrameAssetAvailable, true);
     assert.strictEqual(result.finalStatus.apiFsStatAvailable, result.status.api_fs_stat_available);
@@ -820,6 +853,18 @@ async function main() {
     assert.strictEqual(result.uploadRaw?.range_start, 10);
     assert.strictEqual(result.uploadRaw?.range_end, 16);
     assert.strictEqual(result.uploadRaw?.resumable, true);
+    assert.strictEqual(result.mediaTransfer?.annotation?._httpStatus, 200);
+    assert.strictEqual(result.mediaTransfer?.annotation?._httpOk, true);
+    assert.strictEqual(result.mediaTransfer?.annotation?.t, 'annotation_saved');
+    assert.strictEqual(result.mediaTransfer?.annotation?.frame_id, 'e2e-local-ann-1');
+    assert.strictEqual(result.mediaTransfer?.start?._httpStatus, 200);
+    assert.strictEqual(result.mediaTransfer?.start?.t, 'media_clip_started');
+    assert.strictEqual(result.mediaTransfer?.frame?._httpStatus, 200);
+    assert.strictEqual(result.mediaTransfer?.frame?.t, 'media_clip_frame_saved');
+    assert.strictEqual(result.mediaTransfer?.frame?.frames_received, 1);
+    assert.strictEqual(result.mediaTransfer?.end?._httpStatus, 200);
+    assert.strictEqual(result.mediaTransfer?.end?.t, 'clip_saved');
+    assert.strictEqual(result.mediaTransfer?.end?.frames_registered, 1);
     assert.strictEqual(result.imagePreview?.ok, true);
     assert.strictEqual(result.imagePreview?.previewScheme, 'blob');
     assert(result.imagePreview?.byteStreamDelta >= 1, `image preview did not use a byte stream: ${JSON.stringify(result.imagePreview)}`);

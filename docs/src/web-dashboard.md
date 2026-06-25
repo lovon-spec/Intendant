@@ -473,7 +473,12 @@ pairing, peer message/task/approval actions, peer-display WebRTC signaling,
 eligible-peer lookup,
 visual-freshness diagnostics NDJSON appends, worktree scan/remove, dashboard
 managed-context MCP tool calls, coordinator routing, and dashboard
-session-control and dashboard-action controls.
+session-control and dashboard-action controls. Annotation attach/save/send and
+clip creation use a dedicated dashboard media/editor protocol over the same
+verified channel: annotation image bytes travel as `upload_*` frames committed
+by `api_media_annotation_attach` or `api_media_annotation_submit`; clips use
+`api_media_clip_start`, ordered `api_media_clip_frame` uploads keyed by
+`clip_id`, then `api_media_clip_end` or `api_media_clip_cancel`.
 Allowlisted settings-style `ControlMsg`s, such as autonomy, approval-rule,
 external-agent, Codex, Gemini, and verbosity settings, can also dispatch over
 the DataChannel when it is verified. Display input authority uses dedicated
@@ -509,7 +514,6 @@ Several paths intentionally stay outside this JSON tunnel:
 - static assets and WASM bundles;
 - native media fallback URLs and broad file-transfer bytes;
 - general filesystem mutations and broad/resumable file transfer;
-- annotation/clip media-editor write sequences;
 - generic MCP-over-HTTP for external clients;
 - non-allowlisted `ControlMsg` mutations;
 - display WebRTC media channels;
@@ -783,13 +787,13 @@ same upload store as `POST /api/session/current/uploads`, including the
 resume token. Resumable/range semantics are still required before moving generic
 downloads, native media playback, or broad file transfer.
 
-Dashboard media/editor writes are intentionally outside this generic control
-tunnel for now. Annotation attach/save/send and clip creation currently send
-ordered `annotation_*` and `clip_*` WebSocket messages that may carry many large
-base64 frames and have multi-step commit semantics. Moving them into WebRTC
-should be a dedicated media-transfer protocol with operation ids, ordered frame
-chunks, commit/cancel, cleanup, and no-replay rules; they should not be added to
-the generic `api_dashboard_action_msg` or `api_control_msg` allowlists.
+Dashboard media/editor writes intentionally stay outside the generic
+`api_dashboard_action_msg` and `api_control_msg` allowlists. They use the
+dedicated media protocol instead: annotation attach/save/send commits use
+media-specific upload methods, and clip creation uses an operation id with
+ordered frame uploads plus commit/cancel. Older daemons that do not advertise the
+media protocol still receive the legacy `annotation_*` and `clip_*` WebSocket
+messages before any tunneled write is attempted.
 
 The standalone **Terminal -> Shell** subtab uses `terminal_*` frames when the
 verified tunnel advertises `terminal_frames`. The daemon attaches the tunnel to
@@ -897,6 +901,18 @@ The task attachment upload path uses `api_session_current_upload` over
 back to `POST /api/session/current/uploads` only when the tunnel feature is not
 available. Failed tunneled uploads are not replayed over HTTP, to avoid creating
 duplicate attachments after an ambiguous partial transfer.
+Dashboard annotation media uses the same ordered `upload_*` frame substrate but
+commits to media-specific methods instead of the task attachment store:
+`api_media_annotation_attach` registers a pending annotation frame, and
+`api_media_annotation_submit` registers a saved annotation and optionally queues
+it for the live presence context. Clip creation is stateful: the browser first
+opens a `clip_id` operation with `api_media_clip_start`, uploads each JPEG frame
+with `api_media_clip_frame` in strict `frame_index` order, then commits with
+`api_media_clip_end` or discards with `api_media_clip_cancel`. The dashboard
+chooses the transport once per media operation. If the media protocol is not
+advertised before the first write, it uses the legacy WebSocket media messages;
+after a tunneled media write is attempted, failures are surfaced and are not
+replayed over the WebSocket.
 Current-upload list reads use `api_session_current_uploads`, returning the same
 staged-upload descriptor array as `GET /api/session/current/uploads`.
 Current-upload raw reads use `api_session_current_upload_raw` over
@@ -962,9 +978,8 @@ the next display session.
 
 The remaining migration work is mostly byte-stream and file-transfer heavy:
 generic downloads, native media fallback URLs, broader/resumable file transfer,
-dashboard media/editor writes, and remaining non-allowlisted control mutations
-should move only after resumable stream/file-transfer semantics, dedicated
-media-transfer commit semantics, and per-action no-replay rules are settled.
+and remaining non-allowlisted control mutations should move only after resumable
+stream/file-transfer semantics and per-action no-replay rules are settled.
 
 The dashboard status bar now exposes the selected control transport. Direct
 dashboard access shows the existing HTTP/mTLS path, while opt-in WebRTC control
@@ -1051,11 +1066,11 @@ Treat this as a staged target, not current behavior:
     appends use the tunnel when verified and fall back to HTTP only when the
     tunnel is unavailable. HLS `.ts` playback now builds a blob playlist from
     tunneled recording bytes and falls back to the native daemon URL if rejected.
-    Generic downloads, native media fallback URLs,
-    annotation/clip media-editor writes, remaining non-allowlisted control
-    commands, and broad/resumable file transfer still wait for resumable
-    stream/file-transfer semantics plus a dedicated idempotent media-transfer
-    protocol.
+    Annotation/clip media-editor writes now use a dedicated media protocol with
+    operation ids, ordered frame uploads, commit/cancel, and no replay after a
+    tunneled write attempt. Generic downloads, native media fallback URLs,
+    remaining non-allowlisted control commands, and broad/resumable file
+    transfer still wait for resumable stream/file-transfer semantics.
 11. Keep direct mTLS dashboard access and peer daemon-to-daemon mTLS working
     throughout.
 

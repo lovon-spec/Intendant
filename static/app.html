@@ -30042,10 +30042,61 @@ function sendRawMessage(obj) {
   else if (app.send_server_action) { app.send_server_action(obj); }
 }
 
-// Annotation and clip editing still use the legacy WebSocket message path on
-// purpose. These are ordered, multi-frame media writes with large base64
-// payloads; they need a dedicated idempotent media-transfer protocol before
-// they should move onto the dashboard-control DataChannel.
+function dashboardMediaEditorRpcAvailable() {
+  return Boolean(
+    dashboardTransport &&
+    dashboardTransport.canUseRpc &&
+    dashboardTransport.canUseRpc() &&
+    dashboardControlTransport?.lastStatus?.upload_frames_available === true &&
+    dashboardControlTransport?.lastStatus?.api_media_editor_available === true &&
+    dashboardControlTransport?.lastStatus?.api_media_annotation_attach_available === true &&
+    dashboardControlTransport?.lastStatus?.api_media_annotation_submit_available === true &&
+    dashboardControlTransport?.lastStatus?.api_media_clip_start_available === true &&
+    dashboardControlTransport?.lastStatus?.api_media_clip_frame_available === true &&
+    dashboardControlTransport?.lastStatus?.api_media_clip_end_available === true &&
+    dashboardControlTransport?.lastStatus?.api_media_clip_cancel_available === true
+  );
+}
+
+function dashboardMediaAssertOk(result, label) {
+  if (result && result._httpOk === false) {
+    throw new Error(result.error || `${label || 'media transfer'} failed`);
+  }
+  return result;
+}
+
+function dashboardMediaTransferFailed(err, label) {
+  console.warn(`[dashboard-control] ${label} failed; not replaying over /ws`, err);
+  showControlToast?.('error', err?.message || `${label} failed`);
+}
+
+async function uploadDashboardMediaTunnel(method, params, bytes, label, options = {}) {
+  const result = await dashboardTransport.uploadBytes(method, params, bytes, {
+    timeoutMs: options.timeoutMs || 120000,
+    signal: options.signal,
+    chunkBytes: options.chunkBytes,
+  });
+  return dashboardMediaAssertOk(result, label);
+}
+
+async function requestDashboardMediaTunnel(method, params, label, options = {}) {
+  const result = await dashboardTransport.request(method, params, {
+    timeoutMs: options.timeoutMs || 30000,
+    signal: options.signal,
+  });
+  return dashboardMediaAssertOk(result, label);
+}
+
+async function sendDashboardMediaUpload(method, params, bytes, legacyObj, label, options = {}) {
+  if (dashboardMediaEditorRpcAvailable()) {
+    return uploadDashboardMediaTunnel(method, params, bytes, label, options);
+  }
+  sendLegacyMediaEditorMessage(legacyObj);
+  return null;
+}
+
+// Compatibility fallback for daemons that do not yet advertise the dedicated
+// dashboard media/editor protocol.
 function sendLegacyMediaEditorMessage(obj) {
   if (app && app.send_server_action) app.send_server_action(obj);
 }
@@ -30678,7 +30729,7 @@ class DisplaySlot {
   /// Capture the currently-rendered video frame and queue it as a pending
   /// attachment. Works whether or not the display is currently streaming —
   /// just rasterizes whatever the <video> element is showing right now.
-  attachCurrentFrame() {
+  async attachCurrentFrame() {
     const frame = this.captureCurrentFrame(0.85, { logicalResolution: true });
     if (!frame) {
       this.attachBtn.title = 'No frame available yet';
@@ -30700,7 +30751,18 @@ class DisplaySlot {
       data: b64,
       note: '',
     };
-    sendLegacyMediaEditorMessage(payload);
+    try {
+      await sendDashboardMediaUpload(
+        'api_media_annotation_attach',
+        { frame_id: frameId, stream, note: '' },
+        dashboardControlBase64ToBytes(b64),
+        payload,
+        'annotation attach'
+      );
+    } catch (err) {
+      dashboardMediaTransferFailed(err, 'annotation attach');
+      return;
+    }
     if (typeof addPendingAttachment === 'function') {
       addPendingAttachment({
         frameId,
@@ -33875,7 +33937,18 @@ async function submitAnnotation(action) {
       data: b64,
       note: note,
     };
-    sendLegacyMediaEditorMessage(payload);
+    try {
+      await sendDashboardMediaUpload(
+        'api_media_annotation_attach',
+        { frame_id: frameId, stream, note },
+        blob,
+        payload,
+        'annotation attach'
+      );
+    } catch (err) {
+      dashboardMediaTransferFailed(err, 'annotation attach');
+      return;
+    }
     addPendingAttachment({ frameId, stream, note, dataUrl: 'data:image/jpeg;base64,' + b64 });
   } else {
     // save / send: existing annotation_submit handler. inject=true for 'send'.
@@ -33887,7 +33960,18 @@ async function submitAnnotation(action) {
       note: note,
       inject: action === 'send',
     };
-    sendLegacyMediaEditorMessage(payload);
+    try {
+      await sendDashboardMediaUpload(
+        'api_media_annotation_submit',
+        { frame_id: frameId, stream, note, inject: action === 'send' },
+        blob,
+        payload,
+        action === 'send' ? 'annotation send' : 'annotation save'
+      );
+    } catch (err) {
+      dashboardMediaTransferFailed(err, action === 'send' ? 'annotation send' : 'annotation save');
+      return;
+    }
     addAnnotationRef(frameId, action === 'send');
   }
 
@@ -34787,79 +34871,137 @@ async function submitClip(action) {
   const note = document.getElementById('clip-note').value.trim();
   const inject = action === 'send';
   const stream = activeRecordingStream || 'recording';
-
-  // Send clip_start
-  sendLegacyMediaEditorMessage({
-    t: 'clip_start',
-    clip_id: clipId,
-    stream: stream,
-    in_secs: clipInSecs,
-    out_secs: clipOutSecs,
-    fps: fps,
-    total_frames: timestamps.length,
-    note: note,
-    inject: inject,
-    annotation_layer_count: clipAnnotationLayers.length,
-  });
-
-  // Extract and send frames. Track frame IDs so 'attach' can queue them.
-  const gen = extractClipFrames(recPlayer, clipInSecs, clipOutSecs, fps,
-    clipKeyframes, clipAnnotationLayers, 0.92);
+  const useMediaTunnel = dashboardMediaEditorRpcAvailable();
+  let mediaStarted = false;
   let frameIndex = 0;
   const sentFrames = []; // { frameId, dataUrl } for 'attach'
 
-  for await (const frame of gen) {
-    if (clipAbort) break;
-    const pct = ((frame.index + 1) / frame.total * 100);
-    progressFill.style.width = pct + '%';
-    progressText.textContent = `Extracting ${frame.index + 1}/${frame.total}...`;
-
-    const frameId = `${clipId}-f${String(frame.index).padStart(3, '0')}`;
-    sendLegacyMediaEditorMessage({
-      t: 'clip_frame',
+  try {
+    const startPayload = {
+      t: 'clip_start',
       clip_id: clipId,
-      frame_id: frameId,
-      frame_index: frame.index,
-      timestamp_secs: frame.t,
-      is_keyframe: frame.isKeyframe,
-      annotated: frame.annotated,
-      data: frame.b64,
-    });
-    if (action === 'attach') {
-      sentFrames.push({ frameId, b64: frame.b64 });
+      stream: stream,
+      in_secs: clipInSecs,
+      out_secs: clipOutSecs,
+      fps: fps,
+      total_frames: timestamps.length,
+      note: note,
+      inject: inject,
+      annotation_layer_count: clipAnnotationLayers.length,
+    };
+    if (useMediaTunnel) {
+      await requestDashboardMediaTunnel('api_media_clip_start', {
+        clip_id: clipId,
+        stream,
+        in_secs: clipInSecs,
+        out_secs: clipOutSecs,
+        fps,
+        total_frames: timestamps.length,
+        note,
+        inject,
+        annotation_layer_count: clipAnnotationLayers.length,
+      }, 'clip start');
+      mediaStarted = true;
+    } else {
+      sendLegacyMediaEditorMessage(startPayload);
     }
-    frameIndex++;
 
-    // Yield to UI between frames
-    await new Promise(r => setTimeout(r, 10));
-  }
+    // Extract and send frames. Track frame IDs so 'attach' can queue them.
+    const gen = extractClipFrames(recPlayer, clipInSecs, clipOutSecs, fps,
+      clipKeyframes, clipAnnotationLayers, 0.92);
+    for await (const frame of gen) {
+      if (clipAbort) break;
+      const pct = ((frame.index + 1) / frame.total * 100);
+      progressFill.style.width = pct + '%';
+      progressText.textContent = `Extracting ${frame.index + 1}/${frame.total}...`;
 
-  if (clipAbort) {
-    progress.classList.add('hidden');
-    status.textContent = 'Cancelled';
-    status.style.color = 'var(--red)';
-    setTimeout(() => { status.textContent = ''; status.style.color = ''; }, 3000);
-    return;
-  }
+      const frameId = `${clipId}-f${String(frame.index).padStart(3, '0')}`;
+      const framePayload = {
+        t: 'clip_frame',
+        clip_id: clipId,
+        frame_id: frameId,
+        frame_index: frame.index,
+        timestamp_secs: frame.t,
+        is_keyframe: frame.isKeyframe,
+        annotated: frame.annotated,
+        data: frame.b64,
+      };
+      if (useMediaTunnel) {
+        await uploadDashboardMediaTunnel('api_media_clip_frame', {
+          clip_id: clipId,
+          frame_id: frameId,
+          frame_index: frame.index,
+          timestamp_secs: frame.t,
+          is_keyframe: frame.isKeyframe,
+          annotated: frame.annotated,
+        }, dashboardControlBase64ToBytes(frame.b64), 'clip frame');
+      } else {
+        sendLegacyMediaEditorMessage(framePayload);
+      }
+      if (action === 'attach') {
+        sentFrames.push({ frameId, b64: frame.b64 });
+      }
+      frameIndex++;
 
-  // Send clip_end
-  progressText.textContent = 'Finalizing...';
-  sendLegacyMediaEditorMessage({
-    t: 'clip_end',
-    clip_id: clipId,
-    frames_sent: frameIndex,
-  });
+      // Yield to UI between frames
+      await new Promise(r => setTimeout(r, 10));
+    }
 
-  // Add to pending attachments (after the server has registered them)
-  if (action === 'attach') {
-    for (const f of sentFrames) {
-      addPendingAttachment({
-        frameId: f.frameId,
-        stream: `clip:${clipId}`,
-        note: note,
-        dataUrl: 'data:image/jpeg;base64,' + f.b64,
+    if (clipAbort) {
+      if (useMediaTunnel && mediaStarted) {
+        try {
+          await requestDashboardMediaTunnel('api_media_clip_cancel', { clip_id: clipId }, 'clip cancel');
+        } catch (err) {
+          console.warn('[dashboard-control] clip cancel failed', err);
+        }
+      }
+      progress.classList.add('hidden');
+      status.textContent = 'Cancelled';
+      status.style.color = 'var(--red)';
+      setTimeout(() => { status.textContent = ''; status.style.color = ''; }, 3000);
+      return;
+    }
+
+    // Send clip_end
+    progressText.textContent = 'Finalizing...';
+    if (useMediaTunnel) {
+      await requestDashboardMediaTunnel('api_media_clip_end', {
+        clip_id: clipId,
+        frames_sent: frameIndex,
+      }, 'clip end');
+    } else {
+      sendLegacyMediaEditorMessage({
+        t: 'clip_end',
+        clip_id: clipId,
+        frames_sent: frameIndex,
       });
     }
+
+    // Add to pending attachments (after the server has registered them)
+    if (action === 'attach') {
+      for (const f of sentFrames) {
+        addPendingAttachment({
+          frameId: f.frameId,
+          stream: `clip:${clipId}`,
+          note: note,
+          dataUrl: 'data:image/jpeg;base64,' + f.b64,
+        });
+      }
+    }
+  } catch (err) {
+    if (useMediaTunnel && mediaStarted) {
+      try {
+        await requestDashboardMediaTunnel('api_media_clip_cancel', { clip_id: clipId }, 'clip cancel');
+      } catch (cancelErr) {
+        console.warn('[dashboard-control] clip cancel after failure failed', cancelErr);
+      }
+    }
+    progress.classList.add('hidden');
+    status.textContent = 'Failed';
+    status.style.color = 'var(--red)';
+    setTimeout(() => { status.textContent = ''; status.style.color = ''; }, 5000);
+    dashboardMediaTransferFailed(err, 'clip creation');
+    return;
   }
 
   progress.classList.add('hidden');
@@ -38406,6 +38548,13 @@ class DashboardControlTransport {
       apiSessionCurrentUploadsAvailable: this.lastStatus?.api_session_current_uploads_available ?? null,
       apiSessionCurrentUploadRawAvailable: this.lastStatus?.api_session_current_upload_raw_available ?? null,
       apiSessionCurrentUploadDeleteAvailable: this.lastStatus?.api_session_current_upload_delete_available ?? null,
+      apiMediaEditorAvailable: this.lastStatus?.api_media_editor_available ?? null,
+      apiMediaAnnotationAttachAvailable: this.lastStatus?.api_media_annotation_attach_available ?? null,
+      apiMediaAnnotationSubmitAvailable: this.lastStatus?.api_media_annotation_submit_available ?? null,
+      apiMediaClipStartAvailable: this.lastStatus?.api_media_clip_start_available ?? null,
+      apiMediaClipFrameAvailable: this.lastStatus?.api_media_clip_frame_available ?? null,
+      apiMediaClipEndAvailable: this.lastStatus?.api_media_clip_end_available ?? null,
+      apiMediaClipCancelAvailable: this.lastStatus?.api_media_clip_cancel_available ?? null,
       apiFsStatAvailable: this.lastStatus?.api_fs_stat_available ?? null,
       apiFsListAvailable: this.lastStatus?.api_fs_list_available ?? null,
       apiFsMkdirAvailable: this.lastStatus?.api_fs_mkdir_available ?? null,

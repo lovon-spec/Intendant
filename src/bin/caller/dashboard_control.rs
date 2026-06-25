@@ -8,6 +8,7 @@
 use crate::daemon_identity::{b64u, DaemonIdentity};
 use crate::error::CallerError;
 use crate::event::{AppEvent, ControlMsg};
+use crate::types::LogLevel;
 use base64::Engine as _;
 use bytes::BytesMut;
 use rtc::peer_connection::configuration::setting_engine::SettingEngine;
@@ -43,6 +44,7 @@ const CONTROL_RESPONSE_CHUNK_BYTES: usize = 16 * 1024;
 const CONTROL_BYTE_STREAM_CHUNK_BYTES: usize = 16 * 1024;
 const CONTROL_RESPONSE_INITIAL_CHUNK_CREDIT: usize = 16;
 const CONTROL_RESPONSE_MAX_CREDIT_GRANT: usize = 64;
+const DASHBOARD_MEDIA_CLIP_MAX_FRAMES: usize = 1000;
 const CONTROL_FEATURES: &[&str] = &[
     "ping",
     "config",
@@ -68,6 +70,12 @@ const CONTROL_FEATURES: &[&str] = &[
     "tui_frames",
     "api_session_current_uploads",
     "api_session_current_upload_raw",
+    "api_media_annotation_attach",
+    "api_media_annotation_submit",
+    "api_media_clip_start",
+    "api_media_clip_frame",
+    "api_media_clip_end",
+    "api_media_clip_cancel",
     "api_peers",
     "api_sessions",
     "api_sessions_stream",
@@ -473,6 +481,7 @@ impl DashboardControlPeer {
             agent_card,
             bootstrap_caches,
             display_authority,
+            media_clip_ops: Arc::new(Mutex::new(HashMap::new())),
         };
         let (command_tx, command_rx) = mpsc::channel(COMMAND_CHANNEL);
         let shutdown = CancellationToken::new();
@@ -541,6 +550,19 @@ struct ControlRuntime {
     agent_card: serde_json::Value,
     bootstrap_caches: DashboardBootstrapCaches,
     display_authority: Option<DashboardDisplayAuthorityBridge>,
+    media_clip_ops: Arc<Mutex<HashMap<String, DashboardMediaClipOperation>>>,
+}
+
+#[derive(Debug)]
+struct DashboardMediaClipOperation {
+    stream: String,
+    note: String,
+    inject: bool,
+    in_secs: f64,
+    out_secs: f64,
+    fps: u32,
+    expected_frames: usize,
+    frames: Vec<(String, String)>,
 }
 
 enum ControlCommand {
@@ -572,6 +594,7 @@ struct ControlByteStream {
 }
 
 struct InboundUploadState {
+    method: String,
     params: serde_json::Value,
     tmp: tempfile::NamedTempFile,
     total_bytes: usize,
@@ -1557,6 +1580,9 @@ fn control_frame_response(
                 | "api_session_current_uploads"
                 | "api_session_current_upload_raw"
                 | "api_session_current_upload_delete"
+                | "api_media_clip_start"
+                | "api_media_clip_end"
+                | "api_media_clip_cancel"
                 | "api_fs_stat"
                 | "api_fs_list"
                 | "api_fs_mkdir"
@@ -1687,7 +1713,13 @@ fn control_upload_start_frame(
         return Some(control_upload_error_response(id, 400, "missing request id"));
     }
     let method = frame.get("method").and_then(|v| v.as_str()).unwrap_or("");
-    if method != "api_session_current_upload" {
+    if !matches!(
+        method,
+        "api_session_current_upload"
+            | "api_media_annotation_attach"
+            | "api_media_annotation_submit"
+            | "api_media_clip_frame"
+    ) {
         return Some(control_upload_error_response(
             id,
             400,
@@ -1747,6 +1779,7 @@ fn control_upload_start_frame(
     inbound_uploads.insert(
         id,
         InboundUploadState {
+            method: method.to_string(),
             params: frame
                 .get("params")
                 .cloned()
@@ -1867,7 +1900,33 @@ fn control_upload_end_frame(
     let runtime = runtime.clone();
     let task_tx = task_tx.clone();
     tokio::spawn(async move {
-        let response = api_session_current_upload_task_response(id.clone(), upload, runtime).await;
+        let response = match upload.method.as_str() {
+            "api_session_current_upload" => {
+                api_session_current_upload_task_response(id.clone(), upload, runtime).await
+            }
+            "api_media_annotation_attach" => {
+                api_media_annotation_upload_task_response(id.clone(), upload, runtime, false).await
+            }
+            "api_media_annotation_submit" => {
+                api_media_annotation_upload_task_response(id.clone(), upload, runtime, true).await
+            }
+            "api_media_clip_frame" => api_media_clip_frame_upload_task_response(
+                id.clone(),
+                upload,
+                runtime,
+            )
+            .await,
+            method => ControlTaskResponse {
+                id: id.clone(),
+                frame: control_upload_error_response(
+                    id.clone(),
+                    400,
+                    format!("unknown upload method: {method}"),
+                ),
+                byte_stream: None,
+                done: true,
+            },
+        };
         let _ = task_tx.send(response).await;
     });
     None
@@ -2436,6 +2495,13 @@ fn status_response_frame(id: String, runtime: &ControlRuntime) -> serde_json::Va
         ("api_session_current_upload_available", true),
         ("api_session_current_upload_raw_available", true),
         ("api_session_current_upload_delete_available", true),
+        ("api_media_editor_available", true),
+        ("api_media_annotation_attach_available", true),
+        ("api_media_annotation_submit_available", true),
+        ("api_media_clip_start_available", true),
+        ("api_media_clip_frame_available", true),
+        ("api_media_clip_end_available", true),
+        ("api_media_clip_cancel_available", true),
         ("api_fs_stat_available", true),
         ("api_fs_list_available", true),
         ("api_fs_mkdir_available", true),
@@ -2599,6 +2665,9 @@ async fn control_request_response(
         "api_session_current_upload_delete" => {
             api_session_current_upload_delete_response(id, params.as_ref(), &runtime).await
         }
+        "api_media_clip_start" => api_media_clip_start_response(id, params.as_ref(), &runtime).await,
+        "api_media_clip_end" => api_media_clip_end_response(id, params.as_ref(), &runtime).await,
+        "api_media_clip_cancel" => api_media_clip_cancel_response(id, params.as_ref(), &runtime).await,
         "api_fs_stat" => api_fs_stat_response(id, params.as_ref()).await,
         "api_fs_list" => api_fs_list_response(id, params.as_ref()).await,
         "api_fs_mkdir" => api_fs_mkdir_response(id, params.as_ref()).await,
@@ -3321,6 +3390,533 @@ async fn api_session_current_upload_task_response(
         byte_stream: None,
         done: true,
     }
+}
+
+fn media_http_response(id: String, status: u16, body: serde_json::Value) -> serde_json::Value {
+    http_body_response(id, status, body.to_string(), "dashboard media")
+}
+
+fn media_error_task_response(
+    id: String,
+    status: u16,
+    error: impl Into<String>,
+) -> ControlTaskResponse {
+    ControlTaskResponse {
+        id: id.clone(),
+        frame: media_http_response(
+            id,
+            status,
+            serde_json::json!({
+                "ok": false,
+                "error": error.into(),
+            }),
+        ),
+        byte_stream: None,
+        done: true,
+    }
+}
+
+fn media_task_response(id: String, status: u16, body: serde_json::Value) -> ControlTaskResponse {
+    ControlTaskResponse {
+        id: id.clone(),
+        frame: media_http_response(id, status, body),
+        byte_stream: None,
+        done: true,
+    }
+}
+
+fn read_inbound_upload_bytes(upload: &mut InboundUploadState) -> Result<Vec<u8>, String> {
+    let mut bytes = Vec::with_capacity(upload.received_bytes);
+    upload
+        .tmp
+        .as_file_mut()
+        .seek(std::io::SeekFrom::Start(0))
+        .map_err(|e| format!("seek upload tempfile: {e}"))?;
+    upload
+        .tmp
+        .as_file_mut()
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("read upload tempfile: {e}"))?;
+    if bytes.len() != upload.received_bytes {
+        return Err(format!(
+            "upload byte count changed while committing: expected {}, got {}",
+            upload.received_bytes,
+            bytes.len()
+        ));
+    }
+    Ok(bytes)
+}
+
+async fn dashboard_media_session_handles(
+    runtime: &ControlRuntime,
+) -> (
+    Option<Arc<tokio::sync::RwLock<crate::frames::FrameRegistry>>>,
+    Option<crate::web_gateway::WebQueryCtx>,
+) {
+    let session = runtime.shared_session.read().await;
+    (session.frame_registry.clone(), session.query_ctx.clone())
+}
+
+async fn register_dashboard_media_frame(
+    registry: Option<Arc<tokio::sync::RwLock<crate::frames::FrameRegistry>>>,
+    frame_id: &str,
+    stream: &str,
+    note: Option<String>,
+    bytes: &[u8],
+    log_label: &str,
+) -> (String, bool) {
+    let Some(registry) = registry else {
+        return (String::new(), false);
+    };
+    let meta = presence_core::FrameMeta {
+        frame_id: frame_id.to_string(),
+        stream: stream.to_string(),
+        timestamp: chrono::Utc::now().to_rfc3339(),
+        sent_to_live: false,
+        live_resolution: None,
+        hq_resolution: None,
+        note,
+    };
+    let mut reg = registry.write().await;
+    match reg.register(meta, bytes) {
+        Ok(path) => (path.display().to_string(), true),
+        Err(e) => {
+            eprintln!("{log_label} frame registry write failed: {e}");
+            (String::new(), false)
+        }
+    }
+}
+
+fn inject_annotation_context(
+    query_ctx: Option<&crate::web_gateway::WebQueryCtx>,
+    note: &str,
+    data_b64: String,
+) -> bool {
+    let Some(ctx) = query_ctx else {
+        return false;
+    };
+    let Some(ciq) = ctx.context_injection.as_ref() else {
+        return false;
+    };
+    let Ok(mut queue) = ciq.lock() else {
+        return false;
+    };
+    let label = if note.is_empty() {
+        "[User Annotation] User highlighted something on the screen.".to_string()
+    } else {
+        format!("[User Annotation] {note}")
+    };
+    queue.push(crate::event::ContextInjection {
+        text: label,
+        images: vec![crate::conversation::ImageData {
+            media_type: "image/jpeg".to_string(),
+            data: data_b64,
+        }],
+        source: crate::event::InjectionSource::User,
+        target_session_id: None,
+        steer_id: None,
+    });
+    true
+}
+
+fn inject_clip_context(
+    query_ctx: Option<&crate::web_gateway::WebQueryCtx>,
+    _clip_id: &str,
+    clip: &DashboardMediaClipOperation,
+) -> bool {
+    let Some(ctx) = query_ctx else {
+        return false;
+    };
+    let Some(ciq) = ctx.context_injection.as_ref() else {
+        return false;
+    };
+    let Ok(mut queue) = ciq.lock() else {
+        return false;
+    };
+    let frames_registered = clip.frames.len();
+    let label = if clip.note.is_empty() {
+        format!(
+            "[Video Clip] {} {:.1}s-{:.1}s ({} frames, {}fps)",
+            clip.stream, clip.in_secs, clip.out_secs, frames_registered, clip.fps,
+        )
+    } else {
+        format!(
+            "[Video Clip] {} {:.1}s-{:.1}s ({} frames, {}fps). {}",
+            clip.stream, clip.in_secs, clip.out_secs, frames_registered, clip.fps, clip.note,
+        )
+    };
+    let images = clip
+        .frames
+        .iter()
+        .map(|(_, data)| crate::conversation::ImageData {
+            media_type: "image/jpeg".to_string(),
+            data: data.clone(),
+        })
+        .collect();
+    queue.push(crate::event::ContextInjection {
+        text: label,
+        images,
+        source: crate::event::InjectionSource::User,
+        target_session_id: None,
+        steer_id: None,
+    });
+    true
+}
+
+async fn api_media_annotation_upload_task_response(
+    id: String,
+    mut upload: InboundUploadState,
+    runtime: ControlRuntime,
+    submit: bool,
+) -> ControlTaskResponse {
+    let params = upload.params.clone();
+    let frame_id = string_param(&params, &["frame_id", "frameId"]);
+    if frame_id.is_empty() {
+        return media_error_task_response(id, 400, "missing frame_id");
+    }
+    let stream = optional_string_param(&params, &["stream"]).unwrap_or_else(|| "annotation".into());
+    let note = optional_string_param(&params, &["note"]).unwrap_or_default();
+    let inject = params
+        .get("inject")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+    let bytes = match read_inbound_upload_bytes(&mut upload) {
+        Ok(bytes) if !bytes.is_empty() => bytes,
+        Ok(_) => return media_error_task_response(id, 400, "empty media upload"),
+        Err(e) => return media_error_task_response(id, 500, e),
+    };
+    let data_b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+    let (registry, query_ctx) = dashboard_media_session_handles(&runtime).await;
+    let (saved_path, registered) = register_dashboard_media_frame(
+        registry,
+        &frame_id,
+        &stream,
+        if note.is_empty() {
+            None
+        } else {
+            Some(note.clone())
+        },
+        &bytes,
+        if submit {
+            "annotation"
+        } else {
+            "annotation_attach"
+        },
+    )
+    .await;
+
+    if submit {
+        let injected_to_queue = inject && inject_annotation_context(query_ctx.as_ref(), &note, data_b64);
+        let status_label = if inject {
+            if injected_to_queue {
+                " (sent to agent)"
+            } else {
+                " (saved - no agent connected)"
+            }
+        } else {
+            ""
+        };
+        runtime.bus.send(AppEvent::PresenceLog {
+            message: format!("[annotation] {frame_id} on {stream}{status_label}"),
+            level: Some(LogLevel::Info),
+            turn: None,
+        });
+        media_task_response(
+            id,
+            200,
+            serde_json::json!({
+                "t": "annotation_saved",
+                "ok": registered,
+                "frame_id": frame_id,
+                "stream": stream,
+                "path": saved_path,
+                "injected": injected_to_queue,
+            }),
+        )
+    } else {
+        runtime.bus.send(AppEvent::PresenceLog {
+            message: format!("[annotation] {frame_id} attached (pending)"),
+            level: Some(LogLevel::Info),
+            turn: None,
+        });
+        media_task_response(
+            id,
+            200,
+            serde_json::json!({
+                "t": "annotation_attached",
+                "ok": registered,
+                "frame_id": frame_id,
+                "stream": stream,
+                "path": saved_path,
+                "note": note,
+            }),
+        )
+    }
+}
+
+fn f64_param(params: &serde_json::Value, name: &str, default: f64) -> f64 {
+    params
+        .get(name)
+        .and_then(|value| {
+            value
+                .as_f64()
+                .or_else(|| value.as_str().and_then(|text| text.parse::<f64>().ok()))
+        })
+        .unwrap_or(default)
+}
+
+fn usize_param(params: &serde_json::Value, name: &str, default: usize) -> usize {
+    params
+        .get(name)
+        .and_then(|value| {
+            value
+                .as_u64()
+                .and_then(|number| usize::try_from(number).ok())
+                .or_else(|| {
+                    value
+                        .as_str()
+                        .and_then(|text| text.parse::<usize>().ok())
+                })
+        })
+        .unwrap_or(default)
+}
+
+async fn api_media_clip_start_response(
+    id: String,
+    params: Option<&serde_json::Value>,
+    runtime: &ControlRuntime,
+) -> serde_json::Value {
+    let params = params.cloned().unwrap_or_else(|| serde_json::json!({}));
+    let clip_id = string_param(&params, &["clip_id", "clipId", "op_id", "opId"]);
+    if clip_id.is_empty() {
+        return media_http_response(
+            id,
+            400,
+            serde_json::json!({"ok": false, "error": "missing clip_id"}),
+        );
+    }
+    let total_frames = usize_param(&params, "total_frames", 0);
+    if total_frames > DASHBOARD_MEDIA_CLIP_MAX_FRAMES {
+        return media_http_response(
+            id,
+            413,
+            serde_json::json!({
+                "ok": false,
+                "error": format!(
+                    "clip has {total_frames} frames; cap is {DASHBOARD_MEDIA_CLIP_MAX_FRAMES}"
+                ),
+            }),
+        );
+    }
+    let fps = usize_param(&params, "fps", 2).max(1) as u32;
+    let op = DashboardMediaClipOperation {
+        stream: optional_string_param(&params, &["stream"]).unwrap_or_else(|| "recording".into()),
+        note: optional_string_param(&params, &["note"]).unwrap_or_default(),
+        inject: params
+            .get("inject")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false),
+        in_secs: f64_param(&params, "in_secs", 0.0),
+        out_secs: f64_param(&params, "out_secs", 0.0),
+        fps,
+        expected_frames: total_frames,
+        frames: Vec::with_capacity(total_frames),
+    };
+    let mut ops = runtime.media_clip_ops.lock().await;
+    if ops.contains_key(&clip_id) {
+        return media_http_response(
+            id,
+            409,
+            serde_json::json!({"ok": false, "error": "clip operation already exists"}),
+        );
+    }
+    ops.insert(clip_id.clone(), op);
+    runtime.bus.send(AppEvent::PresenceLog {
+        message: format!("[clip] started {clip_id} ({total_frames} frames, {fps}fps)"),
+        level: Some(LogLevel::Debug),
+        turn: None,
+    });
+    media_http_response(
+        id,
+        200,
+        serde_json::json!({
+            "t": "media_clip_started",
+            "ok": true,
+            "op_id": clip_id,
+            "clip_id": clip_id,
+            "expected_frames": total_frames,
+        }),
+    )
+}
+
+async fn api_media_clip_frame_upload_task_response(
+    id: String,
+    mut upload: InboundUploadState,
+    runtime: ControlRuntime,
+) -> ControlTaskResponse {
+    let params = upload.params.clone();
+    let clip_id = string_param(&params, &["clip_id", "clipId", "op_id", "opId"]);
+    let frame_id = string_param(&params, &["frame_id", "frameId"]);
+    if clip_id.is_empty() {
+        return media_error_task_response(id, 400, "missing clip_id");
+    }
+    if frame_id.is_empty() {
+        return media_error_task_response(id, 400, "missing frame_id");
+    }
+    let bytes = match read_inbound_upload_bytes(&mut upload) {
+        Ok(bytes) if !bytes.is_empty() => bytes,
+        Ok(_) => return media_error_task_response(id, 400, "empty media upload"),
+        Err(e) => return media_error_task_response(id, 500, e),
+    };
+    let data_b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+    let requested_index = usize_param(&params, "frame_index", usize::MAX);
+    let frames_received = {
+        let mut ops = runtime.media_clip_ops.lock().await;
+        let Some(op) = ops.get_mut(&clip_id) else {
+            return media_error_task_response(id, 404, "unknown clip operation");
+        };
+        let next_index = op.frames.len();
+        if requested_index != usize::MAX && requested_index != next_index {
+            return media_error_task_response(
+                id,
+                409,
+                format!("clip frame index mismatch: expected {next_index}, got {requested_index}"),
+            );
+        }
+        if op.expected_frames > 0 && next_index >= op.expected_frames {
+            return media_error_task_response(id, 409, "clip frame count exceeded");
+        }
+        op.frames.push((frame_id.clone(), data_b64));
+        op.frames.len()
+    };
+    let (registry, _) = dashboard_media_session_handles(&runtime).await;
+    let (_, registered) = register_dashboard_media_frame(
+        registry,
+        &frame_id,
+        &format!("clip:{clip_id}"),
+        None,
+        &bytes,
+        "clip",
+    )
+    .await;
+    media_task_response(
+        id,
+        200,
+        serde_json::json!({
+            "t": "media_clip_frame_saved",
+            "ok": true,
+            "registered": registered,
+            "op_id": clip_id,
+            "clip_id": clip_id,
+            "frame_id": frame_id,
+            "frames_received": frames_received,
+        }),
+    )
+}
+
+async fn api_media_clip_end_response(
+    id: String,
+    params: Option<&serde_json::Value>,
+    runtime: &ControlRuntime,
+) -> serde_json::Value {
+    let params = params.cloned().unwrap_or_else(|| serde_json::json!({}));
+    let clip_id = string_param(&params, &["clip_id", "clipId", "op_id", "opId"]);
+    if clip_id.is_empty() {
+        return media_http_response(
+            id,
+            400,
+            serde_json::json!({"ok": false, "error": "missing clip_id"}),
+        );
+    }
+    let frames_sent = usize_param(&params, "frames_sent", usize::MAX);
+    let clip = {
+        let mut ops = runtime.media_clip_ops.lock().await;
+        let Some(op) = ops.get(&clip_id) else {
+            return media_http_response(
+                id,
+                404,
+                serde_json::json!({"ok": false, "error": "unknown clip operation"}),
+            );
+        };
+        let frames_registered = op.frames.len();
+        if frames_sent != usize::MAX && frames_sent != frames_registered {
+            return media_http_response(
+                id,
+                409,
+                serde_json::json!({
+                    "ok": false,
+                    "error": format!(
+                        "clip frame count mismatch: expected {frames_registered}, got {frames_sent}"
+                    ),
+                }),
+            );
+        }
+        if op.expected_frames > 0 && op.expected_frames != frames_registered {
+            return media_http_response(
+                id,
+                409,
+                serde_json::json!({
+                    "ok": false,
+                    "error": format!(
+                        "clip incomplete: expected {}, got {}",
+                        op.expected_frames, frames_registered
+                    ),
+                }),
+            );
+        }
+        ops.remove(&clip_id).expect("clip op existed")
+    };
+    let (_, query_ctx) = dashboard_media_session_handles(runtime).await;
+    let injected = clip.inject && inject_clip_context(query_ctx.as_ref(), &clip_id, &clip);
+    let frames_registered = clip.frames.len();
+    runtime.bus.send(AppEvent::PresenceLog {
+        message: format!(
+            "[clip] {clip_id} - {frames_registered} frames{}",
+            if injected { " (sent to agent)" } else { " (saved)" }
+        ),
+        level: Some(LogLevel::Info),
+        turn: None,
+    });
+    media_http_response(
+        id,
+        200,
+        serde_json::json!({
+            "t": "clip_saved",
+            "ok": true,
+            "op_id": clip_id,
+            "clip_id": clip_id,
+            "frames_registered": frames_registered,
+            "injected": injected,
+        }),
+    )
+}
+
+async fn api_media_clip_cancel_response(
+    id: String,
+    params: Option<&serde_json::Value>,
+    runtime: &ControlRuntime,
+) -> serde_json::Value {
+    let params = params.cloned().unwrap_or_else(|| serde_json::json!({}));
+    let clip_id = string_param(&params, &["clip_id", "clipId", "op_id", "opId"]);
+    if clip_id.is_empty() {
+        return media_http_response(
+            id,
+            400,
+            serde_json::json!({"ok": false, "error": "missing clip_id"}),
+        );
+    }
+    let existed = runtime.media_clip_ops.lock().await.remove(&clip_id).is_some();
+    media_http_response(
+        id,
+        200,
+        serde_json::json!({
+            "t": "media_clip_cancelled",
+            "ok": true,
+            "op_id": clip_id,
+            "clip_id": clip_id,
+            "existed": existed,
+        }),
+    )
 }
 
 async fn api_session_delete_response(
@@ -6341,6 +6937,7 @@ mod tests {
             web_tui_tx: None,
             bootstrap_caches: DashboardBootstrapCaches::default(),
             display_authority: None,
+            media_clip_ops: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -6396,6 +6993,25 @@ mod tests {
             &mut terminal_forwarders,
             &mut tui_connections,
         )
+    }
+
+    fn test_upload_state(
+        method: &str,
+        params: serde_json::Value,
+        bytes: &[u8],
+    ) -> InboundUploadState {
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        tmp.as_file_mut().write_all(bytes).unwrap();
+        tmp.as_file_mut().flush().unwrap();
+        InboundUploadState {
+            method: method.to_string(),
+            params,
+            tmp,
+            total_bytes: bytes.len(),
+            expected_chunks: if bytes.is_empty() { 0 } else { 1 },
+            next_seq: if bytes.is_empty() { 0 } else { 1 },
+            received_bytes: bytes.len(),
+        }
     }
 
     #[test]
@@ -7591,6 +8207,107 @@ mod tests {
             }
             other => panic!("expected upload ready event, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn media_annotation_upload_registers_frame() {
+        let session_dir = tempfile::tempdir().unwrap();
+        let rt = runtime();
+        let registry = Arc::new(tokio::sync::RwLock::new(crate::frames::FrameRegistry::new(
+            session_dir.path(),
+        )));
+        {
+            let mut session = rt.shared_session.write().await;
+            session.frame_registry = Some(registry.clone());
+        }
+        let bytes = b"jpeg annotation bytes";
+        let upload = test_upload_state(
+            "api_media_annotation_submit",
+            serde_json::json!({
+                "frame_id": "ann-test-1",
+                "stream": "annotation",
+                "note": "look here",
+                "inject": false,
+            }),
+            bytes,
+        );
+
+        let response =
+            api_media_annotation_upload_task_response("ann1".into(), upload, rt.clone(), true)
+                .await;
+
+        assert_eq!(response.frame["t"], "response");
+        assert_eq!(response.frame["ok"], true);
+        assert_eq!(response.frame["result"]["_httpStatus"], 200);
+        assert_eq!(response.frame["result"]["t"], "annotation_saved");
+        assert_eq!(response.frame["result"]["ok"], true);
+        assert_eq!(response.frame["result"]["frame_id"], "ann-test-1");
+        assert_eq!(response.frame["result"]["injected"], false);
+        let stored = registry.read().await.read_hq("ann-test-1").unwrap();
+        assert_eq!(stored, bytes);
+    }
+
+    #[tokio::test]
+    async fn media_clip_operation_commits_ordered_frames() {
+        let session_dir = tempfile::tempdir().unwrap();
+        let rt = runtime();
+        let registry = Arc::new(tokio::sync::RwLock::new(crate::frames::FrameRegistry::new(
+            session_dir.path(),
+        )));
+        {
+            let mut session = rt.shared_session.write().await;
+            session.frame_registry = Some(registry.clone());
+        }
+
+        let start = api_media_clip_start_response(
+            "clip-start".into(),
+            Some(&serde_json::json!({
+                "clip_id": "clip-test-1",
+                "stream": "recording",
+                "fps": 2,
+                "total_frames": 1,
+                "inject": false,
+            })),
+            &rt,
+        )
+        .await;
+        assert_eq!(start["result"]["_httpStatus"], 200);
+        assert_eq!(start["result"]["t"], "media_clip_started");
+
+        let bytes = b"jpeg clip frame";
+        let frame_upload = test_upload_state(
+            "api_media_clip_frame",
+            serde_json::json!({
+                "clip_id": "clip-test-1",
+                "frame_id": "clip-test-1-f000",
+                "frame_index": 0,
+            }),
+            bytes,
+        );
+        let frame =
+            api_media_clip_frame_upload_task_response("clip-frame".into(), frame_upload, rt.clone())
+                .await;
+        assert_eq!(frame.frame["result"]["_httpStatus"], 200);
+        assert_eq!(frame.frame["result"]["t"], "media_clip_frame_saved");
+        assert_eq!(frame.frame["result"]["frames_received"], 1);
+        assert_eq!(
+            registry.read().await.read_hq("clip-test-1-f000").unwrap(),
+            bytes
+        );
+
+        let end = api_media_clip_end_response(
+            "clip-end".into(),
+            Some(&serde_json::json!({
+                "clip_id": "clip-test-1",
+                "frames_sent": 1,
+            })),
+            &rt,
+        )
+        .await;
+        assert_eq!(end["result"]["_httpStatus"], 200);
+        assert_eq!(end["result"]["t"], "clip_saved");
+        assert_eq!(end["result"]["frames_registered"], 1);
+        assert_eq!(end["result"]["injected"], false);
     }
 
     #[tokio::test]
