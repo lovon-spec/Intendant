@@ -1381,6 +1381,39 @@ async function main() {
           throw new Error(`${label}: ${err?.message || err}`);
         }
       };
+      const peerOps = async () => ({
+        addMissingCardUrl: await labeled('api_peer_add missing card_url', ctl.request('api_peer_add', {
+          persist: false,
+        }, { timeoutMs: 60000 })),
+        removeMissingPeer: await labeled('api_peer_remove missing peer', ctl.request('api_peer_remove', {
+          peer_id: 'missing-peer',
+        }, { timeoutMs: 60000 })),
+        eligibleMissingCapability: await labeled('api_peer_eligible missing capability', ctl.request('api_peer_eligible', {
+          capabilities: [],
+        }, { timeoutMs: 60000 })),
+        eligibleNoMatch: await labeled('api_peer_eligible no match', ctl.request('api_peer_eligible', {
+          capabilities: ['custom:validator-route-missing'],
+        }, { timeoutMs: 60000 })),
+        messageMissingPeer: await labeled('api_peer_message missing peer', ctl.request('api_peer_message', {
+          peer_id: 'missing-peer',
+          text: 'hello from rendezvous validator',
+        }, { timeoutMs: 60000 })),
+        taskMissingPeer: await labeled('api_peer_task missing peer', ctl.request('api_peer_task', {
+          peer_id: 'missing-peer',
+          instructions: 'noop from rendezvous validator',
+        }, { timeoutMs: 60000 })),
+        approvalMissingPeer: await labeled('api_peer_approval missing peer', ctl.request('api_peer_approval', {
+          peer_id: 'missing-peer',
+          request_id: 'validator-approval',
+          decision: 'accept',
+        }, { timeoutMs: 60000 })),
+        coordinatorNoRoute: await labeled('api_coordinator_route no route', ctl.request('api_coordinator_route', {
+          required_capabilities: ['custom:validator-route-missing'],
+          task: {
+            instructions: 'noop from rendezvous validator',
+          },
+        }, { timeoutMs: 60000 })),
+      });
       const beforeChunks = ctl.status().completedChunkedResponses || 0;
       const largeSessions = await ctl.request('api_sessions', { limit: 'all' }, { timeoutMs: 60000 });
       const largeSessionsJson = JSON.stringify(largeSessions);
@@ -1850,6 +1883,7 @@ async function main() {
         sessionDelete,
         sessionControl,
         dashboardAction,
+        peerOps: await peerOps(),
         peerWebRtcSignal: await labeled('api_peer_webrtc_signal missing peer', ctl.request('api_peer_webrtc_signal', {
           peer_id: 'missing-peer',
           display_id: 0,
@@ -2290,6 +2324,57 @@ async function main() {
     );
     assert.strictEqual(result.peerWebRtcSignal?._httpOk, false);
     assert.strictEqual(result.peerWebRtcSignal?.error, 'peer not found');
+    assert.strictEqual(
+      result.peerOps?.addMissingCardUrl?._httpStatus,
+      400,
+      'peer add RPC did not preserve missing-card-url status'
+    );
+    assert.strictEqual(result.peerOps?.addMissingCardUrl?._httpOk, false);
+    assert.strictEqual(
+      result.peerOps?.removeMissingPeer?._httpStatus,
+      404,
+      'peer remove RPC did not preserve missing-peer status'
+    );
+    assert.strictEqual(result.peerOps?.removeMissingPeer?._httpOk, false);
+    assert.strictEqual(result.peerOps?.removeMissingPeer?.error, 'peer not found');
+    assert.strictEqual(
+      result.peerOps?.eligibleMissingCapability?._httpStatus,
+      400,
+      'peer eligible RPC did not preserve missing-capability status'
+    );
+    assert.strictEqual(result.peerOps?.eligibleMissingCapability?._httpOk, false);
+    assert.strictEqual(
+      result.peerOps?.eligibleNoMatch?._httpStatus,
+      200,
+      'peer eligible RPC did not preserve no-match success status'
+    );
+    assert(Array.isArray(result.peerOps?.eligibleNoMatch?.peers), 'peer eligible RPC did not return peers array');
+    assert.strictEqual(result.peerOps.eligibleNoMatch.peers.length, 0);
+    assert.strictEqual(
+      result.peerOps?.messageMissingPeer?._httpStatus,
+      404,
+      'peer message RPC did not preserve missing-peer status'
+    );
+    assert.strictEqual(result.peerOps?.messageMissingPeer?._httpOk, false);
+    assert.strictEqual(
+      result.peerOps?.taskMissingPeer?._httpStatus,
+      404,
+      'peer task RPC did not preserve missing-peer status'
+    );
+    assert.strictEqual(result.peerOps?.taskMissingPeer?._httpOk, false);
+    assert.strictEqual(
+      result.peerOps?.approvalMissingPeer?._httpStatus,
+      404,
+      'peer approval RPC did not preserve missing-peer status'
+    );
+    assert.strictEqual(result.peerOps?.approvalMissingPeer?._httpOk, false);
+    assert.strictEqual(
+      result.peerOps?.coordinatorNoRoute?._httpStatus,
+      404,
+      'coordinator route RPC did not preserve no-route status'
+    );
+    assert.strictEqual(result.peerOps?.coordinatorNoRoute?._httpOk, false);
+    assert.strictEqual(result.peerOps?.coordinatorNoRoute?.error, 'no route');
     assert(Array.isArray(result.peerPairing?.requests?.requests), 'peer pairing requests RPC did not return an array');
     assert(Array.isArray(result.peerPairing?.identities?.identities), 'peer pairing identities RPC did not return an array');
     assert.strictEqual(result.peerPairing?.missingDecision?._httpStatus, 400);
@@ -2682,6 +2767,14 @@ async function main() {
         diagnosticsMarkerRegistryAvailable: result.dashboardAction.diagnosticsVisualMarker?.registry_available,
         diagnosticsMarkerActiveDisplayUpdated: result.dashboardAction.diagnosticsVisualMarker?.active_display_updated,
         rejectedDashboardActionStatus: result.dashboardAction.rejectedSettingsAction?._httpStatus,
+        peerAddMissingCardStatus: result.peerOps.addMissingCardUrl._httpStatus,
+        peerRemoveMissingStatus: result.peerOps.removeMissingPeer._httpStatus,
+        peerEligibleMissingCapabilityStatus: result.peerOps.eligibleMissingCapability._httpStatus,
+        peerEligibleNoMatchStatus: result.peerOps.eligibleNoMatch._httpStatus,
+        peerMessageMissingStatus: result.peerOps.messageMissingPeer._httpStatus,
+        peerTaskMissingStatus: result.peerOps.taskMissingPeer._httpStatus,
+        peerApprovalMissingStatus: result.peerOps.approvalMissingPeer._httpStatus,
+        coordinatorNoRouteStatus: result.peerOps.coordinatorNoRoute._httpStatus,
         peerPairingRequestCount: result.peerPairing.requests.requests.length,
         peerPairingIdentityCount: result.peerPairing.identities.identities.length,
         peerPairingMissingDecisionStatus: result.peerPairing.missingDecision._httpStatus,

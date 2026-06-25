@@ -883,12 +883,11 @@ normally hydrated by `/config` and `/.well-known/agent-card.json`.
 `api_cached_bootstrap_events` returns the daemon's current non-personalized
 dashboard event cache (`usage`/`usage_update`, `live_usage_update`, `status`,
 `autonomy_changed`, `external_agent_changed`, and `user_display_granted` when
-present) as parsed JSON events. This is intentionally narrower than the
-WebSocket open sequence: it does not include `state_snapshot`, browser workspace
-snapshots, display-ready replay, display authority snapshots, session-log
-replay, or external-session transcript replay. Those pieces still need separate
-identity-aware APIs before a public origin can fully hydrate the dashboard
-without the primary WebSocket.
+present) as parsed JSON events. This cached-event RPC is intentionally narrower
+than the WebSocket open sequence, but the tunnel exposes the personalized
+bootstrap pieces as separate identity-aware APIs below. `api_dashboard_bootstrap`
+composes those pieces so a public-origin dashboard can hydrate without the
+primary daemon WebSocket.
 `api_browser_workspace_snapshot` returns the existing
 `browser_workspace_snapshot` message shape with active browser workspaces and
 lease state; callers can feed it through the same browser workspace handler that
@@ -1062,6 +1061,15 @@ list, and identity revoke over the DataChannel when it is connected. Mutating
 pairing operations deliberately fail rather than silently falling back after a
 WebRTC RPC error, so an operator does not approve or mint credentials over an
 unexpected transport.
+General peer and coordinator controls are covered by the same rule. Peer add,
+remove, eligibility discovery, per-peer message/task/approval, peer-display
+signaling, and coordinator route calls use `api_peer_add`, `api_peer_remove`,
+`api_peer_eligible`, `api_peer_message`, `api_peer_task`, `api_peer_approval`,
+`api_peer_webrtc_signal`, and `api_coordinator_route` over the verified tunnel.
+They preserve the existing HTTP endpoint metadata (`_httpStatus`/`_httpOk`) so
+the dashboard can render the same success and error states on either transport,
+but state-changing calls do not replay over HTTP once a verified DataChannel
+request has been attempted.
 
 #### Relationship to Existing Auth Modes
 
