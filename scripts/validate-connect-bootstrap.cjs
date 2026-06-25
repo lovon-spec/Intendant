@@ -131,10 +131,19 @@ async function main() {
 
     const result = await page.evaluate(async () => {
       const ctl = window.intendantConnectDashboard;
+      const beforeChunks = ctl.status().completedChunkedResponses || 0;
+      const largeSessions = await ctl.request('api_sessions', { limit: 'all' }, { timeoutMs: 60000 });
+      const largeSessionsJson = JSON.stringify(largeSessions);
       return {
         status: await ctl.request('status'),
         config: await ctl.request('config'),
         sessions: await ctl.request('api_sessions', { limit: 2 }),
+        largeSessions: {
+          ok: Array.isArray(largeSessions),
+          length: Array.isArray(largeSessions) ? largeSessions.length : null,
+          jsonBytes: new TextEncoder().encode(largeSessionsJson).length,
+          completedChunkedResponsesBefore: beforeChunks,
+        },
         appError: await ctl.request('api_peer_eligible', { capabilities: [] }),
         finalStatus: ctl.status(),
       };
@@ -147,6 +156,20 @@ async function main() {
       result.appError && result.appError._httpStatus === 400,
       'application error metadata was not preserved'
     );
+    assert(result.largeSessions.ok, 'large api_sessions did not return an array');
+    assert(
+      result.largeSessions.jsonBytes > 65536,
+      `large api_sessions did not cross chunk threshold: ${result.largeSessions.jsonBytes}`
+    );
+    assert(
+      result.finalStatus.completedChunkedResponses > result.largeSessions.completedChunkedResponsesBefore,
+      'chunked response counter did not advance'
+    );
+    assert.strictEqual(
+      result.finalStatus.pendingChunkedResponses,
+      0,
+      'chunked response map was not drained'
+    );
     assert.strictEqual(result.finalStatus.pendingRequests, 0, 'request map was not drained');
 
     console.log(JSON.stringify({
@@ -157,8 +180,12 @@ async function main() {
       rpc: {
         controlSessionId: result.status.session_id,
         sessionCount: result.sessions.length,
+        largeSessionCount: result.largeSessions.length,
+        largeSessionBytes: result.largeSessions.jsonBytes,
+        completedChunkedResponses: result.finalStatus.completedChunkedResponses,
         appErrorStatus: result.appError._httpStatus,
         pendingRequests: result.finalStatus.pendingRequests,
+        pendingChunkedResponses: result.finalStatus.pendingChunkedResponses,
       },
     }, null, 2));
 

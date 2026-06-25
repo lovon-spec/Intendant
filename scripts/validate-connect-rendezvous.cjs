@@ -282,6 +282,7 @@ function publicBootstrapHtml() {
 (() => {
   const statusEl = document.getElementById('status');
   const daemonId = new URLSearchParams(location.search).get('daemon_id') || '${DEFAULT_DAEMON_ID}';
+  const MAX_CHUNKED_RESPONSE_BYTES = 128 * 1024 * 1024;
   function paint(value) {
     statusEl.textContent = typeof value === 'string' ? value : JSON.stringify(value, null, 2);
   }
@@ -293,6 +294,12 @@ function publicBootstrapHtml() {
   function base64UrlToBytes(value) {
     const normalized = String(value || '').replace(/-/g, '+').replace(/_/g, '/');
     const binary = atob(normalized.padEnd(Math.ceil(normalized.length / 4) * 4, '='));
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    return bytes;
+  }
+  function base64ToBytes(value) {
+    const binary = atob(String(value || ''));
     const bytes = new Uint8Array(binary.length);
     for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
     return bytes;
@@ -352,6 +359,8 @@ function publicBootstrapHtml() {
     verifiedBinding: null,
     pendingIce: [],
     pending: new Map(),
+    chunkedResponses: new Map(),
+    completedChunkedResponses: 0,
     seq: 0,
     async start() {
       this.pc = new RTCPeerConnection({});
@@ -399,8 +408,23 @@ function publicBootstrapHtml() {
     handleMessage(data) {
       let msg;
       try { msg = JSON.parse(String(data)); } catch { return; }
+      this.handleFrame(msg);
+    },
+    handleFrame(msg) {
       if (msg.t === 'hello_ack') {
         paint(this.status());
+        return;
+      }
+      if (msg.t === 'response_start') {
+        this.handleResponseStart(msg);
+        return;
+      }
+      if (msg.t === 'response_chunk') {
+        this.handleResponseChunk(msg);
+        return;
+      }
+      if (msg.t === 'response_end') {
+        this.handleResponseEnd(msg);
         return;
       }
       if (msg.t !== 'pong' && msg.t !== 'response') return;
@@ -410,6 +434,113 @@ function publicBootstrapHtml() {
       if (msg.cancelled) pending.reject(abortError(msg.error || 'request cancelled'));
       else if (msg.t === 'response' && msg.ok === false) pending.reject(new Error(msg.error || 'request failed'));
       else pending.resolve(msg.t === 'pong' ? msg : msg.result);
+    },
+    handleResponseStart(msg) {
+      const id = String(msg.id || '');
+      if (!id || !this.pending.has(id)) return;
+      const totalBytes = Number(msg.total_bytes);
+      const expectedChunks = Number(msg.chunks);
+      if (
+        msg.encoding !== 'base64-json-frame' ||
+        !Number.isSafeInteger(totalBytes) ||
+        totalBytes < 0 ||
+        totalBytes > MAX_CHUNKED_RESPONSE_BYTES ||
+        !Number.isSafeInteger(expectedChunks) ||
+        expectedChunks < 0
+      ) {
+        this.rejectChunkedResponse(id, 'invalid dashboard control chunked response header');
+        return;
+      }
+      this.chunkedResponses.set(id, {
+        totalBytes,
+        expectedChunks,
+        receivedBytes: 0,
+        chunks: new Map(),
+        ended: false,
+      });
+      paint(this.status());
+    },
+    handleResponseChunk(msg) {
+      const id = String(msg.id || '');
+      const state = this.chunkedResponses.get(id);
+      if (!state) return;
+      const seq = Number(msg.seq);
+      if (!Number.isSafeInteger(seq) || seq < 0 || seq >= state.expectedChunks) {
+        this.rejectChunkedResponse(id, 'invalid dashboard control chunk sequence');
+        return;
+      }
+      if (state.chunks.has(seq)) return;
+      let bytes;
+      try {
+        bytes = base64ToBytes(msg.data);
+      } catch {
+        this.rejectChunkedResponse(id, 'invalid dashboard control chunk encoding');
+        return;
+      }
+      state.chunks.set(seq, bytes);
+      state.receivedBytes += bytes.byteLength;
+      if (state.receivedBytes > state.totalBytes) {
+        this.rejectChunkedResponse(id, 'dashboard control chunked response exceeded declared size');
+        return;
+      }
+      this.maybeCompleteChunkedResponse(id);
+      paint(this.status());
+    },
+    handleResponseEnd(msg) {
+      const id = String(msg.id || '');
+      const state = this.chunkedResponses.get(id);
+      if (!state) return;
+      const finalChunks = Number(msg.chunks);
+      if (!Number.isSafeInteger(finalChunks) || finalChunks !== state.expectedChunks) {
+        this.rejectChunkedResponse(id, 'invalid dashboard control chunked response footer');
+        return;
+      }
+      state.ended = true;
+      this.maybeCompleteChunkedResponse(id);
+      paint(this.status());
+    },
+    maybeCompleteChunkedResponse(id) {
+      const state = this.chunkedResponses.get(id);
+      if (!state || !state.ended || state.chunks.size !== state.expectedChunks) return false;
+      const merged = new Uint8Array(state.totalBytes);
+      let offset = 0;
+      for (let seq = 0; seq < state.expectedChunks; seq++) {
+        const chunk = state.chunks.get(seq);
+        if (!chunk) {
+          this.rejectChunkedResponse(id, 'dashboard control chunked response missed a chunk');
+          return false;
+        }
+        merged.set(chunk, offset);
+        offset += chunk.byteLength;
+      }
+      if (offset !== state.totalBytes) {
+        this.rejectChunkedResponse(id, 'dashboard control chunked response size mismatch');
+        return false;
+      }
+      this.chunkedResponses.delete(id);
+      let frame;
+      try {
+        frame = JSON.parse(new TextDecoder().decode(merged));
+      } catch {
+        this.rejectChunkedResponse(id, 'dashboard control chunked response was not valid JSON');
+        return false;
+      }
+      if (frame.t !== 'response' || String(frame.id || '') !== id) {
+        this.rejectChunkedResponse(id, 'dashboard control chunked response id mismatch');
+        return false;
+      }
+      this.completedChunkedResponses += 1;
+      this.handleFrame(frame);
+      return true;
+    },
+    rejectChunkedResponse(id, message) {
+      this.chunkedResponses.delete(id);
+      const pending = this.pending.get(id);
+      if (pending) {
+        this.pending.delete(id);
+        pending.reject(new Error(message));
+      }
+      paint(this.status());
     },
     request(method, params = {}, options = {}) {
       if (options.signal?.aborted) return Promise.reject(abortError());
@@ -429,10 +560,12 @@ function publicBootstrapHtml() {
           clearTimeout(timer);
           if (signal && abortHandler) signal.removeEventListener('abort', abortHandler);
           this.pending.delete(id);
+          this.chunkedResponses.delete(id);
           if (cancel) this.sendFrame({ t: 'cancel', id });
           reject(err);
         };
-        const timer = setTimeout(() => fail(new Error('request timed out'), true), 10000);
+        const timeoutMs = Number.isFinite(Number(options.timeoutMs)) ? Number(options.timeoutMs) : 10000;
+        const timer = setTimeout(() => fail(new Error('request timed out'), true), timeoutMs);
         const abortHandler = signal ? () => fail(abortError(), true) : null;
         if (signal && abortHandler) signal.addEventListener('abort', abortHandler, { once: true });
         this.pending.set(id, {
@@ -441,6 +574,7 @@ function publicBootstrapHtml() {
             settled = true;
             clearTimeout(timer);
             if (signal && abortHandler) signal.removeEventListener('abort', abortHandler);
+            this.chunkedResponses.delete(id);
             resolve(value);
           },
           reject: err => fail(err),
@@ -462,6 +596,8 @@ function publicBootstrapHtml() {
         sessionId: this.sessionId,
         verifiedBinding: this.verifiedBinding,
         pendingRequests: this.pending.size,
+        pendingChunkedResponses: this.chunkedResponses.size,
+        completedChunkedResponses: this.completedChunkedResponses,
       };
     },
     close() {
@@ -472,6 +608,7 @@ function publicBootstrapHtml() {
           body: JSON.stringify({ daemon_id: daemonId, session_id: this.sessionId }),
         }).catch(() => {});
       }
+      this.chunkedResponses.clear();
       try { this.channel?.close(); } catch {}
       try { this.pc?.close(); } catch {}
     },
@@ -589,10 +726,19 @@ async function main() {
 
     const result = await page.evaluate(async () => {
       const ctl = window.intendantPublicConnectDashboard;
+      const beforeChunks = ctl.status().completedChunkedResponses || 0;
+      const largeSessions = await ctl.request('api_sessions', { limit: 'all' }, { timeoutMs: 60000 });
+      const largeSessionsJson = JSON.stringify(largeSessions);
       return {
         status: await ctl.request('status'),
         config: await ctl.request('config'),
         sessions: await ctl.request('api_sessions', { limit: 2 }),
+        largeSessions: {
+          ok: Array.isArray(largeSessions),
+          length: Array.isArray(largeSessions) ? largeSessions.length : null,
+          jsonBytes: new TextEncoder().encode(largeSessionsJson).length,
+          completedChunkedResponsesBefore: beforeChunks,
+        },
         appError: await ctl.request('api_peer_eligible', { capabilities: [] }),
         finalStatus: ctl.status(),
       };
@@ -600,7 +746,21 @@ async function main() {
     assert(result.status && result.status.session_id, 'status RPC did not return a session id');
     assert(result.config && typeof result.config === 'object', 'config RPC did not return an object');
     assert(Array.isArray(result.sessions), 'api_sessions did not return an array');
+    assert(result.largeSessions.ok, 'large api_sessions did not return an array');
+    assert(
+      result.largeSessions.jsonBytes > 65536,
+      `large api_sessions did not cross chunk threshold: ${result.largeSessions.jsonBytes}`
+    );
     assert(result.appError && result.appError._httpStatus === 400, 'application error metadata was not preserved');
+    assert(
+      result.finalStatus.completedChunkedResponses > result.largeSessions.completedChunkedResponsesBefore,
+      'chunked response counter did not advance'
+    );
+    assert.strictEqual(
+      result.finalStatus.pendingChunkedResponses,
+      0,
+      'chunked response map was not drained'
+    );
     assert.strictEqual(result.finalStatus.pendingRequests, 0, 'request map was not drained');
 
     console.log(JSON.stringify({
@@ -612,8 +772,12 @@ async function main() {
       rpc: {
         controlSessionId: result.status.session_id,
         sessionCount: result.sessions.length,
+        largeSessionCount: result.largeSessions.length,
+        largeSessionBytes: result.largeSessions.jsonBytes,
+        completedChunkedResponses: result.finalStatus.completedChunkedResponses,
         appErrorStatus: result.appError._httpStatus,
         pendingRequests: result.finalStatus.pendingRequests,
+        pendingChunkedResponses: result.finalStatus.pendingChunkedResponses,
       },
     }, null, 2));
 

@@ -11393,6 +11393,7 @@ fn connect_bootstrap_html() -> String {
   <script>
 (() => {
   const statusEl = document.getElementById('status');
+  const MAX_CHUNKED_RESPONSE_BYTES = 128 * 1024 * 1024;
   function paint(message, kind = '') {
     statusEl.textContent = typeof message === 'string' ? message : JSON.stringify(message, null, 2);
     statusEl.className = kind;
@@ -11415,6 +11416,13 @@ fn connect_bootstrap_html() -> String {
   function base64UrlToBytes(value) {
     const padded = String(value || '').replace(/-/g, '+').replace(/_/g, '/').padEnd(Math.ceil(String(value || '').length / 4) * 4, '=');
     const binary = atob(padded);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    return bytes;
+  }
+
+  function base64ToBytes(value) {
+    const binary = atob(String(value || ''));
     const bytes = new Uint8Array(binary.length);
     for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
     return bytes;
@@ -11479,6 +11487,8 @@ fn connect_bootstrap_html() -> String {
     localOfferSdp: '',
     pendingIce: [],
     pending: new Map(),
+    chunkedResponses: new Map(),
+    completedChunkedResponses: 0,
     seq: 0,
     started: false,
 
@@ -11537,8 +11547,24 @@ fn connect_bootstrap_html() -> String {
     handleMessage(data) {
       let msg;
       try { msg = JSON.parse(String(data)); } catch { return; }
+      this.handleFrame(msg);
+    },
+
+    handleFrame(msg) {
       if (msg.t === 'hello_ack') {
         paint(this.status(), 'ok');
+        return;
+      }
+      if (msg.t === 'response_start') {
+        this.handleResponseStart(msg);
+        return;
+      }
+      if (msg.t === 'response_chunk') {
+        this.handleResponseChunk(msg);
+        return;
+      }
+      if (msg.t === 'response_end') {
+        this.handleResponseEnd(msg);
         return;
       }
       if (msg.t !== 'pong' && msg.t !== 'response') return;
@@ -11548,6 +11574,118 @@ fn connect_bootstrap_html() -> String {
       if (msg.cancelled) pending.reject(abortError(msg.error || 'dashboard control request cancelled'));
       else if (msg.t === 'response' && msg.ok === false) pending.reject(new Error(msg.error || 'dashboard control request failed'));
       else pending.resolve(msg.t === 'pong' ? msg : msg.result);
+    },
+
+    handleResponseStart(msg) {
+      const id = String(msg.id || '');
+      if (!id || !this.pending.has(id)) return;
+      const totalBytes = Number(msg.total_bytes);
+      const expectedChunks = Number(msg.chunks);
+      if (
+        msg.encoding !== 'base64-json-frame' ||
+        !Number.isSafeInteger(totalBytes) ||
+        totalBytes < 0 ||
+        totalBytes > MAX_CHUNKED_RESPONSE_BYTES ||
+        !Number.isSafeInteger(expectedChunks) ||
+        expectedChunks < 0
+      ) {
+        this.rejectChunkedResponse(id, 'invalid connect dashboard chunked response header');
+        return;
+      }
+      this.chunkedResponses.set(id, {
+        totalBytes,
+        expectedChunks,
+        receivedBytes: 0,
+        chunks: new Map(),
+        ended: false,
+      });
+      paint(this.status(), 'ok');
+    },
+
+    handleResponseChunk(msg) {
+      const id = String(msg.id || '');
+      const state = this.chunkedResponses.get(id);
+      if (!state) return;
+      const seq = Number(msg.seq);
+      if (!Number.isSafeInteger(seq) || seq < 0 || seq >= state.expectedChunks) {
+        this.rejectChunkedResponse(id, 'invalid connect dashboard chunk sequence');
+        return;
+      }
+      if (state.chunks.has(seq)) return;
+      let bytes;
+      try {
+        bytes = base64ToBytes(msg.data);
+      } catch {
+        this.rejectChunkedResponse(id, 'invalid connect dashboard chunk encoding');
+        return;
+      }
+      state.chunks.set(seq, bytes);
+      state.receivedBytes += bytes.byteLength;
+      if (state.receivedBytes > state.totalBytes) {
+        this.rejectChunkedResponse(id, 'connect dashboard chunked response exceeded declared size');
+        return;
+      }
+      this.maybeCompleteChunkedResponse(id);
+      paint(this.status(), 'ok');
+    },
+
+    handleResponseEnd(msg) {
+      const id = String(msg.id || '');
+      const state = this.chunkedResponses.get(id);
+      if (!state) return;
+      const finalChunks = Number(msg.chunks);
+      if (!Number.isSafeInteger(finalChunks) || finalChunks !== state.expectedChunks) {
+        this.rejectChunkedResponse(id, 'invalid connect dashboard chunked response footer');
+        return;
+      }
+      state.ended = true;
+      this.maybeCompleteChunkedResponse(id);
+      paint(this.status(), 'ok');
+    },
+
+    maybeCompleteChunkedResponse(id) {
+      const state = this.chunkedResponses.get(id);
+      if (!state || !state.ended || state.chunks.size !== state.expectedChunks) return false;
+      const merged = new Uint8Array(state.totalBytes);
+      let offset = 0;
+      for (let seq = 0; seq < state.expectedChunks; seq++) {
+        const chunk = state.chunks.get(seq);
+        if (!chunk) {
+          this.rejectChunkedResponse(id, 'connect dashboard chunked response missed a chunk');
+          return false;
+        }
+        merged.set(chunk, offset);
+        offset += chunk.byteLength;
+      }
+      if (offset !== state.totalBytes) {
+        this.rejectChunkedResponse(id, 'connect dashboard chunked response size mismatch');
+        return false;
+      }
+      this.chunkedResponses.delete(id);
+      let frame;
+      try {
+        frame = JSON.parse(new TextDecoder().decode(merged));
+      } catch {
+        this.rejectChunkedResponse(id, 'connect dashboard chunked response was not valid JSON');
+        return false;
+      }
+      if (frame.t !== 'response' || String(frame.id || '') !== id) {
+        this.rejectChunkedResponse(id, 'connect dashboard chunked response id mismatch');
+        return false;
+      }
+      this.completedChunkedResponses += 1;
+      this.handleFrame(frame);
+      return true;
+    },
+
+    rejectChunkedResponse(id, message) {
+      this.chunkedResponses.delete(id);
+      const pending = this.pending.get(id);
+      if (pending) {
+        this.pending.delete(id);
+        pending.reject(new Error(message));
+      }
+      paint(this.status(), 'err');
     },
 
     request(method, params = {}, options = {}) {
@@ -11569,11 +11707,13 @@ fn connect_bootstrap_html() -> String {
           clearTimeout(timer);
           if (signal && abortHandler) signal.removeEventListener('abort', abortHandler);
           this.pending.delete(id);
+          this.chunkedResponses.delete(id);
           if (cancel) this.sendFrame({ t: 'cancel', id });
           reject(err);
         };
         const abortHandler = signal ? () => fail(abortError(), true) : null;
-        const timer = setTimeout(() => fail(new Error('connect dashboard request timed out'), true), 10000);
+        const timeoutMs = Number.isFinite(Number(options.timeoutMs)) ? Number(options.timeoutMs) : 10000;
+        const timer = setTimeout(() => fail(new Error('connect dashboard request timed out'), true), timeoutMs);
         if (signal && abortHandler) signal.addEventListener('abort', abortHandler, { once: true });
         this.pending.set(id, {
           resolve: value => {
@@ -11581,6 +11721,7 @@ fn connect_bootstrap_html() -> String {
             settled = true;
             clearTimeout(timer);
             if (signal && abortHandler) signal.removeEventListener('abort', abortHandler);
+            this.chunkedResponses.delete(id);
             resolve(value);
           },
           reject: err => fail(err),
@@ -11604,6 +11745,8 @@ fn connect_bootstrap_html() -> String {
         sessionId: this.sessionId,
         verifiedBinding: this.verifiedBinding,
         pendingRequests: this.pending.size,
+        pendingChunkedResponses: this.chunkedResponses.size,
+        completedChunkedResponses: this.completedChunkedResponses,
       };
     },
 
@@ -11615,6 +11758,7 @@ fn connect_bootstrap_html() -> String {
           body: JSON.stringify({ session_id: this.sessionId }),
         }).catch(() => {});
       }
+      this.chunkedResponses.clear();
       try { this.channel?.close(); } catch {}
       try { this.pc?.close(); } catch {}
     },

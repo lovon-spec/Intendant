@@ -540,8 +540,9 @@ PLAYWRIGHT_NODE_PATH=/path/to/node_modules \
 That script starts a local rendezvous HTTP origin, launches a fresh daemon child
 with Connect env vars, verifies that `https://127.0.0.1:<daemon-port>/config`
 still rejects a certless request with `401`, then loads the browser from the
-rendezvous origin and drives `status`, `config`, `api_sessions`, and application
-error RPCs over the verified DataChannel.
+rendezvous origin and drives `status`, `config`, `api_sessions`, a chunked
+large `api_sessions` response, and application error RPCs over the verified
+DataChannel.
 
 This still is not consumer Connect. It has no account, passkey, daemon claim,
 grant issuance, revocation, audit log, or hosted public HTTPS. It is the
@@ -706,6 +707,14 @@ TURN-relayed candidate pair, or `failed` when signaling or daemon-binding
 verification fails. The tooltip carries the detailed state that is also exposed
 through `window.intendantDashboardControl.status()`.
 
+Peer access-request APIs now use the same transport boundary. The dashboard's
+pairing/request panes call `api_peer_pairing_requests`,
+`api_peer_pairing_request_decision`, invite/join/request-access/poll, identity
+list, and identity revoke over the DataChannel when it is connected. Mutating
+pairing operations deliberately fail rather than silently falling back after a
+WebRTC RPC error, so an operator does not approve or mint credentials over an
+unexpected transport.
+
 #### Relationship to Existing Auth Modes
 
 This design should not remove local/offline mTLS. It gives the product two clear
@@ -744,8 +753,10 @@ Treat this as a staged target, not current behavior:
    WebRTC relayed, failed verification, or application-proxied. The dashboard
    now shows mTLS/HTTP, checking, verified WebRTC, TURN-relay, and failed states
    for the current control transport.
-9. Carry peer access-request approve/deny over the DataChannel with passkey
-   step-up in the public UI.
+9. Carry peer access-request approve/deny over the DataChannel. The dashboard
+   now routes peer access-request list/decision and related pairing APIs through
+   the DataChannel transport boundary; hosted passkey step-up still belongs to
+   the future public Connect UI.
 10. Gradually migrate larger API surfaces. Managed-context history reads now use
     the tunnel, and oversized JSON responses now use chunked response framing.
     Uploads, downloads, recordings, terminals, and file transfer still wait for
