@@ -9528,6 +9528,44 @@ async fn drain_external_agent_events(
     handled_steer_ids: &mut std::collections::HashSet<String>,
     cancelled_follow_ups: &mut HashSet<String>,
     codex_thread_action_dedupe: &mut CodexThreadActionDedupe,
+    side_sessions: Option<&mut ExternalSideSessionState<'_>>,
+    managed_context_recovery_kickstart: bool,
+    managed_context_density_handoff: bool,
+    managed_context_density_handoff_completed: bool,
+) -> DrainOutcome {
+    let mut prefetched_events = std::collections::VecDeque::new();
+    drain_external_agent_events_with_prefetched(
+        agent,
+        event_rx,
+        bus_rx,
+        config,
+        stats,
+        diff_tracker,
+        pending_runtime_steers,
+        handled_steer_ids,
+        cancelled_follow_ups,
+        codex_thread_action_dedupe,
+        &mut prefetched_events,
+        side_sessions,
+        managed_context_recovery_kickstart,
+        managed_context_density_handoff,
+        managed_context_density_handoff_completed,
+    )
+    .await
+}
+
+async fn drain_external_agent_events_with_prefetched(
+    agent: &mut Box<dyn external_agent::ExternalAgent>,
+    event_rx: &mut tokio::sync::mpsc::UnboundedReceiver<external_agent::AgentEvent>,
+    bus_rx: &mut tokio::sync::broadcast::Receiver<AppEvent>,
+    config: &DrainConfig<'_>,
+    stats: &mut LoopStats,
+    diff_tracker: &mut ExternalDiffDeltaTracker,
+    pending_runtime_steers: &mut std::collections::VecDeque<PendingRuntimeSteer>,
+    handled_steer_ids: &mut std::collections::HashSet<String>,
+    cancelled_follow_ups: &mut HashSet<String>,
+    codex_thread_action_dedupe: &mut CodexThreadActionDedupe,
+    prefetched_events: &mut std::collections::VecDeque<external_agent::AgentEvent>,
     mut side_sessions: Option<&mut ExternalSideSessionState<'_>>,
     managed_context_recovery_kickstart: bool,
     managed_context_density_handoff: bool,
@@ -9652,7 +9690,10 @@ async fn drain_external_agent_events(
     let mut approve_all_session = false;
 
     loop {
-        let event = tokio::select! {
+        let event = if let Some(event) = prefetched_events.pop_front() {
+            event
+        } else {
+            tokio::select! {
             biased;
             bus_event = bus_rx.recv() => {
                 match bus_event {
@@ -10272,6 +10313,7 @@ async fn drain_external_agent_events(
                     message,
                     turns_in_round,
                 );
+            }
             }
         };
 
@@ -29132,7 +29174,7 @@ async fn run_external_agent_mode(
                     maybe_event = event_rx.recv() => {
                         match maybe_event {
                             Some(event) => {
-                                let (event_thread_id, _event_turn_id, event) = event.into_scope();
+                                let (event_thread_id, event_turn_id, event) = event.into_scope();
                                 if let Some(child_thread_id) =
                                     scoped_event_codex_subagent_thread_id(&event_thread_id, &stats)
                                 {
@@ -29171,7 +29213,202 @@ async fn run_external_agent_mode(
                                         stats.terminal_outcome = Some(reason);
                                         break 'outer;
                                     }
-                                    _ => {}
+                                    other => {
+                                        let event_targets_primary = scoped_event_targets_config(
+                                            &event_thread_id,
+                                            &live_session_id,
+                                            &drain_config.alias_session_id,
+                                        );
+                                        let event_targets_side = event_thread_id
+                                            .as_deref()
+                                            .is_some_and(|id| open_side_threads.contains_key(id));
+                                        if !event_targets_primary && !event_targets_side {
+                                            continue;
+                                        }
+
+                                        let prefetched_event = external_agent::AgentEvent::scoped(
+                                            event_thread_id.clone(),
+                                            event_turn_id,
+                                            other,
+                                        );
+                                        let observed_session_id =
+                                            event_thread_id.clone().or_else(|| live_session_id.clone());
+                                        let mut prefetched_events =
+                                            std::collections::VecDeque::new();
+                                        prefetched_events.push_back(prefetched_event);
+                                        let mut side_session_state = ExternalSideSessionState {
+                                            open_side_threads: &mut open_side_threads,
+                                            side_rounds: &mut side_rounds,
+                                            side_turn_revisions: &mut side_turn_revisions,
+                                        };
+                                        round += 1;
+                                        stats.turns = 0;
+                                        emit_external_turn_status(
+                                            &bus,
+                                            &autonomy,
+                                            observed_session_id.as_deref(),
+                                            round,
+                                            "running",
+                                            format!(
+                                                "{} backend turn {} observed while idle",
+                                                agent.name(),
+                                                round
+                                            ),
+                                        )
+                                        .await;
+                                        match drain_external_agent_events_with_prefetched(
+                                            &mut agent,
+                                            &mut event_rx,
+                                            &mut external_control_rx,
+                                            &drain_config,
+                                            &mut stats,
+                                            &mut diff_tracker,
+                                            &mut pending_runtime_steers,
+                                            &mut handled_steer_ids,
+                                            &mut cancelled_follow_ups,
+                                            &mut codex_thread_action_dedupe,
+                                            &mut prefetched_events,
+                                            Some(&mut side_session_state),
+                                            false,
+                                            false,
+                                            false,
+                                        )
+                                        .await
+                                        {
+                                            DrainOutcome::TurnCompleted {
+                                                message,
+                                                turns_in_round,
+                                            } => {
+                                                stats.rounds = round;
+                                                record_external_done_and_round_inline(
+                                                    &session_log,
+                                                    persist_model_responses_inline,
+                                                    live_session_id.as_deref(),
+                                                    message.as_deref(),
+                                                    round,
+                                                    turns_in_round,
+                                                );
+                                                bus.send(AppEvent::DoneSignal {
+                                                    session_id: live_session_id.clone(),
+                                                    message: message.clone(),
+                                                });
+                                                bus.send(AppEvent::RoundComplete {
+                                                    session_id: live_session_id.clone(),
+                                                    round,
+                                                    turns_in_round,
+                                                    native_message_count: None,
+                                                });
+                                            }
+                                            DrainOutcome::ContextRewindRequested {
+                                                request,
+                                                message,
+                                                turns_in_round,
+                                                ..
+                                            } => {
+                                                stats.rounds = round;
+                                                record_external_done_and_round_inline(
+                                                    &session_log,
+                                                    persist_model_responses_inline,
+                                                    live_session_id.as_deref(),
+                                                    message.as_deref(),
+                                                    round,
+                                                    turns_in_round,
+                                                );
+                                                bus.send(AppEvent::DoneSignal {
+                                                    session_id: live_session_id.clone(),
+                                                    message: message.clone(),
+                                                });
+                                                bus.send(AppEvent::RoundComplete {
+                                                    session_id: live_session_id.clone(),
+                                                    round,
+                                                    turns_in_round,
+                                                    native_message_count: None,
+                                                });
+                                                emit_context_rewind_failure(
+                                                    &request,
+                                                    "context rewind was requested during a backend-started turn observed from idle; the turn was recorded, but the rewind was not applied automatically".to_string(),
+                                                    &drain_config,
+                                                );
+                                            }
+                                            DrainOutcome::RecoveryRequired {
+                                                message,
+                                                recovery_hint,
+                                                turns_in_round,
+                                            } => {
+                                                stats.rounds = round;
+                                                let message = recovery_required_message(
+                                                    &message,
+                                                    recovery_hint.as_deref(),
+                                                );
+                                                slog(&session_log, |l| l.warn(&message));
+                                                record_external_round_inline(
+                                                    &session_log,
+                                                    persist_model_responses_inline,
+                                                    round,
+                                                    turns_in_round,
+                                                );
+                                                bus.send(AppEvent::RoundComplete {
+                                                    session_id: live_session_id.clone(),
+                                                    round,
+                                                    turns_in_round,
+                                                    native_message_count: None,
+                                                });
+                                                bus.send(AppEvent::LoopError(message));
+                                                stats.terminal_outcome =
+                                                    Some("recovery required".to_string());
+                                                break 'outer;
+                                            }
+                                            DrainOutcome::Interrupted { reason } => {
+                                                stats.rounds = round;
+                                                slog(&session_log, |l| {
+                                                    l.info(&format!(
+                                                        "External agent interrupted while observed from idle: {}",
+                                                        reason
+                                                    ))
+                                                });
+                                                record_external_round_inline(
+                                                    &session_log,
+                                                    persist_model_responses_inline,
+                                                    round,
+                                                    stats.turns,
+                                                );
+                                                bus.send(AppEvent::RoundComplete {
+                                                    session_id: live_session_id.clone(),
+                                                    round,
+                                                    turns_in_round: stats.turns,
+                                                    native_message_count: None,
+                                                });
+                                            }
+                                            DrainOutcome::Terminated { reason, exit_code } => {
+                                                stats.rounds = round;
+                                                slog(&session_log, |l| {
+                                                    l.info(&format!(
+                                                        "External agent terminated while observed from idle: {} (exit code: {:?})",
+                                                        reason,
+                                                        exit_code
+                                                    ))
+                                                });
+                                                bus.send(AppEvent::TaskComplete {
+                                                    session_id: live_session_id.clone(),
+                                                    reason: reason.clone(),
+                                                    summary: stats.last_response.clone(),
+                                                });
+                                                stats.terminal_outcome = Some(reason);
+                                                break 'outer;
+                                            }
+                                            DrainOutcome::ChannelClosed => {
+                                                slog(&session_log, |l| {
+                                                    l.info(
+                                                        "External agent event channel closed while observed from idle",
+                                                    )
+                                                });
+                                                stats.terminal_outcome = Some(
+                                                    "external agent event channel closed".to_string(),
+                                                );
+                                                break 'outer;
+                                            }
+                                        }
+                                    }
                                 }
                                 continue;
                             }

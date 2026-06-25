@@ -2584,6 +2584,25 @@ fn session_log_mtime(path: &Path) -> std::time::SystemTime {
         .unwrap_or(std::time::UNIX_EPOCH)
 }
 
+fn external_session_mtime(
+    home: &Path,
+    source: &str,
+    session_id: &str,
+) -> Option<std::time::SystemTime> {
+    let path = session_log_search_file_path(home, source, session_id, None)?;
+    std::fs::metadata(path).and_then(|m| m.modified()).ok()
+}
+
+fn external_session_newer_than_wrapper(
+    home: &Path,
+    wrapper_log_dir: &Path,
+    source: &str,
+    session_id: &str,
+) -> bool {
+    external_session_mtime(home, source, session_id)
+        .is_some_and(|external_mtime| external_mtime > session_log_mtime(wrapper_log_dir))
+}
+
 fn is_valid_agent_output_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= 128
@@ -15839,8 +15858,19 @@ pub fn spawn_web_gateway(
                             })
                             .unwrap_or_default();
                     active_external_sessions.sort_by(|a, b| a.0.cmp(&b.0));
+                    let home_dir = crate::platform::home_dir();
                     for (session_id, source) in active_external_sessions {
-                        if replayed_external_session_ids.contains(&session_id) {
+                        let wrapper_replay_is_current = replayed_external_session_ids
+                            .contains(&session_id)
+                            && replay_log_dir.as_ref().is_some_and(|log_dir| {
+                                !external_session_newer_than_wrapper(
+                                    &home_dir,
+                                    log_dir,
+                                    &source,
+                                    &session_id,
+                                )
+                            });
+                        if wrapper_replay_is_current {
                             continue;
                         }
                         if let Some(replay) =
