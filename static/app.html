@@ -26759,7 +26759,7 @@ function hydrateSessionRelationshipRows(rel) {
   if (sessionRelationshipHydrationInFlight.has(key)) return;
   sessionRelationshipHydrationInFlight.add(key);
   const url = `/api/sessions?ids=${encodeURIComponent(ids.join(','))}`;
-  authedFetch(url)
+  dashboardJsonFetch('api_sessions', { ids }, () => authedFetch(url), 'api_sessions_relationships')
     .then(r => r.ok ? r.json() : Promise.reject(new Error(`${url} returned ${r.status}`)))
     .then(rows => {
       if (!Array.isArray(rows)) return;
