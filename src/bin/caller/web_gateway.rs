@@ -14051,7 +14051,7 @@ pub(crate) async fn handle_history_prune(
 
 /// Delete session data: entire session, media, recordings, frames, or turns.
 /// Returns a JSON result with `ok` and `bytes_freed`.
-fn delete_session_data(session_id: &str, target: &str) -> String {
+pub(crate) fn delete_session_data(session_id: &str, target: &str) -> String {
     // Path traversal protection
     if !session_lookup_id_is_safe(session_id) {
         return serde_json::json!({"ok": false, "error": "invalid session id"}).to_string();

@@ -36662,6 +36662,9 @@ window.intendantDashboardControl = {
   sessionDetail(sessionId, params = {}) {
     return dashboardTransport.request('api_session_detail', { session_id: sessionId, ...params });
   },
+  sessionDelete(sessionId, target = 'session', options = {}) {
+    return dashboardTransport.request('api_session_delete', { session_id: sessionId, target }, options);
+  },
   currentAgentOutput(ids = [], options = {}) {
     return dashboardTransport.request('api_session_current_agent_output', { ids }, options);
   },
@@ -48042,7 +48045,9 @@ async function confirmSessionDeleteModal() {
   showSessionDeleteStatus('Deleting...');
 
   try {
-    const resp = await fetch(url, { method: 'POST' });
+    const resp = await dashboardJsonFetch('api_session_delete', { session_id: sessionId, target }, () => (
+      fetch(url, { method: 'POST' })
+    ), 'api_session_delete', { fallbackAfterRpcFailure: false });
     const result = await resp.json().catch(() => ({}));
     if (!resp.ok || !result.ok) throw new Error(result.error || resp.statusText || 'unknown');
     if (target === 'session') {

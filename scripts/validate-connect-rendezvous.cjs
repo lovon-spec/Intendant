@@ -817,12 +817,16 @@ async function main() {
       const sessionsById = firstSessionId
         ? await ctl.request('api_sessions', { ids: [firstSessionId] })
         : [];
+      const sessionDelete = {
+        invalidSession: await ctl.request('api_session_delete', { session_id: '../bad' }),
+      };
       return {
         status: await ctl.request('status'),
         config: await ctl.request('config'),
         sessions,
         sessionsById,
         sessionsByIdTarget: firstSessionId,
+        sessionDelete,
         sessionsStream: {
           result: streamResult,
           eventTypes: streamEvents.map(event => event.type),
@@ -936,6 +940,16 @@ async function main() {
       result.status.api_session_current_agent_output_available,
       true,
       'dashboard control status did not advertise current agent output'
+    );
+    assert.strictEqual(
+      result.status.api_session_delete_available,
+      true,
+      'dashboard control status did not advertise session deletion'
+    );
+    assert(
+      result.sessionDelete?.invalidSession?.ok === false &&
+        result.sessionDelete.invalidSession.error === 'invalid session id',
+      'session delete RPC did not preserve invalid session body'
     );
     assert.strictEqual(
       result.status.api_session_current_history_available,
@@ -1134,6 +1148,7 @@ async function main() {
         responseCredit: result.status.response_credit_enabled,
         sessionCount: result.sessions.length,
         sessionByIdCount: result.sessionsById.length,
+        sessionDeleteInvalidOk: result.sessionDelete.invalidSession?.ok,
         streamEventCount: result.sessionsStream.eventCount,
         streamReplaceCount: result.sessionsStream.replaceCount,
         largeStreamEventCount: result.largeSessionsStream.eventCount,

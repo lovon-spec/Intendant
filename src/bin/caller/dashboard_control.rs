@@ -52,6 +52,7 @@ const CONTROL_FEATURES: &[&str] = &[
     "api_sessions",
     "api_sessions_stream",
     "api_session_detail",
+    "api_session_delete",
     "api_session_current_agent_output",
     "api_session_current_history",
     "api_session_current_rollback",
@@ -1123,6 +1124,7 @@ fn control_frame_response(
                 }
                 "api_sessions"
                 | "api_session_detail"
+                | "api_session_delete"
                 | "api_session_current_agent_output"
                 | "api_session_current_history"
                 | "api_session_current_rollback"
@@ -1243,6 +1245,7 @@ fn status_response_frame(id: String, runtime: &ControlRuntime) -> serde_json::Va
         ("api_sessions_available", true),
         ("api_sessions_stream_available", true),
         ("api_session_detail_available", true),
+        ("api_session_delete_available", true),
         ("api_session_current_agent_output_available", true),
         ("api_session_current_history_available", true),
         ("api_session_current_rollback_available", true),
@@ -1357,6 +1360,7 @@ async fn control_request_response(
     match method.as_str() {
         "api_sessions" => api_sessions_response(id, params.as_ref()).await,
         "api_session_detail" => api_session_detail_response(id, params.as_ref()).await,
+        "api_session_delete" => api_session_delete_response(id, params.as_ref()).await,
         "api_session_current_agent_output" => {
             api_session_current_agent_output_response(id, params.as_ref(), &runtime).await
         }
@@ -1655,6 +1659,29 @@ async fn api_session_detail_response(
         }
     };
     json_body_response(id, body, "session detail")
+}
+
+async fn api_session_delete_response(
+    id: String,
+    params: Option<&serde_json::Value>,
+) -> serde_json::Value {
+    let params = params.cloned().unwrap_or_else(|| serde_json::json!({}));
+    let session_id = string_param(&params, &["session_id", "sessionId", "id"]);
+    let target =
+        optional_string_param(&params, &["target"]).unwrap_or_else(|| "session".to_string());
+    let result = tokio::task::spawn_blocking(move || {
+        crate::web_gateway::delete_session_data(&session_id, &target)
+    })
+    .await;
+    match result {
+        Ok(body) => json_body_response(id, body, "session delete"),
+        Err(e) => serde_json::json!({
+            "t": "response",
+            "id": id,
+            "ok": false,
+            "error": format!("session delete task failed: {e}"),
+        }),
+    }
 }
 
 async fn api_session_current_agent_output_response(
@@ -2958,6 +2985,7 @@ mod tests {
         assert_eq!(status["result"]["api_sessions_available"], true);
         assert_eq!(status["result"]["api_sessions_stream_available"], true);
         assert_eq!(status["result"]["api_session_detail_available"], true);
+        assert_eq!(status["result"]["api_session_delete_available"], true);
         assert_eq!(
             status["result"]["api_session_current_agent_output_available"],
             true
@@ -3098,6 +3126,19 @@ mod tests {
         assert_eq!(response.frame["result"]["error"], "no active session log");
         assert_eq!(response.frame["result"]["_httpStatus"], 404);
         assert_eq!(response.frame["result"]["_httpOk"], false);
+    }
+
+    #[tokio::test]
+    async fn session_delete_rpc_preserves_body_shape() {
+        let invalid_session = api_session_delete_response(
+            "del1".to_string(),
+            Some(&serde_json::json!({ "session_id": "../bad" })),
+        )
+        .await;
+        assert_eq!(invalid_session["t"], "response");
+        assert_eq!(invalid_session["ok"], true);
+        assert_eq!(invalid_session["result"]["ok"], false);
+        assert_eq!(invalid_session["result"]["error"], "invalid session id");
     }
 
     #[tokio::test]
