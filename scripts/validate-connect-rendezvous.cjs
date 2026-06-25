@@ -857,6 +857,13 @@ async function main() {
           list: await ctl.request('api_session_current_changes'),
           traversal: await ctl.request('api_session_current_changes', { path: '../Cargo.toml' }),
         },
+        contextSnapshots: {
+          missingSelector: await ctl.request('api_session_context_snapshot', { session_id: 'missing-context-session' }),
+          invalidSession: await ctl.request('api_session_context_snapshot', {
+            session_id: '../bad',
+            file: 'snapshot.json',
+          }),
+        },
         recordings: {
           live: await ctl.request('api_recordings'),
           invalidSession: await ctl.request('api_session_recordings', { session_id: '../bad' }),
@@ -989,6 +996,19 @@ async function main() {
       'changes path validation RPC did not preserve endpoint status'
     );
     assert.strictEqual(
+      result.status.api_session_context_snapshot_available,
+      true,
+      'dashboard control status did not advertise context snapshots'
+    );
+    assert(
+      result.contextSnapshots?.missingSelector?._httpStatus === 400,
+      'context snapshot RPC did not preserve missing selector status'
+    );
+    assert(
+      result.contextSnapshots?.invalidSession?._httpStatus === 400,
+      'context snapshot RPC did not preserve invalid session status'
+    );
+    assert.strictEqual(
       result.status.api_recordings_available,
       true,
       'dashboard control status did not advertise recordings'
@@ -1116,6 +1136,10 @@ async function main() {
           value?._httpStatus || 200,
         ])),
         changesStatuses: Object.fromEntries(Object.entries(result.changes || {}).map(([key, value]) => [
+          key,
+          value?._httpStatus || 200,
+        ])),
+        contextSnapshotStatuses: Object.fromEntries(Object.entries(result.contextSnapshots || {}).map(([key, value]) => [
           key,
           value?._httpStatus || 200,
         ])),

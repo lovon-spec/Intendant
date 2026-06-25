@@ -58,6 +58,7 @@ const CONTROL_FEATURES: &[&str] = &[
     "api_session_current_redo",
     "api_session_current_prune",
     "api_session_current_changes",
+    "api_session_context_snapshot",
     "api_fs_stat",
     "api_fs_list",
     "api_fs_mkdir",
@@ -1127,6 +1128,7 @@ fn control_frame_response(
                 | "api_session_current_redo"
                 | "api_session_current_prune"
                 | "api_session_current_changes"
+                | "api_session_context_snapshot"
                 | "api_fs_stat"
                 | "api_fs_list"
                 | "api_fs_mkdir"
@@ -1245,6 +1247,7 @@ fn status_response_frame(id: String, runtime: &ControlRuntime) -> serde_json::Va
         ("api_session_current_redo_available", true),
         ("api_session_current_prune_available", true),
         ("api_session_current_changes_available", true),
+        ("api_session_context_snapshot_available", true),
         ("api_fs_stat_available", true),
         ("api_fs_list_available", true),
         ("api_fs_mkdir_available", true),
@@ -1362,6 +1365,9 @@ async fn control_request_response(
         "api_session_current_prune" => api_session_current_prune_response(id, &runtime).await,
         "api_session_current_changes" => {
             api_session_current_changes_response(id, params.as_ref(), &runtime).await
+        },
+        "api_session_context_snapshot" => {
+            api_session_context_snapshot_response(id, params.as_ref()).await
         },
         "api_fs_stat" => api_fs_stat_response(id, params.as_ref()).await,
         "api_fs_list" => api_fs_list_response(id, params.as_ref()).await,
@@ -1756,6 +1762,59 @@ async fn api_session_current_changes_response(
             "id": id,
             "ok": false,
             "error": format!("session changes task failed: {e}"),
+        }),
+    }
+}
+
+async fn api_session_context_snapshot_response(
+    id: String,
+    params: Option<&serde_json::Value>,
+) -> serde_json::Value {
+    let params = params.cloned().unwrap_or_else(|| serde_json::json!({}));
+    let session_id = string_param(&params, &["session_id", "sessionId", "id"]);
+    if session_id.is_empty() {
+        return missing_param_response(id, "session_id");
+    }
+    let source = optional_string_param(&params, &["source"]).unwrap_or_else(|| "intendant".into());
+    let file = optional_string_param(&params, &["file"]);
+    let request_id = optional_string_param(&params, &["request_id", "requestId"]);
+    let request_index = match optional_u64_param(&params, &["request_index", "requestIndex"]) {
+        Ok(value) => value,
+        Err(error) => {
+            return http_body_response(
+                id,
+                400,
+                serde_json::json!({ "error": error }).to_string(),
+                "context snapshot",
+            );
+        }
+    };
+    let ts = optional_string_param(&params, &["ts"]);
+    let home = crate::platform::home_dir();
+    let result = tokio::task::spawn_blocking(move || {
+        crate::web_gateway::session_context_snapshot_response_body(
+            &home,
+            &session_id,
+            &source,
+            file,
+            request_id,
+            request_index,
+            ts,
+        )
+    })
+    .await;
+    match result {
+        Ok((status_line, body)) => http_body_response(
+            id,
+            status_line_code(status_line),
+            body,
+            "context snapshot",
+        ),
+        Err(e) => serde_json::json!({
+            "t": "response",
+            "id": id,
+            "ok": false,
+            "error": format!("context snapshot task failed: {e}"),
         }),
     }
 }
@@ -2653,6 +2712,44 @@ fn string_param(params: &serde_json::Value, names: &[&str]) -> String {
     String::new()
 }
 
+fn optional_string_param(params: &serde_json::Value, names: &[&str]) -> Option<String> {
+    let value = string_param(params, names);
+    if value.is_empty() {
+        None
+    } else {
+        Some(value)
+    }
+}
+
+fn optional_u64_param(
+    params: &serde_json::Value,
+    names: &[&str],
+) -> Result<Option<u64>, String> {
+    for name in names {
+        let Some(value) = params.get(*name) else {
+            continue;
+        };
+        if value.is_null() {
+            return Ok(None);
+        }
+        if let Some(number) = value.as_u64() {
+            return Ok(Some(number));
+        }
+        if let Some(text) = value.as_str() {
+            let text = text.trim();
+            if text.is_empty() {
+                return Ok(None);
+            }
+            return text
+                .parse::<u64>()
+                .map(Some)
+                .map_err(|_| format!("invalid {name}"));
+        }
+        return Err(format!("invalid {name}"));
+    }
+    Ok(None)
+}
+
 fn split_control_session_ids(value: &str) -> impl Iterator<Item = String> + '_ {
     value
         .split(',')
@@ -2810,6 +2907,10 @@ mod tests {
         );
         assert_eq!(
             status["result"]["api_session_current_changes_available"],
+            true
+        );
+        assert_eq!(
+            status["result"]["api_session_context_snapshot_available"],
             true
         );
         assert_eq!(status["result"]["api_fs_stat_available"], true);
@@ -2998,6 +3099,46 @@ mod tests {
         assert_eq!(response.frame["result"]["error"], "file watcher not active");
         assert_eq!(response.frame["result"]["_httpStatus"], 503);
         assert_eq!(response.frame["result"]["_httpOk"], false);
+    }
+
+    #[tokio::test]
+    async fn context_snapshot_rpc_preserves_http_status() {
+        let invalid_session = api_session_context_snapshot_response(
+            "ctx1".to_string(),
+            Some(&serde_json::json!({
+                "session_id": "../bad",
+                "file": "snapshot.json",
+            })),
+        )
+        .await;
+        assert_eq!(invalid_session["t"], "response");
+        assert_eq!(invalid_session["ok"], true);
+        assert_eq!(invalid_session["result"]["error"], "invalid session id");
+        assert_eq!(invalid_session["result"]["_httpStatus"], 400);
+        assert_eq!(invalid_session["result"]["_httpOk"], false);
+
+        let missing_selector = api_session_context_snapshot_response(
+            "ctx2".to_string(),
+            Some(&serde_json::json!({
+                "session_id": "missing-session",
+            })),
+        )
+        .await;
+        assert_eq!(missing_selector["result"]["error"], "missing snapshot selector");
+        assert_eq!(missing_selector["result"]["_httpStatus"], 400);
+        assert_eq!(missing_selector["result"]["_httpOk"], false);
+
+        let invalid_index = api_session_context_snapshot_response(
+            "ctx3".to_string(),
+            Some(&serde_json::json!({
+                "session_id": "missing-session",
+                "request_index": "abc",
+            })),
+        )
+        .await;
+        assert_eq!(invalid_index["result"]["error"], "invalid request_index");
+        assert_eq!(invalid_index["result"]["_httpStatus"], 400);
+        assert_eq!(invalid_index["result"]["_httpOk"], false);
     }
 
     #[tokio::test]

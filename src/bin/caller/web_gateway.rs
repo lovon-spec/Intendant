@@ -4021,12 +4021,6 @@ fn context_snapshot_selector_from_request(
     request_line: &str,
 ) -> Result<ContextSnapshotSelector, String> {
     let file = query_param(request_line, "file").filter(|value| !value.trim().is_empty());
-    if file
-        .as_deref()
-        .is_some_and(|file| !context_snapshot_file_selector_is_safe(file))
-    {
-        return Err("invalid snapshot file".to_string());
-    }
     let request_index =
         match query_param(request_line, "request_index").filter(|value| !value.trim().is_empty()) {
             Some(value) => Some(
@@ -4036,12 +4030,32 @@ fn context_snapshot_selector_from_request(
             ),
             None => None,
         };
+    context_snapshot_selector_from_parts(
+        file,
+        query_param(request_line, "request_id").filter(|value| !value.trim().is_empty()),
+        request_index,
+        query_param(request_line, "ts").filter(|value| !value.trim().is_empty()),
+    )
+}
+
+fn context_snapshot_selector_from_parts(
+    file: Option<String>,
+    request_id: Option<String>,
+    request_index: Option<u64>,
+    ts: Option<String>,
+) -> Result<ContextSnapshotSelector, String> {
+    let file = file.filter(|value| !value.trim().is_empty());
+    if file
+        .as_deref()
+        .is_some_and(|file| !context_snapshot_file_selector_is_safe(file))
+    {
+        return Err("invalid snapshot file".to_string());
+    }
     let selector = ContextSnapshotSelector {
         file,
-        request_id: query_param(request_line, "request_id")
-            .filter(|value| !value.trim().is_empty()),
+        request_id: request_id.filter(|value| !value.trim().is_empty()),
         request_index,
-        ts: query_param(request_line, "ts").filter(|value| !value.trim().is_empty()),
+        ts: ts.filter(|value| !value.trim().is_empty()),
     };
     if selector.is_empty() {
         return Err("missing snapshot selector".to_string());
@@ -4176,6 +4190,34 @@ fn exact_context_snapshot_from_log_entry(
     Some(value)
 }
 
+pub(crate) fn session_context_snapshot_response_body(
+    home: &Path,
+    session_id: &str,
+    source: &str,
+    file: Option<String>,
+    request_id: Option<String>,
+    request_index: Option<u64>,
+    ts: Option<String>,
+) -> (&'static str, String) {
+    if !session_lookup_id_is_safe(session_id) {
+        return (
+            "400 Bad Request",
+            serde_json::json!({"error": "invalid session id"}).to_string(),
+        );
+    }
+    let selector =
+        match context_snapshot_selector_from_parts(file, request_id, request_index, ts) {
+            Ok(selector) => selector,
+            Err(error) => {
+                return (
+                    "400 Bad Request",
+                    serde_json::json!({"error": error}).to_string(),
+                );
+            }
+        };
+    session_context_snapshot_response_for_selector(home, session_id, source, selector)
+}
+
 fn get_session_context_snapshot_from_home(
     home: &Path,
     session_id: &str,
@@ -4197,6 +4239,15 @@ fn get_session_context_snapshot_from_home(
             );
         }
     };
+    session_context_snapshot_response_for_selector(home, session_id, source, selector)
+}
+
+fn session_context_snapshot_response_for_selector(
+    home: &Path,
+    session_id: &str,
+    source: &str,
+    selector: ContextSnapshotSelector,
+) -> (&'static str, String) {
     for log_dir in context_snapshot_candidate_log_dirs(home, session_id, source) {
         let Ok(contents) = std::fs::read_to_string(log_dir.join("session.jsonl")) else {
             continue;
