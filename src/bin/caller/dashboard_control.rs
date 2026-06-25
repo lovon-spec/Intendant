@@ -7,6 +7,7 @@
 
 use crate::daemon_identity::{b64u, DaemonIdentity};
 use crate::error::CallerError;
+use base64::Engine as _;
 use bytes::BytesMut;
 use rtc::peer_connection::configuration::setting_engine::SettingEngine;
 use rtc::peer_connection::configuration::RTCConfigurationBuilder;
@@ -35,11 +36,14 @@ const CONTROL_CHANNEL_LABEL: &str = "intendant-dashboard-control";
 const CONTROL_PROTOCOL_VERSION: u32 = 1;
 const CONTROL_SIGNATURE_CONTEXT: &str = "intendant-dashboard-control-v1";
 const CONTROL_DEFAULT_SESSION_LIMIT: usize = 600;
+const CONTROL_RESPONSE_CHUNK_THRESHOLD_BYTES: usize = 64 * 1024;
+const CONTROL_RESPONSE_CHUNK_BYTES: usize = 16 * 1024;
 const CONTROL_FEATURES: &[&str] = &[
     "ping",
     "config",
     "status",
     "events",
+    "response_chunks",
     "api_peers",
     "api_sessions",
     "api_session_detail",
@@ -486,7 +490,7 @@ async fn control_driver<I: rtc::interceptor::Interceptor + Send + Sync + 'static
             }
             Some(task_response) = task_rx.recv() => {
                 if pending_requests.remove(&task_response.id).is_some() {
-                    send_control_text(&mut rtc, &channels, task_response.frame.to_string());
+                    send_control_frame(&mut rtc, &channels, task_response.frame);
                 }
                 let _ = rtc.handle_timeout(Instant::now());
             }
@@ -581,7 +585,7 @@ async fn drain_control_outputs<I: rtc::interceptor::Interceptor>(
             continue;
         };
         if let Some(response) = control_frame_response(text, runtime, task_tx, pending_requests) {
-            send_control_text(rtc, channels, response.to_string());
+            send_control_frame(rtc, channels, response);
         }
     }
 
@@ -633,6 +637,80 @@ fn send_control_text<I: rtc::interceptor::Interceptor>(
             eprintln!("[dashboard/control] data channel write failed: {e:?}");
         }
     }
+}
+
+fn send_control_frame<I: rtc::interceptor::Interceptor>(
+    rtc: &mut RTCPeerConnection<I>,
+    channels: &HashMap<String, rtc::data_channel::RTCDataChannelId>,
+    frame: serde_json::Value,
+) {
+    for text in control_frame_texts(frame) {
+        send_control_text(rtc, channels, text);
+    }
+}
+
+fn control_frame_texts(frame: serde_json::Value) -> Vec<String> {
+    chunk_control_response_frame(
+        frame,
+        CONTROL_RESPONSE_CHUNK_THRESHOLD_BYTES,
+        CONTROL_RESPONSE_CHUNK_BYTES,
+    )
+}
+
+fn chunk_control_response_frame(
+    frame: serde_json::Value,
+    threshold_bytes: usize,
+    chunk_bytes: usize,
+) -> Vec<String> {
+    let text = frame.to_string();
+    if frame.get("t").and_then(|v| v.as_str()) != Some("response")
+        || text.len() <= threshold_bytes
+        || chunk_bytes == 0
+    {
+        return vec![text];
+    }
+    let id = frame
+        .get("id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    if id.is_empty() {
+        return vec![text];
+    }
+
+    let bytes = text.as_bytes();
+    let chunk_count = bytes.len().div_ceil(chunk_bytes);
+    let mut frames = Vec::with_capacity(chunk_count + 2);
+    frames.push(
+        serde_json::json!({
+            "t": "response_start",
+            "id": id,
+            "encoding": "base64-json-frame",
+            "total_bytes": bytes.len(),
+            "chunks": chunk_count,
+        })
+        .to_string(),
+    );
+    for (seq, chunk) in bytes.chunks(chunk_bytes).enumerate() {
+        frames.push(
+            serde_json::json!({
+                "t": "response_chunk",
+                "id": id,
+                "seq": seq,
+                "data": base64::engine::general_purpose::STANDARD.encode(chunk),
+            })
+            .to_string(),
+        );
+    }
+    frames.push(
+        serde_json::json!({
+            "t": "response_end",
+            "id": id,
+            "chunks": chunk_count,
+        })
+        .to_string(),
+    );
+    frames
 }
 
 fn control_frame_response(
@@ -1900,5 +1978,79 @@ mod tests {
         assert_eq!(frame["result"]["error"], "missing");
         assert_eq!(frame["result"]["_httpStatus"], 404);
         assert_eq!(frame["result"]["_httpOk"], false);
+    }
+
+    #[test]
+    fn oversized_response_frames_are_chunked_and_reassemble() {
+        let frame = serde_json::json!({
+            "t": "response",
+            "id": "large-1",
+            "ok": true,
+            "result": {
+                "text": "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+            }
+        });
+        let original = frame.to_string();
+        let frames = chunk_control_response_frame(frame, 40, 12);
+        assert!(frames.len() > 3, "expected start/chunks/end frames");
+
+        let start: serde_json::Value = serde_json::from_str(&frames[0]).unwrap();
+        assert_eq!(start["t"], "response_start");
+        assert_eq!(start["id"], "large-1");
+        assert_eq!(start["encoding"], "base64-json-frame");
+        assert_eq!(start["total_bytes"], original.len());
+
+        let end: serde_json::Value = serde_json::from_str(frames.last().unwrap()).unwrap();
+        assert_eq!(end["t"], "response_end");
+        assert_eq!(end["id"], "large-1");
+        assert_eq!(end["chunks"], start["chunks"]);
+
+        let mut bytes = Vec::new();
+        for (seq, text) in frames[1..frames.len() - 1].iter().enumerate() {
+            let chunk: serde_json::Value = serde_json::from_str(text).unwrap();
+            assert_eq!(chunk["t"], "response_chunk");
+            assert_eq!(chunk["id"], "large-1");
+            assert_eq!(chunk["seq"], seq);
+            let encoded = chunk["data"].as_str().unwrap();
+            bytes.extend(
+                base64::engine::general_purpose::STANDARD
+                    .decode(encoded)
+                    .unwrap(),
+            );
+        }
+        assert_eq!(String::from_utf8(bytes).unwrap(), original);
+    }
+
+    #[test]
+    fn default_response_chunks_stay_below_datachannel_edge() {
+        let frame = serde_json::json!({
+            "t": "response",
+            "id": "large-2",
+            "ok": true,
+            "result": {
+                "text": "x".repeat(CONTROL_RESPONSE_CHUNK_THRESHOLD_BYTES * 4)
+            }
+        });
+        let frames = control_frame_texts(frame);
+        assert!(frames.len() > 3, "expected default chunking");
+
+        for text in frames {
+            let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
+            if parsed["t"] == "response_chunk" {
+                assert!(
+                    text.len() < 32 * 1024,
+                    "chunk frame is too close to common DataChannel limits: {} bytes",
+                    text.len()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn small_or_non_response_frames_are_not_chunked() {
+        let response = serde_json::json!({"t":"response","id":"small","ok":true,"result":{}});
+        assert_eq!(chunk_control_response_frame(response, 4096, 16).len(), 1);
+        let event = serde_json::json!({"t":"event","id":"e1","payload":{"text":"large enough"}});
+        assert_eq!(chunk_control_response_frame(event, 1, 1).len(), 1);
     }
 }

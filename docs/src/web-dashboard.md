@@ -679,10 +679,20 @@ messages. The first useful envelope set is:
 | `hello` / `hello_ack` | both | Version negotiation, daemon identity, session id, role, feature flags |
 | `request` | browser -> daemon | HTTP-like method/body call with a request id |
 | `response` | daemon -> browser | Status, metadata, body, or application error for a request id |
+| `response_start` / `response_chunk` / `response_end` | daemon -> browser | Chunked delivery of an oversized JSON `response` frame |
 | `event` | daemon -> browser | Control-plane event stream entry |
 | `cancel` | browser -> daemon | Cancel an in-flight request or stream |
 | `credit` | both | Backpressure for large responses or long streams |
 | `ping` / `pong` | both | Liveness, latency, and reconnect diagnostics |
+
+Oversized DataChannel `response` frames are now split at the transport layer.
+The daemon sends a `response_start` header, base64-encoded `response_chunk`
+frames containing the original JSON response bytes, and a `response_end` marker.
+The browser reassembles and parses the original `response` frame before handing
+it to existing request/response code, so API semantics stay unchanged. This is
+chunking only; adaptive credit-based flow control and resumable transfers are
+still required before moving uploads, downloads, recordings, terminal streams,
+or file transfer.
 
 The first production APIs should be small and high value: `/config`, the main
 event stream, peer access-request list/approve/deny, and a basic health
@@ -737,8 +747,9 @@ Treat this as a staged target, not current behavior:
 9. Carry peer access-request approve/deny over the DataChannel with passkey
    step-up in the public UI.
 10. Gradually migrate larger API surfaces. Managed-context history reads now use
-    the tunnel; uploads, downloads, recordings, terminals, and file transfer
-    still wait for chunking, flow control, and resume semantics.
+    the tunnel, and oversized JSON responses now use chunked response framing.
+    Uploads, downloads, recordings, terminals, and file transfer still wait for
+    credit-based flow control and resume semantics.
 11. Keep direct mTLS dashboard access and peer daemon-to-daemon mTLS working
     throughout.
 
