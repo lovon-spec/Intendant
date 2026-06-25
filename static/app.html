@@ -15832,15 +15832,24 @@ async function stationOpenDiff(path) {
 }
 
 function stationSetActivityVerbosity(level) {
+  const next = applyDashboardVerbosity(level, { dispatch: true });
+  if (!next) return;
+  if (typeof showControlToast === 'function') {
+    showControlToast('success', `Activity log verbosity: ${next}`);
+  }
+}
+
+function applyDashboardVerbosity(level, options = {}) {
   const next = String(level || '').trim();
-  if (!['normal', 'verbose', 'debug'].includes(next)) return;
+  if (!['normal', 'verbose', 'debug'].includes(next)) return '';
   const select = document.getElementById('verbosity-select');
   if (select) select.value = next;
   if (app) processCommands(app.set_verbosity(next));
   localStorage.setItem(VERBOSITY_KEY, next);
-  if (typeof showControlToast === 'function') {
-    showControlToast('success', `Activity log verbosity: ${next}`);
+  if (options.dispatch !== false) {
+    dispatchControlMsg({ action: 'set_verbosity', level: next });
   }
+  return next;
 }
 
 function stationClearActivityHostFilter() {
@@ -36800,8 +36809,7 @@ function restoreClientToggles() {
   if (verbSelect) {
     const stored = localStorage.getItem(VERBOSITY_KEY);
     if (stored && ['normal', 'verbose', 'debug'].includes(stored)) {
-      verbSelect.value = stored;
-      if (app) processCommands(app.set_verbosity(stored));
+      applyDashboardVerbosity(stored, { dispatch: false });
     }
     // Note: the 'change' listener that calls app.set_verbosity is
     // wired separately below (see existing handler). We extend it
@@ -50437,8 +50445,7 @@ updateTaskTargetChip();
 
 // Verbosity toggle
 document.getElementById('verbosity-select').addEventListener('change', (e) => {
-  if (app) processCommands(app.set_verbosity(e.target.value));
-  localStorage.setItem(VERBOSITY_KEY, e.target.value);
+  applyDashboardVerbosity(e.target.value);
 });
 
 // Host filter (Activity tab)
