@@ -343,7 +343,7 @@ function publicBootstrapHtml() {
       this.pc = new RTCPeerConnection({});
       this.channel = this.pc.createDataChannel('intendant-dashboard-control', { ordered: true });
       this.channel.onopen = () => {
-        this.sendFrame({ t: 'hello', id: this.nextId() });
+        this.sendFrame({ t: 'hello', id: this.nextId(), features: ['response_credit'] });
         paint(this.status());
       };
       this.channel.onmessage = ev => this.handleMessage(ev.data);
@@ -460,7 +460,10 @@ function publicBootstrapHtml() {
         this.rejectChunkedResponse(id, 'dashboard control chunked response exceeded declared size');
         return;
       }
-      this.maybeCompleteChunkedResponse(id);
+      const completed = this.maybeCompleteChunkedResponse(id);
+      if (!completed && this.chunkedResponses.has(id)) {
+        this.sendChunkCredit(id, 1);
+      }
       paint(this.status());
     },
     handleResponseEnd(msg) {
@@ -563,6 +566,9 @@ function publicBootstrapHtml() {
     },
     sendFrame(frame) {
       if (this.channel?.readyState === 'open') this.channel.send(JSON.stringify(frame));
+    },
+    sendChunkCredit(id, chunks) {
+      this.sendFrame({ t: 'credit', id, chunks });
     },
     status() {
       return {
@@ -711,6 +717,11 @@ async function main() {
       };
     });
     assert(result.status && result.status.session_id, 'status RPC did not return a session id');
+    assert.strictEqual(
+      result.status.response_credit_enabled,
+      true,
+      'dashboard control did not negotiate response credit'
+    );
     assert(result.config && typeof result.config === 'object', 'config RPC did not return an object');
     assert(Array.isArray(result.sessions), 'api_sessions did not return an array');
     assert(result.largeSessions.ok, 'large api_sessions did not return an array');
@@ -738,6 +749,7 @@ async function main() {
       connected,
       rpc: {
         controlSessionId: result.status.session_id,
+        responseCredit: result.status.response_credit_enabled,
         sessionCount: result.sessions.length,
         largeSessionCount: result.largeSessions.length,
         largeSessionBytes: result.largeSessions.jsonBytes,

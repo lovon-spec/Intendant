@@ -695,10 +695,13 @@ Oversized DataChannel `response` frames are now split at the transport layer.
 The daemon sends a `response_start` header, base64-encoded `response_chunk`
 frames containing the original JSON response bytes, and a `response_end` marker.
 The browser reassembles and parses the original `response` frame before handing
-it to existing request/response code, so API semantics stay unchanged. This is
-chunking only; adaptive credit-based flow control and resumable transfers are
-still required before moving uploads, downloads, recordings, terminal streams,
-or file transfer.
+it to existing request/response code, so API semantics stay unchanged. Current
+browser clients advertise `response_credit` in `hello`; when that feature is
+negotiated, the daemon sends an initial chunk window and then waits for browser
+`credit` frames before releasing more chunks. Older clients that do not
+advertise the feature still receive the legacy eager chunk burst. Resumable
+transfer semantics are still required before moving uploads, downloads,
+recordings, terminal streams, or file transfer.
 
 The first production APIs should be small and high value: `/config`, the main
 event stream, peer access-request list/approve/deny, and a basic health
@@ -763,9 +766,10 @@ Treat this as a staged target, not current behavior:
    the DataChannel transport boundary; hosted passkey step-up still belongs to
    the future public Connect UI.
 10. Gradually migrate larger API surfaces. Managed-context history reads now use
-    the tunnel, and oversized JSON responses now use chunked response framing.
+    the tunnel, and oversized JSON responses now use credit-windowed chunked
+    response framing.
     Uploads, downloads, recordings, terminals, and file transfer still wait for
-    credit-based flow control and resume semantics.
+    resumable stream/file-transfer semantics.
 11. Keep direct mTLS dashboard access and peer daemon-to-daemon mTLS working
     throughout.
 

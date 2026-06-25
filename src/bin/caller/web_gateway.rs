@@ -11498,7 +11498,7 @@ fn connect_bootstrap_html() -> String {
       this.pc = new RTCPeerConnection({});
       this.channel = this.pc.createDataChannel('intendant-dashboard-control', { ordered: true });
       this.channel.onopen = () => {
-        this.sendFrame({ t: 'hello', id: this.nextId() });
+        this.sendFrame({ t: 'hello', id: this.nextId(), features: ['response_credit'] });
         paint(this.status(), 'ok');
       };
       this.channel.onmessage = ev => this.handleMessage(ev.data);
@@ -11625,7 +11625,10 @@ fn connect_bootstrap_html() -> String {
         this.rejectChunkedResponse(id, 'connect dashboard chunked response exceeded declared size');
         return;
       }
-      this.maybeCompleteChunkedResponse(id);
+      const completed = this.maybeCompleteChunkedResponse(id);
+      if (!completed && this.chunkedResponses.has(id)) {
+        this.sendChunkCredit(id, 1);
+      }
       paint(this.status(), 'ok');
     },
 
@@ -11735,6 +11738,10 @@ fn connect_bootstrap_html() -> String {
 
     sendFrame(frame) {
       if (this.channel?.readyState === 'open') this.channel.send(JSON.stringify(frame));
+    },
+
+    sendChunkCredit(id, chunks) {
+      this.sendFrame({ t: 'credit', id, chunks });
     },
 
     status() {

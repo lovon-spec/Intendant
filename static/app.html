@@ -36751,7 +36751,7 @@ class DashboardControlTransport {
     dashboardSetControlLastError('');
     this.refreshIceRoute().catch(() => {});
     dashboardUpdateTransportStatus();
-    this.sendFrame({ t: 'hello', id: this.nextId() });
+    this.sendFrame({ t: 'hello', id: this.nextId(), features: ['response_credit'] });
     this.ping().catch(() => {});
     this.request('status').then(status => {
       if (status && typeof status === 'object') {
@@ -36882,7 +36882,10 @@ class DashboardControlTransport {
       this.rejectChunkedResponse(id, 'dashboard control chunked response exceeded declared size');
       return;
     }
-    this.maybeCompleteChunkedResponse(id);
+    const completed = this.maybeCompleteChunkedResponse(id);
+    if (!completed && this.chunkedResponses.has(id)) {
+      this.sendChunkCredit(id, 1);
+    }
     dashboardUpdateTransportStatus();
   }
 
@@ -37020,6 +37023,10 @@ class DashboardControlTransport {
   sendFrame(frame) {
     if (!this.channel || this.channel.readyState !== 'open') return;
     this.channel.send(JSON.stringify(frame));
+  }
+
+  sendChunkCredit(id, chunks) {
+    this.sendFrame({ t: 'credit', id, chunks });
   }
 
   sendSignal(frame) {

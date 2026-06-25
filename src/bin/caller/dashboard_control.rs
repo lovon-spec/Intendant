@@ -23,7 +23,7 @@ use rtc::sansio::Protocol;
 use rtc::shared::{TaggedBytesMut, TransportContext, TransportProtocol};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -38,12 +38,15 @@ const CONTROL_SIGNATURE_CONTEXT: &str = "intendant-dashboard-control-v1";
 const CONTROL_DEFAULT_SESSION_LIMIT: usize = 600;
 const CONTROL_RESPONSE_CHUNK_THRESHOLD_BYTES: usize = 64 * 1024;
 const CONTROL_RESPONSE_CHUNK_BYTES: usize = 16 * 1024;
+const CONTROL_RESPONSE_INITIAL_CHUNK_CREDIT: usize = 16;
+const CONTROL_RESPONSE_MAX_CREDIT_GRANT: usize = 64;
 const CONTROL_FEATURES: &[&str] = &[
     "ping",
     "config",
     "status",
     "events",
     "response_chunks",
+    "response_credit",
     "api_peers",
     "api_sessions",
     "api_session_detail",
@@ -296,6 +299,7 @@ impl DashboardControlPeer {
             created_unix_ms: binding.created_unix_ms,
             events_subscribed: false,
             events_sent: 0,
+            response_credit_enabled: false,
             config: serde_json::to_value(config).unwrap_or_else(|_| serde_json::json!({})),
             bus,
             peer_registry,
@@ -356,6 +360,7 @@ struct ControlRuntime {
     created_unix_ms: i64,
     events_subscribed: bool,
     events_sent: u64,
+    response_credit_enabled: bool,
     config: serde_json::Value,
     bus: crate::event::EventBus,
     peer_registry: Option<crate::peer::PeerRegistry>,
@@ -378,6 +383,70 @@ struct InboundPacket {
 struct ControlTaskResponse {
     id: String,
     frame: serde_json::Value,
+}
+
+struct OutboundControlQueue {
+    chunked: HashMap<String, QueuedChunkedResponse>,
+    order: VecDeque<String>,
+}
+
+struct QueuedChunkedResponse {
+    chunks: Vec<String>,
+    end: String,
+    next_chunk: usize,
+    credit: usize,
+}
+
+enum ControlFrameTexts {
+    Immediate(Vec<String>),
+    Chunked {
+        id: String,
+        start: String,
+        chunks: Vec<String>,
+        end: String,
+    },
+}
+
+impl OutboundControlQueue {
+    fn new() -> Self {
+        Self {
+            chunked: HashMap::new(),
+            order: VecDeque::new(),
+        }
+    }
+
+    fn enqueue_chunked(&mut self, id: String, chunks: Vec<String>, end: String) {
+        self.cancel(&id);
+        self.order.push_back(id.clone());
+        self.chunked.insert(
+            id,
+            QueuedChunkedResponse {
+                chunks,
+                end,
+                next_chunk: 0,
+                credit: CONTROL_RESPONSE_INITIAL_CHUNK_CREDIT,
+            },
+        );
+    }
+
+    fn grant_credit(&mut self, id: &str, chunks: usize) {
+        if chunks == 0 {
+            return;
+        }
+        if let Some(queued) = self.chunked.get_mut(id) {
+            queued.credit = queued
+                .credit
+                .saturating_add(chunks.min(CONTROL_RESPONSE_MAX_CREDIT_GRANT));
+        }
+    }
+
+    fn cancel(&mut self, id: &str) -> bool {
+        let removed = self.chunked.remove(id).is_some();
+        if removed {
+            self.order.retain(|queued_id| queued_id != id);
+        }
+        removed
+    }
 }
 
 async fn control_driver<I: rtc::interceptor::Interceptor + Send + Sync + 'static>(
@@ -430,6 +499,7 @@ async fn control_driver<I: rtc::interceptor::Interceptor + Send + Sync + 'static
     let mut channels: HashMap<String, rtc::data_channel::RTCDataChannelId> = HashMap::new();
     let (task_tx, mut task_rx) = mpsc::channel::<ControlTaskResponse>(64);
     let mut pending_requests: HashMap<String, CancellationToken> = HashMap::new();
+    let mut outbound_queue = OutboundControlQueue::new();
 
     loop {
         let timeout_at = match drain_control_outputs(
@@ -439,6 +509,7 @@ async fn control_driver<I: rtc::interceptor::Interceptor + Send + Sync + 'static
             &mut runtime,
             &task_tx,
             &mut pending_requests,
+            &mut outbound_queue,
         )
         .await
         {
@@ -490,7 +561,13 @@ async fn control_driver<I: rtc::interceptor::Interceptor + Send + Sync + 'static
             }
             Some(task_response) = task_rx.recv() => {
                 if pending_requests.remove(&task_response.id).is_some() {
-                    send_control_frame(&mut rtc, &channels, task_response.frame);
+                    send_control_frame(
+                        &mut rtc,
+                        &channels,
+                        &mut outbound_queue,
+                        runtime.response_credit_enabled,
+                        task_response.frame,
+                    );
                 }
                 let _ = rtc.handle_timeout(Instant::now());
             }
@@ -545,6 +622,7 @@ async fn drain_control_outputs<I: rtc::interceptor::Interceptor>(
     runtime: &mut ControlRuntime,
     task_tx: &mpsc::Sender<ControlTaskResponse>,
     pending_requests: &mut HashMap<String, CancellationToken>,
+    outbound_queue: &mut OutboundControlQueue,
 ) -> Result<Instant, ()> {
     while let Some(t) = rtc.poll_write() {
         if t.transport.transport_protocol != TransportProtocol::UDP {
@@ -584,8 +662,16 @@ async fn drain_control_outputs<I: rtc::interceptor::Interceptor>(
         let Ok(text) = std::str::from_utf8(&msg.data) else {
             continue;
         };
-        if let Some(response) = control_frame_response(text, runtime, task_tx, pending_requests) {
-            send_control_frame(rtc, channels, response);
+        if let Some(response) =
+            control_frame_response(text, runtime, task_tx, pending_requests, outbound_queue)
+        {
+            send_control_frame(
+                rtc,
+                channels,
+                outbound_queue,
+                runtime.response_credit_enabled,
+                response,
+            );
         }
     }
 
@@ -619,6 +705,8 @@ async fn drain_control_outputs<I: rtc::interceptor::Interceptor>(
         }
     }
 
+    drain_queued_control_frames(rtc, channels, outbound_queue);
+
     Ok(rtc
         .poll_timeout()
         .unwrap_or_else(|| Instant::now() + Duration::from_secs(86_400)))
@@ -642,32 +730,74 @@ fn send_control_text<I: rtc::interceptor::Interceptor>(
 fn send_control_frame<I: rtc::interceptor::Interceptor>(
     rtc: &mut RTCPeerConnection<I>,
     channels: &HashMap<String, rtc::data_channel::RTCDataChannelId>,
+    outbound_queue: &mut OutboundControlQueue,
+    response_credit_enabled: bool,
     frame: serde_json::Value,
 ) {
-    for text in control_frame_texts(frame) {
-        send_control_text(rtc, channels, text);
-    }
-}
-
-fn control_frame_texts(frame: serde_json::Value) -> Vec<String> {
-    chunk_control_response_frame(
+    match control_frame_text_parts(
         frame,
         CONTROL_RESPONSE_CHUNK_THRESHOLD_BYTES,
         CONTROL_RESPONSE_CHUNK_BYTES,
-    )
+    ) {
+        ControlFrameTexts::Immediate(frames) => {
+            for text in frames {
+                send_control_text(rtc, channels, text);
+            }
+        }
+        ControlFrameTexts::Chunked {
+            id,
+            start,
+            chunks,
+            end,
+        } => {
+            send_control_text(rtc, channels, start);
+            if response_credit_enabled {
+                outbound_queue.enqueue_chunked(id, chunks, end);
+                drain_queued_control_frames(rtc, channels, outbound_queue);
+            } else {
+                for text in chunks {
+                    send_control_text(rtc, channels, text);
+                }
+                send_control_text(rtc, channels, end);
+            }
+        }
+    }
 }
 
-fn chunk_control_response_frame(
+#[cfg(test)]
+fn control_frame_texts(frame: serde_json::Value) -> Vec<String> {
+    match control_frame_text_parts(
+        frame,
+        CONTROL_RESPONSE_CHUNK_THRESHOLD_BYTES,
+        CONTROL_RESPONSE_CHUNK_BYTES,
+    ) {
+        ControlFrameTexts::Immediate(frames) => frames,
+        ControlFrameTexts::Chunked {
+            start,
+            chunks,
+            end,
+            ..
+        } => {
+            let mut frames = Vec::with_capacity(chunks.len() + 2);
+            frames.push(start);
+            frames.extend(chunks);
+            frames.push(end);
+            frames
+        }
+    }
+}
+
+fn control_frame_text_parts(
     frame: serde_json::Value,
     threshold_bytes: usize,
     chunk_bytes: usize,
-) -> Vec<String> {
+) -> ControlFrameTexts {
     let text = frame.to_string();
     if frame.get("t").and_then(|v| v.as_str()) != Some("response")
         || text.len() <= threshold_bytes
         || chunk_bytes == 0
     {
-        return vec![text];
+        return ControlFrameTexts::Immediate(vec![text]);
     }
     let id = frame
         .get("id")
@@ -675,24 +805,22 @@ fn chunk_control_response_frame(
         .unwrap_or("")
         .to_string();
     if id.is_empty() {
-        return vec![text];
+        return ControlFrameTexts::Immediate(vec![text]);
     }
 
     let bytes = text.as_bytes();
     let chunk_count = bytes.len().div_ceil(chunk_bytes);
-    let mut frames = Vec::with_capacity(chunk_count + 2);
-    frames.push(
-        serde_json::json!({
-            "t": "response_start",
-            "id": id,
-            "encoding": "base64-json-frame",
-            "total_bytes": bytes.len(),
-            "chunks": chunk_count,
-        })
-        .to_string(),
-    );
+    let start = serde_json::json!({
+        "t": "response_start",
+        "id": id,
+        "encoding": "base64-json-frame",
+        "total_bytes": bytes.len(),
+        "chunks": chunk_count,
+    })
+    .to_string();
+    let mut chunks = Vec::with_capacity(chunk_count);
     for (seq, chunk) in bytes.chunks(chunk_bytes).enumerate() {
-        frames.push(
+        chunks.push(
             serde_json::json!({
                 "t": "response_chunk",
                 "id": id,
@@ -702,15 +830,67 @@ fn chunk_control_response_frame(
             .to_string(),
         );
     }
-    frames.push(
-        serde_json::json!({
-            "t": "response_end",
-            "id": id,
-            "chunks": chunk_count,
-        })
-        .to_string(),
-    );
-    frames
+    let end = serde_json::json!({
+        "t": "response_end",
+        "id": id,
+        "chunks": chunk_count,
+    })
+    .to_string();
+    ControlFrameTexts::Chunked {
+        id,
+        start,
+        chunks,
+        end,
+    }
+}
+
+#[cfg(test)]
+fn chunk_control_response_frame(
+    frame: serde_json::Value,
+    threshold_bytes: usize,
+    chunk_bytes: usize,
+) -> Vec<String> {
+    match control_frame_text_parts(frame, threshold_bytes, chunk_bytes) {
+        ControlFrameTexts::Immediate(frames) => frames,
+        ControlFrameTexts::Chunked {
+            start,
+            chunks,
+            end,
+            ..
+        } => {
+            let mut frames = Vec::with_capacity(chunks.len() + 2);
+            frames.push(start);
+            frames.extend(chunks);
+            frames.push(end);
+            frames
+        }
+    }
+}
+
+fn drain_queued_control_frames<I: rtc::interceptor::Interceptor>(
+    rtc: &mut RTCPeerConnection<I>,
+    channels: &HashMap<String, rtc::data_channel::RTCDataChannelId>,
+    outbound_queue: &mut OutboundControlQueue,
+) {
+    let ids: Vec<String> = outbound_queue.order.iter().cloned().collect();
+    for id in ids {
+        let mut completed_end: Option<String> = None;
+        if let Some(queued) = outbound_queue.chunked.get_mut(&id) {
+            while queued.credit > 0 && queued.next_chunk < queued.chunks.len() {
+                let text = queued.chunks[queued.next_chunk].clone();
+                queued.next_chunk += 1;
+                queued.credit -= 1;
+                send_control_text(rtc, channels, text);
+            }
+            if queued.next_chunk >= queued.chunks.len() {
+                completed_end = Some(queued.end.clone());
+            }
+        }
+        if let Some(end) = completed_end {
+            outbound_queue.cancel(&id);
+            send_control_text(rtc, channels, end);
+        }
+    }
 }
 
 fn control_frame_response(
@@ -718,6 +898,7 @@ fn control_frame_response(
     runtime: &mut ControlRuntime,
     task_tx: &mpsc::Sender<ControlTaskResponse>,
     pending_requests: &mut HashMap<String, CancellationToken>,
+    outbound_queue: &mut OutboundControlQueue,
 ) -> Option<serde_json::Value> {
     let parsed: serde_json::Value = serde_json::from_str(text).ok()?;
     let t = parsed.get("t").and_then(|v| v.as_str()).unwrap_or("");
@@ -727,14 +908,28 @@ fn control_frame_response(
         .unwrap_or("")
         .to_string();
     match t {
-        "hello" => Some(serde_json::json!({
-            "t": "hello_ack",
-            "id": id,
-            "protocol": CONTROL_PROTOCOL_VERSION,
-            "session_id": runtime.session_id,
-            "daemon_public_key": runtime.daemon_public_key,
-            "features": CONTROL_FEATURES,
-        })),
+        "hello" => {
+            runtime.response_credit_enabled = parsed
+                .get("features")
+                .and_then(|features| features.as_array())
+                .map(|features| {
+                    features.iter().any(|feature| {
+                        matches!(
+                            feature.as_str(),
+                            Some("response_credit") | Some("credit")
+                        )
+                    })
+                })
+                .unwrap_or(false);
+            Some(serde_json::json!({
+                "t": "hello_ack",
+                "id": id,
+                "protocol": CONTROL_PROTOCOL_VERSION,
+                "session_id": runtime.session_id,
+                "daemon_public_key": runtime.daemon_public_key,
+                "features": CONTROL_FEATURES,
+            }))
+        }
         "ping" => Some(serde_json::json!({
             "t": "pong",
             "id": id,
@@ -756,6 +951,7 @@ fn control_frame_response(
                         "transport": "webrtc-datachannel",
                         "events_subscribed": runtime.events_subscribed,
                         "events_sent": runtime.events_sent,
+                        "response_credit_enabled": runtime.response_credit_enabled,
                         "api_peers_available": runtime.peer_registry.is_some(),
                         "api_sessions_available": true,
                         "api_session_detail_available": true,
@@ -866,14 +1062,25 @@ fn control_frame_response(
             }
         }
         "cancel" => {
-            let existed = pending_requests
+            let pending_existed = pending_requests
                 .remove(&id)
                 .map(|token| {
                     token.cancel();
                     true
                 })
                 .unwrap_or(false);
+            let queued_existed = outbound_queue.cancel(&id);
+            let existed = pending_existed || queued_existed;
             Some(cancelled_control_response(id, existed))
+        }
+        "credit" => {
+            let chunks = parsed
+                .get("chunks")
+                .and_then(|value| value.as_u64())
+                .and_then(|value| usize::try_from(value).ok())
+                .unwrap_or(0);
+            outbound_queue.grant_credit(&id, chunks);
+            None
         }
         _ => Some(serde_json::json!({
             "t": "response",
@@ -1747,6 +1954,7 @@ mod tests {
             created_unix_ms: 123,
             events_subscribed: false,
             events_sent: 0,
+            response_credit_enabled: false,
             config: serde_json::json!({"provider":"openai"}),
             bus: crate::event::EventBus::new(),
             peer_registry: None,
@@ -1776,14 +1984,26 @@ mod tests {
         let mut rt = runtime();
         let (tx, mut rx) = mpsc::channel::<ControlTaskResponse>(8);
         let mut pending = HashMap::new();
-        let hello =
-            control_frame_response(r#"{"t":"hello","id":"h1"}"#, &mut rt, &tx, &mut pending)
-                .unwrap();
+        let mut outbound = OutboundControlQueue::new();
+        let hello = control_frame_response(
+            r#"{"t":"hello","id":"h1"}"#,
+            &mut rt,
+            &tx,
+            &mut pending,
+            &mut outbound,
+        )
+        .unwrap();
         assert_eq!(hello["t"], "hello_ack");
         assert_eq!(hello["session_id"], "session-1");
 
-        let ping = control_frame_response(r#"{"t":"ping","id":"p1"}"#, &mut rt, &tx, &mut pending)
-            .unwrap();
+        let ping = control_frame_response(
+            r#"{"t":"ping","id":"p1"}"#,
+            &mut rt,
+            &tx,
+            &mut pending,
+            &mut outbound,
+        )
+        .unwrap();
         assert_eq!(ping["t"], "pong");
         assert_eq!(ping["id"], "p1");
 
@@ -1792,6 +2012,7 @@ mod tests {
             &mut rt,
             &tx,
             &mut pending,
+            &mut outbound,
         )
         .unwrap();
         assert_eq!(config["t"], "response");
@@ -1803,6 +2024,7 @@ mod tests {
             &mut rt,
             &tx,
             &mut pending,
+            &mut outbound,
         )
         .unwrap();
         assert_eq!(status["t"], "response");
@@ -1811,6 +2033,7 @@ mod tests {
         assert_eq!(status["result"]["created_unix_ms"], 123);
         assert_eq!(status["result"]["transport"], "webrtc-datachannel");
         assert_eq!(status["result"]["events_subscribed"], false);
+        assert_eq!(status["result"]["response_credit_enabled"], false);
         assert_eq!(status["result"]["api_peers_available"], false);
         assert_eq!(status["result"]["api_sessions_available"], true);
         assert_eq!(status["result"]["api_session_detail_available"], true);
@@ -1830,6 +2053,7 @@ mod tests {
             &mut rt,
             &tx,
             &mut pending,
+            &mut outbound,
         )
         .unwrap();
         assert_eq!(peers["t"], "response");
@@ -1841,6 +2065,7 @@ mod tests {
             &mut rt,
             &tx,
             &mut pending,
+            &mut outbound,
         )
         .unwrap();
         assert_eq!(subscribed["t"], "response");
@@ -1853,6 +2078,7 @@ mod tests {
             &mut rt,
             &tx,
             &mut pending,
+            &mut outbound,
         );
         assert!(project_root.is_none());
         assert!(pending.contains_key("pr1"));
@@ -1869,16 +2095,76 @@ mod tests {
             &mut rt,
             &tx,
             &mut pending,
+            &mut outbound,
         );
         assert!(queued.is_none());
         assert!(pending.contains_key("q1"));
-        let cancelled =
-            control_frame_response(r#"{"t":"cancel","id":"q1"}"#, &mut rt, &tx, &mut pending)
-                .unwrap();
+        let cancelled = control_frame_response(
+            r#"{"t":"cancel","id":"q1"}"#,
+            &mut rt,
+            &tx,
+            &mut pending,
+            &mut outbound,
+        )
+        .unwrap();
         assert_eq!(cancelled["t"], "response");
         assert_eq!(cancelled["ok"], false);
         assert_eq!(cancelled["cancelled"], true);
         assert!(pending.get("q1").is_none());
+    }
+
+    #[tokio::test]
+    async fn control_frames_negotiate_and_apply_response_credit() {
+        let mut rt = runtime();
+        let (tx, _rx) = mpsc::channel::<ControlTaskResponse>(8);
+        let mut pending = HashMap::new();
+        let mut outbound = OutboundControlQueue::new();
+
+        let hello = control_frame_response(
+            r#"{"t":"hello","id":"h1","features":["response_credit"]}"#,
+            &mut rt,
+            &tx,
+            &mut pending,
+            &mut outbound,
+        )
+        .unwrap();
+        assert_eq!(hello["t"], "hello_ack");
+        assert!(rt.response_credit_enabled);
+
+        let status = control_frame_response(
+            r#"{"t":"request","id":"s1","method":"status"}"#,
+            &mut rt,
+            &tx,
+            &mut pending,
+            &mut outbound,
+        )
+        .unwrap();
+        assert_eq!(status["result"]["response_credit_enabled"], true);
+
+        outbound.enqueue_chunked("large".into(), vec!["chunk".into()], "end".into());
+        if let Some(queued) = outbound.chunked.get_mut("large") {
+            queued.credit = 0;
+        }
+        assert!(control_frame_response(
+            r#"{"t":"credit","id":"large","chunks":3}"#,
+            &mut rt,
+            &tx,
+            &mut pending,
+            &mut outbound,
+        )
+        .is_none());
+        assert_eq!(outbound.chunked["large"].credit, 3);
+
+        let cancelled = control_frame_response(
+            r#"{"t":"cancel","id":"large"}"#,
+            &mut rt,
+            &tx,
+            &mut pending,
+            &mut outbound,
+        )
+        .unwrap();
+        assert_eq!(cancelled["cancelled"], true);
+        assert!(!outbound.chunked.contains_key("large"));
     }
 
     #[test]
