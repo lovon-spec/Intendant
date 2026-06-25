@@ -1334,6 +1334,15 @@ async function main() {
           text: raw?.data_base64 ? atob(String(raw.data_base64)) : '',
         };
       };
+      const peerPairing = async () => ({
+        requests: await labeled('api_peer_pairing_requests', ctl.request('api_peer_pairing_requests', {}, { timeoutMs: 60000 })),
+        identities: await labeled('api_peer_pairing_identities', ctl.request('api_peer_pairing_identities', {}, { timeoutMs: 60000 })),
+        missingDecision: await labeled('api_peer_pairing_request_decision missing request', ctl.request('api_peer_pairing_request_decision', {
+          request_id: `missing-request-${Date.now()}`,
+          op: 'approve',
+        }, { timeoutMs: 60000 })),
+        missingRevokeIdentity: await labeled('api_peer_pairing_identity_revoke missing identity', ctl.request('api_peer_pairing_identity_revoke', {}, { timeoutMs: 60000 })),
+      });
       const recordingFallbackPlayback = async () => {
         if (typeof RecordingPlayer !== 'function') {
           return { skipped: true, reason: 'RecordingPlayer unavailable on rendezvous emulator' };
@@ -1531,6 +1540,7 @@ async function main() {
         filesystemRead: await filesystemRead(),
         recordingFallbackPlayback: await recordingFallbackPlayback(),
         diagnosticsVisualFreshness: await diagnosticsVisualFreshness(),
+        peerPairing: await peerPairing(),
         terminal: await terminal(),
         tui: status.tui_frames_available ? await tui() : { skipped: true, subscribed: false, frameBytes: 0 },
         sessionsStream: {
@@ -1673,6 +1683,16 @@ async function main() {
       result.status.api_diagnostics_visual_freshness_available,
       true,
       'dashboard control status did not advertise diagnostics visual freshness uploads'
+    );
+    assert.strictEqual(
+      result.status.api_peer_mutations_available,
+      true,
+      'dashboard control status did not advertise peer mutations'
+    );
+    assert.strictEqual(
+      result.status.api_peer_pairing_available,
+      true,
+      'dashboard control status did not advertise peer pairing'
     );
     assert.strictEqual(
       result.status.api_peer_webrtc_signal_available,
@@ -1884,6 +1904,12 @@ async function main() {
     );
     assert.strictEqual(result.peerWebRtcSignal?._httpOk, false);
     assert.strictEqual(result.peerWebRtcSignal?.error, 'peer not found');
+    assert(Array.isArray(result.peerPairing?.requests?.requests), 'peer pairing requests RPC did not return an array');
+    assert(Array.isArray(result.peerPairing?.identities?.identities), 'peer pairing identities RPC did not return an array');
+    assert.strictEqual(result.peerPairing?.missingDecision?._httpStatus, 400);
+    assert.strictEqual(result.peerPairing?.missingDecision?._httpOk, false);
+    assert.strictEqual(result.peerPairing?.missingRevokeIdentity?._httpStatus, 400);
+    assert.strictEqual(result.peerPairing?.missingRevokeIdentity?._httpOk, false);
     if (result.sessionReport?.ok === true) {
       assert.strictEqual(result.sessionReport.content_type, 'application/zip');
       assert(String(result.sessionReport.filename || '').endsWith('.zip'), 'session report filename was not a zip');
@@ -2212,11 +2238,17 @@ async function main() {
         rejectedSessionControlStatus: result.sessionControl.rejectedSettingsAction?._httpStatus,
         apiDashboardActionMsgAvailable: result.status.api_dashboard_action_msg_available,
         apiDiagnosticsVisualFreshnessAvailable: result.status.api_diagnostics_visual_freshness_available,
+        apiPeerMutationsAvailable: result.status.api_peer_mutations_available,
+        apiPeerPairingAvailable: result.status.api_peer_pairing_available,
         apiPeerWebRtcSignalAvailable: result.status.api_peer_webrtc_signal_available,
         dashboardActionAction: result.dashboardAction.closeWorkspace?.action,
         diagnosticsMarkerRegistryAvailable: result.dashboardAction.diagnosticsVisualMarker?.registry_available,
         diagnosticsMarkerActiveDisplayUpdated: result.dashboardAction.diagnosticsVisualMarker?.active_display_updated,
         rejectedDashboardActionStatus: result.dashboardAction.rejectedSettingsAction?._httpStatus,
+        peerPairingRequestCount: result.peerPairing.requests.requests.length,
+        peerPairingIdentityCount: result.peerPairing.identities.identities.length,
+        peerPairingMissingDecisionStatus: result.peerPairing.missingDecision._httpStatus,
+        peerPairingMissingRevokeStatus: result.peerPairing.missingRevokeIdentity._httpStatus,
         peerWebRtcSignalStatus: result.peerWebRtcSignal?._httpStatus,
         apiSessionReportAvailable: result.status.api_session_report_available,
         byteStreamsAvailable: result.status.byte_streams_available,

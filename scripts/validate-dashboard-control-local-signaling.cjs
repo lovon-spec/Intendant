@@ -453,6 +453,15 @@ async function main() {
           bodyLength: body.length,
         };
       };
+      const peerPairing = async () => ({
+        requests: await labeled('api_peer_pairing_requests', ctl.request('api_peer_pairing_requests', {}, { timeoutMs: 60000 })),
+        identities: await labeled('api_peer_pairing_identities', ctl.request('api_peer_pairing_identities', {}, { timeoutMs: 60000 })),
+        missingDecision: await labeled('api_peer_pairing_request_decision missing request', ctl.request('api_peer_pairing_request_decision', {
+          request_id: `missing-request-${Date.now()}`,
+          op: 'approve',
+        }, { timeoutMs: 60000 })),
+        missingRevokeIdentity: await labeled('api_peer_pairing_identity_revoke missing identity', ctl.request('api_peer_pairing_identity_revoke', {}, { timeoutMs: 60000 })),
+      });
       const terminal = async () => {
         const terminalId = `dashboard-terminal-local-${Date.now()}`;
         const token = 'dashboard_terminal_e2e_local';
@@ -611,6 +620,7 @@ async function main() {
         diagnosticsMarkerActionMsg: await labeled('api_dashboard_action_msg diagnostics visual marker', ctl.request('api_dashboard_action_msg', {
           message: { action: 'set_diagnostics_visual_marker', display_id: 0, enabled: false },
         }, { timeoutMs: 60000 })),
+        peerPairing: await peerPairing(),
         peerWebRtcSignal: await labeled('api_peer_webrtc_signal missing peer', ctl.request('api_peer_webrtc_signal', {
           peer_id: 'missing-peer',
           display_id: 0,
@@ -714,6 +724,8 @@ async function main() {
     assert.strictEqual(result.finalStatus.apiSessionControlMsgAvailable, true);
     assert.strictEqual(result.finalStatus.apiDashboardActionMsgAvailable, true);
     assert.strictEqual(result.finalStatus.apiDiagnosticsVisualFreshnessAvailable, true);
+    assert.strictEqual(result.finalStatus.apiPeerMutationsAvailable, true);
+    assert.strictEqual(result.finalStatus.apiPeerPairingAvailable, true);
     assert.strictEqual(result.finalStatus.apiPeerWebRtcSignalAvailable, true);
     assert.strictEqual(result.finalStatus.apiSessionReportAvailable, true);
     assert.strictEqual(result.finalStatus.byteStreamsAvailable, true);
@@ -830,6 +842,12 @@ async function main() {
     assert.strictEqual(result.diagnosticsMarkerActionMsg?.display_id, 0);
     assert.strictEqual(typeof result.diagnosticsMarkerActionMsg?.registry_available, 'boolean');
     assert.strictEqual(typeof result.diagnosticsMarkerActionMsg?.active_display_updated, 'boolean');
+    assert(Array.isArray(result.peerPairing?.requests?.requests), 'peer pairing requests RPC did not return an array');
+    assert(Array.isArray(result.peerPairing?.identities?.identities), 'peer pairing identities RPC did not return an array');
+    assert.strictEqual(result.peerPairing?.missingDecision?._httpStatus, 400);
+    assert.strictEqual(result.peerPairing?.missingDecision?._httpOk, false);
+    assert.strictEqual(result.peerPairing?.missingRevokeIdentity?._httpStatus, 400);
+    assert.strictEqual(result.peerPairing?.missingRevokeIdentity?._httpOk, false);
     assert.strictEqual(result.peerWebRtcSignal?._httpStatus, 404);
     assert.strictEqual(result.peerWebRtcSignal?._httpOk, false);
     assert.strictEqual(result.peerWebRtcSignal?.error, 'peer not found');
@@ -869,6 +887,8 @@ async function main() {
         apiSessionControlMsgAvailable: result.finalStatus.apiSessionControlMsgAvailable,
         apiDashboardActionMsgAvailable: result.finalStatus.apiDashboardActionMsgAvailable,
         apiDiagnosticsVisualFreshnessAvailable: result.finalStatus.apiDiagnosticsVisualFreshnessAvailable,
+        apiPeerMutationsAvailable: result.finalStatus.apiPeerMutationsAvailable,
+        apiPeerPairingAvailable: result.finalStatus.apiPeerPairingAvailable,
         apiPeerWebRtcSignalAvailable: result.finalStatus.apiPeerWebRtcSignalAvailable,
         apiSessionReportAvailable: result.finalStatus.apiSessionReportAvailable,
         byteStreamsAvailable: result.finalStatus.byteStreamsAvailable,
@@ -911,6 +931,10 @@ async function main() {
         dashboardActionAction: result.dashboardActionMsg.action,
         diagnosticsMarkerRegistryAvailable: result.diagnosticsMarkerActionMsg.registry_available,
         diagnosticsMarkerActiveDisplayUpdated: result.diagnosticsMarkerActionMsg.active_display_updated,
+        peerPairingRequestCount: result.peerPairing.requests.requests.length,
+        peerPairingIdentityCount: result.peerPairing.identities.identities.length,
+        peerPairingMissingDecisionStatus: result.peerPairing.missingDecision._httpStatus,
+        peerPairingMissingRevokeStatus: result.peerPairing.missingRevokeIdentity._httpStatus,
         peerWebRtcSignalStatus: result.peerWebRtcSignal._httpStatus,
         rejectedDashboardActionStatus: result.rejectedDashboardActionMsg._httpStatus,
         signalingMode: result.finalStatus.signalingMode,
