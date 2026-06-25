@@ -762,6 +762,10 @@ snapshots, display-ready replay, display authority snapshots, session-log
 replay, or external-session transcript replay. Those pieces still need separate
 identity-aware APIs before a public origin can fully hydrate the dashboard
 without the primary WebSocket.
+`api_browser_workspace_snapshot` returns the existing
+`browser_workspace_snapshot` message shape with active browser workspaces and
+lease state; callers can feed it through the same browser workspace handler that
+currently receives the WebSocket bootstrap message.
 Lazy command-output expansion for finalized log command groups uses
 `api_session_current_agent_output`, preserving the same `_httpStatus`/`_httpOk`
 metadata as the existing HTTP endpoint.

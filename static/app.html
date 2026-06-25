@@ -36706,6 +36706,9 @@ window.intendantDashboardControl = {
   cachedBootstrapEvents(options = {}) {
     return dashboardTransport.request('api_cached_bootstrap_events', {}, options);
   },
+  browserWorkspaceSnapshot(options = {}) {
+    return dashboardTransport.request('api_browser_workspace_snapshot', {}, options);
+  },
   peers() {
     return dashboardTransport.request('api_peers');
   },
@@ -37398,6 +37401,7 @@ class DashboardControlTransport {
       eventsActive: dashboardControlEventsActive,
       apiAgentCardAvailable: this.lastStatus?.api_agent_card_available ?? null,
       apiCachedBootstrapEventsAvailable: this.lastStatus?.api_cached_bootstrap_events_available ?? null,
+      apiBrowserWorkspaceSnapshotAvailable: this.lastStatus?.api_browser_workspace_snapshot_available ?? null,
       apiPeersAvailable: this.lastStatus?.api_peers_available ?? null,
       apiSessionsAvailable: this.lastStatus?.api_sessions_available ?? null,
       apiSessionsStreamAvailable: this.lastStatus?.api_sessions_stream_available ?? null,

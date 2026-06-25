@@ -827,6 +827,7 @@ async function main() {
         config: await ctl.request('config'),
         agentCard: await ctl.request('api_agent_card'),
         cachedBootstrapEvents: await ctl.request('api_cached_bootstrap_events'),
+        browserWorkspaceSnapshot: await ctl.request('api_browser_workspace_snapshot'),
         sessions,
         sessionsById,
         sessionsByIdTarget: firstSessionId,
@@ -922,6 +923,11 @@ async function main() {
       true,
       'dashboard control status did not advertise cached bootstrap events'
     );
+    assert.strictEqual(
+      result.status.api_browser_workspace_snapshot_available,
+      true,
+      'dashboard control status did not advertise browser workspace snapshots'
+    );
     assert(result.config && typeof result.config === 'object', 'config RPC did not return an object');
     assert(result.agentCard && result.agentCard.id, 'api_agent_card did not return an id');
     assert(Array.isArray(result.cachedBootstrapEvents?.events), 'cached bootstrap events RPC did not return events');
@@ -930,6 +936,12 @@ async function main() {
       result.cachedBootstrapEvents.events.length,
       'cached bootstrap events count did not match events length'
     );
+    assert.strictEqual(
+      result.browserWorkspaceSnapshot?.t,
+      'browser_workspace_snapshot',
+      'browser workspace snapshot RPC did not return the event shape'
+    );
+    assert(Array.isArray(result.browserWorkspaceSnapshot.workspaces), 'browser workspace snapshot did not return workspaces');
     assert(Array.isArray(result.sessions), 'api_sessions did not return an array');
     assert(Array.isArray(result.sessionsById), 'api_sessions ids did not return an array');
     if (result.sessionsByIdTarget) {
@@ -1190,6 +1202,7 @@ async function main() {
         responseCredit: result.status.response_credit_enabled,
         agentCardId: result.agentCard.id,
         cachedBootstrapEventCount: result.cachedBootstrapEvents.event_count,
+        browserWorkspaceCount: result.browserWorkspaceSnapshot.workspaces.length,
         sessionCount: result.sessions.length,
         sessionByIdCount: result.sessionsById.length,
         sessionDeleteInvalidOk: result.sessionDelete.invalidSession?.ok,

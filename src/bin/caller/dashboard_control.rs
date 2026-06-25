@@ -46,6 +46,7 @@ const CONTROL_FEATURES: &[&str] = &[
     "config",
     "api_agent_card",
     "api_cached_bootstrap_events",
+    "api_browser_workspace_snapshot",
     "status",
     "events",
     "response_chunks",
@@ -1194,6 +1195,7 @@ fn control_frame_response(
                 | "api_displays"
                 | "api_recordings"
                 | "api_session_recordings"
+                | "api_browser_workspace_snapshot"
                 | "api_worktrees"
                 | "api_worktrees_scan"
                 | "api_worktrees_remove"
@@ -1373,6 +1375,7 @@ fn status_response_frame(id: String, runtime: &ControlRuntime) -> serde_json::Va
         ("api_peers_available", peer_registry_available),
         ("api_agent_card_available", true),
         ("api_cached_bootstrap_events_available", true),
+        ("api_browser_workspace_snapshot_available", true),
         ("api_sessions_available", true),
         ("api_sessions_stream_available", true),
         ("api_session_detail_available", true),
@@ -1535,6 +1538,7 @@ async fn control_request_response(
         "api_displays" => api_displays_response(id, &runtime).await,
         "api_recordings" => api_recordings_response(id, &runtime).await,
         "api_session_recordings" => api_session_recordings_response(id, params.as_ref()).await,
+        "api_browser_workspace_snapshot" => api_browser_workspace_snapshot_response(id).await,
         "api_worktrees" => api_worktrees_response(id, &runtime).await,
         "api_worktrees_scan" => api_worktrees_scan_response(id, &runtime).await,
         "api_worktrees_remove" => {
@@ -2188,6 +2192,19 @@ async fn api_session_recordings_response(
         body,
         "session recordings",
     )
+}
+
+async fn api_browser_workspace_snapshot_response(id: String) -> serde_json::Value {
+    let workspaces = crate::browser_workspace::list_workspaces().await;
+    serde_json::json!({
+        "t": "response",
+        "id": id,
+        "ok": true,
+        "result": {
+            "t": "browser_workspace_snapshot",
+            "workspaces": workspaces,
+        },
+    })
 }
 
 async fn api_worktrees_response(id: String, runtime: &ControlRuntime) -> serde_json::Value {
@@ -3474,6 +3491,10 @@ mod tests {
             status["result"]["api_cached_bootstrap_events_available"],
             true
         );
+        assert_eq!(
+            status["result"]["api_browser_workspace_snapshot_available"],
+            true
+        );
         assert_eq!(status["result"]["api_sessions_available"], true);
         assert_eq!(status["result"]["api_sessions_stream_available"], true);
         assert_eq!(status["result"]["api_session_detail_available"], true);
@@ -3904,6 +3925,16 @@ mod tests {
         assert_eq!(invalid_session["result"]["error"], "invalid session id");
         assert_eq!(invalid_session["result"]["_httpStatus"], 400);
         assert_eq!(invalid_session["result"]["_httpOk"], false);
+
+        let workspace_snapshot =
+            api_browser_workspace_snapshot_response("bw1".to_string()).await;
+        assert_eq!(workspace_snapshot["t"], "response");
+        assert_eq!(workspace_snapshot["ok"], true);
+        assert_eq!(
+            workspace_snapshot["result"]["t"],
+            "browser_workspace_snapshot"
+        );
+        assert!(workspace_snapshot["result"]["workspaces"].as_array().is_some());
     }
 
     #[tokio::test]

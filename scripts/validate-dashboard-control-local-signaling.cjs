@@ -134,6 +134,7 @@ async function main() {
         status: await ctl.request('status', {}, { timeoutMs: 60000 }),
         agentCard: await ctl.agentCard({ timeoutMs: 60000 }),
         cachedBootstrapEvents: await ctl.cachedBootstrapEvents({ timeoutMs: 60000 }),
+        browserWorkspaceSnapshot: await ctl.browserWorkspaceSnapshot({ timeoutMs: 60000 }),
         sessions: await ctl.request('api_sessions', { limit: 2 }, { timeoutMs: 60000 }),
         rejectedControlMsg: await ctl.request('api_control_msg', {
           message: { action: 'create_session', task: 'noop' },
@@ -151,10 +152,17 @@ async function main() {
       result.cachedBootstrapEvents.events.length,
       'cached bootstrap events count did not match events length'
     );
+    assert.strictEqual(
+      result.browserWorkspaceSnapshot?.t,
+      'browser_workspace_snapshot',
+      'browser workspace snapshot RPC did not return the event shape'
+    );
+    assert(Array.isArray(result.browserWorkspaceSnapshot.workspaces), 'browser workspace snapshot did not return workspaces');
     assert(Array.isArray(result.sessions), 'api_sessions did not return an array');
     assert.strictEqual(result.finalStatus.signalingMode, 'local-http');
     assert.strictEqual(result.finalStatus.apiAgentCardAvailable, true);
     assert.strictEqual(result.finalStatus.apiCachedBootstrapEventsAvailable, true);
+    assert.strictEqual(result.finalStatus.apiBrowserWorkspaceSnapshotAvailable, true);
     assert.strictEqual(result.finalStatus.apiControlMsgAvailable, true);
     assert.strictEqual(result.rejectedControlMsg?._httpStatus, 400);
     assert.strictEqual(result.rejectedControlMsg?._httpOk, false);
@@ -171,9 +179,11 @@ async function main() {
         controlSessionId: result.status.session_id,
         agentCardId: result.agentCard.id,
         cachedBootstrapEventCount: result.cachedBootstrapEvents.event_count,
+        browserWorkspaceCount: result.browserWorkspaceSnapshot.workspaces.length,
         sessionCount: result.sessions.length,
         apiAgentCardAvailable: result.finalStatus.apiAgentCardAvailable,
         apiCachedBootstrapEventsAvailable: result.finalStatus.apiCachedBootstrapEventsAvailable,
+        apiBrowserWorkspaceSnapshotAvailable: result.finalStatus.apiBrowserWorkspaceSnapshotAvailable,
         apiControlMsgAvailable: result.finalStatus.apiControlMsgAvailable,
         rejectedControlStatus: result.rejectedControlMsg._httpStatus,
         signalingMode: result.finalStatus.signalingMode,
