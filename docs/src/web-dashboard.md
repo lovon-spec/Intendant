@@ -508,7 +508,7 @@ Several paths intentionally stay outside this JSON tunnel:
 
 - static assets and WASM bundles;
 - native media fallback URLs and broad file-transfer bytes;
-- general filesystem mutations and file content transfer;
+- general filesystem mutations and broad/resumable file transfer;
 - generic MCP-over-HTTP for external clients;
 - non-allowlisted `ControlMsg` mutations;
 - display WebRTC media channels;
@@ -902,6 +902,12 @@ the same no-replay fallback rule as other writes.
 The filesystem picker's path checks, directory listings, and mkdir operation use
 `api_fs_stat`, `api_fs_list`, and `api_fs_mkdir`; mkdir uses the same no-replay
 fallback rule as other writes.
+Bounded filesystem file reads use `api_fs_read` when the verified tunnel
+advertises byte streams. The request uses the same absolute-path or `~/` path
+rules as the picker, rejects directories, accepts optional `offset`/`length`,
+and returns bytes plus `content_type`, `range_start`, `range_end`, `total_size`,
+and `resumable: true` metadata. This is a read-only preview/diagnostic
+primitive, not yet a general download or bidirectional file-transfer adapter.
 Lazy exact context-snapshot loads use `api_session_context_snapshot`, keeping
 large raw request payloads out of ordinary session-detail hydration while still
 allowing the Context pane to fetch a single archived snapshot on demand.
@@ -946,7 +952,7 @@ available, or records the desired state as a pending per-display default for
 the next display session.
 
 The remaining migration work is mostly byte-stream and file-transfer heavy:
-generic downloads, native media fallback URLs, broader file transfer,
+generic downloads, native media fallback URLs, broader/resumable file transfer,
 and remaining non-allowlisted control mutations should move only after resumable
 stream/file-transfer semantics and per-action no-replay rules are settled.
 
@@ -1015,6 +1021,7 @@ Treat this as a staged target, not current behavior:
     frame image byte streams, session-report zip downloads,
     bounded byte-stream artifact transfer,
     worktree inventory, filesystem picker stat/list/mkdir operations,
+    bounded filesystem file reads,
     local Agent Card reads, and local session hydration now use the tunnel,
     oversized JSON responses now use credit-windowed chunked response framing,
     and the sessions stream uses explicit
@@ -1035,8 +1042,8 @@ Treat this as a staged target, not current behavior:
     tunnel is unavailable. HLS `.ts` playback now builds a blob playlist from
     tunneled recording bytes and falls back to the native daemon URL if rejected.
     Generic downloads, native media fallback URLs,
-    remaining non-allowlisted control commands, and file transfer still wait
-    for resumable stream/file-transfer semantics.
+    remaining non-allowlisted control commands, and broad/resumable file
+    transfer still wait for resumable stream/file-transfer semantics.
 11. Keep direct mTLS dashboard access and peer daemon-to-daemon mTLS working
     throughout.
 

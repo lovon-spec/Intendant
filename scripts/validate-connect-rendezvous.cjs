@@ -976,6 +976,19 @@ function removeSessionFrameFixture(fixture) {
   fs.rmSync(fixture.dir, { recursive: true, force: true });
 }
 
+function createFilesystemFixture(label) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), `intendant-dashboard-control-fs-${label}-`));
+  const filePath = path.join(dir, 'filesystem-read.txt');
+  const text = `dashboard filesystem read e2e ${label}`;
+  fs.writeFileSync(filePath, text);
+  return { dir, filePath, text };
+}
+
+function removeFilesystemFixture(fixture) {
+  if (!fixture?.dir) return;
+  fs.rmSync(fixture.dir, { recursive: true, force: true });
+}
+
 async function waitFor(predicate, timeoutMs, label) {
   const deadline = Date.now() + timeoutMs;
   let last;
@@ -1023,6 +1036,7 @@ async function main() {
   const recordingFixture = createRecordingFixture('rendezvous');
   const hlsRecordingFixture = createHlsRecordingFixture('rendezvous');
   const sessionFrameFixture = createSessionFrameFixture('rendezvous');
+  const filesystemFixture = createFilesystemFixture('rendezvous');
   const daemon = spawn(options.dashboardBinary, ['--no-tui', '--web', String(options.daemonPort)], {
     cwd: options.repoRoot,
     env: {
@@ -1069,11 +1083,16 @@ async function main() {
       sessionId: sessionFrameFixture.sessionId,
       filename: sessionFrameFixture.filename,
     })}`);
+    await page.evaluate(`window.__intendantFilesystemFixture = ${JSON.stringify({
+      filePath: filesystemFixture.filePath,
+      text: filesystemFixture.text,
+    })}`);
     const result = await page.evaluate(async () => {
       const ctl = window.intendantPublicConnectDashboard;
       const recordingStreamName = window.__intendantRecordingStreamName;
       const hlsRecordingStreamName = window.__intendantHlsRecordingStreamName;
       const sessionFrameFixture = window.__intendantSessionFrameFixture;
+      const filesystemFixture = window.__intendantFilesystemFixture;
       const labeled = async (label, promise) => {
         try {
           return await promise;
@@ -1295,6 +1314,26 @@ async function main() {
           },
         };
       };
+      const filesystemRead = async () => {
+        const raw = await labeled('api_fs_read fixture', ctl.requestBytes('api_fs_read', {
+          path: filesystemFixture.filePath,
+          offset: 10,
+          length: 10,
+        }, { timeoutMs: 60000 }));
+        if (raw?.bytes instanceof Uint8Array) {
+          const { bytes, ...rest } = raw;
+          return {
+            ...rest,
+            byteLength: bytes.byteLength,
+            text: new TextDecoder().decode(bytes),
+          };
+        }
+        return {
+          ...(raw || {}),
+          byteLength: raw?.data_base64 ? atob(String(raw.data_base64)).length : 0,
+          text: raw?.data_base64 ? atob(String(raw.data_base64)) : '',
+        };
+      };
       const recordingFallbackPlayback = async () => {
         if (typeof RecordingPlayer !== 'function') {
           return { skipped: true, reason: 'RecordingPlayer unavailable on rendezvous emulator' };
@@ -1489,6 +1528,7 @@ async function main() {
         recordingAsset: await recordingAsset(),
         recordingHlsAssets: await recordingHlsAssets(),
         sessionFrameAsset: await sessionFrameAsset(),
+        filesystemRead: await filesystemRead(),
         recordingFallbackPlayback: await recordingFallbackPlayback(),
         diagnosticsVisualFreshness: await diagnosticsVisualFreshness(),
         terminal: await terminal(),
@@ -2091,6 +2131,11 @@ async function main() {
       true,
       'dashboard control status did not advertise filesystem mkdir'
     );
+    assert.strictEqual(
+      result.status.api_fs_read_available,
+      true,
+      'dashboard control status did not advertise filesystem read'
+    );
     assert(
       result.filesystem?.statHome &&
         result.filesystem.statHome._httpStatus === 200 &&
@@ -2122,6 +2167,14 @@ async function main() {
         result.filesystem.mkdirBadRelative._httpOk === false,
       'filesystem mkdir RPC did not preserve bad path status'
     );
+    assert.strictEqual(result.filesystemRead?.ok, true);
+    assert.strictEqual(result.filesystemRead?.byteLength, 10);
+    assert.strictEqual(result.filesystemRead?.text, 'filesystem');
+    assert.strictEqual(result.filesystemRead?.content_type, 'text/plain; charset=utf-8');
+    assert.strictEqual(result.filesystemRead?.range_start, 10);
+    assert.strictEqual(result.filesystemRead?.range_end, 20);
+    assert.strictEqual(result.filesystemRead?.total_size, filesystemFixture.text.length);
+    assert.strictEqual(result.filesystemRead?.resumable, true);
     assert(result.appError && result.appError._httpStatus === 400, 'application error metadata was not preserved');
     assert(
       result.finalStatus.completedChunkedResponses > result.largeSessions.completedChunkedResponsesBefore,
@@ -2175,6 +2228,7 @@ async function main() {
         apiSessionCurrentUploadRawAvailable: result.status.api_session_current_upload_raw_available,
         apiRecordingAssetAvailable: result.status.api_recording_asset_available,
         apiSessionFrameAssetAvailable: result.status.api_session_frame_asset_available,
+        apiFsReadAvailable: result.status.api_fs_read_available,
         uploadStatus: result.upload._httpStatus,
         uploadListCount: result.uploadList.length,
         uploadSize: result.upload.size,
@@ -2189,6 +2243,8 @@ async function main() {
         recordingHlsSegmentBytes: result.recordingHlsAssets.segment.byteLength,
         sessionFrameAssetBytes: result.sessionFrameAsset.byteLength,
         sessionFrameAssetSignature: result.sessionFrameAsset.firstBytes,
+        filesystemReadBytes: result.filesystemRead.byteLength,
+        filesystemReadText: result.filesystemRead.text,
         recordingFallbackSrcScheme: result.recordingFallbackPlayback.srcScheme || null,
         recordingFallbackByteStreamDelta: result.recordingFallbackPlayback.byteStreamDelta || 0,
         recordingFallbackSkipped: Boolean(result.recordingFallbackPlayback.skipped),
@@ -2253,6 +2309,7 @@ async function main() {
     removeRecordingFixture(recordingFixture);
     removeRecordingFixture(hlsRecordingFixture);
     removeSessionFrameFixture(sessionFrameFixture);
+    removeFilesystemFixture(filesystemFixture);
   }
 }
 

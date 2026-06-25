@@ -13849,7 +13849,7 @@ const SOURCE_VIEWER_JS: &str = r##"
 })();
 "##;
 
-fn expand_dashboard_fs_path(raw: &str) -> Result<PathBuf, String> {
+pub(crate) fn expand_dashboard_fs_path(raw: &str) -> Result<PathBuf, String> {
     let trimmed = raw.trim();
     let path = if trimmed.is_empty() || trimmed == "~" {
         dirs::home_dir().ok_or_else(|| "could not resolve home directory".to_string())?

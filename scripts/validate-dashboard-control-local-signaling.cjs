@@ -85,6 +85,19 @@ function removeSessionFrameFixture(fixture) {
   fs.rmSync(fixture.dir, { recursive: true, force: true });
 }
 
+function createFilesystemFixture(label) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), `intendant-dashboard-control-fs-${label}-`));
+  const filePath = path.join(dir, 'filesystem-read.txt');
+  const text = `dashboard filesystem read e2e ${label}`;
+  fs.writeFileSync(filePath, text);
+  return { dir, filePath, text };
+}
+
+function removeFilesystemFixture(fixture) {
+  if (!fixture?.dir) return;
+  fs.rmSync(fixture.dir, { recursive: true, force: true });
+}
+
 async function waitFor(predicate, timeoutMs, label) {
   const deadline = Date.now() + timeoutMs;
   let last;
@@ -126,6 +139,7 @@ async function main() {
   const recordingFixture = createRecordingFixture('local');
   const hlsRecordingFixture = createHlsRecordingFixture('local');
   const sessionFrameFixture = createSessionFrameFixture('local');
+  const filesystemFixture = createFilesystemFixture('local');
   const daemon = spawn(options.dashboardBinary, [
     '--no-tui',
     '--no-tls',
@@ -178,11 +192,16 @@ async function main() {
       sessionId: sessionFrameFixture.sessionId,
       filename: sessionFrameFixture.filename,
     })}`);
+    await page.evaluate(`window.__intendantFilesystemFixture = ${JSON.stringify({
+      filePath: filesystemFixture.filePath,
+      text: filesystemFixture.text,
+    })}`);
     const result = await page.evaluate(async () => {
       const ctl = window.intendantDashboardControl;
       const recordingStreamName = window.__intendantRecordingStreamName;
       const hlsRecordingStreamName = window.__intendantHlsRecordingStreamName;
       const sessionFrameFixture = window.__intendantSessionFrameFixture;
+      const filesystemFixture = window.__intendantFilesystemFixture;
       const labeled = async (label, promise) => {
         try {
           return await promise;
@@ -401,6 +420,26 @@ async function main() {
           wrap.remove();
         }
       };
+      const filesystemRead = async () => {
+        const raw = await labeled('api_fs_read fixture', ctl.requestBytes('api_fs_read', {
+          path: filesystemFixture.filePath,
+          offset: 10,
+          length: 10,
+        }, { timeoutMs: 60000 }));
+        if (raw?.bytes instanceof Uint8Array) {
+          const { bytes, ...rest } = raw;
+          return {
+            ...rest,
+            byteLength: bytes.byteLength,
+            text: new TextDecoder().decode(bytes),
+          };
+        }
+        return {
+          ...(raw || {}),
+          byteLength: raw?.data_base64 ? atob(String(raw.data_base64)).length : 0,
+          text: raw?.data_base64 ? atob(String(raw.data_base64)) : '',
+        };
+      };
       const diagnosticsVisualFreshness = async () => {
         const sessionId = `validator-local-vf-${Date.now()}-${Math.random().toString(36).slice(2)}`;
         const body = '{"t":"session_start"}\n{"t":"summary","transitions":1}\n';
@@ -553,6 +592,7 @@ async function main() {
         sessionFramePreview: await sessionFramePreview(),
         recordingFallbackPlayback: await recordingFallbackPlayback(),
         recordingHlsBlobPlaylist: await recordingHlsBlobPlaylist(),
+        filesystemRead: await filesystemRead(),
         diagnosticsVisualFreshness: await diagnosticsVisualFreshness(),
         terminal: await terminal(),
         tui: status.tui_frames_available ? await tui() : { skipped: true, subscribed: false, frameBytes: 0 },
@@ -685,6 +725,7 @@ async function main() {
     assert.strictEqual(result.finalStatus.apiSessionCurrentUploadRawAvailable, true);
     assert.strictEqual(result.finalStatus.apiRecordingAssetAvailable, true);
     assert.strictEqual(result.finalStatus.apiSessionFrameAssetAvailable, true);
+    assert.strictEqual(result.finalStatus.apiFsReadAvailable, true);
     assert.strictEqual(result.upload?._httpStatus, 200);
     assert.strictEqual(result.upload?._httpOk, true);
     assert.strictEqual(result.upload?.name, 'dashboard-upload-local.txt');
@@ -731,6 +772,14 @@ async function main() {
     assert.strictEqual(result.recordingHlsBlobPlaylist?.srcScheme, 'blob');
     assert(result.recordingHlsBlobPlaylist?.objectUrlCount >= 2, `HLS blob playlist did not create playlist and segment URLs: ${JSON.stringify(result.recordingHlsBlobPlaylist)}`);
     assert(result.recordingHlsBlobPlaylist?.byteStreamDelta >= 2, `HLS blob playlist did not use byte streams: ${JSON.stringify(result.recordingHlsBlobPlaylist)}`);
+    assert.strictEqual(result.filesystemRead?.ok, true);
+    assert.strictEqual(result.filesystemRead?.byteLength, 10);
+    assert.strictEqual(result.filesystemRead?.text, 'filesystem');
+    assert.strictEqual(result.filesystemRead?.content_type, 'text/plain; charset=utf-8');
+    assert.strictEqual(result.filesystemRead?.range_start, 10);
+    assert.strictEqual(result.filesystemRead?.range_end, 20);
+    assert.strictEqual(result.filesystemRead?.total_size, filesystemFixture.text.length);
+    assert.strictEqual(result.filesystemRead?.resumable, true);
     assert.strictEqual(result.status.api_diagnostics_visual_freshness_available, true);
     assert.strictEqual(result.diagnosticsVisualFreshness?.ok, true);
     assert.strictEqual(result.diagnosticsVisualFreshness?._httpStatus, 200);
@@ -831,6 +880,7 @@ async function main() {
         apiSessionCurrentUploadRawAvailable: result.finalStatus.apiSessionCurrentUploadRawAvailable,
         apiRecordingAssetAvailable: result.finalStatus.apiRecordingAssetAvailable,
         apiSessionFrameAssetAvailable: result.finalStatus.apiSessionFrameAssetAvailable,
+        apiFsReadAvailable: result.finalStatus.apiFsReadAvailable,
         uploadStatus: result.upload._httpStatus,
         uploadListCount: result.uploads.length,
         uploadSize: result.upload.size,
@@ -848,6 +898,8 @@ async function main() {
         recordingHlsSrcScheme: result.recordingHlsBlobPlaylist.srcScheme,
         recordingHlsObjectUrlCount: result.recordingHlsBlobPlaylist.objectUrlCount,
         recordingHlsByteStreamDelta: result.recordingHlsBlobPlaylist.byteStreamDelta,
+        filesystemReadBytes: result.filesystemRead.byteLength,
+        filesystemReadText: result.filesystemRead.text,
         diagnosticsVisualFreshnessWritten: result.diagnosticsVisualFreshness.written,
         terminalOutputBytes: result.terminal.outputBytes,
         tuiFrameBytes: result.tui.frameBytes,
@@ -874,6 +926,7 @@ async function main() {
     removeRecordingFixture(recordingFixture);
     removeRecordingFixture(hlsRecordingFixture);
     removeSessionFrameFixture(sessionFrameFixture);
+    removeFilesystemFixture(filesystemFixture);
     if (daemonLogs.length && daemon.exitCode && daemon.exitCode !== 0 && daemon.exitCode !== 130) {
       console.error(daemonLogs.join('').slice(-4000));
     }

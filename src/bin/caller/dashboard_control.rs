@@ -85,6 +85,7 @@ const CONTROL_FEATURES: &[&str] = &[
     "api_fs_stat",
     "api_fs_list",
     "api_fs_mkdir",
+    "api_fs_read",
     "api_sessions_search",
     "api_settings",
     "api_settings_save",
@@ -1559,6 +1560,7 @@ fn control_frame_response(
                 | "api_fs_stat"
                 | "api_fs_list"
                 | "api_fs_mkdir"
+                | "api_fs_read"
                 | "api_sessions_search"
                 | "api_settings"
                 | "api_settings_save"
@@ -2437,6 +2439,7 @@ fn status_response_frame(id: String, runtime: &ControlRuntime) -> serde_json::Va
         ("api_fs_stat_available", true),
         ("api_fs_list_available", true),
         ("api_fs_mkdir_available", true),
+        ("api_fs_read_available", true),
         ("api_sessions_search_available", true),
         ("api_settings_available", true),
         (
@@ -2510,6 +2513,7 @@ fn spawn_control_request(
             "api_session_frame_asset" => {
                 api_session_frame_asset_task_response(id.clone(), params.as_ref()).await
             }
+            "api_fs_read" => api_fs_read_task_response(id.clone(), params.as_ref()).await,
             _ => {
                 let frame =
                     control_request_response(id.clone(), method, params, runtime, cancel).await;
@@ -3594,6 +3598,218 @@ async fn api_fs_mkdir_response(
     let path = string_param(&params, &["path"]);
     let (status_line, body) = crate::web_gateway::dashboard_fs_mkdir_response_body(&path);
     http_body_response(id, status_line_code(&status_line), body, "filesystem mkdir")
+}
+
+async fn api_fs_read_task_response(
+    id: String,
+    params: Option<&serde_json::Value>,
+) -> ControlTaskResponse {
+    let params = params.cloned().unwrap_or_else(|| serde_json::json!({}));
+    let path_param = string_param(&params, &["path"]);
+    let offset = match optional_u64_param(&params, &["offset", "start"]) {
+        Ok(value) => value.unwrap_or(0),
+        Err(error) => {
+            return filesystem_read_error_task_response(
+                id,
+                400,
+                serde_json::json!({ "ok": false, "error": error }),
+            );
+        }
+    };
+    let length = match optional_u64_param(&params, &["length", "limit"]) {
+        Ok(value) => value,
+        Err(error) => {
+            return filesystem_read_error_task_response(
+                id,
+                400,
+                serde_json::json!({ "ok": false, "error": error }),
+            );
+        }
+    };
+    let path = match crate::web_gateway::expand_dashboard_fs_path(&path_param) {
+        Ok(path) => path,
+        Err(error) => {
+            return filesystem_read_error_task_response(
+                id,
+                400,
+                serde_json::json!({ "ok": false, "error": error }),
+            );
+        }
+    };
+    let filename = path
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .filter(|name| !name.is_empty());
+    let content_type = dashboard_fs_content_type(&path);
+    let read_result = tokio::task::spawn_blocking({
+        let path = path.clone();
+        move || read_dashboard_fs_file_range(&path, offset, length)
+    })
+    .await;
+    let (bytes, total_size, end, display_path) = match read_result {
+        Ok(Ok(value)) => value,
+        Ok(Err((status, body))) => return filesystem_read_error_task_response(id, status, body),
+        Err(e) => {
+            return ControlTaskResponse {
+                id: id.clone(),
+                frame: serde_json::json!({
+                    "t": "response",
+                    "id": id,
+                    "ok": false,
+                    "error": format!("filesystem read task failed: {e}"),
+                }),
+                byte_stream: None,
+                done: true,
+            };
+        }
+    };
+    let size = bytes.len();
+    let stream_name = display_path.to_string_lossy().to_string();
+    ControlTaskResponse {
+        id: id.clone(),
+        frame: serde_json::Value::Null,
+        byte_stream: Some(ControlByteStream {
+            id: id.clone(),
+            stream_id: format!("{id}:fs-read"),
+            content_type: content_type.clone(),
+            filename: filename.clone(),
+            bytes,
+            result: serde_json::json!({
+                "ok": true,
+                "path": stream_name,
+                "filename": filename,
+                "content_type": content_type,
+                "size": size,
+                "total_size": total_size,
+                "offset": offset,
+                "range_start": offset,
+                "range_end": end,
+                "resumable": true,
+            }),
+        }),
+        done: true,
+    }
+}
+
+fn dashboard_fs_content_type(path: &std::path::Path) -> String {
+    match path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| extension.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("css") => "text/css; charset=utf-8",
+        Some("csv") => "text/csv; charset=utf-8",
+        Some("html") | Some("htm") => "text/html; charset=utf-8",
+        Some("json") => "application/json",
+        Some("js") | Some("mjs") => "text/javascript; charset=utf-8",
+        Some("md") | Some("markdown") | Some("txt") | Some("toml") | Some("yaml") | Some("yml") => {
+            "text/plain; charset=utf-8"
+        }
+        Some("png") => "image/png",
+        Some("jpg") | Some("jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("svg") => "image/svg+xml",
+        Some("webp") => "image/webp",
+        Some("wasm") => "application/wasm",
+        Some("zip") => "application/zip",
+        _ => "application/octet-stream",
+    }
+    .to_string()
+}
+
+fn read_dashboard_fs_file_range(
+    path: &std::path::Path,
+    offset: u64,
+    length: Option<u64>,
+) -> Result<(Vec<u8>, u64, u64, PathBuf), (u16, serde_json::Value)> {
+    let metadata = std::fs::metadata(path).map_err(|e| {
+        (
+            404,
+            serde_json::json!({ "ok": false, "error": format!("file not accessible: {e}") }),
+        )
+    })?;
+    if !metadata.is_file() {
+        return Err((
+            400,
+            serde_json::json!({ "ok": false, "error": "path is not a regular file" }),
+        ));
+    }
+    let total_size = metadata.len();
+    let (start, transfer_len, end) = filesystem_read_range(total_size, offset, length)?;
+    let mut file = std::fs::File::open(path).map_err(|e| {
+        (
+            500,
+            serde_json::json!({ "ok": false, "error": format!("open file: {e}") }),
+        )
+    })?;
+    file.seek(std::io::SeekFrom::Start(start)).map_err(|e| {
+        (
+            500,
+            serde_json::json!({ "ok": false, "error": format!("seek file: {e}") }),
+        )
+    })?;
+    let mut bytes = vec![0u8; transfer_len];
+    file.read_exact(&mut bytes).map_err(|e| {
+        (
+            500,
+            serde_json::json!({ "ok": false, "error": format!("read file: {e}") }),
+        )
+    })?;
+    let display = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    Ok((bytes, total_size, end, display))
+}
+
+fn filesystem_read_range(
+    total_size: u64,
+    offset: u64,
+    length: Option<u64>,
+) -> Result<(u64, usize, u64), (u16, serde_json::Value)> {
+    if offset > total_size {
+        return Err((
+            416,
+            serde_json::json!({
+                "ok": false,
+                "error": "range start beyond file size",
+                "total_size": total_size,
+            }),
+        ));
+    }
+    let available = total_size.saturating_sub(offset);
+    let requested = length.unwrap_or(available).min(available);
+    if requested > crate::web_gateway::UPLOAD_MAX_BYTES as u64 {
+        return Err((
+            413,
+            serde_json::json!({
+                "ok": false,
+                "error": format!(
+                    "range too large: {} bytes (cap is {})",
+                    requested,
+                    crate::web_gateway::UPLOAD_MAX_BYTES
+                ),
+            }),
+        ));
+    }
+    let transfer_len = usize::try_from(requested).map_err(|_| {
+        (
+            413,
+            serde_json::json!({ "ok": false, "error": "range too large for this platform" }),
+        )
+    })?;
+    Ok((offset, transfer_len, offset.saturating_add(requested)))
+}
+
+fn filesystem_read_error_task_response(
+    id: String,
+    status: u16,
+    body: serde_json::Value,
+) -> ControlTaskResponse {
+    ControlTaskResponse {
+        id: id.clone(),
+        frame: http_body_response(id, status, body.to_string(), "filesystem read"),
+        byte_stream: None,
+        done: true,
+    }
 }
 
 async fn api_sessions_search_response(
@@ -6360,6 +6576,7 @@ mod tests {
         assert_eq!(status["result"]["api_fs_stat_available"], true);
         assert_eq!(status["result"]["api_fs_list_available"], true);
         assert_eq!(status["result"]["api_fs_mkdir_available"], true);
+        assert_eq!(status["result"]["api_fs_read_available"], true);
         assert_eq!(status["result"]["api_sessions_search_available"], true);
         assert_eq!(status["result"]["api_settings_available"], true);
         assert_eq!(status["result"]["api_settings_save_available"], false);
@@ -8058,6 +8275,73 @@ mod tests {
                 assert_eq!(response.frame["result"]["_httpOk"], true);
             }
         }
+    }
+
+    #[tokio::test]
+    async fn fs_read_returns_bounded_byte_stream() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("note.txt");
+        std::fs::write(&file, b"filesystem read fixture").unwrap();
+
+        let response = api_fs_read_task_response(
+            "fs-read".to_string(),
+            Some(&serde_json::json!({
+                "path": file.to_string_lossy(),
+                "offset": 11,
+                "length": 4,
+            })),
+        )
+        .await;
+
+        assert!(response.byte_stream.is_some());
+        let stream = response.byte_stream.unwrap();
+        assert_eq!(stream.content_type, "text/plain; charset=utf-8");
+        assert_eq!(stream.filename.as_deref(), Some("note.txt"));
+        assert_eq!(stream.bytes, b"read");
+        assert_eq!(stream.result["ok"], true);
+        assert_eq!(stream.result["range_start"].as_u64(), Some(11));
+        assert_eq!(stream.result["range_end"].as_u64(), Some(15));
+        assert_eq!(
+            stream.result["total_size"].as_u64(),
+            Some("filesystem read fixture".len() as u64)
+        );
+        assert_eq!(stream.result["resumable"], true);
+    }
+
+    #[tokio::test]
+    async fn fs_read_rejects_relative_paths_and_directories() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let relative = api_fs_read_task_response(
+            "fs-read-relative".to_string(),
+            Some(&serde_json::json!({
+                "path": "relative/path",
+            })),
+        )
+        .await;
+        assert!(relative.byte_stream.is_none());
+        assert_eq!(relative.frame["t"], "response");
+        assert_eq!(relative.frame["result"]["_httpStatus"], 400);
+        assert_eq!(relative.frame["result"]["_httpOk"], false);
+        assert!(relative.frame["result"]["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("path must be absolute"));
+
+        let directory = api_fs_read_task_response(
+            "fs-read-dir".to_string(),
+            Some(&serde_json::json!({
+                "path": dir.path().to_string_lossy(),
+            })),
+        )
+        .await;
+        assert!(directory.byte_stream.is_none());
+        assert_eq!(directory.frame["result"]["_httpStatus"], 400);
+        assert_eq!(directory.frame["result"]["_httpOk"], false);
+        assert!(directory.frame["result"]["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("not a regular file"));
     }
 
     #[test]

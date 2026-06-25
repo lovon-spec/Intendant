@@ -38402,6 +38402,7 @@ class DashboardControlTransport {
       apiSessionCurrentUploadsAvailable: this.lastStatus?.api_session_current_uploads_available ?? null,
       apiSessionCurrentUploadRawAvailable: this.lastStatus?.api_session_current_upload_raw_available ?? null,
       apiFsMkdirAvailable: this.lastStatus?.api_fs_mkdir_available ?? null,
+      apiFsReadAvailable: this.lastStatus?.api_fs_read_available ?? null,
       apiSessionsSearchAvailable: this.lastStatus?.api_sessions_search_available ?? null,
       apiSettingsAvailable: this.lastStatus?.api_settings_available ?? null,
       apiControlMsgAvailable: this.lastStatus?.api_control_msg_available ?? null,
@@ -38478,6 +38479,7 @@ function dashboardControlRequestTimeoutMs(method) {
     case 'api_worktrees_scan':
     case 'api_worktrees_remove':
     case 'api_fs_mkdir':
+    case 'api_fs_read':
     case 'api_managed_context_records':
     case 'api_managed_context_anchors':
     case 'api_managed_context_fission':
