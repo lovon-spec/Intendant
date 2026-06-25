@@ -899,7 +899,8 @@ HLS/`.ts` playback also prefers the tunnel when available: the browser reads
 `playlist.m3u8` and validated `.ts` segments with the same recording asset RPC,
 rewrites the playlist to local blob URLs, and points the native video element at
 that object URL. If the browser rejects the blob playlist, it falls back to the
-daemon-served `m3u8` URL.
+daemon-served `m3u8` URL only on a daemon-origin dashboard page; public-origin
+Connect mode does not attempt same-origin HTTP fallback for self-daemon media.
 Archived session frame images use `api_session_frame_asset` for validated `.jpg`
 and `.png` filenames under a resolved session's `frames/` directory. The session
 detail gallery renders returned bytes through browser blob URLs when the verified
@@ -1081,7 +1082,8 @@ Treat this as a staged target, not current behavior:
     verified and advertised by the daemon. Visual-freshness diagnostics NDJSON
     appends use the tunnel when verified and fall back to HTTP only when the
     tunnel is unavailable. HLS `.ts` playback now builds a blob playlist from
-    tunneled recording bytes and falls back to the native daemon URL if rejected.
+    tunneled recording bytes and falls back to the native daemon URL only on a
+    daemon-origin dashboard page.
     Annotation/clip media-editor writes now use a dedicated media protocol with
     operation ids, ordered frame uploads, commit/cancel, and no replay after a
     tunneled write attempt. Generic downloads, native media fallback URLs,

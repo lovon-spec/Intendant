@@ -32138,6 +32138,9 @@ class RecordingPlayer {
     } catch (err) {
       console.warn('[dashboard-control] recording segments RPC failed', err);
     }
+    if (dashboardConnectModeEnabled()) {
+      throw new Error('recording segments are unavailable without the Connect tunnel');
+    }
     const resp = await fetch(`${this.baseUrl}/${this.streamName}/segments`);
     return resp.json();
   }
@@ -32150,6 +32153,9 @@ class RecordingPlayer {
       } catch (err) {
         console.warn('[dashboard-control] recording segment RPC failed', err);
       }
+    }
+    if (dashboardConnectModeEnabled()) {
+      throw new Error('recording segment bytes are unavailable without the Connect tunnel');
     }
     const url = `${this.baseUrl}/${this.streamName}/${filename}`;
     const resp = await fetch(url, { cache: 'no-store', ...fetchOptions });
@@ -32194,6 +32200,7 @@ class RecordingPlayer {
 
   _installHlsFallback(primarySrc, fallbackSrc, generation) {
     if (!fallbackSrc) return;
+    if (dashboardConnectModeEnabled()) return;
     this._clearHlsFallbackHandler();
     const handler = () => {
       if (this._hlsLoadGeneration !== generation) return;
@@ -32454,9 +32461,11 @@ class RecordingPlayer {
     this.currentSegIdx = idx;
     const seg = this.segments[idx];
     // Native HLS wants a URL. Prefer a blob playlist built from tunneled bytes;
-    // fall back to the daemon-served playlist if the browser rejects it.
+    // only daemon-origin dashboard pages can fall back to the daemon playlist.
     if (seg.filename.endsWith('.ts')) {
-      const playlistUrl = `${this.baseUrl}/${this.streamName}/playlist.m3u8`;
+      const playlistUrl = dashboardConnectModeEnabled()
+        ? ''
+        : `${this.baseUrl}/${this.streamName}/playlist.m3u8`;
       const tunneled = await this._loadHlsBlobPlaylist(playlistUrl);
       if (!tunneled) this._setVideoSrc(playlistUrl);
     } else {
@@ -32466,13 +32475,15 @@ class RecordingPlayer {
         if (buf && buf.byteLength > 0) {
           const objectUrl = URL.createObjectURL(new Blob([buf], { type: 'video/mp4' }));
           this._setVideoSrc(objectUrl, { objectUrl });
-        } else {
+        } else if (!dashboardConnectModeEnabled()) {
           this._setVideoSrc(`${this.baseUrl}/${this.streamName}/${seg.filename}`);
         }
       } catch (err) {
         if (generation !== this._segmentLoadGeneration) return;
         console.warn('[dashboard-control] recording segment byte-stream fallback failed', err);
-        this._setVideoSrc(`${this.baseUrl}/${this.streamName}/${seg.filename}`);
+        if (!dashboardConnectModeEnabled()) {
+          this._setVideoSrc(`${this.baseUrl}/${this.streamName}/${seg.filename}`);
+        }
       }
     }
     this.video.currentTime = offsetSecs || 0;
@@ -33505,8 +33516,14 @@ async function uploadImagePreviewUrl(descriptor) {
         return { dataUrl: url, dataObjectUrl: url };
       }
     } catch (err) {
-      console.warn('[upload] Failed to load image preview over dashboard control; using HTTP URL fallback', err);
+      const suffix = dashboardConnectModeEnabled()
+        ? '; no HTTP fallback in Connect mode'
+        : '; using HTTP URL fallback';
+      console.warn(`[upload] Failed to load image preview over dashboard control${suffix}`, err);
     }
+  }
+  if (dashboardConnectModeEnabled()) {
+    return { dataUrl: null, dataObjectUrl: null };
   }
   return {
     dataUrl: `/api/session/current/uploads/${encodeURIComponent(id)}/raw`,
@@ -33557,6 +33574,10 @@ async function uploadOneFile(file, destination) {
         return null;
       }
     } else {
+      if (dashboardConnectModeEnabled()) {
+        logErrorToActivity(`Upload failed (${file.name}): Connect upload tunnel is unavailable.`);
+        return null;
+      }
       const resp = await fetch(`/api/session/current/uploads?${q}`, {
         method: 'POST',
         headers: { 'Content-Type': mime },
@@ -38953,7 +38974,15 @@ function downloadDashboardBytes(bytes, filename, contentType) {
 }
 
 async function downloadSessionReportViaDashboardControl(event) {
-  if (!dashboardReportRpcAvailable()) return;
+  if (!dashboardReportRpcAvailable()) {
+    if (dashboardConnectModeEnabled()) {
+      event.preventDefault();
+      if (typeof showControlToast === 'function') {
+        showControlToast('error', 'Session report requires the Connect tunnel');
+      }
+    }
+    return;
+  }
   event.preventDefault();
   const link = event.currentTarget;
   const previousText = link?.textContent || '';
@@ -39348,8 +39377,12 @@ async function refreshPeersFromApi() {
       try {
         data = await dashboardTransport.request('api_peers');
       } catch (err) {
+        if (dashboardConnectModeEnabled()) throw err;
         console.warn('[dashboard-control] api_peers RPC failed, falling back to HTTP', err);
       }
+    }
+    if (!data && dashboardConnectModeEnabled()) {
+      throw new Error('peer list is unavailable without the Connect tunnel');
     }
     if (!data) {
       const resp = await authedFetch('/api/peers');
@@ -44076,8 +44109,12 @@ function fetchSessionsForHost(hostId, options = {}) {
       try {
         return await dashboardTransport.request('api_sessions', { limit });
       } catch (err) {
+        if (dashboardConnectModeEnabled()) throw err;
         console.warn('[dashboard-control] api_sessions RPC failed, falling back to HTTP', err);
       }
+    }
+    if (hostId === selfPeerId && dashboardConnectModeEnabled()) {
+      throw new Error('session list is unavailable without the Connect tunnel');
     }
     const r = await (hostId === selfPeerId ? authedFetch(url) : fetch(url));
     if (!r.ok) throw new Error(`/api/sessions returned ${r.status}`);
@@ -44161,8 +44198,12 @@ async function streamSessionsForHost(hostId, options = {}, onEvent = {}) {
       return state.finalSessions;
     } catch (err) {
       if (err?.name === 'AbortError') throw err;
+      if (dashboardConnectModeEnabled()) throw err;
       console.warn('[dashboard-control] api_sessions_stream RPC failed, falling back to HTTP stream', err);
     }
+  }
+  if (hostId === selfPeerId && dashboardConnectModeEnabled()) {
+    throw new Error('session stream is unavailable without the Connect tunnel');
   }
   const url = sessionListStreamUrl(baseUrl, limit);
   const request = hostId === selfPeerId
@@ -49840,7 +49881,10 @@ async function sessionFrameAssetObjectUrl(sessionId, filename) {
     sessionFrameObjectUrls.add(url);
     return url;
   } catch (err) {
-    console.warn('session frame asset RPC failed; using HTTP image fallback', err);
+    const suffix = dashboardConnectModeEnabled()
+      ? '; no HTTP fallback in Connect mode'
+      : '; using HTTP image fallback';
+    console.warn(`session frame asset RPC failed${suffix}`, err);
     return null;
   }
 }
@@ -49976,11 +50020,15 @@ function renderSessionFrames(sessionId, frames) {
     const img = document.createElement('img');
     const fallbackSrc = `/api/session/${encodeURIComponent(sessionId)}/frames/${encodeURIComponent(name)}`;
     img.loading = 'lazy';
-    img.src = fallbackSrc;
+    const placeholderSrc = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=';
+    img.src = dashboardConnectModeEnabled() ? placeholderSrc : fallbackSrc;
     img.dataset.fallbackSrc = fallbackSrc;
     img.alt = name;
     sessionFrameAssetObjectUrl(sessionId, name).then(url => {
-      if (!url) return;
+      if (!url) {
+        if (!dashboardConnectModeEnabled() && !img.src) img.src = fallbackSrc;
+        return;
+      }
       if (!img.isConnected) {
         URL.revokeObjectURL(url);
         sessionFrameObjectUrls.delete(url);
@@ -49998,7 +50046,7 @@ function renderSessionFrames(sessionId, frames) {
       const lb = document.createElement('div');
       lb.className = 'sd-frame-lightbox';
       const full = document.createElement('img');
-      full.src = img.src || fallbackSrc;
+      full.src = img.src || (dashboardConnectModeEnabled() ? placeholderSrc : fallbackSrc);
       lb.appendChild(full);
       lb.addEventListener('click', () => lb.remove());
       document.body.appendChild(lb);

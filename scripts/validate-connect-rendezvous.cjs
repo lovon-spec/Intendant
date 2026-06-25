@@ -2626,7 +2626,13 @@ async function main() {
     }, null, 2));
 
     const appPage = await browser.newPage();
-    appPage.on('console', msg => console.log(`[app-browser:${msg.type()}] ${msg.text()}`));
+    const appConsoleErrors = [];
+    appPage.on('console', msg => {
+      const type = msg.type();
+      const text = msg.text();
+      console.log(`[app-browser:${type}] ${text}`);
+      if (type === 'error') appConsoleErrors.push(text);
+    });
     const appResponse = await appPage.goto(
       `${publicOrigin}/app?connect=1&daemon_id=${encodeURIComponent(options.daemonId)}`,
       {
@@ -2683,6 +2689,7 @@ async function main() {
       'Connect',
       `real SPA did not expose Connect transport status: ${JSON.stringify(appResult)}`
     );
+    assert.deepStrictEqual(appConsoleErrors, [], 'real SPA emitted browser console errors');
 
     console.log(JSON.stringify({
       publicApp: {
