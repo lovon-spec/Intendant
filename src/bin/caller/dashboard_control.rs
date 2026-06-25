@@ -4815,15 +4815,42 @@ async fn api_dashboard_action_msg_response(
         );
     }
     let action = dashboard_control_msg_action(&ctrl);
+    let marker_apply = match &ctrl {
+        ControlMsg::SetDiagnosticsVisualMarker {
+            display_id,
+            enabled,
+        } => {
+            let display_id = display_id.unwrap_or(0);
+            Some((
+                display_id,
+                apply_dashboard_diagnostics_visual_marker(runtime, display_id, *enabled).await,
+            ))
+        }
+        _ => None,
+    };
     dispatch_dashboard_control_msg(&runtime.bus, ctrl, "dashboard-action");
+    let mut result = serde_json::json!({
+        "ok": true,
+        "action": action,
+    });
+    if let Some((display_id, marker_result)) = marker_apply {
+        if let Some(result_obj) = result.as_object_mut() {
+            result_obj.insert("display_id".to_string(), serde_json::json!(display_id));
+            result_obj.insert(
+                "registry_available".to_string(),
+                serde_json::json!(marker_result.registry_available),
+            );
+            result_obj.insert(
+                "active_display_updated".to_string(),
+                serde_json::json!(marker_result.active_display_updated),
+            );
+        }
+    }
     serde_json::json!({
         "t": "response",
         "id": id,
         "ok": true,
-        "result": {
-            "ok": true,
-            "action": action,
-        },
+        "result": result,
     })
 }
 
@@ -4862,6 +4889,49 @@ fn dispatch_dashboard_control_msg(bus: &crate::event::EventBus, ctrl: ControlMsg
         turn: None,
     });
     bus.send(AppEvent::ControlCommand(ctrl));
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DiagnosticsVisualMarkerApply {
+    registry_available: bool,
+    active_display_updated: bool,
+}
+
+async fn apply_dashboard_diagnostics_visual_marker(
+    runtime: &ControlRuntime,
+    display_id: u32,
+    enabled: bool,
+) -> DiagnosticsVisualMarkerApply {
+    let session_registry = {
+        let session = runtime.shared_session.read().await;
+        session.session_registry.clone()
+    };
+    let Some(session_registry) = session_registry else {
+        eprintln!(
+            "[dashboard/control] diagnostics visual marker request for display {display_id} ({enabled}) ignored; no session registry"
+        );
+        return DiagnosticsVisualMarkerApply {
+            registry_available: false,
+            active_display_updated: false,
+        };
+    };
+
+    let active_display_updated = session_registry
+        .write()
+        .await
+        .set_diagnostics_visual_marker(display_id, enabled);
+    eprintln!(
+        "[dashboard/control] diagnostics visual marker for display {display_id} = {enabled}{}",
+        if active_display_updated {
+            ""
+        } else {
+            " (pending)"
+        },
+    );
+    DiagnosticsVisualMarkerApply {
+        registry_available: true,
+        active_display_updated,
+    }
 }
 
 fn dashboard_control_msg_allowed(ctrl: &ControlMsg) -> bool {
@@ -4936,6 +5006,7 @@ fn dashboard_action_msg_allowed(ctrl: &ControlMsg) -> bool {
             | ControlMsg::StartRecording { .. }
             | ControlMsg::StopRecording { .. }
             | ControlMsg::DeleteRecording { .. }
+            | ControlMsg::SetDiagnosticsVisualMarker { .. }
     )
 }
 
@@ -5758,6 +5829,36 @@ mod tests {
         }
     }
 
+    struct DashboardControlStubDisplayBackend;
+
+    #[async_trait::async_trait]
+    impl crate::display::DisplayBackend for DashboardControlStubDisplayBackend {
+        async fn start_capture(
+            &self,
+            _fps: u32,
+        ) -> Result<mpsc::Receiver<crate::display::Frame>, CallerError> {
+            let (_tx, rx) = mpsc::channel(1);
+            Ok(rx)
+        }
+
+        async fn stop_capture(&self) {}
+
+        async fn inject_input(
+            &self,
+            _event: crate::display::InputEvent,
+        ) -> Result<(), CallerError> {
+            Ok(())
+        }
+
+        fn resolution(&self) -> (u32, u32) {
+            (64, 64)
+        }
+
+        fn kind(&self) -> &'static str {
+            "dashboard-control-stub"
+        }
+    }
+
     fn test_control_frame_response(
         text: &str,
         runtime: &mut ControlRuntime,
@@ -6297,6 +6398,53 @@ mod tests {
             .as_str()
             .unwrap_or("")
             .contains("not available over dashboard action WebRTC"));
+    }
+
+    #[tokio::test]
+    async fn api_dashboard_action_msg_applies_diagnostics_visual_marker_to_display_registry() {
+        let rt = runtime();
+        let registry = Arc::new(tokio::sync::RwLock::new(
+            crate::display::SessionRegistry::new(),
+        ));
+        let display_session = Arc::new(crate::display::DisplaySession::new(
+            2,
+            Arc::new(DashboardControlStubDisplayBackend),
+        ));
+        registry
+            .write()
+            .await
+            .insert(2, Arc::clone(&display_session));
+        {
+            let mut session = rt.shared_session.write().await;
+            session.session_registry = Some(Arc::clone(&registry));
+        }
+
+        let response = api_dashboard_action_msg_response(
+            "dash-action-marker".to_string(),
+            Some(&serde_json::json!({
+                "message": {
+                    "action": "set_diagnostics_visual_marker",
+                    "display_id": 2,
+                    "enabled": true,
+                }
+            })),
+            &rt,
+        )
+        .await;
+        assert_eq!(response["t"], "response");
+        assert_eq!(response["ok"], true);
+        assert_eq!(response["result"]["ok"], true);
+        assert_eq!(
+            response["result"]["action"],
+            "set_diagnostics_visual_marker"
+        );
+        assert_eq!(response["result"]["display_id"], 2);
+        assert_eq!(response["result"]["registry_available"], true);
+        assert_eq!(response["result"]["active_display_updated"], true);
+        assert!(
+            display_session.diagnostics_visual_marker_enabled(),
+            "dashboard-control RPC did not toggle the live display session"
+        );
     }
 
     #[tokio::test]

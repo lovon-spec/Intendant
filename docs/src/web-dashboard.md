@@ -486,9 +486,9 @@ changes use a separate
 `api_session_control_msg` RPC with its own allowlist instead of broadening the
 generic settings-style `api_control_msg`. Smaller dashboard action controls use
 `api_dashboard_action_msg`; this includes Codex/Gemini thread actions, display
-take/release/grant/revoke, recording and debug toggles, and browser workspace
-create/acquire/close/release. It has its own allowlist and the same no-replay
-fallback rule as the other mutation RPCs.
+take/release/grant/revoke, the diagnostics visual-marker toggle, recording and
+debug toggles, and browser workspace create/acquire/close/release. It has its
+own allowlist and the same no-replay fallback rule as the other mutation RPCs.
 Mutation fallbacks are deliberately conservative: if a connected WebRTC RPC
 fails after it may have reached the daemon, the dashboard surfaces the error
 instead of repeating the write over HTTP.
@@ -909,11 +909,15 @@ falls back to the WebSocket before it has attempted the RPC; once a verified
 DataChannel write is sent, an error is surfaced to the operator instead of
 replaying a potentially duplicated action.
 Small dashboard action controls use `api_dashboard_action_msg`. This covers
-Codex/Gemini attached-thread actions, local display authority toggles, recording
-and debug screen controls, and browser workspace create/acquire/close/release.
-The browser applies the same no-replay fallback rule: use the WebSocket only
-before a verified DataChannel request is attempted, then surface RPC failures
-instead of duplicating a potentially state-changing action.
+Codex/Gemini attached-thread actions, local display authority toggles, the
+diagnostics visual-marker toggle, recording and debug screen controls, and
+browser workspace create/acquire/close/release. The browser applies the same
+no-replay fallback rule: use the WebSocket only before a verified DataChannel
+request is attempted, then surface RPC failures instead of duplicating a
+potentially state-changing action. For `set_diagnostics_visual_marker`, the
+daemon applies the request directly to the active display registry when
+available, or records the desired state as a pending per-display default for
+the next display session.
 
 The remaining migration work is mostly byte-stream and file-transfer heavy:
 generic downloads, native recording/HLS media URL playback, broader file
@@ -995,7 +999,8 @@ Treat this as a staged target, not current behavior:
     approvals, interrupt, resume/stop/restart, rename, and launch-config writes
     with no-replay fallback. Dedicated dashboard-action `ControlMsg` dispatch
     now covers Codex/Gemini thread actions, display take/release/grant/revoke,
-    recording/debug toggles, and browser workspace create/acquire/close/release.
+    diagnostics visual-marker toggles, recording/debug toggles, and browser
+    workspace create/acquire/close/release.
     Standalone Shell terminal frames and WebTui frames also use the tunnel when
     verified and advertised by the daemon. Generic downloads, native
     recording/HLS URL playback, remaining non-allowlisted control commands, and

@@ -1102,6 +1102,9 @@ async function main() {
         closeWorkspace: await labeled('api_dashboard_action_msg close_browser_workspace', ctl.request('api_dashboard_action_msg', {
           message: { action: 'close_browser_workspace', workspace_id: `validator-workspace-${Date.now()}` },
         })),
+        diagnosticsVisualMarker: await labeled('api_dashboard_action_msg diagnostics visual marker', ctl.request('api_dashboard_action_msg', {
+          message: { action: 'set_diagnostics_visual_marker', display_id: 0, enabled: false },
+        })),
         rejectedSettingsAction: await labeled('api_dashboard_action_msg rejected set_codex_sandbox', ctl.request('api_dashboard_action_msg', {
           message: { action: 'set_codex_sandbox', mode: 'workspace-write' },
         })),
@@ -1614,6 +1617,20 @@ async function main() {
     );
     assert.strictEqual(result.dashboardAction?.closeWorkspace?.ok, true);
     assert.strictEqual(result.dashboardAction?.closeWorkspace?.action, 'close_browser_workspace');
+    assert.strictEqual(result.dashboardAction?.diagnosticsVisualMarker?.ok, true);
+    assert.strictEqual(
+      result.dashboardAction?.diagnosticsVisualMarker?.action,
+      'set_diagnostics_visual_marker'
+    );
+    assert.strictEqual(result.dashboardAction?.diagnosticsVisualMarker?.display_id, 0);
+    assert.strictEqual(
+      typeof result.dashboardAction?.diagnosticsVisualMarker?.registry_available,
+      'boolean'
+    );
+    assert.strictEqual(
+      typeof result.dashboardAction?.diagnosticsVisualMarker?.active_display_updated,
+      'boolean'
+    );
     assert.strictEqual(
       result.dashboardAction?.rejectedSettingsAction?._httpStatus,
       400,
@@ -1890,6 +1907,8 @@ async function main() {
         rejectedSessionControlStatus: result.sessionControl.rejectedSettingsAction?._httpStatus,
         apiDashboardActionMsgAvailable: result.status.api_dashboard_action_msg_available,
         dashboardActionAction: result.dashboardAction.closeWorkspace?.action,
+        diagnosticsMarkerRegistryAvailable: result.dashboardAction.diagnosticsVisualMarker?.registry_available,
+        diagnosticsMarkerActiveDisplayUpdated: result.dashboardAction.diagnosticsVisualMarker?.active_display_updated,
         rejectedDashboardActionStatus: result.dashboardAction.rejectedSettingsAction?._httpStatus,
         apiSessionReportAvailable: result.status.api_session_report_available,
         byteStreamsAvailable: result.status.byte_streams_available,

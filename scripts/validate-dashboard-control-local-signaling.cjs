@@ -369,6 +369,9 @@ async function main() {
         dashboardActionMsg: await labeled('api_dashboard_action_msg close_browser_workspace', ctl.request('api_dashboard_action_msg', {
           message: { action: 'close_browser_workspace', workspace_id: `validator-workspace-${Date.now()}` },
         }, { timeoutMs: 60000 })),
+        diagnosticsMarkerActionMsg: await labeled('api_dashboard_action_msg diagnostics visual marker', ctl.request('api_dashboard_action_msg', {
+          message: { action: 'set_diagnostics_visual_marker', display_id: 0, enabled: false },
+        }, { timeoutMs: 60000 })),
         rejectedDashboardActionMsg: await labeled('api_dashboard_action_msg rejected set_codex_sandbox', ctl.request('api_dashboard_action_msg', {
           message: { action: 'set_codex_sandbox', mode: 'workspace-write' },
         }, { timeoutMs: 60000 })),
@@ -526,6 +529,11 @@ async function main() {
     );
     assert.strictEqual(result.dashboardActionMsg?.ok, true);
     assert.strictEqual(result.dashboardActionMsg?.action, 'close_browser_workspace');
+    assert.strictEqual(result.diagnosticsMarkerActionMsg?.ok, true);
+    assert.strictEqual(result.diagnosticsMarkerActionMsg?.action, 'set_diagnostics_visual_marker');
+    assert.strictEqual(result.diagnosticsMarkerActionMsg?.display_id, 0);
+    assert.strictEqual(typeof result.diagnosticsMarkerActionMsg?.registry_available, 'boolean');
+    assert.strictEqual(typeof result.diagnosticsMarkerActionMsg?.active_display_updated, 'boolean');
     assert.strictEqual(result.rejectedDashboardActionMsg?._httpStatus, 400);
     assert.strictEqual(result.rejectedDashboardActionMsg?._httpOk, false);
     assert(
@@ -583,6 +591,8 @@ async function main() {
         sessionControlAction: result.sessionControlMsg.action,
         rejectedSessionControlStatus: result.rejectedSessionControlMsg._httpStatus,
         dashboardActionAction: result.dashboardActionMsg.action,
+        diagnosticsMarkerRegistryAvailable: result.diagnosticsMarkerActionMsg.registry_available,
+        diagnosticsMarkerActiveDisplayUpdated: result.diagnosticsMarkerActionMsg.active_display_updated,
         rejectedDashboardActionStatus: result.rejectedDashboardActionMsg._httpStatus,
         signalingMode: result.finalStatus.signalingMode,
         pendingRequests: result.finalStatus.pendingRequests,
