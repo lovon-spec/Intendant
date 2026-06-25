@@ -39,6 +39,7 @@ const CONTROL_SIGNATURE_CONTEXT: &str = "intendant-dashboard-control-v1";
 const CONTROL_DEFAULT_SESSION_LIMIT: usize = 600;
 const CONTROL_RESPONSE_CHUNK_THRESHOLD_BYTES: usize = 64 * 1024;
 const CONTROL_RESPONSE_CHUNK_BYTES: usize = 16 * 1024;
+const CONTROL_BYTE_STREAM_CHUNK_BYTES: usize = 16 * 1024;
 const CONTROL_RESPONSE_INITIAL_CHUNK_CREDIT: usize = 16;
 const CONTROL_RESPONSE_MAX_CREDIT_GRANT: usize = 64;
 const CONTROL_FEATURES: &[&str] = &[
@@ -60,6 +61,7 @@ const CONTROL_FEATURES: &[&str] = &[
     "response_chunks",
     "response_credit",
     "stream_frames",
+    "byte_streams",
     "api_peers",
     "api_sessions",
     "api_sessions_stream",
@@ -530,7 +532,17 @@ struct InboundPacket {
 struct ControlTaskResponse {
     id: String,
     frame: serde_json::Value,
+    byte_stream: Option<ControlByteStream>,
     done: bool,
+}
+
+struct ControlByteStream {
+    id: String,
+    stream_id: String,
+    content_type: String,
+    filename: Option<String>,
+    bytes: Vec<u8>,
+    result: serde_json::Value,
 }
 
 struct OutboundControlQueue {
@@ -758,15 +770,17 @@ async fn control_driver<I: rtc::interceptor::Interceptor + Send + Sync + 'static
             }
             Some(task_response) = task_rx.recv() => {
                 if pending_requests.contains_key(&task_response.id) {
-                    send_control_frame(
+                    let task_id = task_response.id.clone();
+                    let done = task_response.done;
+                    send_control_task_response(
                         &mut rtc,
                         &channels,
                         &mut outbound_queue,
                         runtime.response_credit_enabled,
-                        task_response.frame,
+                        task_response,
                     );
-                    if task_response.done {
-                        pending_requests.remove(&task_response.id);
+                    if done {
+                        pending_requests.remove(&task_id);
                     }
                 }
                 let _ = rtc.handle_timeout(Instant::now());
@@ -981,6 +995,32 @@ fn send_control_text<I: rtc::interceptor::Interceptor>(
     }
 }
 
+fn send_control_task_response<I: rtc::interceptor::Interceptor>(
+    rtc: &mut RTCPeerConnection<I>,
+    channels: &HashMap<String, rtc::data_channel::RTCDataChannelId>,
+    outbound_queue: &mut OutboundControlQueue,
+    response_credit_enabled: bool,
+    response: ControlTaskResponse,
+) {
+    if let Some(byte_stream) = response.byte_stream {
+        send_control_byte_stream(
+            rtc,
+            channels,
+            outbound_queue,
+            response_credit_enabled,
+            byte_stream,
+        );
+    } else {
+        send_control_frame(
+            rtc,
+            channels,
+            outbound_queue,
+            response_credit_enabled,
+            response.frame,
+        );
+    }
+}
+
 fn send_control_frame<I: rtc::interceptor::Interceptor>(
     rtc: &mut RTCPeerConnection<I>,
     channels: &HashMap<String, rtc::data_channel::RTCDataChannelId>,
@@ -1029,6 +1069,40 @@ fn send_control_frame<I: rtc::interceptor::Interceptor>(
     }
 }
 
+fn send_control_byte_stream<I: rtc::interceptor::Interceptor>(
+    rtc: &mut RTCPeerConnection<I>,
+    channels: &HashMap<String, rtc::data_channel::RTCDataChannelId>,
+    outbound_queue: &mut OutboundControlQueue,
+    response_credit_enabled: bool,
+    byte_stream: ControlByteStream,
+) {
+    match byte_stream_frame_text_parts(byte_stream, CONTROL_BYTE_STREAM_CHUNK_BYTES) {
+        ControlFrameTexts::Immediate(frames) => {
+            for text in frames {
+                send_control_text(rtc, channels, text);
+            }
+        }
+        ControlFrameTexts::Chunked {
+            request_id,
+            chunk_id,
+            start,
+            chunks,
+            end,
+        } => {
+            if response_credit_enabled {
+                outbound_queue.enqueue_chunked(request_id, chunk_id, start, chunks, end);
+                drain_queued_control_frames(rtc, channels, outbound_queue);
+            } else {
+                send_control_text(rtc, channels, start);
+                for text in chunks {
+                    send_control_text(rtc, channels, text);
+                }
+                send_control_text(rtc, channels, end);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 fn control_frame_texts(frame: serde_json::Value) -> Vec<String> {
     match control_frame_text_parts(
@@ -1036,6 +1110,76 @@ fn control_frame_texts(frame: serde_json::Value) -> Vec<String> {
         CONTROL_RESPONSE_CHUNK_THRESHOLD_BYTES,
         CONTROL_RESPONSE_CHUNK_BYTES,
     ) {
+        ControlFrameTexts::Immediate(frames) => frames,
+        ControlFrameTexts::Chunked {
+            start, chunks, end, ..
+        } => {
+            let mut frames = Vec::with_capacity(chunks.len() + 2);
+            frames.push(start);
+            frames.extend(chunks);
+            frames.push(end);
+            frames
+        }
+    }
+}
+
+fn byte_stream_frame_text_parts(
+    byte_stream: ControlByteStream,
+    chunk_bytes: usize,
+) -> ControlFrameTexts {
+    let request_id = byte_stream.id;
+    let chunk_id = byte_stream.stream_id;
+    if request_id.is_empty() || chunk_id.is_empty() || chunk_bytes == 0 {
+        return ControlFrameTexts::Immediate(Vec::new());
+    }
+
+    let total_bytes = byte_stream.bytes.len();
+    let chunk_count = total_bytes.div_ceil(chunk_bytes);
+    let start = serde_json::json!({
+        "t": "byte_stream_start",
+        "id": request_id,
+        "stream_id": chunk_id,
+        "encoding": "base64",
+        "content_type": byte_stream.content_type,
+        "filename": byte_stream.filename,
+        "total_bytes": total_bytes,
+        "chunks": chunk_count,
+    })
+    .to_string();
+    let mut chunks = Vec::with_capacity(chunk_count);
+    for (seq, chunk) in byte_stream.bytes.chunks(chunk_bytes).enumerate() {
+        chunks.push(
+            serde_json::json!({
+                "t": "byte_stream_chunk",
+                "id": request_id,
+                "stream_id": chunk_id,
+                "seq": seq,
+                "data": base64::engine::general_purpose::STANDARD.encode(chunk),
+            })
+            .to_string(),
+        );
+    }
+    let end = serde_json::json!({
+        "t": "byte_stream_end",
+        "id": request_id,
+        "stream_id": chunk_id,
+        "ok": true,
+        "chunks": chunk_count,
+        "result": byte_stream.result,
+    })
+    .to_string();
+    ControlFrameTexts::Chunked {
+        request_id,
+        chunk_id,
+        start,
+        chunks,
+        end,
+    }
+}
+
+#[cfg(test)]
+fn byte_stream_frame_texts(byte_stream: ControlByteStream, chunk_bytes: usize) -> Vec<String> {
+    match byte_stream_frame_text_parts(byte_stream, chunk_bytes) {
         ControlFrameTexts::Immediate(frames) => frames,
         ControlFrameTexts::Chunked {
             start, chunks, end, ..
@@ -1577,6 +1721,7 @@ fn status_response_frame(id: String, runtime: &ControlRuntime) -> serde_json::Va
         ("api_session_log_replay_available", true),
         ("api_external_session_activity_replay_available", true),
         ("api_dashboard_bootstrap_available", true),
+        ("byte_streams_available", true),
         ("api_sessions_available", true),
         ("api_sessions_stream_available", true),
         ("api_session_detail_available", true),
@@ -1644,14 +1789,18 @@ fn spawn_control_request(
     let cancel = CancellationToken::new();
     pending_requests.insert(id.clone(), cancel.clone());
     tokio::spawn(async move {
-        let frame = control_request_response(id.clone(), method, params, runtime, cancel).await;
-        let _ = task_tx
-            .send(ControlTaskResponse {
+        let response = if method == "api_session_report" {
+            api_session_report_task_response(id.clone(), params.as_ref(), &runtime).await
+        } else {
+            let frame = control_request_response(id.clone(), method, params, runtime, cancel).await;
+            ControlTaskResponse {
                 id,
                 frame,
+                byte_stream: None,
                 done: true,
-            })
-            .await;
+            }
+        };
+        let _ = task_tx.send(response).await;
     });
 }
 
@@ -1683,6 +1832,7 @@ fn spawn_control_stream(
                     .send(ControlTaskResponse {
                         id,
                         frame,
+                        byte_stream: None,
                         done: true,
                     })
                     .await;
@@ -1704,7 +1854,6 @@ async fn control_request_response(
     match method.as_str() {
         "api_sessions" => api_sessions_response(id, params.as_ref()).await,
         "api_session_detail" => api_session_detail_response(id, params.as_ref()).await,
-        "api_session_report" => api_session_report_response(id, params.as_ref(), &runtime).await,
         "api_session_delete" => api_session_delete_response(id, params.as_ref()).await,
         "api_session_current_agent_output" => {
             api_session_current_agent_output_response(id, params.as_ref(), &runtime).await
@@ -1862,6 +2011,7 @@ async fn stream_json_lines_response(
                 "id": id,
                 "method": method,
             }),
+            byte_stream: None,
             done: false,
         })
         .await
@@ -1892,6 +2042,7 @@ async fn stream_json_lines_response(
                     .send(ControlTaskResponse {
                         id,
                         frame,
+                        byte_stream: None,
                         done: true,
                     })
                     .await;
@@ -1911,6 +2062,7 @@ async fn stream_json_lines_response(
             .send(ControlTaskResponse {
                 id: id.clone(),
                 frame,
+                byte_stream: None,
                 done: false,
             })
             .await
@@ -1941,6 +2093,7 @@ async fn stream_json_lines_response(
             .send(ControlTaskResponse {
                 id,
                 frame,
+                byte_stream: None,
                 done: true,
             })
             .await;
@@ -2032,11 +2185,11 @@ async fn api_session_detail_response(
     json_body_response(id, body, "session detail")
 }
 
-async fn api_session_report_response(
+async fn api_session_report_task_response(
     id: String,
     params: Option<&serde_json::Value>,
     runtime: &ControlRuntime,
-) -> serde_json::Value {
+) -> ControlTaskResponse {
     let params = params.cloned().unwrap_or_else(|| serde_json::json!({}));
     let session_id = optional_string_param(&params, &["session_id", "sessionId", "id"])
         .unwrap_or_else(|| "current".to_string());
@@ -2066,8 +2219,8 @@ async fn api_session_report_response(
                     (500, format!("Failed to build report: {error}"))
                 }
             };
-            return http_body_response(
-                id,
+            let frame = http_body_response(
+                id.clone(),
                 status,
                 serde_json::json!({
                     "ok": false,
@@ -2076,29 +2229,48 @@ async fn api_session_report_response(
                 .to_string(),
                 "session report",
             );
+            return ControlTaskResponse {
+                id,
+                frame,
+                byte_stream: None,
+                done: true,
+            };
         }
         Err(e) => {
-            return serde_json::json!({
-                "t": "response",
-                "id": id,
-                "ok": false,
-                "error": format!("session report task failed: {e}"),
-            });
+            return ControlTaskResponse {
+                id: id.clone(),
+                frame: serde_json::json!({
+                    "t": "response",
+                    "id": id,
+                    "ok": false,
+                    "error": format!("session report task failed: {e}"),
+                }),
+                byte_stream: None,
+                done: true,
+            };
         }
     };
     let size = report.bytes.len();
-    serde_json::json!({
-        "t": "response",
-        "id": id,
-        "ok": true,
-        "result": {
-            "ok": true,
-            "filename": report.filename,
-            "content_type": "application/zip",
-            "size": size,
-            "data_base64": base64::engine::general_purpose::STANDARD.encode(report.bytes),
-        },
-    })
+    let filename = report.filename;
+    let content_type = "application/zip".to_string();
+    ControlTaskResponse {
+        id: id.clone(),
+        frame: serde_json::Value::Null,
+        byte_stream: Some(ControlByteStream {
+            id: id.clone(),
+            stream_id: format!("{id}:session-report"),
+            content_type: content_type.clone(),
+            filename: Some(filename.clone()),
+            bytes: report.bytes,
+            result: serde_json::json!({
+                "ok": true,
+                "filename": filename,
+                "content_type": content_type,
+                "size": size,
+            }),
+        }),
+        done: true,
+    }
 }
 
 async fn api_session_delete_response(
@@ -4318,6 +4490,7 @@ mod tests {
             true
         );
         assert_eq!(status["result"]["api_dashboard_bootstrap_available"], true);
+        assert_eq!(status["result"]["byte_streams_available"], true);
         assert_eq!(status["result"]["api_sessions_available"], true);
         assert_eq!(status["result"]["api_sessions_stream_available"], true);
         assert_eq!(status["result"]["api_session_detail_available"], true);
@@ -4815,8 +4988,6 @@ mod tests {
 
     #[tokio::test]
     async fn session_report_rpc_returns_zip_for_active_log() {
-        use base64::Engine as _;
-
         let dir = tempfile::tempdir().unwrap();
         let session_dir = dir.path().join("session-report");
         let log = crate::session_log::SessionLog::open(session_dir.clone()).unwrap();
@@ -4833,36 +5004,43 @@ mod tests {
             let mut session = rt.shared_session.write().await;
             session.session_log = Some(Arc::new(std::sync::Mutex::new(log)));
         }
-        let report =
-            api_session_report_response("report1".to_string(), Some(&serde_json::json!({})), &rt)
-                .await;
-        assert_eq!(report["t"], "response");
-        assert_eq!(report["ok"], true);
-        assert_eq!(report["result"]["ok"], true);
-        assert_eq!(report["result"]["content_type"], "application/zip");
-        assert!(report["result"]["filename"]
+        let report = api_session_report_task_response(
+            "report1".to_string(),
+            Some(&serde_json::json!({})),
+            &rt,
+        )
+        .await;
+        assert!(report.done);
+        assert_eq!(report.id, "report1");
+        assert!(report.byte_stream.is_some());
+        let stream = report.byte_stream.unwrap();
+        assert_eq!(stream.id, "report1");
+        assert_eq!(stream.stream_id, "report1:session-report");
+        assert_eq!(stream.content_type, "application/zip");
+        assert!(stream.filename.as_deref().unwrap_or("").ends_with(".zip"));
+        assert_eq!(stream.result["ok"], true);
+        assert_eq!(stream.result["content_type"], "application/zip");
+        assert!(stream.result["filename"]
             .as_str()
             .unwrap_or("")
             .ends_with(".zip"));
-        let bytes = base64::engine::general_purpose::STANDARD
-            .decode(report["result"]["data_base64"].as_str().unwrap_or(""))
-            .unwrap();
         assert_eq!(
-            report["result"]["size"].as_u64().unwrap(),
-            bytes.len() as u64
+            stream.result["size"].as_u64().unwrap(),
+            stream.bytes.len() as u64
         );
-        let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+        let mut zip = zip::ZipArchive::new(std::io::Cursor::new(stream.bytes)).unwrap();
         assert!(zip.by_name("summary.json").is_ok());
         assert!(zip.by_name("turns/turn_001_stdout.txt").is_ok());
 
-        let invalid = api_session_report_response(
+        let invalid = api_session_report_task_response(
             "report2".to_string(),
             Some(&serde_json::json!({ "session_id": "../bad" })),
             &rt,
         )
         .await;
-        assert_eq!(invalid["result"]["_httpStatus"], 400);
-        assert_eq!(invalid["result"]["_httpOk"], false);
+        assert!(invalid.byte_stream.is_none());
+        assert_eq!(invalid.frame["result"]["_httpStatus"], 400);
+        assert_eq!(invalid.frame["result"]["_httpOk"], false);
     }
 
     #[tokio::test]
@@ -5571,6 +5749,57 @@ mod tests {
             );
         }
         assert_eq!(String::from_utf8(bytes).unwrap(), frame.to_string());
+    }
+
+    #[test]
+    fn byte_stream_frames_are_chunked_and_credit_addressable() {
+        let bytes: Vec<u8> = (0..73).map(|i| (i % 251) as u8).collect();
+        let stream = ControlByteStream {
+            id: "download-1".to_string(),
+            stream_id: "download-1:file".to_string(),
+            content_type: "application/octet-stream".to_string(),
+            filename: Some("artifact.bin".to_string()),
+            bytes: bytes.clone(),
+            result: serde_json::json!({
+                "ok": true,
+                "filename": "artifact.bin",
+                "size": bytes.len(),
+            }),
+        };
+        let frames = byte_stream_frame_texts(stream, 13);
+        assert_eq!(frames.len(), 8, "expected start + 6 chunks + end");
+
+        let start: serde_json::Value = serde_json::from_str(&frames[0]).unwrap();
+        assert_eq!(start["t"], "byte_stream_start");
+        assert_eq!(start["id"], "download-1");
+        assert_eq!(start["stream_id"], "download-1:file");
+        assert_eq!(start["encoding"], "base64");
+        assert_eq!(start["content_type"], "application/octet-stream");
+        assert_eq!(start["filename"], "artifact.bin");
+        assert_eq!(start["total_bytes"], bytes.len());
+        assert_eq!(start["chunks"], 6);
+
+        let mut decoded = Vec::new();
+        for (seq, text) in frames[1..frames.len() - 1].iter().enumerate() {
+            let chunk: serde_json::Value = serde_json::from_str(text).unwrap();
+            assert_eq!(chunk["t"], "byte_stream_chunk");
+            assert_eq!(chunk["id"], "download-1");
+            assert_eq!(chunk["stream_id"], "download-1:file");
+            assert_eq!(chunk["seq"], seq);
+            decoded.extend(
+                base64::engine::general_purpose::STANDARD
+                    .decode(chunk["data"].as_str().unwrap())
+                    .unwrap(),
+            );
+        }
+        assert_eq!(decoded, bytes);
+
+        let end: serde_json::Value = serde_json::from_str(frames.last().unwrap()).unwrap();
+        assert_eq!(end["t"], "byte_stream_end");
+        assert_eq!(end["id"], "download-1");
+        assert_eq!(end["stream_id"], "download-1:file");
+        assert_eq!(end["chunks"], 6);
+        assert_eq!(end["result"]["filename"], "artifact.bin");
     }
 
     #[test]

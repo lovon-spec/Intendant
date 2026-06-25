@@ -260,6 +260,7 @@ function publicBootstrapHtml() {
   const statusEl = document.getElementById('status');
   const daemonId = new URLSearchParams(location.search).get('daemon_id') || '${DEFAULT_DAEMON_ID}';
   const MAX_CHUNKED_RESPONSE_BYTES = 128 * 1024 * 1024;
+  const MAX_BYTE_STREAM_BYTES = 128 * 1024 * 1024;
   function paint(value) {
     statusEl.textContent = typeof value === 'string' ? value : JSON.stringify(value, null, 2);
   }
@@ -337,13 +338,15 @@ function publicBootstrapHtml() {
     pendingIce: [],
     pending: new Map(),
     chunkedResponses: new Map(),
+    byteStreams: new Map(),
     completedChunkedResponses: 0,
+    completedByteStreams: 0,
     seq: 0,
     async start() {
       this.pc = new RTCPeerConnection({});
       this.channel = this.pc.createDataChannel('intendant-dashboard-control', { ordered: true });
       this.channel.onopen = () => {
-        this.sendFrame({ t: 'hello', id: this.nextId(), features: ['response_credit'] });
+        this.sendFrame({ t: 'hello', id: this.nextId(), features: ['response_credit', 'byte_streams'] });
         paint(this.status());
       };
       this.channel.onmessage = ev => this.handleMessage(ev.data);
@@ -402,6 +405,18 @@ function publicBootstrapHtml() {
       }
       if (msg.t === 'response_end') {
         this.handleResponseEnd(msg);
+        return;
+      }
+      if (msg.t === 'byte_stream_start') {
+        this.handleByteStreamStart(msg);
+        return;
+      }
+      if (msg.t === 'byte_stream_chunk') {
+        this.handleByteStreamChunk(msg);
+        return;
+      }
+      if (msg.t === 'byte_stream_end') {
+        this.handleByteStreamEnd(msg);
         return;
       }
       if (msg.t === 'stream_start') {
@@ -540,6 +555,134 @@ function publicBootstrapHtml() {
       }
       paint(this.status());
     },
+    handleByteStreamStart(msg) {
+      const id = String(msg.id || '');
+      const streamId = String(msg.stream_id || id);
+      if (!id || !streamId || !this.pending.has(id)) return;
+      const totalBytes = Number(msg.total_bytes);
+      const expectedChunks = Number(msg.chunks);
+      if (
+        msg.encoding !== 'base64' ||
+        !Number.isSafeInteger(totalBytes) ||
+        totalBytes < 0 ||
+        totalBytes > MAX_BYTE_STREAM_BYTES ||
+        !Number.isSafeInteger(expectedChunks) ||
+        expectedChunks < 0
+      ) {
+        this.rejectByteStream(streamId, 'invalid dashboard control byte stream header', id);
+        return;
+      }
+      this.byteStreams.set(streamId, {
+        id,
+        streamId,
+        totalBytes,
+        expectedChunks,
+        receivedBytes: 0,
+        chunks: new Map(),
+        ended: false,
+        result: null,
+        contentType: String(msg.content_type || 'application/octet-stream'),
+        filename: msg.filename ? String(msg.filename) : '',
+      });
+      paint(this.status());
+    },
+    handleByteStreamChunk(msg) {
+      const id = String(msg.id || '');
+      const streamId = String(msg.stream_id || id);
+      const state = this.byteStreams.get(streamId);
+      if (!state) return;
+      const seq = Number(msg.seq);
+      if (!Number.isSafeInteger(seq) || seq < 0 || seq >= state.expectedChunks) {
+        this.rejectByteStream(streamId, 'invalid dashboard control byte stream chunk sequence');
+        return;
+      }
+      if (state.chunks.has(seq)) return;
+      let bytes;
+      try {
+        bytes = base64ToBytes(msg.data);
+      } catch {
+        this.rejectByteStream(streamId, 'invalid dashboard control byte stream encoding');
+        return;
+      }
+      state.chunks.set(seq, bytes);
+      state.receivedBytes += bytes.byteLength;
+      if (state.receivedBytes > state.totalBytes) {
+        this.rejectByteStream(streamId, 'dashboard control byte stream exceeded declared size');
+        return;
+      }
+      const completed = this.maybeCompleteByteStream(streamId);
+      if (!completed && this.byteStreams.has(streamId)) {
+        this.sendChunkCredit(id, 1, streamId === id ? null : streamId);
+      }
+      paint(this.status());
+    },
+    handleByteStreamEnd(msg) {
+      const id = String(msg.id || '');
+      const streamId = String(msg.stream_id || id);
+      const state = this.byteStreams.get(streamId);
+      if (!state) return;
+      if (msg.ok === false) {
+        this.rejectByteStream(streamId, msg.error || 'dashboard control byte stream failed');
+        return;
+      }
+      const finalChunks = Number(msg.chunks);
+      if (!Number.isSafeInteger(finalChunks) || finalChunks !== state.expectedChunks) {
+        this.rejectByteStream(streamId, 'invalid dashboard control byte stream footer');
+        return;
+      }
+      state.ended = true;
+      state.result = msg.result || null;
+      this.maybeCompleteByteStream(streamId);
+      paint(this.status());
+    },
+    maybeCompleteByteStream(streamId) {
+      const state = this.byteStreams.get(streamId);
+      if (!state || !state.ended || state.chunks.size !== state.expectedChunks) return false;
+      const merged = new Uint8Array(state.totalBytes);
+      let offset = 0;
+      for (let seq = 0; seq < state.expectedChunks; seq++) {
+        const chunk = state.chunks.get(seq);
+        if (!chunk) {
+          this.rejectByteStream(streamId, 'dashboard control byte stream missed a chunk');
+          return false;
+        }
+        merged.set(chunk, offset);
+        offset += chunk.byteLength;
+      }
+      if (offset !== state.totalBytes) {
+        this.rejectByteStream(streamId, 'dashboard control byte stream size mismatch');
+        return false;
+      }
+      this.byteStreams.delete(streamId);
+      const pending = this.pending.get(state.id);
+      if (!pending) return true;
+      const result = state.result && typeof state.result === 'object' && !Array.isArray(state.result)
+        ? { ...state.result }
+        : {};
+      result.ok = result.ok !== false;
+      result.bytes = merged;
+      result.size = state.totalBytes;
+      result.content_type = result.content_type || state.contentType;
+      result.filename = result.filename || state.filename;
+      result.stream_id = state.streamId;
+      this.completedByteStreams += 1;
+      this.pending.delete(state.id);
+      this.deleteChunkedResponsesForRequest(state.id);
+      pending.resolve(result);
+      paint(this.status());
+      return true;
+    },
+    rejectByteStream(streamId, message, requestId = '') {
+      const state = this.byteStreams.get(streamId);
+      const id = state?.id || requestId || streamId;
+      this.byteStreams.delete(streamId);
+      const pending = this.pending.get(id);
+      if (pending) {
+        this.pending.delete(id);
+        pending.reject(new Error(message));
+      }
+      paint(this.status());
+    },
     handleStreamStart(msg) {
       const pending = this.pending.get(String(msg.id || ''));
       const stream = pending?.stream;
@@ -583,6 +726,16 @@ function publicBootstrapHtml() {
       this.sendFrame({ t: 'request', id, method, params });
       return promise;
     },
+    requestBytes(method, params = {}, options = {}) {
+      if (options.signal?.aborted) return Promise.reject(abortError());
+      if (!this.canUseRpc()) return Promise.reject(new Error('dashboard control byte stream is not connected'));
+      const id = this.nextId();
+      const promise = this.waitFor(id, options);
+      const pending = this.pending.get(id);
+      if (pending) pending.expectBytes = true;
+      this.sendFrame({ t: 'request', id, method, params, bytes: true });
+      return promise;
+    },
     stream(method, params = {}, options = {}, onEvent = {}) {
       if (options.signal?.aborted) return Promise.reject(abortError());
       if (!this.canUseRpc()) return Promise.reject(new Error('dashboard control stream is not connected'));
@@ -610,6 +763,7 @@ function publicBootstrapHtml() {
           if (signal && abortHandler) signal.removeEventListener('abort', abortHandler);
           this.pending.delete(id);
           this.deleteChunkedResponsesForRequest(id);
+          this.deleteByteStreamsForRequest(id);
           if (cancel) this.sendFrame({ t: 'cancel', id });
           reject(err);
         };
@@ -624,6 +778,7 @@ function publicBootstrapHtml() {
             clearTimeout(timer);
             if (signal && abortHandler) signal.removeEventListener('abort', abortHandler);
             this.deleteChunkedResponsesForRequest(id);
+            this.deleteByteStreamsForRequest(id);
             resolve(value);
           },
           reject: err => fail(err),
@@ -634,6 +789,13 @@ function publicBootstrapHtml() {
       for (const [chunkKey, state] of this.chunkedResponses) {
         if (chunkKey === id || state?.id === id) {
           this.chunkedResponses.delete(chunkKey);
+        }
+      }
+    },
+    deleteByteStreamsForRequest(id) {
+      for (const [streamId, state] of this.byteStreams) {
+        if (streamId === id || state?.id === id) {
+          this.byteStreams.delete(streamId);
         }
       }
     },
@@ -658,7 +820,9 @@ function publicBootstrapHtml() {
         verifiedBinding: this.verifiedBinding,
         pendingRequests: this.pending.size,
         pendingChunkedResponses: this.chunkedResponses.size,
+        pendingByteStreams: this.byteStreams.size,
         completedChunkedResponses: this.completedChunkedResponses,
+        completedByteStreams: this.completedByteStreams,
       };
     },
     close() {
@@ -670,6 +834,7 @@ function publicBootstrapHtml() {
         }).catch(() => {});
       }
       this.chunkedResponses.clear();
+      this.byteStreams.clear();
       try { this.channel?.close(); } catch {}
       try { this.pc?.close(); } catch {}
     },
@@ -845,6 +1010,23 @@ async function main() {
           message: { action: 'set_codex_sandbox', mode: 'workspace-write' },
         })),
       };
+      const sessionReport = async () => {
+        const report = await labeled('api_session_report current', (
+          ctl.requestBytes ? ctl.requestBytes('api_session_report', {
+            session_id: 'current',
+          }, { timeoutMs: 120000 }) : ctl.request('api_session_report', {
+            session_id: 'current',
+          }, { timeoutMs: 120000 })
+        ));
+        if (report?.bytes instanceof Uint8Array) {
+          const { bytes, ...rest } = report;
+          return { ...rest, byteLength: bytes.byteLength };
+        }
+        return {
+          ...(report || {}),
+          byteLength: report?.data_base64 ? atob(String(report.data_base64)).length : 0,
+        };
+      };
       return {
         status: await ctl.request('status'),
         config: await ctl.request('config'),
@@ -863,9 +1045,7 @@ async function main() {
         sessionDelete,
         sessionControl,
         dashboardAction,
-        sessionReport: await labeled('api_session_report current', ctl.request('api_session_report', {
-          session_id: 'current',
-        }, { timeoutMs: 120000 })),
+        sessionReport: await sessionReport(),
         sessionsStream: {
           result: streamResult,
           eventTypes: streamEvents.map(event => event.type),
@@ -956,6 +1136,11 @@ async function main() {
       result.status.api_session_report_available,
       true,
       'dashboard control status did not advertise session report downloads'
+    );
+    assert.strictEqual(
+      result.status.byte_streams_available,
+      true,
+      'dashboard control status did not advertise byte streams'
     );
     assert.strictEqual(
       result.status.api_dashboard_action_msg_available,
@@ -1150,7 +1335,8 @@ async function main() {
       assert.strictEqual(result.sessionReport.content_type, 'application/zip');
       assert(String(result.sessionReport.filename || '').endsWith('.zip'), 'session report filename was not a zip');
       assert(Number(result.sessionReport.size || 0) > 0, 'session report had no bytes');
-      assert(String(result.sessionReport.data_base64 || '').length > 0, 'session report had no base64 body');
+      assert(Number(result.sessionReport.byteLength || 0) > 0, 'session report had no byte-stream body');
+      assert.strictEqual(result.sessionReport.byteLength, result.sessionReport.size);
     } else {
       assert.strictEqual(
         result.sessionReport?._httpStatus,
@@ -1387,8 +1573,9 @@ async function main() {
         dashboardActionAction: result.dashboardAction.closeWorkspace?.action,
         rejectedDashboardActionStatus: result.dashboardAction.rejectedSettingsAction?._httpStatus,
         apiSessionReportAvailable: result.status.api_session_report_available,
+        byteStreamsAvailable: result.status.byte_streams_available,
         sessionReportStatus: result.sessionReport._httpStatus || 200,
-        sessionReportSize: result.sessionReport.size || 0,
+        sessionReportSize: result.sessionReport.byteLength || result.sessionReport.size || 0,
         streamEventCount: result.sessionsStream.eventCount,
         streamReplaceCount: result.sessionsStream.replaceCount,
         largeStreamEventCount: result.largeSessionsStream.eventCount,

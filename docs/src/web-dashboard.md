@@ -736,9 +736,10 @@ messages. The first useful envelope set is:
 | `response` | daemon -> browser | Status, metadata, body, or application error for a request id |
 | `response_start` / `response_chunk` / `response_end` | daemon -> browser | Chunked delivery of an oversized JSON `response` frame |
 | `stream_start` / `stream_event` / `stream_end` | daemon -> browser | Ordered event stream for a long-lived request id |
+| `byte_stream_start` / `byte_stream_chunk` / `byte_stream_end` | daemon -> browser | Bounded raw-byte artifact transfer for a request id |
 | `event` | daemon -> browser | Control-plane event stream entry |
 | `cancel` | browser -> daemon | Cancel an in-flight request or stream |
-| `credit` | browser -> daemon | Backpressure for chunked responses or chunked stream events |
+| `credit` | browser -> daemon | Backpressure for chunked responses, chunked stream events, or bounded byte streams |
 | `ping` / `pong` | both | Liveness, latency, and reconnect diagnostics |
 
 Oversized DataChannel `response` and `stream_event` frames are split at the
@@ -751,9 +752,14 @@ that feature is negotiated, the daemon sends an initial chunk window and then
 waits for browser `credit` frames before releasing more chunks. Stream chunks
 carry a `chunk_id` so a large event inside a longer stream can be credited and
 cancelled without ending the whole request id. Older clients that do not
-advertise the feature still receive the legacy eager chunk burst. Resumable
-transfer semantics are still required before moving uploads, downloads,
-recordings, terminal streams, or file transfer.
+advertise the feature still receive the legacy eager chunk burst.
+
+Bounded artifact downloads use `byte_stream_start`, base64 `byte_stream_chunk`
+frames, and `byte_stream_end`. This avoids wrapping raw bytes inside a JSON
+result and reuses the same credit-window queue, but it is still an in-memory,
+single-shot transfer. Resumable/range semantics are still required before moving
+uploads, generic downloads, recordings, terminal streams, or broad file
+transfer.
 
 The first streamed API on this substrate is `api_sessions_stream`, which mirrors
 the existing `/api/sessions/stream` NDJSON event shape (`start`, partial
@@ -825,10 +831,9 @@ Live and per-session recording stream lists use `api_recordings` and
 `api_session_recordings`; HLS playlists and media segments remain on HTTP until
 the tunnel has resumable byte-stream semantics.
 The Settings debug session-report download uses `api_session_report`, returning
-the same text-artifact zip as `/api/session/{id}/report` as base64 inside the
-existing credited chunked JSON response framing. This is intentionally scoped to
-the bounded diagnostic report; generic downloads still wait for raw byte-stream
-semantics.
+the same text-artifact zip as `/api/session/{id}/report` through bounded
+`byte_stream_*` frames. This is intentionally scoped to the diagnostic report;
+generic downloads still wait for resumable/range semantics.
 Worktree cached inventory reads, explicit scans, and guarded removals use
 `api_worktrees`, `api_worktrees_scan`, and `api_worktrees_remove`; removal uses
 the same no-replay fallback rule as other writes.
@@ -934,7 +939,8 @@ Treat this as a staged target, not current behavior:
     active-session command-output loads, active-session timeline operations,
     active-session changes/diffs, lazy context-snapshot exact-loads, session-data
     deletion, staged upload deletion, recording metadata, session-report zip
-    downloads, worktree inventory, filesystem picker stat/list/mkdir operations,
+    downloads, bounded byte-stream artifact transfer, worktree inventory,
+    filesystem picker stat/list/mkdir operations,
     local Agent Card reads, and local session hydration now use the tunnel,
     oversized JSON responses now use credit-windowed chunked response framing,
     and the sessions stream uses explicit
