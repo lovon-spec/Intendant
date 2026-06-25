@@ -14994,6 +14994,7 @@ pub fn spawn_web_gateway(
     let agent_card_json = serde_json::to_string(&agent_card).unwrap_or_else(|_| "{}".to_string());
     let agent_card_value =
         serde_json::to_value(&agent_card).unwrap_or_else(|_| serde_json::json!({}));
+    let bootstrap_caches = crate::dashboard_control::DashboardBootstrapCaches::default();
     let dashboard_control = Arc::new(crate::dashboard_control::DashboardControlRegistry::new(
         config.clone(),
         broadcast_tx.clone(),
@@ -15004,6 +15005,7 @@ pub fn spawn_web_gateway(
         project_root.clone(),
         worktree_inventory_cache.clone(),
         agent_card_value,
+        bootstrap_caches.clone(),
     ));
     let _connect_rendezvous_handle = crate::connect_rendezvous::spawn_connect_rendezvous_client(
         config.connect.clone(),
@@ -15150,20 +15152,20 @@ pub fn spawn_web_gateway(
 
     // Cache the latest usage_update JSON so late-connecting browsers get it
     // without sending ControlMsg (which would pollute the event log).
-    let last_usage_json: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let last_usage_json = bootstrap_caches.last_usage_json.clone();
     // Cache the latest live_usage_update JSON for late-connecting browsers.
-    let last_live_usage_json: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let last_live_usage_json = bootstrap_caches.last_live_usage_json.clone();
     // Cache the latest status event (has autonomy, session_id, task).
-    let last_status_json: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let last_status_json = bootstrap_caches.last_status_json.clone();
     // Cache standalone autonomy changes so reconnecting dashboards do not
     // fall back to the stale autonomy value in the latest status event.
-    let last_autonomy_json: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let last_autonomy_json = bootstrap_caches.last_autonomy_json.clone();
     // Cache the latest external_agent_changed event so a refreshed
     // browser learns the current value without having to re-fetch
     // settings. Without this the dashboard dropdown snaps back to
     // "None (internal agent)" on every page refresh even though the
     // daemon still has the value in memory.
-    let last_external_agent_json: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let last_external_agent_json = bootstrap_caches.last_external_agent_json.clone();
     // Cache all currently externally-attached sessions so refreshed browsers
     // can rehydrate every open Activity window with the same compact
     // transcript shown in the Sessions tab. This must be a set, not "last
@@ -15177,7 +15179,7 @@ pub fn spawn_web_gateway(
     // this cache a refreshed browser shows "off" regardless of whether
     // the user has actually granted access. Cleared on user_display_revoked
     // so a stale grant doesn't get replayed after the user revokes.
-    let last_user_display_json: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let last_user_display_json = bootstrap_caches.last_user_display_json.clone();
     // Cache display_ready JSON per display_id for late-connecting browsers.
     // Using a HashMap so multiple concurrent display sessions are all replayed.
     let display_ready_cache: Arc<Mutex<HashMap<u32, String>>> =

@@ -753,6 +753,15 @@ the HTTP stream on safe errors. Peer session lists still use direct peer HTTP.
 The local daemon identity is available as `api_agent_card`, returning the same
 Agent Card shape served by `/.well-known/agent-card.json`; the HTTP endpoint
 remains the unauthenticated discovery surface.
+`api_cached_bootstrap_events` returns the daemon's current non-personalized
+dashboard event cache (`usage`/`usage_update`, `live_usage_update`, `status`,
+`autonomy_changed`, `external_agent_changed`, and `user_display_granted` when
+present) as parsed JSON events. This is intentionally narrower than the
+WebSocket open sequence: it does not include `state_snapshot`, browser workspace
+snapshots, display-ready replay, display authority snapshots, session-log
+replay, or external-session transcript replay. Those pieces still need separate
+identity-aware APIs before a public origin can fully hydrate the dashboard
+without the primary WebSocket.
 Lazy command-output expansion for finalized log command groups uses
 `api_session_current_agent_output`, preserving the same `_httpStatus`/`_httpOk`
 metadata as the existing HTTP endpoint.

@@ -45,6 +45,7 @@ const CONTROL_FEATURES: &[&str] = &[
     "ping",
     "config",
     "api_agent_card",
+    "api_cached_bootstrap_events",
     "status",
     "events",
     "response_chunks",
@@ -113,8 +114,19 @@ pub struct DashboardControlRegistry {
     project_root: Option<PathBuf>,
     worktree_inventory_cache: Arc<std::sync::Mutex<Option<String>>>,
     agent_card: serde_json::Value,
+    bootstrap_caches: DashboardBootstrapCaches,
     identity: Mutex<Option<Arc<DaemonIdentity>>>,
     peers: Mutex<HashMap<String, DashboardControlPeer>>,
+}
+
+#[derive(Clone, Default)]
+pub struct DashboardBootstrapCaches {
+    pub(crate) last_usage_json: Arc<std::sync::Mutex<Option<String>>>,
+    pub(crate) last_live_usage_json: Arc<std::sync::Mutex<Option<String>>>,
+    pub(crate) last_status_json: Arc<std::sync::Mutex<Option<String>>>,
+    pub(crate) last_autonomy_json: Arc<std::sync::Mutex<Option<String>>>,
+    pub(crate) last_external_agent_json: Arc<std::sync::Mutex<Option<String>>>,
+    pub(crate) last_user_display_json: Arc<std::sync::Mutex<Option<String>>>,
 }
 
 impl DashboardControlRegistry {
@@ -128,6 +140,7 @@ impl DashboardControlRegistry {
         project_root: Option<PathBuf>,
         worktree_inventory_cache: Arc<std::sync::Mutex<Option<String>>>,
         agent_card: serde_json::Value,
+        bootstrap_caches: DashboardBootstrapCaches,
     ) -> Self {
         Self {
             config,
@@ -139,6 +152,7 @@ impl DashboardControlRegistry {
             project_root,
             worktree_inventory_cache,
             agent_card,
+            bootstrap_caches,
             identity: Mutex::new(None),
             peers: Mutex::new(HashMap::new()),
         }
@@ -159,6 +173,7 @@ impl DashboardControlRegistry {
             self.project_root.clone(),
             self.worktree_inventory_cache.clone(),
             self.agent_card.clone(),
+            self.bootstrap_caches.clone(),
             identity,
         )
         .await
@@ -275,6 +290,7 @@ impl DashboardControlPeer {
         project_root: Option<PathBuf>,
         worktree_inventory_cache: Arc<std::sync::Mutex<Option<String>>>,
         agent_card: serde_json::Value,
+        bootstrap_caches: DashboardBootstrapCaches,
         identity: Arc<DaemonIdentity>,
     ) -> Result<(Self, String, DashboardControlBinding), CallerError> {
         let mut setting_engine = SettingEngine::default();
@@ -347,6 +363,7 @@ impl DashboardControlPeer {
             project_root,
             worktree_inventory_cache,
             agent_card,
+            bootstrap_caches,
         };
         let (command_tx, command_rx) = mpsc::channel(COMMAND_CHANNEL);
         let shutdown = CancellationToken::new();
@@ -411,6 +428,7 @@ struct ControlRuntime {
     project_root: Option<PathBuf>,
     worktree_inventory_cache: Arc<std::sync::Mutex<Option<String>>>,
     agent_card: serde_json::Value,
+    bootstrap_caches: DashboardBootstrapCaches,
 }
 
 enum ControlCommand {
@@ -1137,6 +1155,10 @@ fn control_frame_response(
                     "ok": true,
                     "result": runtime.agent_card,
                 })),
+                "api_cached_bootstrap_events" => Some(cached_bootstrap_events_response_frame(
+                    id,
+                    &runtime.bootstrap_caches,
+                )),
                 "api_sessions_stream" => {
                     spawn_control_stream(
                         id,
@@ -1243,6 +1265,85 @@ fn control_frame_response(
     }
 }
 
+fn cached_bootstrap_events_response_frame(
+    id: String,
+    caches: &DashboardBootstrapCaches,
+) -> serde_json::Value {
+    let mut events = Vec::new();
+    let mut malformed = Vec::new();
+    push_cached_bootstrap_event(
+        &mut events,
+        &mut malformed,
+        "usage",
+        &caches.last_usage_json,
+    );
+    push_cached_bootstrap_event(
+        &mut events,
+        &mut malformed,
+        "live_usage",
+        &caches.last_live_usage_json,
+    );
+    push_cached_bootstrap_event(
+        &mut events,
+        &mut malformed,
+        "status",
+        &caches.last_status_json,
+    );
+    push_cached_bootstrap_event(
+        &mut events,
+        &mut malformed,
+        "autonomy",
+        &caches.last_autonomy_json,
+    );
+    push_cached_bootstrap_event(
+        &mut events,
+        &mut malformed,
+        "external_agent",
+        &caches.last_external_agent_json,
+    );
+    push_cached_bootstrap_event(
+        &mut events,
+        &mut malformed,
+        "user_display",
+        &caches.last_user_display_json,
+    );
+    let event_count = events.len();
+
+    serde_json::json!({
+        "t": "response",
+        "id": id,
+        "ok": true,
+        "result": {
+            "events": events,
+            "event_count": event_count,
+            "malformed_sources": malformed,
+            "omitted": [
+                "state_snapshot",
+                "browser_workspace_snapshot",
+                "display_ready",
+                "display_input_authority_state",
+                "session_log_replay",
+                "external_session_activity_replay"
+            ],
+        },
+    })
+}
+
+fn push_cached_bootstrap_event(
+    events: &mut Vec<serde_json::Value>,
+    malformed: &mut Vec<&'static str>,
+    name: &'static str,
+    cache: &Arc<std::sync::Mutex<Option<String>>>,
+) {
+    let Some(line) = cache.lock().ok().and_then(|guard| guard.clone()) else {
+        return;
+    };
+    match serde_json::from_str::<serde_json::Value>(&line) {
+        Ok(value) => events.push(value),
+        Err(_) => malformed.push(name),
+    }
+}
+
 fn status_response_frame(id: String, runtime: &ControlRuntime) -> serde_json::Value {
     let mut result = serde_json::Map::new();
     result.insert("protocol".to_string(), serde_json::json!(CONTROL_PROTOCOL_VERSION));
@@ -1271,6 +1372,7 @@ fn status_response_frame(id: String, runtime: &ControlRuntime) -> serde_json::Va
     let capabilities = [
         ("api_peers_available", peer_registry_available),
         ("api_agent_card_available", true),
+        ("api_cached_bootstrap_events_available", true),
         ("api_sessions_available", true),
         ("api_sessions_stream_available", true),
         ("api_session_detail_available", true),
@@ -3250,6 +3352,7 @@ mod tests {
             shared_session: crate::web_gateway::ActiveSessionState::empty(),
             project_root: None,
             worktree_inventory_cache: Arc::new(std::sync::Mutex::new(None)),
+            bootstrap_caches: DashboardBootstrapCaches::default(),
         }
     }
 
@@ -3322,6 +3425,34 @@ mod tests {
         assert_eq!(card["result"]["id"], "intendant:test-daemon");
         assert_eq!(card["result"]["label"], "test-daemon");
 
+        {
+            let mut guard = rt.bootstrap_caches.last_status_json.lock().unwrap();
+            *guard = Some(r#"{"event":"status","session_id":"s-1"}"#.to_string());
+        }
+        {
+            let mut guard = rt.bootstrap_caches.last_autonomy_json.lock().unwrap();
+            *guard = Some(r#"{"event":"autonomy_changed","mode":"ask"}"#.to_string());
+        }
+        let cached_bootstrap = control_frame_response(
+            r#"{"t":"request","id":"b1","method":"api_cached_bootstrap_events"}"#,
+            &mut rt,
+            &tx,
+            &mut pending,
+            &mut outbound,
+        )
+        .unwrap();
+        assert_eq!(cached_bootstrap["t"], "response");
+        assert_eq!(cached_bootstrap["ok"], true);
+        assert_eq!(cached_bootstrap["result"]["event_count"], 2);
+        assert_eq!(
+            cached_bootstrap["result"]["events"][0]["event"],
+            "status"
+        );
+        assert_eq!(
+            cached_bootstrap["result"]["events"][1]["event"],
+            "autonomy_changed"
+        );
+
         let status = control_frame_response(
             r#"{"t":"request","id":"s1","method":"status"}"#,
             &mut rt,
@@ -3339,6 +3470,10 @@ mod tests {
         assert_eq!(status["result"]["response_credit_enabled"], false);
         assert_eq!(status["result"]["api_peers_available"], false);
         assert_eq!(status["result"]["api_agent_card_available"], true);
+        assert_eq!(
+            status["result"]["api_cached_bootstrap_events_available"],
+            true
+        );
         assert_eq!(status["result"]["api_sessions_available"], true);
         assert_eq!(status["result"]["api_sessions_stream_available"], true);
         assert_eq!(status["result"]["api_session_detail_available"], true);

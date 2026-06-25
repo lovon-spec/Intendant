@@ -825,6 +825,8 @@ async function main() {
       return {
         status: await ctl.request('status'),
         config: await ctl.request('config'),
+        agentCard: await ctl.request('api_agent_card'),
+        cachedBootstrapEvents: await ctl.request('api_cached_bootstrap_events'),
         sessions,
         sessionsById,
         sessionsByIdTarget: firstSessionId,
@@ -910,7 +912,24 @@ async function main() {
       true,
       'dashboard control status did not advertise sessions streaming'
     );
+    assert.strictEqual(
+      result.status.api_agent_card_available,
+      true,
+      'dashboard control status did not advertise agent card'
+    );
+    assert.strictEqual(
+      result.status.api_cached_bootstrap_events_available,
+      true,
+      'dashboard control status did not advertise cached bootstrap events'
+    );
     assert(result.config && typeof result.config === 'object', 'config RPC did not return an object');
+    assert(result.agentCard && result.agentCard.id, 'api_agent_card did not return an id');
+    assert(Array.isArray(result.cachedBootstrapEvents?.events), 'cached bootstrap events RPC did not return events');
+    assert.strictEqual(
+      result.cachedBootstrapEvents.event_count,
+      result.cachedBootstrapEvents.events.length,
+      'cached bootstrap events count did not match events length'
+    );
     assert(Array.isArray(result.sessions), 'api_sessions did not return an array');
     assert(Array.isArray(result.sessionsById), 'api_sessions ids did not return an array');
     if (result.sessionsByIdTarget) {
@@ -1169,6 +1188,8 @@ async function main() {
       rpc: {
         controlSessionId: result.status.session_id,
         responseCredit: result.status.response_credit_enabled,
+        agentCardId: result.agentCard.id,
+        cachedBootstrapEventCount: result.cachedBootstrapEvents.event_count,
         sessionCount: result.sessions.length,
         sessionByIdCount: result.sessionsById.length,
         sessionDeleteInvalidOk: result.sessionDelete.invalidSession?.ok,
