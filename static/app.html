@@ -36671,6 +36671,15 @@ window.intendantDashboardControl = {
   sessionRecordings(sessionId, options = {}) {
     return dashboardTransport.request('api_session_recordings', { session_id: sessionId }, options);
   },
+  worktrees(options = {}) {
+    return dashboardTransport.request('api_worktrees', {}, options);
+  },
+  worktreesScan(options = {}) {
+    return dashboardTransport.request('api_worktrees_scan', {}, options);
+  },
+  worktreesRemove(params = {}, options = {}) {
+    return dashboardTransport.request('api_worktrees_remove', params, options);
+  },
   sessionSearch(params = {}, options = {}) {
     return dashboardTransport.request('api_sessions_search', params, options);
   },
@@ -37255,6 +37264,9 @@ class DashboardControlTransport {
       apiDisplaysAvailable: this.lastStatus?.api_displays_available ?? null,
       apiRecordingsAvailable: this.lastStatus?.api_recordings_available ?? null,
       apiSessionRecordingsAvailable: this.lastStatus?.api_session_recordings_available ?? null,
+      apiWorktreesAvailable: this.lastStatus?.api_worktrees_available ?? null,
+      apiWorktreesScanAvailable: this.lastStatus?.api_worktrees_scan_available ?? null,
+      apiWorktreesRemoveAvailable: this.lastStatus?.api_worktrees_remove_available ?? null,
       apiManagedContextAvailable: this.lastStatus?.api_managed_context_available ?? null,
       pendingRequests: this.pending.size,
       pendingChunkedResponses: this.chunkedResponses.size,
@@ -37297,6 +37309,9 @@ function dashboardControlRequestTimeoutMs(method) {
     case 'api_session_current_changes':
     case 'api_recordings':
     case 'api_session_recordings':
+    case 'api_worktrees':
+    case 'api_worktrees_scan':
+    case 'api_worktrees_remove':
     case 'api_managed_context_records':
     case 'api_managed_context_anchors':
     case 'api_managed_context_fission':
@@ -47454,7 +47469,10 @@ function loadWorktrees(options = {}) {
     }
   }
   const url = forceScan ? '/api/worktrees/scan' : '/api/worktrees';
-  return authedFetch(url, { method: forceScan ? 'POST' : 'GET' })
+  const rpcMethod = forceScan ? 'api_worktrees_scan' : 'api_worktrees';
+  return dashboardJsonFetch(rpcMethod, {}, () => (
+    authedFetch(url, { method: forceScan ? 'POST' : 'GET' })
+  ), rpcMethod)
     .then(r => r.ok ? r.json() : Promise.reject(new Error(`${url} returned ${r.status}`)))
     .then(scan => {
       if (requestSerial !== worktreesRequestSerial) return;
@@ -47665,15 +47683,18 @@ async function removeWorktree(wt, button) {
   setWorktreesActivityNotice('pending', `Removing ${wt.path}...`);
 
   try {
-    const r = await authedFetch('/api/worktrees/remove', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        repo_root: wt.repo_root,
-        path: wt.path,
-        expected_head: wt.head || null,
-      }),
-    });
+    const payload = {
+      repo_root: wt.repo_root,
+      path: wt.path,
+      expected_head: wt.head || null,
+    };
+    const r = await dashboardTransport.jsonFetch('api_worktrees_remove', payload, () => (
+      authedFetch('/api/worktrees/remove', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      })
+    ), 'api_worktrees_remove', { fallbackAfterRpcFailure: false });
     const text = await r.text();
     let result = {};
     try { result = text ? JSON.parse(text) : {}; } catch (_) {}

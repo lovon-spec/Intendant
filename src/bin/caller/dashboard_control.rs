@@ -69,6 +69,9 @@ const CONTROL_FEATURES: &[&str] = &[
     "api_displays",
     "api_recordings",
     "api_session_recordings",
+    "api_worktrees",
+    "api_worktrees_scan",
+    "api_worktrees_remove",
     "api_managed_context_records",
     "api_managed_context_anchors",
     "api_managed_context_fission",
@@ -98,6 +101,7 @@ pub struct DashboardControlRegistry {
     peer_registry: Option<crate::peer::PeerRegistry>,
     shared_session: crate::web_gateway::SharedActiveSession,
     project_root: Option<PathBuf>,
+    worktree_inventory_cache: Arc<std::sync::Mutex<Option<String>>>,
     identity: Mutex<Option<Arc<DaemonIdentity>>>,
     peers: Mutex<HashMap<String, DashboardControlPeer>>,
 }
@@ -110,6 +114,7 @@ impl DashboardControlRegistry {
         peer_registry: Option<crate::peer::PeerRegistry>,
         shared_session: crate::web_gateway::SharedActiveSession,
         project_root: Option<PathBuf>,
+        worktree_inventory_cache: Arc<std::sync::Mutex<Option<String>>>,
     ) -> Self {
         Self {
             config,
@@ -118,6 +123,7 @@ impl DashboardControlRegistry {
             peer_registry,
             shared_session,
             project_root,
+            worktree_inventory_cache,
             identity: Mutex::new(None),
             peers: Mutex::new(HashMap::new()),
         }
@@ -135,6 +141,7 @@ impl DashboardControlRegistry {
             self.peer_registry.clone(),
             self.shared_session.clone(),
             self.project_root.clone(),
+            self.worktree_inventory_cache.clone(),
             identity,
         )
         .await
@@ -248,6 +255,7 @@ impl DashboardControlPeer {
         peer_registry: Option<crate::peer::PeerRegistry>,
         shared_session: crate::web_gateway::SharedActiveSession,
         project_root: Option<PathBuf>,
+        worktree_inventory_cache: Arc<std::sync::Mutex<Option<String>>>,
         identity: Arc<DaemonIdentity>,
     ) -> Result<(Self, String, DashboardControlBinding), CallerError> {
         let mut setting_engine = SettingEngine::default();
@@ -317,6 +325,7 @@ impl DashboardControlPeer {
             peer_registry,
             shared_session,
             project_root,
+            worktree_inventory_cache,
         };
         let (command_tx, command_rx) = mpsc::channel(COMMAND_CHANNEL);
         let shutdown = CancellationToken::new();
@@ -378,6 +387,7 @@ struct ControlRuntime {
     peer_registry: Option<crate::peer::PeerRegistry>,
     shared_session: crate::web_gateway::SharedActiveSession,
     project_root: Option<PathBuf>,
+    worktree_inventory_cache: Arc<std::sync::Mutex<Option<String>>>,
 }
 
 enum ControlCommand {
@@ -1084,6 +1094,9 @@ fn control_frame_response(
                         "api_displays_available": true,
                         "api_recordings_available": true,
                         "api_session_recordings_available": true,
+                        "api_worktrees_available": true,
+                        "api_worktrees_scan_available": true,
+                        "api_worktrees_remove_available": true,
                         "api_managed_context_available": true,
                         "api_peer_mutations_available": runtime.peer_registry.is_some(),
                         "api_peer_pairing_available": true,
@@ -1167,6 +1180,9 @@ fn control_frame_response(
                 | "api_displays"
                 | "api_recordings"
                 | "api_session_recordings"
+                | "api_worktrees"
+                | "api_worktrees_scan"
+                | "api_worktrees_remove"
                 | "api_managed_context_records"
                 | "api_managed_context_anchors"
                 | "api_managed_context_fission"
@@ -1339,6 +1355,11 @@ async fn control_request_response(
         "api_displays" => api_displays_response(id, &runtime).await,
         "api_recordings" => api_recordings_response(id, &runtime).await,
         "api_session_recordings" => api_session_recordings_response(id, params.as_ref()).await,
+        "api_worktrees" => api_worktrees_response(id, &runtime).await,
+        "api_worktrees_scan" => api_worktrees_scan_response(id, &runtime).await,
+        "api_worktrees_remove" => {
+            api_worktrees_remove_response(id, params.as_ref(), &runtime).await
+        }
         "api_managed_context_records" => {
             api_managed_context_response(id, "records", params.as_ref(), &runtime).await
         }
@@ -1836,6 +1857,83 @@ async fn api_session_recordings_response(
         body,
         "session recordings",
     )
+}
+
+async fn api_worktrees_response(id: String, runtime: &ControlRuntime) -> serde_json::Value {
+    let body = runtime
+        .worktree_inventory_cache
+        .lock()
+        .ok()
+        .and_then(|guard| guard.clone())
+        .unwrap_or_else(crate::web_gateway::empty_worktree_inventory_response);
+    json_body_response(id, body, "worktrees")
+}
+
+async fn api_worktrees_scan_response(id: String, runtime: &ControlRuntime) -> serde_json::Value {
+    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
+    let project_root = runtime.project_root.clone();
+    let cache = runtime.worktree_inventory_cache.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let body = crate::web_gateway::scan_worktree_inventory_response(
+            &home,
+            project_root.as_deref(),
+        );
+        if let Ok(mut guard) = cache.lock() {
+            *guard = Some(body.clone());
+        }
+        body
+    })
+    .await;
+    match result {
+        Ok(body) => json_body_response(id, body, "worktree scan"),
+        Err(e) => http_body_response(
+            id,
+            500,
+            serde_json::json!({
+                "error": format!("worktree scan task failed: {e}")
+            })
+            .to_string(),
+            "worktree scan",
+        ),
+    }
+}
+
+async fn api_worktrees_remove_response(
+    id: String,
+    params: Option<&serde_json::Value>,
+    runtime: &ControlRuntime,
+) -> serde_json::Value {
+    let body_text = params_body_text(params);
+    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
+    let cache = runtime.worktree_inventory_cache.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let result = crate::web_gateway::remove_worktree_inventory_response(&home, &body_text);
+        if result.0 == "200 OK" {
+            if let Ok(mut guard) = cache.lock() {
+                *guard = None;
+            }
+        }
+        result
+    })
+    .await;
+    match result {
+        Ok((status_line, body)) => http_body_response(
+            id,
+            status_line_code(status_line),
+            body,
+            "worktree remove",
+        ),
+        Err(e) => http_body_response(
+            id,
+            500,
+            serde_json::json!({
+                "ok": false,
+                "error": format!("worktree removal task failed: {e}")
+            })
+            .to_string(),
+            "worktree remove",
+        ),
+    }
 }
 
 async fn api_managed_context_response(
@@ -2576,6 +2674,7 @@ mod tests {
             peer_registry: None,
             shared_session: crate::web_gateway::ActiveSessionState::empty(),
             project_root: None,
+            worktree_inventory_cache: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -2686,6 +2785,9 @@ mod tests {
         assert_eq!(status["result"]["api_displays_available"], true);
         assert_eq!(status["result"]["api_recordings_available"], true);
         assert_eq!(status["result"]["api_session_recordings_available"], true);
+        assert_eq!(status["result"]["api_worktrees_available"], true);
+        assert_eq!(status["result"]["api_worktrees_scan_available"], true);
+        assert_eq!(status["result"]["api_worktrees_remove_available"], true);
         assert_eq!(status["result"]["api_peer_mutations_available"], false);
         assert_eq!(status["result"]["api_peer_pairing_available"], true);
         assert_eq!(status["result"]["api_coordinator_available"], false);
@@ -2878,6 +2980,35 @@ mod tests {
         assert_eq!(invalid_session["result"]["error"], "invalid session id");
         assert_eq!(invalid_session["result"]["_httpStatus"], 400);
         assert_eq!(invalid_session["result"]["_httpOk"], false);
+    }
+
+    #[tokio::test]
+    async fn worktree_rpcs_preserve_cache_and_error_status() {
+        let rt = runtime();
+        {
+            let mut cache = rt.worktree_inventory_cache.lock().unwrap();
+            *cache = Some(
+                serde_json::json!({
+                    "worktrees": [{ "path": "/tmp/wt", "branch": "feature" }],
+                    "summary": { "worktrees": 1 },
+                })
+                .to_string(),
+            );
+        }
+
+        let cached = api_worktrees_response("wt1".to_string(), &rt).await;
+        assert_eq!(cached["t"], "response");
+        assert_eq!(cached["ok"], true);
+        assert_eq!(cached["result"]["summary"]["worktrees"], 1);
+
+        let invalid_remove =
+            api_worktrees_remove_response("wt2".to_string(), Some(&serde_json::json!({})), &rt)
+                .await;
+        assert_eq!(invalid_remove["t"], "response");
+        assert_eq!(invalid_remove["ok"], true);
+        assert_eq!(invalid_remove["result"]["ok"], false);
+        assert_eq!(invalid_remove["result"]["_httpStatus"], 400);
+        assert_eq!(invalid_remove["result"]["_httpOk"], false);
     }
 
     #[tokio::test]

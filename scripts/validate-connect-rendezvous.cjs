@@ -861,6 +861,11 @@ async function main() {
           live: await ctl.request('api_recordings'),
           invalidSession: await ctl.request('api_session_recordings', { session_id: '../bad' }),
         },
+        worktrees: {
+          cached: await ctl.request('api_worktrees'),
+          scan: await ctl.request('api_worktrees_scan', {}, { timeoutMs: 120000 }),
+          invalidRemove: await ctl.request('api_worktrees_remove', {}),
+        },
         filesystem: {
           statHome: await ctl.request('api_fs_stat', { path: '~' }),
           listHome: await ctl.request('api_fs_list', { path: '~' }),
@@ -869,7 +874,7 @@ async function main() {
         appError: await ctl.request('api_peer_eligible', { capabilities: [] }),
         finalStatus: ctl.status(),
       };
-    });
+    }, { timeoutMs: 180000 });
     assert(result.status && result.status.session_id, 'status RPC did not return a session id');
     assert.strictEqual(
       result.status.response_credit_enabled,
@@ -1000,6 +1005,33 @@ async function main() {
       'session recordings RPC did not preserve invalid id status'
     );
     assert.strictEqual(
+      result.status.api_worktrees_available,
+      true,
+      'dashboard control status did not advertise worktrees'
+    );
+    assert.strictEqual(
+      result.status.api_worktrees_scan_available,
+      true,
+      'dashboard control status did not advertise worktree scan'
+    );
+    assert.strictEqual(
+      result.status.api_worktrees_remove_available,
+      true,
+      'dashboard control status did not advertise worktree remove'
+    );
+    assert(
+      result.worktrees?.cached && typeof result.worktrees.cached === 'object',
+      'worktree cached RPC did not return an inventory object'
+    );
+    assert(
+      result.worktrees?.scan && typeof result.worktrees.scan === 'object',
+      'worktree scan RPC did not return an inventory object'
+    );
+    assert(
+      result.worktrees?.invalidRemove?._httpStatus === 400,
+      'worktree remove RPC did not preserve invalid request status'
+    );
+    assert.strictEqual(
       result.status.api_fs_stat_available,
       true,
       'dashboard control status did not advertise filesystem stat'
@@ -1069,6 +1101,10 @@ async function main() {
           value?._httpStatus || 200,
         ])),
         recordingsStatuses: Object.fromEntries(Object.entries(result.recordings || {}).map(([key, value]) => [
+          key,
+          value?._httpStatus || 200,
+        ])),
+        worktreesStatuses: Object.fromEntries(Object.entries(result.worktrees || {}).map(([key, value]) => [
           key,
           value?._httpStatus || 200,
         ])),

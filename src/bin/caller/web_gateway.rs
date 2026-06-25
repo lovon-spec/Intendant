@@ -8748,18 +8748,24 @@ fn cached_intendant_log_dirs_for_session_id(session_id: &str) -> Vec<PathBuf> {
     dirs
 }
 
-fn empty_worktree_inventory_response() -> String {
+pub(crate) fn empty_worktree_inventory_response() -> String {
     serde_json::to_string(&crate::worktree_inventory::empty_scan())
         .unwrap_or_else(|_| "{}".to_string())
 }
 
-fn scan_worktree_inventory_response(home: &Path, project_root: Option<&Path>) -> String {
+pub(crate) fn scan_worktree_inventory_response(
+    home: &Path,
+    project_root: Option<&Path>,
+) -> String {
     let hints = worktree_session_hints_from_home(home);
     let scan = crate::worktree_inventory::scan_worktrees(home, project_root, &hints);
     serde_json::to_string(&scan).unwrap_or_else(|_| "{}".to_string())
 }
 
-fn remove_worktree_inventory_response(home: &Path, body_text: &str) -> (&'static str, String) {
+pub(crate) fn remove_worktree_inventory_response(
+    home: &Path,
+    body_text: &str,
+) -> (&'static str, String) {
     let request =
         match serde_json::from_str::<crate::worktree_inventory::WorktreeRemoveRequest>(body_text) {
             Ok(request) => request,
@@ -14857,6 +14863,11 @@ pub fn spawn_web_gateway(
 ) -> tokio::task::JoinHandle<()> {
     let config_json = serde_json::to_string(&config).unwrap_or_else(|_| "{}".to_string());
     let peer_access_request_config = config.peer_access_requests.clone();
+    // Cache the most recent worktree inventory scan. Scanning can walk
+    // large worktree directories for disk-size accounting, so the
+    // dashboard explicitly triggers refreshes instead of doing it on
+    // every GET. Shared by HTTP and the dashboard WebRTC control tunnel.
+    let worktree_inventory_cache: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let dashboard_control = Arc::new(crate::dashboard_control::DashboardControlRegistry::new(
         config.clone(),
         broadcast_tx.clone(),
@@ -14864,6 +14875,7 @@ pub fn spawn_web_gateway(
         peer_registry.clone(),
         shared_session.clone(),
         project_root.clone(),
+        worktree_inventory_cache.clone(),
     ));
     let _connect_rendezvous_handle = crate::connect_rendezvous::spawn_connect_rendezvous_client(
         config.connect.clone(),
@@ -15063,11 +15075,6 @@ pub fn spawn_web_gateway(
     // Using a HashMap so multiple concurrent display sessions are all replayed.
     let display_ready_cache: Arc<Mutex<HashMap<u32, String>>> =
         Arc::new(Mutex::new(HashMap::new()));
-    // Cache the most recent worktree inventory scan. Scanning can walk
-    // large worktree directories for disk-size accounting, so the
-    // dashboard explicitly triggers refreshes instead of doing it on
-    // every GET.
-    let worktree_inventory_cache: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     {
         let usage_cache = last_usage_json.clone();
         let live_usage_cache = last_live_usage_json.clone();
