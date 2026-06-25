@@ -2696,6 +2696,7 @@ async function main() {
         ctl.dashboardBootstrap({ timeoutMs: 60000 }),
       ]);
       const transportLabel = document.getElementById('sb-dashboard-transport-label')?.textContent || '';
+      const serverLabel = document.getElementById('sb-conn-label')?.textContent || '';
       const serverClass = document.getElementById('sb-conn')?.className || '';
       return {
         status,
@@ -2704,6 +2705,7 @@ async function main() {
         sessionCount: Array.isArray(sessions) ? sessions.length : null,
         bootstrapFrameCount: bootstrap?.frame_count ?? (Array.isArray(bootstrap?.frames) ? bootstrap.frames.length : null),
         transportLabel,
+        serverLabel,
         serverClass,
       };
     });
@@ -2731,6 +2733,15 @@ async function main() {
       'Connect',
       `real SPA did not expose Connect transport status: ${JSON.stringify(appResult)}`
     );
+    assert.strictEqual(
+      appResult.serverLabel,
+      'events',
+      `real SPA did not relabel primary event status in Connect mode: ${JSON.stringify(appResult)}`
+    );
+    assert(
+      String(appResult.serverClass || '').includes('ok'),
+      `real SPA did not mark primary events healthy in Connect mode: ${JSON.stringify(appResult)}`
+    );
     assert.deepStrictEqual(appConsoleErrors, [], 'real SPA emitted browser console errors');
     assert.deepStrictEqual(
       [...new Set(appUnexpectedPublicRequests)],
@@ -2750,6 +2761,7 @@ async function main() {
         sessionCount: appResult.sessionCount,
         dashboardBootstrapFrameCount: appResult.bootstrapFrameCount,
         transportLabel: appResult.transportLabel,
+        serverLabel: appResult.serverLabel,
         serverClass: appResult.serverClass,
         unexpectedPublicRequests: appUnexpectedPublicRequests,
         unexpectedPublicWebSockets: appUnexpectedPublicWebSockets,

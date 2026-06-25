@@ -1004,7 +1004,10 @@ dashboard access shows the existing HTTP/mTLS path, while opt-in WebRTC control
 shows `checking`, verified `WebRTC`, `relay` when browser ICE stats report a
 TURN-relayed candidate pair, or `failed` when signaling or daemon-binding
 verification fails. The tooltip carries the detailed state that is also exposed
-through `window.intendantDashboardControl.status()`.
+through `window.intendantDashboardControl.status()`. In public-origin Connect
+mode, the legacy `ws` indicator is relabeled to `events`; it turns green only
+after the verified DataChannel has hydrated dashboard bootstrap events, since no
+same-origin daemon WebSocket is expected in that mode.
 
 Peer access-request APIs now use the same transport boundary. The dashboard's
 pairing/request panes call `api_peer_pairing_requests`,

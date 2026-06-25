@@ -8774,8 +8774,8 @@ body.display-fullscreen-open {
     <span class="field-label">Intendant session</span>
     <span class="session" id="sb-session"></span>
     <span class="sep">|</span>
-    <span class="sb-dot-group" title="WebSocket connection to this daemon">
-      <span class="field-label">ws</span>
+    <span class="sb-dot-group" id="sb-conn-group" title="WebSocket connection to this daemon">
+      <span class="field-label" id="sb-conn-label">ws</span>
       <span class="conn-dot err" id="sb-conn"></span>
     </span>
     <span class="sb-dot-group" id="sb-dashboard-transport" title="Dashboard control transport">
@@ -17877,6 +17877,36 @@ function clearServerWebSocketErrorStatus() {
   el.textContent = '';
   el.className = 'voice-status hidden';
 }
+
+function setPrimaryEventStatus(kind, label, title) {
+  const group = document.getElementById('sb-conn-group');
+  const conn = document.getElementById('sb-conn');
+  const connLabel = document.getElementById('sb-conn-label');
+  if (group && title) group.title = title;
+  if (conn) {
+    conn.className = `conn-dot ${kind || 'err'}`;
+    if (title) conn.title = title;
+  }
+  if (connLabel && label) connLabel.textContent = label;
+}
+
+function setServerWebSocketStatus(connected) {
+  if (dashboardConnectModeEnabled()) return;
+  setPrimaryEventStatus(
+    connected ? 'ok' : 'err',
+    'ws',
+    connected
+      ? 'WebSocket connection to this daemon is connected'
+      : 'WebSocket connection to this daemon is disconnected'
+  );
+  if (connected) clearServerWebSocketErrorStatus();
+}
+
+function setConnectEventStatus(kind, title) {
+  setPrimaryEventStatus(kind, 'events', title);
+  if (kind === 'ok') clearServerWebSocketErrorStatus();
+}
+
 function hideVoiceStatus() {
   document.getElementById('voiceStatus').classList.add('hidden');
 }
@@ -18437,10 +18467,9 @@ async function main() {
 
   // Connection state indicator
   app.set_on_server_state((connected) => {
-    document.getElementById('sb-conn').className = connected ? 'conn-dot ok' : 'conn-dot err';
+    setServerWebSocketStatus(connected);
     dashboardUpdateTransportStatus();
     if (connected) {
-      clearServerWebSocketErrorStatus();
       // Fresh WS sessions start unsubscribed on the server. Reassert
       // our local subscription state so reloads / reconnects restore
       // frame flow to a Terminal-tab view without requiring the user
@@ -18667,19 +18696,17 @@ async function main() {
   window.__presenceWeb = app;
 
   if (dashboardConnectModeEnabled()) {
-    const connDot = document.getElementById('sb-conn');
-    if (connDot) {
-      connDot.className = 'conn-dot warn';
-      connDot.title = 'Primary server events are arriving over the Connect WebRTC dashboard tunnel';
-    }
+    setConnectEventStatus('warn', 'Connecting dashboard events over the Connect WebRTC tunnel');
     try {
       await maybeStartDashboardControlTransport();
       await waitForDashboardControlReady(30000);
       await hydrateDashboardFromControl();
+      setConnectEventStatus('ok', 'Dashboard events are arriving over the verified Connect WebRTC tunnel; no same-origin WebSocket is used');
     } catch (err) {
       console.warn('[dashboard-control] Connect dashboard bootstrap failed', err);
       dashboardSetControlLastError(err?.message || String(err));
       dashboardUpdateTransportStatus();
+      setConnectEventStatus('err', 'Connect dashboard event tunnel failed');
     }
   } else {
     // Connect to server over the normal daemon-origin WebSocket.
@@ -18938,8 +18965,14 @@ function processCommands(cmds) {
       case 'hide_badge': hideBadge(c.tab); break;
       case 'term_data': handleTermData(c.base64); break;
       case 'set_connected':
-        document.getElementById('sb-conn').className = c.connected ? 'conn-dot ok' : 'conn-dot err';
-        if (c.connected) clearServerWebSocketErrorStatus();
+        if (dashboardConnectModeEnabled()) {
+          setConnectEventStatus(
+            dashboardTransport?.canUseRpc?.() ? 'ok' : 'warn',
+            'Dashboard events are routed by the Connect WebRTC tunnel in public-origin mode'
+          );
+        } else {
+          setServerWebSocketStatus(c.connected);
+        }
         break;
       case 'file_changed':
         onFileChanged(c.path, c.kind, c.lines_added, c.lines_removed);
