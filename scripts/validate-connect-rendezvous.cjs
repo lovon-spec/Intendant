@@ -355,7 +355,7 @@ function publicBootstrapHtml() {
       this.pc = new RTCPeerConnection({});
       this.channel = this.pc.createDataChannel('intendant-dashboard-control', { ordered: true });
       this.channel.onopen = () => {
-        this.sendFrame({ t: 'hello', id: this.nextId(), features: ['response_credit', 'byte_streams', 'terminal_frames'] });
+        this.sendFrame({ t: 'hello', id: this.nextId(), features: ['response_credit', 'byte_streams', 'terminal_frames', 'tui_frames'] });
         paint(this.status());
       };
       this.channel.onmessage = ev => this.handleMessage(ev.data);
@@ -407,6 +407,12 @@ function publicBootstrapHtml() {
       if (msg.t === 'terminal_output' || msg.t === 'terminal_exited' || msg.t === 'terminal_opened' || msg.t === 'terminal_error') {
         try {
           window.dispatchEvent(new CustomEvent('intendant-dashboard-terminal-frame', { detail: msg }));
+        } catch (_) {}
+        return;
+      }
+      if (msg.t === 'tui_term' || msg.t === 'tui_error') {
+        try {
+          window.dispatchEvent(new CustomEvent('intendant-dashboard-tui-frame', { detail: msg }));
         } catch (_) {}
         return;
       }
@@ -800,6 +806,11 @@ function publicBootstrapHtml() {
       }
     },
     terminalFrame(frame) {
+      if (!this.canUseRpc()) return false;
+      this.sendFrame(frame);
+      return true;
+    },
+    tuiFrame(frame) {
       if (!this.canUseRpc()) return false;
       this.sendFrame(frame);
       return true;
@@ -1217,9 +1228,69 @@ async function main() {
           window.removeEventListener('intendant-dashboard-terminal-frame', handler);
         }
       };
+      const tui = async () => {
+        const connectionId = `dashboard-tui-rendezvous-${Date.now()}`;
+        const frames = [];
+        const handler = event => frames.push(event.detail || {});
+        const waitFor = (predicate, label) => new Promise((resolve, reject) => {
+          const started = Date.now();
+          const tick = () => {
+            const found = frames.find(predicate);
+            if (found) {
+              resolve(found);
+              return;
+            }
+            if (Date.now() - started > 60000) {
+              reject(new Error(`tui ${label} timed out`));
+              return;
+            }
+            setTimeout(tick, 25);
+          };
+          tick();
+        });
+        window.addEventListener('intendant-dashboard-tui-frame', handler);
+        try {
+          ctl.tuiFrame({
+            t: 'tui_subscribe',
+            connection_id: connectionId,
+            cols: 80,
+            rows: 24,
+          });
+          const frame = await waitFor(item => (
+            item.t === 'tui_term' &&
+            item.connection_id === connectionId &&
+            Boolean(item.base64 || item.d)
+          ), 'term frame');
+          ctl.tuiFrame({
+            t: 'tui_key',
+            connection_id: connectionId,
+            key: 'Tab',
+            ctrl: false,
+            alt: false,
+            shift: false,
+          });
+          ctl.tuiFrame({
+            t: 'tui_unsubscribe',
+            connection_id: connectionId,
+          });
+          ctl.tuiFrame({
+            t: 'tui_close',
+            connection_id: connectionId,
+          });
+          const data = String(frame.base64 || frame.d || '');
+          return {
+            subscribed: true,
+            connectionId,
+            frameBytes: atob(data).length,
+          };
+        } finally {
+          window.removeEventListener('intendant-dashboard-tui-frame', handler);
+        }
+      };
+      const status = await ctl.request('status');
       const uploaded = await upload();
       return {
-        status: await ctl.request('status'),
+        status,
         config: await ctl.request('config'),
         agentCard: await ctl.request('api_agent_card'),
         cachedBootstrapEvents: await ctl.request('api_cached_bootstrap_events'),
@@ -1241,6 +1312,7 @@ async function main() {
         uploadRaw: await uploadRaw(uploaded),
         recordingAsset: await recordingAsset(),
         terminal: await terminal(),
+        tui: status.tui_frames_available ? await tui() : { skipped: true, subscribed: false, frameBytes: 0 },
         sessionsStream: {
           result: streamResult,
           eventTypes: streamEvents.map(event => event.type),
@@ -1586,6 +1658,12 @@ async function main() {
     assert.strictEqual(result.recordingAsset?.resumable, true);
     assert.strictEqual(result.terminal?.opened, true);
     assert.strictEqual(result.terminal?.sawToken, true);
+    if (result.status.tui_frames_available) {
+      assert.strictEqual(result.tui?.subscribed, true);
+      assert(Number(result.tui?.frameBytes || 0) > 0, 'TUI frame did not contain bytes');
+    } else {
+      assert.strictEqual(result.tui?.skipped, true);
+    }
     assert.strictEqual(
       result.status.api_session_current_history_available,
       true,
@@ -1817,6 +1895,7 @@ async function main() {
         byteStreamsAvailable: result.status.byte_streams_available,
         uploadFramesAvailable: result.status.upload_frames_available,
         terminalFramesAvailable: result.status.terminal_frames_available,
+        tuiFramesAvailable: result.status.tui_frames_available,
         apiSessionCurrentUploadAvailable: result.status.api_session_current_upload_available,
         apiSessionCurrentUploadRawAvailable: result.status.api_session_current_upload_raw_available,
         apiRecordingAssetAvailable: result.status.api_recording_asset_available,
@@ -1827,6 +1906,7 @@ async function main() {
         recordingAssetBytes: result.recordingAsset.byteLength,
         recordingAssetText: result.recordingAsset.text,
         terminalOutputBytes: result.terminal.outputBytes,
+        tuiFrameBytes: result.tui.frameBytes,
         sessionReportStatus: result.sessionReport._httpStatus || 200,
         sessionReportSize: result.sessionReport.byteLength || result.sessionReport.size || 0,
         streamEventCount: result.sessionsStream.eventCount,

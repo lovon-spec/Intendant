@@ -15436,6 +15436,7 @@ pub fn spawn_web_gateway(
         project_root.clone(),
         worktree_inventory_cache.clone(),
         terminal_registry.clone(),
+        web_tui_tx.clone(),
         agent_card_value,
         bootstrap_caches.clone(),
         Some(dashboard_display_authority),

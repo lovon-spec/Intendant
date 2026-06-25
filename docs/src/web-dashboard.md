@@ -476,9 +476,13 @@ external-agent, Codex, Gemini, and verbosity settings, can also dispatch over
 the DataChannel when it is verified. Display input authority uses dedicated
 DataChannel RPCs and a `display_input` frame rather than the generic
 `ControlMsg` allowlist. The standalone Shell terminal subtab uses dedicated
-`terminal_*` frames over the same verified channel; the TUI terminal mirror
-remains on the main WebSocket. Session lifecycle, steering, approvals, interrupt,
-resume, stop/restart, rename, and launch-config changes use a separate
+`terminal_*` frames over the same verified channel. The server-side ratatui TUI
+subtab uses `tui_subscribe`, `tui_key`, `tui_resize`, `tui_unsubscribe`, and
+`tui_close` frames when the daemon has a live WebTui renderer; idle daemon
+launches that do not run WebTui advertise `tui_frames_available: false` and keep
+the WebSocket path as the only possible TUI transport. Session lifecycle,
+steering, approvals, interrupt, resume, stop/restart, rename, and launch-config
+changes use a separate
 `api_session_control_msg` RPC with its own allowlist instead of broadening the
 generic settings-style `api_control_msg`. Smaller dashboard action controls use
 `api_dashboard_action_msg`; this includes Codex/Gemini thread actions, display
@@ -743,6 +747,8 @@ messages. The first useful envelope set is:
 | `upload_start` / `upload_chunk` / `upload_end` | browser -> daemon | Bounded raw-byte upload transfer for a request id |
 | `terminal_open` / `terminal_input` / `terminal_resize` / `terminal_close` | browser -> daemon | Standalone Shell PTY control for one terminal id |
 | `terminal_output` / `terminal_exited` / `terminal_opened` / `terminal_error` | daemon -> browser | Standalone Shell PTY data and lifecycle frames |
+| `tui_subscribe` / `tui_key` / `tui_resize` / `tui_unsubscribe` / `tui_close` | browser -> daemon | Server-side WebTui connection control when a WebTui renderer is available |
+| `tui_term` / `tui_error` | daemon -> browser | WebTui terminal bytes and errors for one dashboard-control connection id |
 | `event` | daemon -> browser | Control-plane event stream entry |
 | `cancel` | browser -> daemon | Cancel an in-flight request or stream |
 | `credit` | browser -> daemon | Backpressure for chunked responses, chunked stream events, or bounded byte streams |
@@ -770,14 +776,18 @@ Bounded dashboard uploads use `upload_start`, base64 `upload_chunk`, and
 same upload store as `POST /api/session/current/uploads`, including the
 `UploadReady` broadcast. This is still a one-shot, ordered transfer with no
 resume token. Resumable/range semantics are still required before moving generic
-downloads, recordings, the TUI terminal mirror, or broad file transfer.
+downloads, native media playback, or broad file transfer.
 
 The standalone **Terminal -> Shell** subtab uses `terminal_*` frames when the
 verified tunnel advertises `terminal_frames`. The daemon attaches the tunnel to
 the same PTY registry used by the WebSocket path, so scrollback and reconnect
-behavior stay consistent. The server-side ratatui **TUI** subtab still uses the
-main WebSocket because its frame subscription is tied to WebTui's per-connection
-render loop.
+behavior stay consistent. The server-side ratatui **TUI** subtab uses `tui_*`
+frames when the verified tunnel advertises `tui_frames`. The daemon creates a
+dashboard-control-owned WebTui connection, forwards WebTui's existing
+`{"t":"term","d":"..."}` output as `tui_term`, and removes the connection on
+`tui_close` or DataChannel cleanup. Idle daemon launches intentionally do not run
+WebTui, so they report `tui_frames_available: false` and the browser leaves that
+subtab on the existing WebSocket/fallback behavior.
 
 The first streamed API on this substrate is `api_sessions_stream`, which mirrors
 the existing `/api/sessions/stream` NDJSON event shape (`start`, partial
@@ -906,10 +916,10 @@ before a verified DataChannel request is attempted, then surface RPC failures
 instead of duplicating a potentially state-changing action.
 
 The remaining migration work is mostly byte-stream and file-transfer heavy:
-generic downloads, native recording/HLS media URL playback, the TUI terminal
-mirror, broader file transfer, and remaining non-allowlisted control mutations
-should move only after resumable stream/file-transfer semantics and per-action
-no-replay rules are settled.
+generic downloads, native recording/HLS media URL playback, broader file
+transfer, and remaining non-allowlisted control mutations should move only after
+resumable stream/file-transfer semantics and per-action no-replay rules are
+settled.
 
 The dashboard status bar now exposes the selected control transport. Direct
 dashboard access shows the existing HTTP/mTLS path, while opt-in WebRTC control
@@ -986,10 +996,10 @@ Treat this as a staged target, not current behavior:
     with no-replay fallback. Dedicated dashboard-action `ControlMsg` dispatch
     now covers Codex/Gemini thread actions, display take/release/grant/revoke,
     recording/debug toggles, and browser workspace create/acquire/close/release.
-    Standalone Shell terminal frames also use the tunnel when verified. Generic
-    downloads, native recording/HLS URL playback, the TUI terminal mirror,
-    remaining non-allowlisted control commands, and file transfer still wait for
-    resumable stream/file-transfer semantics.
+    Standalone Shell terminal frames and WebTui frames also use the tunnel when
+    verified and advertised by the daemon. Generic downloads, native
+    recording/HLS URL playback, remaining non-allowlisted control commands, and
+    file transfer still wait for resumable stream/file-transfer semantics.
 11. Keep direct mTLS dashboard access and peer daemon-to-daemon mTLS working
     throughout.
 

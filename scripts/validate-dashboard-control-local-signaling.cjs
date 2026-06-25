@@ -278,9 +278,69 @@ async function main() {
           window.removeEventListener('intendant-dashboard-terminal-frame', handler);
         }
       };
+      const tui = async () => {
+        const connectionId = `dashboard-tui-local-${Date.now()}`;
+        const frames = [];
+        const handler = event => frames.push(event.detail || {});
+        const waitFor = (predicate, label) => new Promise((resolve, reject) => {
+          const started = Date.now();
+          const tick = () => {
+            const found = frames.find(predicate);
+            if (found) {
+              resolve(found);
+              return;
+            }
+            if (Date.now() - started > 60000) {
+              reject(new Error(`tui ${label} timed out`));
+              return;
+            }
+            setTimeout(tick, 25);
+          };
+          tick();
+        });
+        window.addEventListener('intendant-dashboard-tui-frame', handler);
+        try {
+          ctl.tuiFrame({
+            t: 'tui_subscribe',
+            connection_id: connectionId,
+            cols: 80,
+            rows: 24,
+          });
+          const frame = await waitFor(item => (
+            item.t === 'tui_term' &&
+            item.connection_id === connectionId &&
+            Boolean(item.base64 || item.d)
+          ), 'term frame');
+          ctl.tuiFrame({
+            t: 'tui_key',
+            connection_id: connectionId,
+            key: 'Tab',
+            ctrl: false,
+            alt: false,
+            shift: false,
+          });
+          ctl.tuiFrame({
+            t: 'tui_unsubscribe',
+            connection_id: connectionId,
+          });
+          ctl.tuiFrame({
+            t: 'tui_close',
+            connection_id: connectionId,
+          });
+          const data = String(frame.base64 || frame.d || '');
+          return {
+            subscribed: true,
+            connectionId,
+            frameBytes: atob(data).length,
+          };
+        } finally {
+          window.removeEventListener('intendant-dashboard-tui-frame', handler);
+        }
+      };
+      const status = await ctl.request('status', {}, { timeoutMs: 60000 });
       const uploaded = await upload();
       return {
-        status: await ctl.request('status', {}, { timeoutMs: 60000 }),
+        status,
         agentCard: await ctl.agentCard({ timeoutMs: 60000 }),
         cachedBootstrapEvents: await ctl.cachedBootstrapEvents({ timeoutMs: 60000 }),
         browserWorkspaceSnapshot: await ctl.browserWorkspaceSnapshot({ timeoutMs: 60000 }),
@@ -296,6 +356,7 @@ async function main() {
         uploadRaw: await uploadRaw(uploaded),
         recordingAsset: await recordingAsset(),
         terminal: await terminal(),
+        tui: status.tui_frames_available ? await tui() : { skipped: true, subscribed: false, frameBytes: 0 },
         rejectedControlMsg: await labeled('api_control_msg rejected create_session', ctl.request('api_control_msg', {
           message: { action: 'create_session', task: 'noop' },
         }, { timeoutMs: 60000 })),
@@ -408,6 +469,7 @@ async function main() {
     assert.strictEqual(result.finalStatus.byteStreamsAvailable, true);
     assert.strictEqual(result.finalStatus.uploadFramesAvailable, true);
     assert.strictEqual(result.finalStatus.terminalFramesAvailable, true);
+    assert.strictEqual(result.finalStatus.tuiFramesAvailable, result.status.tui_frames_available === true);
     assert.strictEqual(result.finalStatus.apiSessionCurrentUploadAvailable, true);
     assert.strictEqual(result.finalStatus.apiSessionCurrentUploadRawAvailable, true);
     assert.strictEqual(result.finalStatus.apiRecordingAssetAvailable, true);
@@ -432,6 +494,12 @@ async function main() {
     assert.strictEqual(result.recordingAsset?.resumable, true);
     assert.strictEqual(result.terminal?.opened, true);
     assert.strictEqual(result.terminal?.sawToken, true);
+    if (result.status.tui_frames_available) {
+      assert.strictEqual(result.tui?.subscribed, true);
+      assert(Number(result.tui?.frameBytes || 0) > 0, 'TUI frame did not contain bytes');
+    } else {
+      assert.strictEqual(result.tui?.skipped, true);
+    }
     if (result.sessionReport?.ok === true) {
       assert.strictEqual(result.sessionReport.content_type, 'application/zip');
       assert(String(result.sessionReport.filename || '').endsWith('.zip'), 'session report filename was not a zip');
@@ -497,6 +565,7 @@ async function main() {
         byteStreamsAvailable: result.finalStatus.byteStreamsAvailable,
         uploadFramesAvailable: result.finalStatus.uploadFramesAvailable,
         terminalFramesAvailable: result.finalStatus.terminalFramesAvailable,
+        tuiFramesAvailable: result.finalStatus.tuiFramesAvailable,
         apiSessionCurrentUploadAvailable: result.finalStatus.apiSessionCurrentUploadAvailable,
         apiSessionCurrentUploadRawAvailable: result.finalStatus.apiSessionCurrentUploadRawAvailable,
         apiRecordingAssetAvailable: result.finalStatus.apiRecordingAssetAvailable,
@@ -507,6 +576,7 @@ async function main() {
         recordingAssetBytes: result.recordingAsset.byteLength,
         recordingAssetText: result.recordingAsset.text,
         terminalOutputBytes: result.terminal.outputBytes,
+        tuiFrameBytes: result.tui.frameBytes,
         sessionReportStatus: result.sessionReport._httpStatus || 200,
         sessionReportSize: result.sessionReport.byteLength || result.sessionReport.size || 0,
         rejectedControlStatus: result.rejectedControlMsg._httpStatus,

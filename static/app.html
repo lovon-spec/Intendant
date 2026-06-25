@@ -30030,6 +30030,36 @@ function sendShellMessage(obj) {
   sendRawMessage(obj);
 }
 
+const TUI_CONNECTION_ID = `tui-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+
+function sendTuiKey(domEvent) {
+  if (dashboardTuiFramesAvailable() && dashboardTransport.tuiFrame({
+    t: 'tui_key',
+    connection_id: TUI_CONNECTION_ID,
+    key: domEvent.key,
+    ctrl: domEvent.ctrlKey,
+    alt: domEvent.altKey,
+    shift: domEvent.shiftKey,
+  })) {
+    return;
+  }
+  if (app?.send_key) {
+    app.send_key(domEvent.key, domEvent.ctrlKey, domEvent.altKey, domEvent.shiftKey);
+  }
+}
+
+function sendTuiResize(cols, rows) {
+  if (dashboardTuiFramesAvailable() && dashboardTransport.tuiFrame({
+    t: 'tui_resize',
+    connection_id: TUI_CONNECTION_ID,
+    cols,
+    rows,
+  })) {
+    return;
+  }
+  if (app?.send_resize) app.send_resize(cols, rows);
+}
+
 function initTerminal() {
   if (termInitialized) return;
   termInitialized = true;
@@ -30063,7 +30093,7 @@ function initTerminal() {
       syncTerminalPaneAccessibility();
       fitAddon.fit();
       term.onKey(({ domEvent }) => {
-        app.send_key(domEvent.key, domEvent.ctrlKey, domEvent.altKey, domEvent.shiftKey);
+        sendTuiKey(domEvent);
       });
       for (const b64 of termBuffer) {
         term.write(base64ToBytes(b64));
@@ -30072,7 +30102,7 @@ function initTerminal() {
       new ResizeObserver(() => {
         if (fitAddon && activeTab === 'terminal' && activeTermSubtab === 'tui') fitAddon.fit();
       }).observe(document.getElementById('terminal-container'));
-      term.onResize(({ cols, rows }) => app.send_resize(cols, rows));
+      term.onResize(({ cols, rows }) => sendTuiResize(cols, rows));
     };
     document.head.appendChild(fitScript);
   };
@@ -30204,11 +30234,53 @@ function switchTerminalSubtab(name) {
 // WebTui stops rendering for this connection entirely. Disconnecting
 // the WebSocket implicitly unsubscribes (the connection is removed).
 let termSubscribed = false;
-function updateTermSubscription() {
-  const wantSubscribed = activeTab === 'terminal' && activeTermSubtab === 'tui';
-  if (wantSubscribed === termSubscribed) return;
-  termSubscribed = wantSubscribed;
+let termSubscriptionTransport = '';
+
+function preferredTuiTransport() {
+  return dashboardTuiFramesAvailable() ? 'webrtc' : 'websocket';
+}
+
+function sendTuiSubscriptionFrame(wantSubscribed, transport) {
+  if (transport === 'webrtc') {
+    return dashboardTransport.tuiFrame({
+      t: wantSubscribed ? 'tui_subscribe' : 'tui_unsubscribe',
+      connection_id: TUI_CONNECTION_ID,
+      cols: term?.cols || 80,
+      rows: term?.rows || 24,
+    });
+  }
   sendRawMessage({ t: wantSubscribed ? 'term_subscribe' : 'term_unsubscribe' });
+  return true;
+}
+
+function updateTermSubscription(force = false) {
+  const wantSubscribed = activeTab === 'terminal' && activeTermSubtab === 'tui';
+  const transport = wantSubscribed
+    ? preferredTuiTransport()
+    : (termSubscriptionTransport || preferredTuiTransport());
+  if (
+    !force &&
+    wantSubscribed === termSubscribed &&
+    (!wantSubscribed || termSubscriptionTransport === transport)
+  ) {
+    return;
+  }
+  if (termSubscribed && termSubscriptionTransport && termSubscriptionTransport !== transport) {
+    sendTuiSubscriptionFrame(false, termSubscriptionTransport);
+  }
+  termSubscribed = wantSubscribed;
+  if (wantSubscribed) {
+    termSubscriptionTransport = transport;
+    if (!sendTuiSubscriptionFrame(true, transport) && transport === 'webrtc') {
+      termSubscriptionTransport = 'websocket';
+      sendTuiSubscriptionFrame(true, 'websocket');
+    }
+  } else {
+    if (termSubscriptionTransport) {
+      sendTuiSubscriptionFrame(false, termSubscriptionTransport);
+    }
+    termSubscriptionTransport = '';
+  }
 }
 
 // ── Shell key bar ──
@@ -33138,6 +33210,15 @@ function dashboardTerminalFramesAvailable() {
     dashboardTransport.canUseRpc &&
     dashboardTransport.canUseRpc() &&
     dashboardControlTransport?.lastStatus?.terminal_frames_available === true
+  );
+}
+
+function dashboardTuiFramesAvailable() {
+  return Boolean(
+    dashboardTransport &&
+    dashboardTransport.canUseRpc &&
+    dashboardTransport.canUseRpc() &&
+    dashboardControlTransport?.lastStatus?.tui_frames_available === true
   );
 }
 
@@ -36877,6 +36958,7 @@ class DashboardTransport {
         if (status && typeof status === 'object') {
           dashboardControlTransport.lastStatus = status;
           dashboardUpdateTransportStatus();
+          updateTermSubscription(true);
         }
         return status;
       });
@@ -36901,6 +36983,11 @@ class DashboardTransport {
   terminalFrame(frame) {
     if (!this.canUseRpc()) return false;
     return dashboardControlTransport.terminalFrame(frame);
+  }
+
+  tuiFrame(frame) {
+    if (!this.canUseRpc()) return false;
+    return dashboardControlTransport.tuiFrame(frame);
   }
 
   displayInput(displayId, event) {
@@ -37040,6 +37127,9 @@ window.intendantDashboardControl = {
   },
   terminalFrame(frame) {
     return dashboardTransport.terminalFrame(frame);
+  },
+  tuiFrame(frame) {
+    return dashboardTransport.tuiFrame(frame);
   },
   agentCard(options = {}) {
     return dashboardTransport.request('api_agent_card', {}, options);
@@ -37191,11 +37281,13 @@ class DashboardControlTransport {
     this.channel.onclose = () => {
       console.info('[dashboard-control] channel closed');
       dashboardUpdateTransportStatus();
+      updateTermSubscription(true);
     };
     this.channel.onerror = () => {
       this.lastError = 'DataChannel error';
       dashboardSetControlLastError(this.lastError);
       dashboardUpdateTransportStatus();
+      updateTermSubscription(true);
     };
     this.pc.onicecandidate = ev => {
       if (!ev.candidate) return;
@@ -37270,13 +37362,14 @@ class DashboardControlTransport {
     dashboardSetControlLastError('');
     this.refreshIceRoute().catch(() => {});
     dashboardUpdateTransportStatus();
-    this.sendFrame({ t: 'hello', id: this.nextId(), features: ['response_credit', 'byte_streams', 'terminal_frames'] });
+    this.sendFrame({ t: 'hello', id: this.nextId(), features: ['response_credit', 'byte_streams', 'terminal_frames', 'tui_frames'] });
     this.ping().catch(() => {});
     this.request('status').then(status => {
       if (status && typeof status === 'object') {
         this.lastStatus = status;
         console.info('[dashboard-control] status RPC ok', status.session_id || '');
         dashboardUpdateTransportStatus();
+        updateTermSubscription(true);
       }
     }).catch(err => console.warn('[dashboard-control] status RPC failed', err));
     this.request('config').then(config => {
@@ -37307,6 +37400,18 @@ class DashboardControlTransport {
   handleFrame(msg) {
     if (msg.t === 'hello_ack') {
       console.info('[dashboard-control] hello_ack', msg.session_id || '');
+      return;
+    }
+    if (msg.t === 'tui_term' || msg.t === 'tui_error') {
+      try {
+        window.dispatchEvent(new CustomEvent('intendant-dashboard-tui-frame', { detail: msg }));
+      } catch (_) {}
+      if (msg.connection_id !== TUI_CONNECTION_ID) return;
+      if (msg.t === 'tui_term') {
+        handleTermData(msg.base64 || msg.d || '');
+      } else if (msg.error) {
+        console.warn('[dashboard-control] TUI frame error', msg.error);
+      }
       return;
     }
     if (msg.t === 'terminal_output' || msg.t === 'terminal_exited' || msg.t === 'terminal_opened' || msg.t === 'terminal_error') {
@@ -37803,6 +37908,12 @@ class DashboardControlTransport {
     return true;
   }
 
+  tuiFrame(frame) {
+    if (!this.canUseRpc()) return false;
+    this.sendFrame(frame);
+    return true;
+  }
+
   stream(method, params = {}, options = {}, onEvent = {}) {
     if (options.signal?.aborted) {
       return Promise.reject(dashboardControlAbortError());
@@ -38049,6 +38160,7 @@ class DashboardControlTransport {
       byteStreamsAvailable: this.lastStatus?.byte_streams_available ?? null,
       uploadFramesAvailable: this.lastStatus?.upload_frames_available ?? null,
       terminalFramesAvailable: this.lastStatus?.terminal_frames_available ?? null,
+      tuiFramesAvailable: this.lastStatus?.tui_frames_available ?? null,
       apiSessionDetailAvailable: this.lastStatus?.api_session_detail_available ?? null,
       apiSessionReportAvailable: this.lastStatus?.api_session_report_available ?? null,
       apiSessionCurrentAgentOutputAvailable: this.lastStatus?.api_session_current_agent_output_available ?? null,
