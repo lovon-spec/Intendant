@@ -766,6 +766,12 @@ without the primary WebSocket.
 `browser_workspace_snapshot` message shape with active browser workspaces and
 lease state; callers can feed it through the same browser workspace handler that
 currently receives the WebSocket bootstrap message.
+`api_state_snapshot` returns the existing `state_snapshot` message shape with
+the current `AgentStateSnapshot`, dashboard config, daemon session id when known,
+and a DataChannel-scoped `connection_id`. The connection id is the WebRTC
+control session id, not the legacy WebSocket connection id; display authority
+still needs its own DataChannel-aware identity handling before display bootstrap
+can move off the primary WebSocket.
 Lazy command-output expansion for finalized log command groups uses
 `api_session_current_agent_output`, preserving the same `_httpStatus`/`_httpOk`
 metadata as the existing HTTP endpoint.

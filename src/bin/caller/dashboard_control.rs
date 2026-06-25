@@ -47,6 +47,7 @@ const CONTROL_FEATURES: &[&str] = &[
     "api_agent_card",
     "api_cached_bootstrap_events",
     "api_browser_workspace_snapshot",
+    "api_state_snapshot",
     "status",
     "events",
     "response_chunks",
@@ -1196,6 +1197,7 @@ fn control_frame_response(
                 | "api_recordings"
                 | "api_session_recordings"
                 | "api_browser_workspace_snapshot"
+                | "api_state_snapshot"
                 | "api_worktrees"
                 | "api_worktrees_scan"
                 | "api_worktrees_remove"
@@ -1376,6 +1378,7 @@ fn status_response_frame(id: String, runtime: &ControlRuntime) -> serde_json::Va
         ("api_agent_card_available", true),
         ("api_cached_bootstrap_events_available", true),
         ("api_browser_workspace_snapshot_available", true),
+        ("api_state_snapshot_available", true),
         ("api_sessions_available", true),
         ("api_sessions_stream_available", true),
         ("api_session_detail_available", true),
@@ -1539,6 +1542,7 @@ async fn control_request_response(
         "api_recordings" => api_recordings_response(id, &runtime).await,
         "api_session_recordings" => api_session_recordings_response(id, params.as_ref()).await,
         "api_browser_workspace_snapshot" => api_browser_workspace_snapshot_response(id).await,
+        "api_state_snapshot" => api_state_snapshot_response(id, &runtime).await,
         "api_worktrees" => api_worktrees_response(id, &runtime).await,
         "api_worktrees_scan" => api_worktrees_scan_response(id, &runtime).await,
         "api_worktrees_remove" => {
@@ -2205,6 +2209,71 @@ async fn api_browser_workspace_snapshot_response(id: String) -> serde_json::Valu
             "workspaces": workspaces,
         },
     })
+}
+
+async fn api_state_snapshot_response(id: String, runtime: &ControlRuntime) -> serde_json::Value {
+    let (daemon_session_id, query_ctx, session_log) = {
+        let session = runtime.shared_session.read().await;
+        (
+            session.daemon_session_id.clone(),
+            session.query_ctx.clone(),
+            session.session_log.clone(),
+        )
+    };
+    let state = query_ctx
+        .as_ref()
+        .map(|ctx| {
+            ctx.agent_state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+        })
+        .unwrap_or_default();
+    let bootstrap_session_id = daemon_session_id
+        .or_else(|| {
+            query_ctx
+                .as_ref()
+                .and_then(|ctx| control_replay_session_id_from_dir(&ctx.log_dir))
+        })
+        .or_else(|| session_log.as_ref().and_then(control_session_log_id))
+        .unwrap_or_default();
+
+    serde_json::json!({
+        "t": "response",
+        "id": id,
+        "ok": true,
+        "result": {
+            "t": "state_snapshot",
+            "state": state,
+            "connection_id": runtime.session_id.clone(),
+            "config": runtime.config.clone(),
+            "session_id": bootstrap_session_id,
+        },
+    })
+}
+
+fn control_replay_session_id_from_dir(log_dir: &std::path::Path) -> Option<String> {
+    std::fs::read_to_string(log_dir.join("session_meta.json"))
+        .ok()
+        .and_then(|meta| serde_json::from_str::<crate::session_log::SessionMeta>(&meta).ok())
+        .map(|meta| meta.session_id)
+        .filter(|session_id| !session_id.trim().is_empty())
+        .or_else(|| {
+            log_dir
+                .file_name()
+                .map(|name| name.to_string_lossy().to_string())
+                .filter(|session_id| !session_id.trim().is_empty())
+        })
+}
+
+fn control_session_log_id(
+    session_log: &Arc<std::sync::Mutex<crate::session_log::SessionLog>>,
+) -> Option<String> {
+    session_log
+        .lock()
+        .ok()
+        .map(|log| log.session_id().to_string())
+        .filter(|id| !id.trim().is_empty())
 }
 
 async fn api_worktrees_response(id: String, runtime: &ControlRuntime) -> serde_json::Value {
@@ -3495,6 +3564,7 @@ mod tests {
             status["result"]["api_browser_workspace_snapshot_available"],
             true
         );
+        assert_eq!(status["result"]["api_state_snapshot_available"], true);
         assert_eq!(status["result"]["api_sessions_available"], true);
         assert_eq!(status["result"]["api_sessions_stream_available"], true);
         assert_eq!(status["result"]["api_session_detail_available"], true);
@@ -3935,6 +4005,20 @@ mod tests {
             "browser_workspace_snapshot"
         );
         assert!(workspace_snapshot["result"]["workspaces"].as_array().is_some());
+    }
+
+    #[tokio::test]
+    async fn state_snapshot_rpc_returns_bootstrap_message_shape() {
+        let rt = runtime();
+        let snapshot = api_state_snapshot_response("snap1".to_string(), &rt).await;
+        assert_eq!(snapshot["t"], "response");
+        assert_eq!(snapshot["id"], "snap1");
+        assert_eq!(snapshot["ok"], true);
+        assert_eq!(snapshot["result"]["t"], "state_snapshot");
+        assert_eq!(snapshot["result"]["connection_id"], "session-1");
+        assert_eq!(snapshot["result"]["config"]["provider"], "openai");
+        assert_eq!(snapshot["result"]["session_id"], "");
+        assert!(snapshot["result"]["state"].is_object());
     }
 
     #[tokio::test]
