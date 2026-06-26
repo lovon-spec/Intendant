@@ -11289,11 +11289,15 @@ let shellTerm = null;
 let shellFitAddon = null;
 let shellInitialized = false;
 let shellOpenSent = false;
+let shellOpenAcked = false;
 const SHELL_HOST_ID = 'local';
 const SHELL_TERMINAL_ID = 'shell-0';
 let shellOutputQueue = [];
 let shellOutputQueuedBytes = 0;
 let shellOutputFlushScheduled = false;
+let shellQueuedInput = '';
+let shellWaitingNoticeShown = false;
+const SHELL_QUEUED_INPUT_MAX_BYTES = 64 * 1024;
 let activeTermSubtab = 'tui';
 
 // Shell key bar state: sticky modifiers (Ctrl, Alt) that transform the
@@ -18363,8 +18367,17 @@ async function main() {
         }
         return;
       }
-      if (d.t === 'terminal_opened' || d.t === 'terminal_error') {
-        return; // ack / error; nothing UI-side to do yet
+      if (d.t === 'terminal_opened') {
+        if (d.terminal_id === SHELL_TERMINAL_ID && d.host_id === SHELL_HOST_ID) {
+          handleShellOpened();
+        }
+        return;
+      }
+      if (d.t === 'terminal_error') {
+        if (d.terminal_id === SHELL_TERMINAL_ID && d.host_id === SHELL_HOST_ID) {
+          handleShellError(d.error);
+        }
+        return;
       }
       // Display resize — update stored dimensions and status text
       if (d.t === 'display_resize' || d.event === 'display_resize') {
@@ -30073,6 +30086,30 @@ function handleShellExited(status) {
   flushShellOutput();
   shellTerm.write(`\r\n\x1b[33m[shell exited with status ${status}]\x1b[0m\r\n`);
   shellOpenSent = false;
+  shellOpenAcked = false;
+  shellQueuedInput = '';
+  shellWaitingNoticeShown = false;
+}
+
+function handleShellOpened() {
+  shellOpenSent = true;
+  shellOpenAcked = true;
+  shellWaitingNoticeShown = false;
+}
+
+function handleShellError(error) {
+  shellOpenSent = false;
+  shellOpenAcked = false;
+  if (shellTerm) {
+    const message = String(error || 'shell unavailable');
+    shellTerm.write(`\r\n\x1b[31m[shell error: ${message}]\x1b[0m\r\n`);
+  }
+}
+
+function showShellWaitingNotice() {
+  if (!dashboardConnectModeEnabled() || shellWaitingNoticeShown || !shellTerm) return;
+  shellWaitingNoticeShown = true;
+  shellTerm.write('\r\n\x1b[90m[waiting for Connect terminal tunnel]\x1b[0m\r\n');
 }
 
 function setTerminalPaneAccessible(pane, active) {
@@ -30421,9 +30458,60 @@ function sendLegacyMediaEditorMessage(obj) {
 
 function sendShellMessage(obj) {
   if (dashboardTerminalFramesAvailable() && dashboardTransport.terminalFrame(obj)) {
-    return;
+    return true;
   }
-  sendRawMessage(obj);
+  if (dashboardConnectModeEnabled()) {
+    if (obj?.t === 'terminal_open') showShellWaitingNotice();
+    return false;
+  }
+  return sendRawMessage(obj);
+}
+
+function shellOpenFrame() {
+  return {
+    t: 'terminal_open',
+    host_id: SHELL_HOST_ID,
+    terminal_id: SHELL_TERMINAL_ID,
+    cols: shellTerm?.cols || 80,
+    rows: shellTerm?.rows || 24,
+  };
+}
+
+function flushQueuedShellInput() {
+  if (!shellQueuedInput || !shellOpenSent) return;
+  const queued = shellQueuedInput;
+  shellQueuedInput = '';
+  sendShellBytes(queued);
+}
+
+function queueShellInput(bytes) {
+  if (!bytes) return;
+  const next = shellQueuedInput + bytes;
+  if (next.length > SHELL_QUEUED_INPUT_MAX_BYTES) {
+    shellQueuedInput = next.slice(next.length - SHELL_QUEUED_INPUT_MAX_BYTES);
+  } else {
+    shellQueuedInput = next;
+  }
+  showShellWaitingNotice();
+}
+
+function openShellSessionIfPossible(force = false) {
+  if (!shellTerm) return false;
+  if (shellOpenSent && !force) return true;
+  const sent = sendShellMessage(shellOpenFrame());
+  if (sent) {
+    shellOpenSent = true;
+    shellWaitingNoticeShown = false;
+    flushQueuedShellInput();
+    return true;
+  }
+  return false;
+}
+
+function maybeOpenShellAfterTransportReady() {
+  if (activeTab !== 'terminal' || activeTermSubtab !== 'shell') return;
+  if (!shellInitialized || !shellTerm || shellOpenSent) return;
+  openShellSessionIfPossible();
 }
 
 const TUI_CONNECTION_ID = `tui-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
@@ -30566,16 +30654,10 @@ function initShell() {
       }
     }).observe(document.getElementById('shell-container'));
 
-    // Ask the server to open (or reattach to) the session. The server
-    // replays scrollback automatically on attach.
-    const dims = { cols: shellTerm.cols, rows: shellTerm.rows };
-    sendShellMessage({
-      t: 'terminal_open',
-      host_id: SHELL_HOST_ID,
-      terminal_id: SHELL_TERMINAL_ID,
-      cols: dims.cols, rows: dims.rows,
-    });
-    shellOpenSent = true;
+    // Ask the server to open (or reattach to) the session. In Connect mode the
+    // dashboard-control tunnel may still be negotiating; if so, this is retried
+    // from dashboardUpdateTransportStatus() once terminal frames are ready.
+    openShellSessionIfPossible();
   };
 
   // If xterm.js is already loaded (e.g. TUI tab was opened first), start
@@ -30613,7 +30695,10 @@ function switchTerminalSubtab(name) {
   if (toggle) toggle.style.display = (name === 'shell') ? '' : 'none';
   if (name === 'shell') {
     if (!shellInitialized) initShell();
-    else if (shellFitAddon) requestAnimationFrame(() => shellFitAddon.fit());
+    else {
+      if (shellFitAddon) requestAnimationFrame(() => shellFitAddon.fit());
+      openShellSessionIfPossible();
+    }
   } else if (name === 'tui' && fitAddon) {
     requestAnimationFrame(() => fitAddon.fit());
   }
@@ -30707,12 +30792,20 @@ function updateTermSubscription(force = false) {
 //   being sent. One-shot: the modifier clears after one transform.
 
 function sendShellBytes(bytes) {
-  sendShellMessage({
+  if (!shellOpenSent && !openShellSessionIfPossible()) {
+    if (dashboardConnectModeEnabled()) queueShellInput(bytes);
+    return;
+  }
+  const sent = sendShellMessage({
     t: 'terminal_input',
     host_id: SHELL_HOST_ID,
     terminal_id: SHELL_TERMINAL_ID,
     data: utf8ToBase64(bytes),
   });
+  if (!sent && dashboardConnectModeEnabled()) {
+    shellOpenSent = false;
+    queueShellInput(bytes);
+  }
 }
 
 /// Apply any armed sticky modifiers to `data`, returning the transformed
@@ -37624,6 +37717,7 @@ function dashboardUpdateTransportStatus() {
   dot.className = `conn-dot ${summary.kind}`;
   label.textContent = summary.label;
   group.title = summary.title;
+  maybeOpenShellAfterTransportReady();
 }
 
 function dashboardTransportStatusSummary(status = {}) {
@@ -38785,6 +38879,14 @@ class DashboardControlTransport {
       try {
         window.dispatchEvent(new CustomEvent('intendant-dashboard-terminal-frame', { detail: msg }));
       } catch (_) {}
+      if (msg.t === 'terminal_opened' && msg.terminal_id === SHELL_TERMINAL_ID && msg.host_id === SHELL_HOST_ID) {
+        handleShellOpened();
+        return;
+      }
+      if (msg.t === 'terminal_error' && msg.terminal_id === SHELL_TERMINAL_ID && msg.host_id === SHELL_HOST_ID) {
+        handleShellError(msg.error);
+        return;
+      }
       if (dashboardServerMessageDispatcher) {
         dashboardServerMessageDispatcher(JSON.stringify(msg));
       } else if (msg.t === 'terminal_output' && msg.terminal_id === SHELL_TERMINAL_ID && msg.host_id === SHELL_HOST_ID) {

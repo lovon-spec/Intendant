@@ -148,6 +148,27 @@ async function click(page, selector) {
   }, page.sessionId);
 }
 
+async function typeText(page, text) {
+  if (page.keyboard?.type) {
+    await page.keyboard.type(text);
+    return;
+  }
+  await page.connection.send('Input.insertText', { text }, page.sessionId);
+}
+
+async function pressKey(page, key) {
+  if (page.keyboard?.press) {
+    await page.keyboard.press(key);
+    return;
+  }
+  const keyMap = {
+    Enter: { key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13 },
+  };
+  const event = keyMap[key] || { key, code: key, windowsVirtualKeyCode: 0, nativeVirtualKeyCode: 0 };
+  await page.connection.send('Input.dispatchKeyEvent', { type: 'keyDown', ...event }, page.sessionId);
+  await page.connection.send('Input.dispatchKeyEvent', { type: 'keyUp', ...event }, page.sessionId);
+}
+
 async function goto(page, url, opts = {}) {
   const response = await page.goto(url, opts);
   if (response && response.status && response.status() >= 400) {
@@ -269,7 +290,7 @@ async function main() {
     assert.strictEqual(labelResult.ok, true, `label update failed: ${JSON.stringify(labelResult)}`);
     assert.strictEqual(labelResult.daemon.label, 'Hosted E2E Daemon');
 
-    await goto(page, `${connectOrigin}/app?connect=1&daemon_id=${encodeURIComponent(options.daemonId)}`, {
+    await goto(page, `${connectOrigin}/app?connect=1&daemon_id=${encodeURIComponent(options.daemonId)}#terminal/shell`, {
       timeout: START_TIMEOUT_MS,
     });
     let connected;
@@ -288,6 +309,21 @@ async function main() {
     assert.strictEqual(connected.claimedDaemonPublicKey, registered.daemon_public_key);
     assert.strictEqual(connected.verifiedBinding.daemonPublicKey, registered.daemon_public_key);
     assert(connected.sessionGrantSha256, 'Connect dashboard did not bind a session grant');
+    assert.strictEqual(connected.terminalFramesAvailable, true, `Connect tunnel did not advertise terminal frames: ${JSON.stringify(connected)}`);
+
+    const shellToken = `connect_shell_${Date.now()}`;
+    await page.waitForFunction(() => Boolean(document.querySelector('#term-pane-shell.active #shell-container .xterm')), {
+      timeout: START_TIMEOUT_MS,
+    });
+    await click(page, '#shell-container');
+    await typeText(page, `echo ${shellToken}`);
+    await pressKey(page, 'Enter');
+    await page.waitForFunction(`(() => {
+      const el = document.getElementById('shell-container');
+      return Boolean(el && el.textContent && el.textContent.includes(${JSON.stringify(shellToken)}));
+    })()`, {
+      timeout: START_TIMEOUT_MS,
+    });
 
     const revoked = await page.evaluate(`(async () => {
       const daemonId = ${JSON.stringify(options.daemonId)};
