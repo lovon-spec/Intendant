@@ -297,11 +297,17 @@ async function main() {
     try {
       connected = await waitFor(async () => {
         const status = await page.evaluate(() => window.intendantDashboardControl?.status?.() || null);
-        if (status?.connected && status?.verifiedBinding?.ok && status?.signalingMode === 'connect-rendezvous') {
+        if (
+          status?.connected &&
+          status?.verifiedBinding?.ok &&
+          status?.signalingMode === 'connect-rendezvous' &&
+          status?.terminalFramesAvailable === true &&
+          status?.tuiFramesAvailable === false
+        ) {
           return status;
         }
         return null;
-      }, CONNECT_TIMEOUT_MS, 'hosted dashboard Connect tunnel');
+      }, CONNECT_TIMEOUT_MS, 'hosted dashboard Connect tunnel capabilities');
     } catch (err) {
       const status = await page.evaluate(() => window.intendantDashboardControl?.status?.() || null).catch(e => ({ error: e.message }));
       throw new Error(`${err.message}; last dashboard status: ${JSON.stringify(status)}`);
@@ -310,8 +316,22 @@ async function main() {
     assert.strictEqual(connected.verifiedBinding.daemonPublicKey, registered.daemon_public_key);
     assert(connected.sessionGrantSha256, 'Connect dashboard did not bind a session grant');
     assert.strictEqual(connected.terminalFramesAvailable, true, `Connect tunnel did not advertise terminal frames: ${JSON.stringify(connected)}`);
+    assert.strictEqual(connected.tuiFramesAvailable, false, `--no-tui daemon unexpectedly advertised TUI frames: ${JSON.stringify(connected)}`);
+
+    await click(page, '#tab-terminal .subtab-btn[data-term-tab="tui"]');
+    await page.waitForFunction(() => {
+      const el = document.getElementById('terminal-tui-unavailable');
+      return Boolean(
+        el &&
+        !el.classList.contains('hidden') &&
+        el.textContent.includes('TUI unavailable for this daemon')
+      );
+    }, {
+      timeout: START_TIMEOUT_MS,
+    });
 
     const shellToken = `connect_shell_${Date.now()}`;
+    await click(page, '#tab-terminal .subtab-btn[data-term-tab="shell"]');
     await page.waitForFunction(() => Boolean(document.querySelector('#term-pane-shell.active #shell-container .xterm')), {
       timeout: START_TIMEOUT_MS,
     });
@@ -324,6 +344,60 @@ async function main() {
     })()`, {
       timeout: START_TIMEOUT_MS,
     });
+
+    const probes = await page.evaluate(async () => {
+      const control = window.intendantDashboardControl;
+      const names = [
+        '_debugProbeControlNoReplay',
+        '_debugProbeControlUnavailableConnectNoLegacy',
+        '_debugProbeMediaConnectNoLegacy',
+        '_debugProbePeerMutationConnectNoHttp',
+        '_debugProbeDiagnosticsConnectNoHttp',
+        '_debugProbeDisplaySignalConnectNoLegacy',
+        '_debugProbeDisplayAuthorityConnectNoLegacy',
+        '_debugProbeTuiConnectNoLegacy',
+        '_debugProbePresenceMediaConnectNoLegacy',
+        '_debugProbePresenceServerSenderConnectNoLegacy',
+        '_debugProbeTunneledPresenceServerCallback',
+      ];
+      const out = {};
+      for (const name of names) {
+        out[name] = await control[name]();
+      }
+      return out;
+    });
+    for (const [name, probe] of Object.entries(probes)) {
+      assert.strictEqual(probe.skipped, false, `${name} skipped: ${JSON.stringify(probe)}`);
+    }
+    assert.strictEqual(probes._debugProbeControlNoReplay.wsReplayCount, 0, `control RPC failure replayed over WS: ${JSON.stringify(probes)}`);
+    assert(probes._debugProbeControlNoReplay.rpcAttempts >= 1, `control probe did not attempt RPC: ${JSON.stringify(probes)}`);
+    assert(probes._debugProbeControlNoReplay.rpcFailureWarnings >= 1, `control probe did not warn on RPC failure: ${JSON.stringify(probes)}`);
+    assert.strictEqual(probes._debugProbeControlUnavailableConnectNoLegacy.wsReplayCount, 0, `unavailable control path replayed over WS: ${JSON.stringify(probes)}`);
+    assert(probes._debugProbeControlUnavailableConnectNoLegacy.unavailableWarnings >= 3, `unavailable control path did not surface all warnings: ${JSON.stringify(probes)}`);
+    assert.strictEqual(probes._debugProbeMediaConnectNoLegacy.threw, true, `media unavailable path did not throw: ${JSON.stringify(probes)}`);
+    assert.strictEqual(probes._debugProbeMediaConnectNoLegacy.wsReplayCount, 0, `media unavailable path replayed over WS: ${JSON.stringify(probes)}`);
+    assert.strictEqual(probes._debugProbePeerMutationConnectNoHttp.threw, true, `peer mutation RPC failure did not throw: ${JSON.stringify(probes)}`);
+    assert(probes._debugProbePeerMutationConnectNoHttp.rpcAttempts >= 1, `peer mutation probe did not attempt RPC: ${JSON.stringify(probes)}`);
+    assert.strictEqual(probes._debugProbePeerMutationConnectNoHttp.httpFallbackCount, 0, `peer mutation used HTTP fallback: ${JSON.stringify(probes)}`);
+    assert.strictEqual(probes._debugProbeDiagnosticsConnectNoHttp.threw, true, `diagnostics unavailable path did not throw: ${JSON.stringify(probes)}`);
+    assert.strictEqual(probes._debugProbeDiagnosticsConnectNoHttp.httpFallbackCount, 0, `diagnostics unavailable path used HTTP fallback: ${JSON.stringify(probes)}`);
+    assert.strictEqual(probes._debugProbeDisplaySignalConnectNoLegacy.wsReplayCount, 0, `display signaling used WS fallback: ${JSON.stringify(probes)}`);
+    assert.strictEqual(probes._debugProbeDisplaySignalConnectNoLegacy.httpFallbackCount, 0, `display signaling used HTTP fallback: ${JSON.stringify(probes)}`);
+    assert.strictEqual(probes._debugProbeDisplayAuthorityConnectNoLegacy.requestResult, false, `display authority request unexpectedly succeeded without tunnel support: ${JSON.stringify(probes)}`);
+    assert.strictEqual(probes._debugProbeDisplayAuthorityConnectNoLegacy.releaseResult, false, `display authority release unexpectedly succeeded without tunnel support: ${JSON.stringify(probes)}`);
+    assert.strictEqual(probes._debugProbeDisplayAuthorityConnectNoLegacy.requestReplayCount, 0, `display authority request used legacy path: ${JSON.stringify(probes)}`);
+    assert.strictEqual(probes._debugProbeDisplayAuthorityConnectNoLegacy.releaseReplayCount, 0, `display authority release used legacy path: ${JSON.stringify(probes)}`);
+    assert.strictEqual(probes._debugProbeTuiConnectNoLegacy.keyReplayCount, 0, `TUI key used legacy path: ${JSON.stringify(probes)}`);
+    assert.strictEqual(probes._debugProbeTuiConnectNoLegacy.resizeReplayCount, 0, `TUI resize used legacy path: ${JSON.stringify(probes)}`);
+    assert.strictEqual(probes._debugProbeTuiConnectNoLegacy.wsReplayCount, 0, `TUI subscription used WS fallback: ${JSON.stringify(probes)}`);
+    assert.strictEqual(probes._debugProbeTuiConnectNoLegacy.subscriptionSent, false, `TUI subscription unexpectedly sent over WS: ${JSON.stringify(probes)}`);
+    assert.strictEqual(probes._debugProbePresenceMediaConnectNoLegacy.presenceFrameCount, 2, `presence frames did not use tunnel: ${JSON.stringify(probes)}`);
+    assert.strictEqual(probes._debugProbePresenceMediaConnectNoLegacy.uploadCount, 1, `presence video did not use upload tunnel: ${JSON.stringify(probes)}`);
+    assert.strictEqual(probes._debugProbePresenceMediaConnectNoLegacy.legacyCount, 0, `presence media used legacy path: ${JSON.stringify(probes)}`);
+    assert.strictEqual(probes._debugProbePresenceServerSenderConnectNoLegacy.presenceFrameCount, 2, `presence server sender did not use frame tunnel: ${JSON.stringify(probes)}`);
+    assert.strictEqual(probes._debugProbePresenceServerSenderConnectNoLegacy.actionRpcCount, 1, `presence server sender did not use action RPC: ${JSON.stringify(probes)}`);
+    assert.strictEqual(probes._debugProbeTunneledPresenceServerCallback.handled, true, `tunneled presence callback was not handled: ${JSON.stringify(probes)}`);
+    assert.strictEqual(probes._debugProbeTunneledPresenceServerCallback.diagnosticCount, 1, `tunneled presence callback did not emit diagnostic: ${JSON.stringify(probes)}`);
 
     const revoked = await page.evaluate(`(async () => {
       const daemonId = ${JSON.stringify(options.daemonId)};

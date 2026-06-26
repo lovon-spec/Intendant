@@ -796,7 +796,12 @@ node scripts/validate-connect-hosted-mvp.cjs
 That validator starts `intendant-connect`, launches a daemon with outbound
 Connect enabled, uses a browser virtual authenticator for passkey registration,
 claims the daemon, labels it, opens the real SPA in `connect=1` mode, verifies
-the daemon-signed binding and Connect grant hash, revokes the daemon while the
+the daemon-signed binding and Connect grant hash, exercises the Shell sub-tab
+over tunneled terminal frames, verifies that a `--no-tui` daemon renders an
+explicit TUI-unavailable state, and runs the SPA's no-legacy-transport probes
+for control actions, media/editor upload, visual-freshness diagnostics, display
+signaling, display input authority, peer mutation fallback, TUI input, presence
+media, and presence server callbacks. It then revokes the daemon while the
 tunnel is still open, waits for the tunnel to close, and checks the audit
 events.
 

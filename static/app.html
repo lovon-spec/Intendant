@@ -6930,6 +6930,26 @@ body.context-focus-active {
   min-height: 0;
   min-width: 0;
 }
+.terminal-container.terminal-container-disabled {
+  visibility: hidden;
+}
+.terminal-unavailable {
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  background: var(--base);
+  color: var(--subtext0);
+  border: 1px solid var(--surface0);
+  border-radius: 6px;
+  font-family: 'JetBrains Mono', 'Fira Code', Menlo, Monaco, monospace;
+  font-size: 13px;
+  line-height: 1.5;
+  text-align: center;
+}
 
 /* ── Shell key bar (mobile + optional desktop) ── */
 .shell-keybar {
@@ -9603,6 +9623,7 @@ body.display-fullscreen-open {
       <div class="subtab-panes">
         <div class="subtab-pane active" id="term-pane-tui">
           <div class="terminal-container" id="terminal-container"></div>
+          <div class="terminal-unavailable hidden" id="terminal-tui-unavailable" role="status" aria-live="polite"></div>
         </div>
         <div class="subtab-pane" id="term-pane-shell">
           <div class="terminal-container" id="shell-container"></div>
@@ -11194,6 +11215,19 @@ const DASHBOARD_ACTION_MSG_RPC_ACTIONS = new Set([
   'set_diagnostics_visual_marker',
 ]);
 
+function dashboardConnectMutationUnavailable(action, label = 'Dashboard control request', options = {}) {
+  const actionLabel = action ? ` ${action}` : '';
+  const message = `${label}${actionLabel} is unavailable until the Connect dashboard tunnel is ready`;
+  console.warn(`[dashboard-control] ${message}`);
+  const err = new Error(message);
+  if (typeof options.onError === 'function') {
+    options.onError(err);
+  } else if (typeof showControlToast === 'function') {
+    showControlToast('error', message);
+  }
+  return false;
+}
+
 function dashboardJsonFetch(method, params, fallback, label = method, options = {}) {
   if (dashboardTransport && typeof dashboardTransport.jsonFetch === 'function') {
     return dashboardTransport.jsonFetch(method, params, fallback, label, options);
@@ -11204,6 +11238,9 @@ function dashboardJsonFetch(method, params, fallback, label = method, options = 
 function dispatchSessionControlMsg(payload, options = {}) {
   const action = String(payload?.action || '').trim();
   const fallback = () => {
+    if (dashboardConnectModeEnabled()) {
+      return dashboardConnectMutationUnavailable(action, 'Session control request', options);
+    }
     if (app && app.send_server_action) {
       app.send_server_action(payload);
       return true;
@@ -11236,6 +11273,9 @@ function dispatchSessionControlMsg(payload, options = {}) {
 function dispatchDashboardActionMsg(payload, options = {}) {
   const action = String(payload?.action || '').trim();
   const fallback = () => {
+    if (dashboardConnectModeEnabled()) {
+      return dashboardConnectMutationUnavailable(action, 'Dashboard action request', options);
+    }
     if (app && app.send_server_action) {
       app.send_server_action(payload);
       return true;
@@ -20035,6 +20075,10 @@ function dispatchControlMsg(payload) {
           showControlToast('error', err?.message || 'Dashboard control request failed');
         }
       });
+    return;
+  }
+  if (dashboardConnectModeEnabled()) {
+    dashboardConnectMutationUnavailable(action, 'Control request');
     return;
   }
   if (app && app.send_server_action) {
@@ -30123,9 +30167,29 @@ function setTerminalPaneAccessible(pane, active) {
   }
 }
 
+function tuiAvailabilityNoticeText() {
+  if (!dashboardConnectModeEnabled() || dashboardTuiFramesAvailable()) return '';
+  if (!dashboardTransport?.canUseRpc?.()) return 'Checking TUI tunnel...';
+  if (dashboardControlTransport?.lastStatus?.tui_frames_available === false) {
+    return 'TUI unavailable for this daemon';
+  }
+  return 'Checking TUI availability...';
+}
+
+function syncTuiAvailabilityNotice() {
+  const notice = document.getElementById('terminal-tui-unavailable');
+  const container = document.getElementById('terminal-container');
+  if (!notice) return;
+  const text = tuiAvailabilityNoticeText();
+  notice.textContent = text;
+  notice.classList.toggle('hidden', !text);
+  if (container) container.classList.toggle('terminal-container-disabled', Boolean(text));
+}
+
 function syncTerminalPaneAccessibility() {
   setTerminalPaneAccessible(document.getElementById('term-pane-tui'), activeTermSubtab === 'tui');
   setTerminalPaneAccessible(document.getElementById('term-pane-shell'), activeTermSubtab === 'shell');
+  syncTuiAvailabilityNotice();
 }
 
 // Encode a string as base64 (UTF-8 safe).
@@ -30682,7 +30746,11 @@ function initShell() {
 }
 
 function switchTerminalSubtab(name) {
-  if (activeTermSubtab === name) return;
+  if (activeTermSubtab === name) {
+    syncTerminalPaneAccessibility();
+    updateTermSubscription();
+    return;
+  }
   activeTermSubtab = name;
   document.querySelectorAll('#tab-terminal .subtab-btn').forEach(btn => {
     btn.classList.toggle('active', btn.dataset.termTab === name);
@@ -30947,8 +31015,21 @@ async function requestDisplayInputAuthorityForSlot(displayId) {
       dashboardApplyServerFrames(result?.frames);
       return true;
     } catch (err) {
+      if (dashboardConnectModeEnabled()) {
+        console.warn('[dashboard-control] display authority request failed', err);
+        if (typeof showControlToast === 'function') {
+          showControlToast('error', err?.message || 'Display input authority is unavailable');
+        }
+        return false;
+      }
       console.warn('[dashboard-control] display authority request failed, falling back to /ws', err);
     }
+  }
+  if (dashboardConnectModeEnabled()) {
+    if (typeof showControlToast === 'function') {
+      showControlToast('error', 'Display input authority requires the Connect tunnel');
+    }
+    return false;
   }
   if (typeof app !== 'undefined' && app &&
       typeof app.request_display_input_authority === 'function') {
@@ -30968,8 +31049,21 @@ async function releaseDisplayInputAuthorityForSlot(displayId) {
       dashboardApplyServerFrames(result?.frames);
       return true;
     } catch (err) {
+      if (dashboardConnectModeEnabled()) {
+        console.warn('[dashboard-control] display authority release failed', err);
+        if (typeof showControlToast === 'function') {
+          showControlToast('error', err?.message || 'Display input authority release is unavailable');
+        }
+        return false;
+      }
       console.warn('[dashboard-control] display authority release failed, falling back to /ws', err);
     }
+  }
+  if (dashboardConnectModeEnabled()) {
+    if (typeof showControlToast === 'function') {
+      showControlToast('error', 'Display input authority release requires the Connect tunnel');
+    }
+    return false;
   }
   if (typeof app !== 'undefined' && app &&
       typeof app.release_display_input_authority === 'function') {
@@ -35816,6 +35910,7 @@ function switchTab(tabId) {
       if (!shellInitialized) initShell();
       if (shellTerm) requestAnimationFrame(() => shellFitAddon && shellFitAddon.fit());
     }
+    syncTerminalPaneAccessibility();
   }
   // Gate the server's ratatui frame stream on whether the user is
   // actually looking at the TUI terminal. Every other tab keeps the
@@ -37709,7 +37804,11 @@ function dashboardUpdateTransportStatus() {
   const group = document.getElementById('sb-dashboard-transport');
   const dot = document.getElementById('sb-dashboard-transport-dot');
   const label = document.getElementById('sb-dashboard-transport-label');
-  if (!group || !dot || !label) return;
+  if (!group || !dot || !label) {
+    syncTuiAvailabilityNotice();
+    maybeOpenShellAfterTransportReady();
+    return;
+  }
   const status = dashboardTransport?.status
     ? dashboardTransport.status()
     : { enabled: dashboardControlTransportEnabled(), connected: false };
@@ -37717,6 +37816,7 @@ function dashboardUpdateTransportStatus() {
   dot.className = `conn-dot ${summary.kind}`;
   label.textContent = summary.label;
   group.title = summary.title;
+  syncTuiAvailabilityNotice();
   maybeOpenShellAfterTransportReady();
 }
 
@@ -38130,6 +38230,63 @@ window.intendantDashboardControl = {
       app = previousApp;
     }
   },
+  async _debugProbeControlUnavailableConnectNoLegacy() {
+    if (
+      !dashboardConnectModeEnabled() ||
+      typeof dispatchControlMsg !== 'function' ||
+      typeof dispatchSessionControlMsg !== 'function' ||
+      typeof dispatchDashboardActionMsg !== 'function' ||
+      !dashboardControlTransport
+    ) {
+      return {
+        skipped: true,
+        connectMode: dashboardConnectModeEnabled(),
+        dispatchType: typeof dispatchControlMsg,
+        sessionDispatchType: typeof dispatchSessionControlMsg,
+        dashboardDispatchType: typeof dispatchDashboardActionMsg,
+        hasControlTransport: Boolean(dashboardControlTransport),
+        wsReplayCount: 0,
+        unavailableWarnings: 0,
+      };
+    }
+    const previousApp = app;
+    const previousStatus = dashboardControlTransport.lastStatus;
+    const previousWarn = console.warn;
+    let wsReplayCount = 0;
+    let unavailableWarnings = 0;
+    app = {
+      send_server_action() {
+        wsReplayCount += 1;
+      },
+    };
+    dashboardControlTransport.lastStatus = {
+      ...(previousStatus || {}),
+      api_control_msg_available: false,
+      api_session_control_msg_available: false,
+      api_dashboard_action_msg_available: false,
+    };
+    console.warn = function(...args) {
+      if (String(args[0] || '').includes('unavailable until the Connect dashboard tunnel is ready')) {
+        unavailableWarnings += 1;
+      }
+      return previousWarn.apply(this, args);
+    };
+    try {
+      dispatchControlMsg({ action: 'set_codex_sandbox', mode: 'workspace-write' });
+      dispatchSessionControlMsg({ action: 'approve', id: -1 });
+      dispatchDashboardActionMsg({ action: 'take_display', display_id: 4294967295 });
+      await new Promise(resolve => setTimeout(resolve, 0));
+    } finally {
+      dashboardControlTransport.lastStatus = previousStatus;
+      console.warn = previousWarn;
+      app = previousApp;
+    }
+    return {
+      skipped: false,
+      wsReplayCount,
+      unavailableWarnings,
+    };
+  },
   async _debugProbeMediaConnectNoLegacy() {
     if (
       !dashboardConnectModeEnabled() ||
@@ -38194,6 +38351,64 @@ window.intendantDashboardControl = {
       app = previousApp;
     }
     return { skipped: false, threw, error, wsReplayCount };
+  },
+  async _debugProbePeerMutationConnectNoHttp() {
+    if (
+      !dashboardConnectModeEnabled() ||
+      !dashboardTransport ||
+      !dashboardControlTransport ||
+      typeof dashboardTransport.jsonFetch !== 'function' ||
+      typeof dashboardControlTransport.request !== 'function'
+    ) {
+      return {
+        skipped: true,
+        connectMode: dashboardConnectModeEnabled(),
+        hasDashboardTransport: Boolean(dashboardTransport),
+        hasControlTransport: Boolean(dashboardControlTransport),
+        jsonFetchType: typeof dashboardTransport?.jsonFetch,
+        requestType: typeof dashboardControlTransport?.request,
+        threw: false,
+        rpcAttempts: 0,
+        httpFallbackCount: 0,
+      };
+    }
+    const previousRequest = dashboardControlTransport.request;
+    const previousFetch = window.fetch;
+    let rpcAttempts = 0;
+    let httpFallbackCount = 0;
+    dashboardControlTransport.request = function(method, params, options) {
+      if (method === 'api_peer_add') {
+        rpcAttempts += 1;
+        return Promise.reject(new Error('synthetic api_peer_add failure'));
+      }
+      return previousRequest.call(this, method, params, options);
+    };
+    window.fetch = function(input, init) {
+      const url = typeof input === 'string' ? input : (input?.url || '');
+      if (String(url).includes('/api/peers')) {
+        httpFallbackCount += 1;
+      }
+      return previousFetch.call(this, input, init);
+    };
+    let threw = false;
+    let error = '';
+    try {
+      await dashboardTransport.jsonFetch('api_peer_add', {
+        url: 'https://127.0.0.1:9/.well-known/agent-card.json',
+        persist: false,
+      }, () => authedFetch('/api/peers', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: '{}',
+      }), 'api_peer_add', { fallbackAfterRpcFailure: false });
+    } catch (err) {
+      threw = true;
+      error = err?.message || String(err);
+    } finally {
+      dashboardControlTransport.request = previousRequest;
+      window.fetch = previousFetch;
+    }
+    return { skipped: false, threw, error, rpcAttempts, httpFallbackCount };
   },
   async _debugProbeDiagnosticsConnectNoHttp() {
     if (
@@ -38300,6 +38515,56 @@ window.intendantDashboardControl = {
       app = previousApp;
     }
     return { skipped: false, threw, error, wsReplayCount, httpFallbackCount };
+  },
+  async _debugProbeDisplayAuthorityConnectNoLegacy() {
+    if (
+      !dashboardConnectModeEnabled() ||
+      typeof requestDisplayInputAuthorityForSlot !== 'function' ||
+      typeof releaseDisplayInputAuthorityForSlot !== 'function' ||
+      !dashboardControlTransport
+    ) {
+      return {
+        skipped: true,
+        connectMode: dashboardConnectModeEnabled(),
+        requestType: typeof requestDisplayInputAuthorityForSlot,
+        releaseType: typeof releaseDisplayInputAuthorityForSlot,
+        hasControlTransport: Boolean(dashboardControlTransport),
+        requestReplayCount: 0,
+        releaseReplayCount: 0,
+      };
+    }
+    const previousStatus = dashboardControlTransport.lastStatus;
+    const previousApp = app;
+    let requestReplayCount = 0;
+    let releaseReplayCount = 0;
+    app = {
+      request_display_input_authority() {
+        requestReplayCount += 1;
+      },
+      release_display_input_authority() {
+        releaseReplayCount += 1;
+      },
+    };
+    dashboardControlTransport.lastStatus = {
+      ...(previousStatus || {}),
+      api_display_input_authority_available: false,
+    };
+    let requestResult = null;
+    let releaseResult = null;
+    try {
+      requestResult = await requestDisplayInputAuthorityForSlot(4294967295);
+      releaseResult = await releaseDisplayInputAuthorityForSlot(4294967295);
+    } finally {
+      dashboardControlTransport.lastStatus = previousStatus;
+      app = previousApp;
+    }
+    return {
+      skipped: false,
+      requestResult,
+      releaseResult,
+      requestReplayCount,
+      releaseReplayCount,
+    };
   },
   _debugProbeTuiConnectNoLegacy() {
     if (
