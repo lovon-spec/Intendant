@@ -706,9 +706,12 @@ The hosted MVP flow is:
 
 1. The daemon registers its `daemon_id` and persistent daemon identity public
    key through `/api/daemon/register`.
-2. If the daemon is unclaimed, Connect returns a short-lived claim code and URL.
+2. If the daemon is unclaimed, Connect returns a short-lived claim phrase and
+   URL. The phrase is seven BIP39 English words (about 77 bits of space),
+   stored only as a hash at rest, and regenerated if it collides with another
+   active unclaimed daemon.
 3. The user opens Connect, signs in or registers with a passkey, and submits the
-   claim code.
+   claim phrase.
 4. Connect sends a `claim_challenge` event to the daemon. The daemon signs that
    challenge with its daemon identity key, and Connect verifies the signature
    before assigning ownership.
@@ -724,9 +727,9 @@ The hosted MVP flow is:
    sending dashboard RPC over the DataChannel.
 
 The state file durably stores users, passkeys, daemon ownership, hashed claim
-codes, and a capped audit log. Plain claim codes, WebAuthn challenge state,
+phrases, and a capped audit log. Plain claim phrases, WebAuthn challenge state,
 browser offers, and dashboard grants are memory-only. The service exposes a
-minimal account/daemon UI today: passkey registration/login, claim-code entry,
+minimal account/daemon UI today: passkey registration/login, claim-phrase entry,
 daemon list, daemon labels, open dashboard, revoke ownership, and audit events.
 
 Production-alpha hardening now includes:
@@ -753,7 +756,7 @@ Current alpha limits:
 
 - one owner per daemon; no shared roles, teams, recovery, or account email flow;
 - one bearer token protects daemon service endpoints;
-- rate limits, sessions, pending offers, plain claim codes, and active-session
+- rate limits, sessions, pending offers, plain claim phrases, and active-session
   tracking are single-process in-memory state;
 - no high-availability storage or database migrations; the state file is a
   single-node alpha persistence layer;
@@ -868,9 +871,9 @@ A concrete flow should look like this:
 
 1. The daemon generates or loads a persistent daemon identity key.
 2. The daemon opens an outbound TLS connection to Intendant Connect and publishes
-   a short-lived claim code or QR URL.
+   a short-lived high-entropy claim phrase or QR URL.
 3. The user opens the public Intendant Connect URL and signs in with a passkey.
-4. The user claims the daemon by entering the code or scanning the QR code.
+4. The user claims the daemon by entering the phrase or scanning the QR code.
 5. Connect records the daemon identity public key, owner account, device label,
    and any local policy metadata the daemon chooses to expose.
 6. On later visits, the browser signs in with a passkey and selects the daemon.
@@ -1242,7 +1245,7 @@ The current implementation has crossed from protocol sketch into hosted MVP:
    pairing actions, local display signaling, and media/editor writes.
 4. The daemon has a disabled-by-default outbound Connect polling client.
 5. `intendant-connect` provides the hosted production alpha: passkey-only
-   account sessions, daemon registration, claim-code ownership proof,
+   account sessions, daemon registration, claim-phrase ownership proof,
    short-lived dashboard grants, signaling, labels, revoke, active tunnel close,
    rate limits, CSRF protection, readiness checks, and audit.
 6. The browser and hosted service both verify that the daemon-signed WebRTC

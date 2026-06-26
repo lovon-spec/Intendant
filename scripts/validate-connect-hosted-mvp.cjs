@@ -226,9 +226,11 @@ async function main() {
 
     const claimCode = await waitFor(() => {
       const logs = `${connectLogs.join('')}\n${daemonLogs.join('')}`;
-      const match = logs.match(/claim_code=([A-Z2-9]+)/) || logs.match(/claim this daemon with code ([A-Z2-9]+)/);
-      return match && match[1];
-    }, START_TIMEOUT_MS, 'claim code log');
+      const urlMatch = logs.match(/claim_code=([^\s"'<>]+)/);
+      if (urlMatch) return decodeURIComponent(urlMatch[1]);
+      const codeMatch = logs.match(/claim this daemon with code ([^\s"'<>]+)/);
+      return codeMatch && codeMatch[1];
+    }, START_TIMEOUT_MS, 'claim phrase log');
 
     browser = await launchBrowser({ ignoreHTTPSErrors: true });
     const page = await browser.newPage();

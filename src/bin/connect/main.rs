@@ -4,15 +4,16 @@ use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use base64::Engine as _;
+use bip39::Language;
 use passkey_auth::{
     AuthenticationResponse, AuthenticationState, CredentialId, PasskeyCredential,
     RegistrationResponse, RegistrationState, Webauthn,
 };
-use rand::RngCore as _;
+use rand::{rngs::OsRng, RngCore as _};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest as _, Sha256};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
@@ -28,6 +29,8 @@ const SESSION_TTL_MS: u64 = 30 * 24 * 60 * 60 * 1000;
 const OFFER_TIMEOUT_MS: u64 = 30_000;
 const CLAIM_TIMEOUT_MS: u64 = 60_000;
 const CLAIM_CODE_TTL_MS: u64 = 10 * 60 * 1000;
+const CLAIM_CODE_WORDS: usize = 7;
+const CLAIM_CODE_GENERATION_ATTEMPTS: usize = 32;
 const ACTIVE_DASHBOARD_SESSION_TTL_MS: u64 = 24 * 60 * 60 * 1000;
 const CSRF_HEADER: &str = "x-intendant-csrf";
 
@@ -436,7 +439,7 @@ fn now_unix_ms() -> u64 {
 
 fn random_b64u(bytes: usize) -> String {
     let mut buf = vec![0u8; bytes];
-    rand::thread_rng().fill_bytes(&mut buf);
+    OsRng.fill_bytes(&mut buf);
     b64u(&buf)
 }
 
@@ -1179,11 +1182,11 @@ async fn api_claim_start(
     let user = require_user(&state, &headers).await?;
     require_csrf(&state, &headers).await?;
     check_rate_limit(&state, &headers, "claim_start", 10, 60_000).await?;
-    let code = body.claim_code.trim().replace(' ', "").to_ascii_uppercase();
+    let code = normalize_claim_code(&body.claim_code);
     if code.is_empty() {
         return Err(ApiError::bad_request("claim_code is required"));
     }
-    let code_hash = sha256_b64u(code.as_bytes());
+    let code_hashes = claim_code_hash_candidates(&body.claim_code);
     let now = now_unix_ms();
     let daemon = {
         let store = state.store.lock().await;
@@ -1192,7 +1195,9 @@ async fn api_claim_start(
             .iter()
             .find(|d| {
                 d.owner_user_id.is_none()
-                    && d.claim_code_hash.as_deref() == Some(&code_hash)
+                    && d.claim_code_hash
+                        .as_deref()
+                        .is_some_and(|hash| code_hashes.iter().any(|candidate| candidate == hash))
                     && d.claim_code_created_unix_ms
                         .is_some_and(|created| now.saturating_sub(created) <= CLAIM_CODE_TTL_MS)
             })
@@ -1373,6 +1378,7 @@ async fn daemon_register(
         let mut claim_codes = state.claim_codes.lock().await;
         let mut store = state.store.lock().await;
         let now = now_unix_ms();
+        let active_claim_hashes = active_claim_code_hashes(&store, &daemon_id, now);
         let claimed_now = if let Some(existing) =
             store.daemons.iter_mut().find(|d| d.daemon_id == daemon_id)
         {
@@ -1385,7 +1391,11 @@ async fn daemon_register(
             existing.last_seen_unix_ms = now;
             existing.updated_unix_ms = now;
             if existing.owner_user_id.is_none() {
-                claim_code = Some(ensure_claim_code(&mut claim_codes, existing));
+                claim_code = Some(ensure_claim_code(
+                    &mut claim_codes,
+                    existing,
+                    &active_claim_hashes,
+                )?);
             }
             existing.owner_user_id.is_some()
         } else {
@@ -1400,7 +1410,11 @@ async fn daemon_register(
                 last_seen_unix_ms: now,
                 updated_unix_ms: now,
             };
-            claim_code = Some(ensure_claim_code(&mut claim_codes, &mut record));
+            claim_code = Some(ensure_claim_code(
+                &mut claim_codes,
+                &mut record,
+                &active_claim_hashes,
+            )?);
             store.daemons.push(record);
             false
         };
@@ -1428,34 +1442,99 @@ async fn daemon_register(
 fn ensure_claim_code(
     claim_codes: &mut HashMap<String, String>,
     daemon: &mut DaemonRecord,
-) -> String {
+    active_claim_hashes: &HashSet<String>,
+) -> ApiResult<String> {
     let now = now_unix_ms();
     let existing_is_fresh = daemon
         .claim_code_created_unix_ms
         .is_some_and(|created| now.saturating_sub(created) <= CLAIM_CODE_TTL_MS);
-    if existing_is_fresh {
+    let existing_hash_is_unique = daemon
+        .claim_code_hash
+        .as_deref()
+        .is_some_and(|hash| !active_claim_hashes.contains(hash));
+    if existing_is_fresh && existing_hash_is_unique {
         if let Some(code) = claim_codes.get(&daemon.daemon_id).cloned() {
-            return code;
+            return Ok(code);
         }
     }
     if !existing_is_fresh {
         claim_codes.remove(&daemon.daemon_id);
     }
-    let code = generate_claim_code();
-    daemon.claim_code_hash = Some(sha256_b64u(code.as_bytes()));
-    daemon.claim_code_created_unix_ms = Some(now);
-    claim_codes.insert(daemon.daemon_id.clone(), code.clone());
-    code
+    for _ in 0..CLAIM_CODE_GENERATION_ATTEMPTS {
+        let code = generate_claim_code();
+        let code_hash = claim_code_hash(&code);
+        if active_claim_hashes.contains(&code_hash) {
+            continue;
+        }
+        daemon.claim_code_hash = Some(code_hash);
+        daemon.claim_code_created_unix_ms = Some(now);
+        claim_codes.insert(daemon.daemon_id.clone(), code.clone());
+        return Ok(code);
+    }
+    Err(ApiError::internal("failed to generate a unique claim code"))
 }
 
 fn generate_claim_code() -> String {
-    const ALPHABET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
-    let mut bytes = [0u8; 8];
-    rand::thread_rng().fill_bytes(&mut bytes);
-    bytes
+    let words = Language::English.word_list();
+    let mut rng = OsRng;
+    let mut out = Vec::with_capacity(CLAIM_CODE_WORDS);
+    debug_assert_eq!(words.len(), 2048);
+    for _ in 0..CLAIM_CODE_WORDS {
+        let index = (rng.next_u32() as usize) % words.len();
+        out.push(words[index]);
+    }
+    out.join("-")
+}
+
+fn active_claim_code_hashes(store: &Store, except_daemon_id: &str, now: u64) -> HashSet<String> {
+    store
+        .daemons
         .iter()
-        .map(|b| ALPHABET[*b as usize % ALPHABET.len()] as char)
+        .filter(|daemon| daemon.daemon_id != except_daemon_id)
+        .filter(|daemon| daemon.owner_user_id.is_none())
+        .filter(|daemon| {
+            daemon
+                .claim_code_created_unix_ms
+                .is_some_and(|created| now.saturating_sub(created) <= CLAIM_CODE_TTL_MS)
+        })
+        .filter_map(|daemon| daemon.claim_code_hash.clone())
         .collect()
+}
+
+fn claim_code_hash(code: &str) -> String {
+    sha256_b64u(normalize_claim_code(code).as_bytes())
+}
+
+fn claim_code_hash_candidates(input: &str) -> Vec<String> {
+    let mut hashes = Vec::with_capacity(2);
+    let normalized = normalize_claim_code(input);
+    if !normalized.is_empty() {
+        hashes.push(sha256_b64u(normalized.as_bytes()));
+    }
+    let legacy = input.trim().replace(' ', "").to_ascii_uppercase();
+    if !legacy.is_empty() && legacy != normalized {
+        let hash = sha256_b64u(legacy.as_bytes());
+        if !hashes.iter().any(|existing| existing == &hash) {
+            hashes.push(hash);
+        }
+    }
+    hashes
+}
+
+fn normalize_claim_code(input: &str) -> String {
+    let mut parts = Vec::new();
+    let mut current = String::new();
+    for ch in input.chars() {
+        if ch.is_ascii_alphanumeric() {
+            current.push(ch.to_ascii_lowercase());
+        } else if !current.is_empty() {
+            parts.push(std::mem::take(&mut current));
+        }
+    }
+    if !current.is_empty() {
+        parts.push(current);
+    }
+    parts.join("-")
 }
 
 #[derive(Debug, Deserialize)]
@@ -2161,7 +2240,7 @@ fn connect_ui_html(origin: &str) -> String {
       </div>
       <div class="stack" style="margin-top:12px">
         <div class="row">
-          <input id="claim-code" placeholder="Claim code" style="max-width:260px">
+          <input id="claim-code" autocomplete="off" spellcheck="false" placeholder="Claim phrase" style="max-width:620px">
           <button id="claim">Claim</button>
         </div>
         <div id="claim-status" class="status"></div>
@@ -2427,4 +2506,120 @@ refreshAll().catch(() => renderAuth());
 </body>
 </html>"#
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn daemon_record(
+        daemon_id: &str,
+        owner_user_id: Option<Uuid>,
+        claim_code: Option<&str>,
+        claim_code_created_unix_ms: Option<u64>,
+    ) -> DaemonRecord {
+        DaemonRecord {
+            daemon_id: daemon_id.to_string(),
+            label: None,
+            daemon_public_key: format!("{daemon_id}-key"),
+            owner_user_id,
+            claim_code_hash: claim_code.map(claim_code_hash),
+            claim_code_created_unix_ms,
+            registered_unix_ms: 1,
+            last_seen_unix_ms: 1,
+            updated_unix_ms: 1,
+        }
+    }
+
+    #[test]
+    fn generated_claim_code_is_word_phrase_with_77_bits_of_space() {
+        let code = generate_claim_code();
+        let parts: Vec<_> = code.split('-').collect();
+        let words = Language::English.word_list();
+        assert_eq!(parts.len(), CLAIM_CODE_WORDS);
+        for part in &parts {
+            assert!(words.contains(part), "unexpected claim word {part}");
+        }
+        assert_eq!(normalize_claim_code(&code), code);
+    }
+
+    #[test]
+    fn claim_code_normalization_accepts_case_and_separator_variants() {
+        let code = "abandon-ability-able-about-above-absent-absorb";
+        assert_eq!(
+            normalize_claim_code("  Abandon Ability--ABLE_about.above absent absorb  "),
+            code
+        );
+        assert_eq!(claim_code_hash(code), claim_code_hash(&code.to_uppercase()));
+        assert_eq!(
+            claim_code_hash(code),
+            claim_code_hash("abandon ability able about above absent absorb")
+        );
+    }
+
+    #[test]
+    fn active_claim_code_hashes_only_tracks_fresh_unclaimed_other_daemons() {
+        let now = now_unix_ms();
+        let fresh = "abandon-ability-able-about-above-absent-absorb";
+        let current = "abstract-absurd-abuse-access-accident-account-accuse";
+        let expired = "achieve-acid-acoustic-acquire-across-act-action";
+        let claimed = "actor-actress-actual-adapt-add-addict-address";
+        let store = Store {
+            users: Vec::new(),
+            daemons: vec![
+                daemon_record("fresh", None, Some(fresh), Some(now)),
+                daemon_record("current", None, Some(current), Some(now)),
+                daemon_record(
+                    "expired",
+                    None,
+                    Some(expired),
+                    Some(now.saturating_sub(CLAIM_CODE_TTL_MS + 1)),
+                ),
+                daemon_record("claimed", Some(Uuid::new_v4()), Some(claimed), Some(now)),
+            ],
+            audit: Vec::new(),
+        };
+        let hashes = active_claim_code_hashes(&store, "current", now);
+        assert!(hashes.contains(&claim_code_hash(fresh)));
+        assert!(!hashes.contains(&claim_code_hash(current)));
+        assert!(!hashes.contains(&claim_code_hash(expired)));
+        assert!(!hashes.contains(&claim_code_hash(claimed)));
+    }
+
+    #[test]
+    fn ensure_claim_code_reuses_fresh_unique_in_memory_code() {
+        let now = now_unix_ms();
+        let code = "abandon-ability-able-about-above-absent-absorb";
+        let mut daemon = daemon_record("daemon", None, Some(code), Some(now));
+        let mut claim_codes = HashMap::from([(daemon.daemon_id.clone(), code.to_string())]);
+        let active_hashes = HashSet::new();
+
+        let returned = ensure_claim_code(&mut claim_codes, &mut daemon, &active_hashes).unwrap();
+
+        assert_eq!(returned, code);
+        let expected_hash = claim_code_hash(code);
+        assert_eq!(
+            daemon.claim_code_hash.as_deref(),
+            Some(expected_hash.as_str())
+        );
+    }
+
+    #[test]
+    fn ensure_claim_code_replaces_active_hash_collision() {
+        let now = now_unix_ms();
+        let code = "abandon-ability-able-about-above-absent-absorb";
+        let mut daemon = daemon_record("daemon", None, Some(code), Some(now));
+        let mut claim_codes = HashMap::from([(daemon.daemon_id.clone(), code.to_string())]);
+        let active_hashes = HashSet::from([claim_code_hash(code)]);
+
+        let returned = ensure_claim_code(&mut claim_codes, &mut daemon, &active_hashes).unwrap();
+
+        assert_ne!(returned, code);
+        assert!(!active_hashes.contains(&claim_code_hash(&returned)));
+        let expected_hash = claim_code_hash(&returned);
+        assert_eq!(
+            daemon.claim_code_hash.as_deref(),
+            Some(expected_hash.as_str())
+        );
+    }
 }

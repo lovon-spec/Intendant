@@ -345,13 +345,15 @@ INTENDANT_CONNECT_TOKEN="shared daemon bearer token" \
 ```
 
 `intendant-connect` is intended to sit behind public TLS for the configured
-origin. It handles passkey-only account sessions, claim-code ownership proof,
+origin. It handles passkey-only account sessions, claim-phrase ownership proof,
 daemon list/open/revoke/label UI, short-lived dashboard grants, WebRTC
 signaling, active-session close on revoke, and a capped audit log. The state
 file durably stores users/passkeys, daemon ownership, labels, hashed claim
-codes, and audit events. Plain claim codes, WebAuthn challenge state, pending
-offers, issued dashboard grants, rate limits, web sessions, and active dashboard
-session tracking are memory-only.
+phrases, and audit events. Plain claim phrases, WebAuthn challenge state,
+pending offers, issued dashboard grants, rate limits, web sessions, and active
+dashboard session tracking are memory-only. The claim API field remains named
+`claim_code` for compatibility, but newly generated claims are seven-word BIP39
+English phrases rather than short PIN-style codes.
 
 For production alpha, terminate public TLS at a reverse proxy and keep
 `intendant-connect` bound to `127.0.0.1`. The proxy should forward `Host`, set
@@ -399,7 +401,7 @@ PLAYWRIGHT_NODE_PATH=/path/to/node_modules \
   node scripts/validate-connect-rendezvous.cjs
 ```
 
-The emulator intentionally has no account, passkey, claim-code, durable device
+The emulator intentionally has no account, passkey, claim phrase, durable device
 registry, or authorization-grant policy. It exists to prove the
 browser-public-origin -> rendezvous -> daemon-outbound-signaling -> direct
 WebRTC DataChannel path while keeping the normal dashboard mTLS default in
