@@ -517,8 +517,9 @@ browser-side promise.
 Several paths intentionally stay outside this JSON tunnel:
 
 - static assets and WASM bundles;
-- native media fallback URLs and broad file-transfer bytes;
-- general filesystem mutations and broad/resumable file transfer;
+- native media fallback URLs and transfer paths outside the scoped dashboard
+  byte/upload protocols;
+- general filesystem mutations and durable broad file-transfer queues;
 - generic MCP-over-HTTP for external clients;
 - non-allowlisted `ControlMsg` mutations;
 - display WebRTC media channels;
@@ -795,6 +796,9 @@ Current alpha limits:
   single-node alpha persistence layer;
 - no application-layer dashboard RPC relay; the default path is browser to
   daemon WebRTC, with TURN/WebRTC relay remaining a transport-level option;
+- Files transfer history and resumed download offsets are browser-session state;
+  they are not durable across reloads yet, and uploads are current-session staged
+  attachments rather than arbitrary daemon filesystem writes;
 - peer daemon-to-daemon mTLS remains separate from Connect account login.
 
 Run the hosted MVP E2E locally with:
@@ -812,10 +816,10 @@ over tunneled terminal frames, verifies that a `--no-tui` daemon renders an
 explicit TUI-unavailable state, and runs the SPA's no-legacy-transport probes
 for control actions, media/editor upload, visual-freshness diagnostics, display
 signaling, display input authority, peer mutation fallback, TUI input, presence
-media, presence server callbacks, the Files tab's ranged filesystem download
-flow, the lower-level generic filesystem download probe, and uploaded-asset raw
-range reads. It then revokes the daemon while the tunnel is still open, waits
-for the tunnel to close, and checks the audit events.
+media, presence server callbacks, the Files tab's ranged download/resume flow,
+the lower-level generic filesystem download probe, and staged upload raw range
+reads. It then revokes the daemon while the tunnel is still open, waits for the
+tunnel to close, and checks the audit events.
 
 ### Design Target: Public Bootstrap with a Direct WebRTC Dashboard Tunnel
 
@@ -1000,9 +1004,12 @@ issuing repeated ranged requests and resuming from the last completed offset.
 Bounded dashboard uploads use `upload_start`, base64 `upload_chunk`, and
 `upload_end`. The daemon writes chunks into a tempfile and commits through the
 same upload store as `POST /api/session/current/uploads`, including the
-`UploadReady` broadcast. This is still a one-shot, ordered transfer with no
-resume token. Resume tokens and application-level restart semantics are still
-required before treating uploads as broad resumable file transfer.
+`UploadReady` broadcast. The Files tab uses this same primitive for browser
+file uploads, so uploaded files become current-session staged attachments. This
+is still a one-shot, ordered transfer with no resume token, destination
+filesystem path, or cross-refresh queue. Resume tokens, explicit destination
+policy, and application-level restart semantics are still required before
+treating uploads as broad resumable file transfer.
 
 Dashboard media/editor writes intentionally stay outside the generic
 `api_dashboard_action_msg` and `api_control_msg` allowlists. They use the
@@ -1160,13 +1167,16 @@ archival. Server-side transcription audio remains intentionally untunneled for
 now; Connect mode drops that optional audio stream rather than replaying it over
 the legacy bridge.
 Current-upload list reads use `api_session_current_uploads`, returning the same
-staged-upload descriptor array as `GET /api/session/current/uploads`.
+staged-upload descriptor array as `GET /api/session/current/uploads`. The Files
+tab shows this as its staged-upload list and can remove entries with
+`api_session_current_upload_delete`.
 Current-upload raw reads use `api_session_current_upload_raw` over
 `byte_stream_*` frames. The request names an uploaded attachment id and may
 include `offset`/`length`; the response carries `range_start`, `range_end`,
-`total_size`, and `resumable: true` metadata with the returned bytes. This is a
-bounded ranged-read primitive for previews/tests and future resumable transfer
-work, not yet a general media/download adapter.
+`total_size`, and `resumable: true` metadata with the returned bytes. The Files
+tab uses repeated ranged reads to download staged uploads back to the browser.
+This is a bounded current-session attachment primitive, not yet a general
+daemon-filesystem upload/download adapter.
 Worktree cached inventory reads, explicit scans, and guarded removals use
 `api_worktrees`, `api_worktrees_scan`, and `api_worktrees_remove`; removal uses
 the same no-replay fallback rule as other writes.
@@ -1177,11 +1187,12 @@ Bounded filesystem file reads use `api_fs_read` when the verified tunnel
 advertises byte streams. The request uses the same absolute-path or `~/` path
 rules as the picker, rejects directories, accepts optional `offset`/`length`,
 and returns bytes plus `content_type`, `range_start`, `range_end`, `total_size`,
-and `resumable: true` metadata. The Files tab exposes this as a generic file
-download path: users can type a path or browse with the filesystem picker, then
-the dashboard downloads through repeated `api_fs_read` ranges with progress and
-cancellation. Public-origin Connect mode does not fall back to daemon HTTP for
-this path.
+and `resumable: true` metadata. The Files tab exposes this as the download side
+of its transfer center: users can type a path or browse with the filesystem
+picker, queue downloads, pause/cancel/retry, and resume from completed ranges
+inside the current browser session. Public-origin Connect mode does not fall
+back to daemon HTTP for this path. The queue/history and partially completed
+ranges are not persisted across page reloads yet.
 Lazy exact context-snapshot loads use `api_session_context_snapshot`, keeping
 large raw request payloads out of ordinary session-detail hydration while still
 allowing the Context pane to fetch a single archived snapshot on demand.

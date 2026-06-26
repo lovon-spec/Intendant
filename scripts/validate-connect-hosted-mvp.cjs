@@ -350,6 +350,15 @@ async function main() {
     assert(filesDownloadPanel.statusText.includes('Downloaded'), `Files tab did not render completion status: ${JSON.stringify(filesDownloadPanel)}`);
     assert.strictEqual(filesDownloadPanel.progressWidth, '100%', `Files tab did not render complete progress: ${JSON.stringify(filesDownloadPanel)}`);
 
+    const filesInterruptedDownload = await page.evaluate(`window.intendantDashboardFiles._debugProbeInterruptedDownload(${JSON.stringify(genericDownloadPath)}, { chunkBytes: 11 })`);
+    assert.strictEqual(filesInterruptedDownload.failedStatus, 'failed', `Files tab interrupted download did not fail first: ${JSON.stringify(filesInterruptedDownload)}`);
+    assert(filesInterruptedDownload.failedLoaded > 0, `Files tab interrupted download did not retain partial bytes: ${JSON.stringify(filesInterruptedDownload)}`);
+    assert(filesInterruptedDownload.failedRangeCount >= 1, `Files tab interrupted download did not record ranges before failure: ${JSON.stringify(filesInterruptedDownload)}`);
+    assert.strictEqual(filesInterruptedDownload.finalStatus, 'completed', `Files tab interrupted download did not complete after resume: ${JSON.stringify(filesInterruptedDownload)}`);
+    assert(filesInterruptedDownload.finalRangeCount >= 2, `Files tab resumed download did not use multiple ranges: ${JSON.stringify(filesInterruptedDownload)}`);
+    assert.strictEqual(filesInterruptedDownload.text, genericDownloadText, `Files tab resumed download returned wrong bytes: ${JSON.stringify(filesInterruptedDownload)}`);
+    assert.strictEqual(filesInterruptedDownload.size, Buffer.byteLength(genericDownloadText), `Files tab resumed download returned wrong size: ${JSON.stringify(filesInterruptedDownload)}`);
+
     await click(page, '.tab-btn[data-tab="terminal"]');
     await click(page, '#tab-terminal .subtab-btn[data-term-tab="tui"]');
     await page.waitForFunction(() => {
@@ -515,6 +524,15 @@ async function main() {
     assert.strictEqual(uploadRawProbe.rawTotalSize, Buffer.byteLength(uploadRawText), `upload raw read returned wrong total size: ${JSON.stringify(uploadRawProbe)}`);
     assert.strictEqual(uploadRawProbe.rawRangeStart, 8, `upload raw read returned wrong start: ${JSON.stringify(uploadRawProbe)}`);
     assert.strictEqual(uploadRawProbe.rawRangeEnd, 18, `upload raw read returned wrong end: ${JSON.stringify(uploadRawProbe)}`);
+
+    const filesUploadProbe = await page.evaluate(`window.intendantDashboardFiles._debugProbeUploadText(${JSON.stringify(uploadRawText)}, { name: 'connect-files-upload.txt', chunkBytes: 9 })`);
+    assert(filesUploadProbe.uploadId, `Files tab upload did not return an id: ${JSON.stringify(filesUploadProbe)}`);
+    assert.strictEqual(filesUploadProbe.uploadName, 'connect-files-upload.txt', `Files tab upload returned wrong descriptor: ${JSON.stringify(filesUploadProbe)}`);
+    assert.strictEqual(filesUploadProbe.transferStatus, 'completed', `Files tab upload transfer did not complete: ${JSON.stringify(filesUploadProbe)}`);
+    assert.strictEqual(filesUploadProbe.httpFallbackCount, 0, `Files tab upload/raw path used HTTP fallback: ${JSON.stringify(filesUploadProbe)}`);
+    assert.strictEqual(filesUploadProbe.rawText, uploadRawText, `Files tab upload raw read returned wrong bytes: ${JSON.stringify(filesUploadProbe)}`);
+    assert(filesUploadProbe.rawRangeCount >= 2, `Files tab upload raw read did not use multiple ranges: ${JSON.stringify(filesUploadProbe)}`);
+    assert(filesUploadProbe.statusText.includes('Uploaded'), `Files tab upload did not render completion status: ${JSON.stringify(filesUploadProbe)}`);
 
     const revoked = await page.evaluate(`(async () => {
       const daemonId = ${JSON.stringify(options.daemonId)};
