@@ -16,8 +16,8 @@ use agent_client_protocol_schema::{
 use crate::error::CallerError;
 
 use super::{
-    AgentConfig, AgentEvent, AgentImageAttachment, AgentThread, ApprovalCategory, ApprovalDecision,
-    ExternalAgent, ToolCompletionStatus,
+    encode_mcp_query_value, AgentConfig, AgentEvent, AgentImageAttachment, AgentThread,
+    ApprovalCategory, ApprovalDecision, ExternalAgent, ToolCompletionStatus,
 };
 
 /// Appended to the first prompt when an Intendant web port is available.
@@ -259,6 +259,15 @@ impl GeminiAgent {
     }
 
     // -- internal helpers ---------------------------------------------------
+
+    fn intendant_mcp_url(port: u16, auth_token: Option<&str>) -> String {
+        let mut url = format!("http://localhost:{port}/mcp");
+        if let Some(token) = auth_token.map(str::trim).filter(|token| !token.is_empty()) {
+            url.push_str("?mcp_token=");
+            url.push_str(&encode_mcp_query_value(token));
+        }
+        url
+    }
 
     async fn send_request(
         &mut self,
@@ -854,7 +863,7 @@ impl ExternalAgent for GeminiAgent {
                 }
                 let mcp_obj = mcp_entry.as_object_mut().expect("mcpServers is object");
                 let prior = mcp_obj.get("intendant").cloned();
-                let mcp_url = format!("http://localhost:{}/mcp", port);
+                let mcp_url = Self::intendant_mcp_url(port, config.mcp_auth_token.as_deref());
                 mcp_obj.insert(
                     "intendant".to_string(),
                     serde_json::json!({ "url": mcp_url }),
@@ -1335,6 +1344,18 @@ mod tests {
         );
         assert!(agent.debug);
         assert_eq!(agent.web_port, Some(8765));
+    }
+
+    #[test]
+    fn intendant_mcp_url_carries_auth_token_when_configured() {
+        assert_eq!(
+            GeminiAgent::intendant_mcp_url(8765, None),
+            "http://localhost:8765/mcp"
+        );
+        assert_eq!(
+            GeminiAgent::intendant_mcp_url(8765, Some("token with spaces&symbols")),
+            "http://localhost:8765/mcp?mcp_token=token%20with%20spaces%26symbols"
+        );
     }
 
     #[test]

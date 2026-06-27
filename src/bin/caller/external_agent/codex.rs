@@ -14,10 +14,10 @@ use tokio::sync::{mpsc, oneshot, Mutex};
 use crate::error::CallerError;
 
 use super::{
-    AgentConfig, AgentContextSnapshot, AgentContextTokenCountKind, AgentEvent,
-    AgentImageAttachment, AgentThread, AgentThreadSnapshot, AgentUsageSnapshot, ApprovalCategory,
-    ApprovalDecision, AutonomousGoalPauseResult, ExternalAgent, RollbackAnchorPosition,
-    SubAgentState, ToolCompletionStatus,
+    encode_mcp_query_value, AgentConfig, AgentContextSnapshot, AgentContextTokenCountKind,
+    AgentEvent, AgentImageAttachment, AgentThread, AgentThreadSnapshot, AgentUsageSnapshot,
+    ApprovalCategory, ApprovalDecision, AutonomousGoalPauseResult, ExternalAgent,
+    RollbackAnchorPosition, SubAgentState, ToolCompletionStatus,
 };
 
 // ---------------------------------------------------------------------------
@@ -1196,19 +1196,6 @@ fn format_duration_short(seconds: u64) -> String {
     }
 }
 
-fn encode_mcp_query_value(value: &str) -> String {
-    let mut encoded = String::new();
-    for byte in value.bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                encoded.push(byte as char)
-            }
-            _ => encoded.push_str(&format!("%{byte:02X}")),
-        }
-    }
-    encoded
-}
-
 // ---------------------------------------------------------------------------
 // JSON-RPC wire types
 // ---------------------------------------------------------------------------
@@ -1413,6 +1400,7 @@ pub struct CodexAgent {
     /// policy text. See the cache-prefix contract on `turn_start_params`.
     thread_developer_instructions: Option<String>,
     web_port: Option<u16>,
+    mcp_auth_token: Option<String>,
     mcp_session_id: Option<String>,
     resume_session: Option<String>,
     codex_home: Option<PathBuf>,
@@ -1743,20 +1731,31 @@ impl CodexAgent {
         } else {
             "vanilla"
         };
-        match self
+        let mut params: Vec<(&str, String)> = Vec::new();
+        if let Some(session_id) = self
             .mcp_session_id
             .as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty())
         {
-            Some(session_id) => format!(
-                "{}?session_id={}&managed_context={}&tool_profile=core",
-                base_url,
-                encode_mcp_query_value(session_id),
-                mode
-            ),
-            None => format!("{}?managed_context={}&tool_profile=core", base_url, mode),
+            params.push(("session_id", encode_mcp_query_value(session_id)));
         }
+        params.push(("managed_context", mode.to_string()));
+        params.push(("tool_profile", "core".to_string()));
+        if let Some(token) = self
+            .mcp_auth_token
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            params.push(("mcp_token", encode_mcp_query_value(token)));
+        }
+        let query = params
+            .into_iter()
+            .map(|(key, value)| format!("{key}={value}"))
+            .collect::<Vec<_>>()
+            .join("&");
+        format!("{base_url}?{query}")
     }
 
     fn intendant_mcp_base_url(port: u16) -> String {
@@ -1772,7 +1771,7 @@ impl CodexAgent {
     }
 
     fn add_intendant_ctl_env(&self, command: &mut tokio::process::Command, port: u16) {
-        command.env("INTENDANT_MCP_URL", Self::intendant_mcp_base_url(port));
+        command.env("INTENDANT_MCP_URL", self.intendant_mcp_url(port));
         command.env(
             "INTENDANT_MANAGED_CONTEXT",
             self.intendant_managed_context_mode(),
@@ -1923,6 +1922,7 @@ impl CodexAgent {
             managed_context: opts.managed_context,
             thread_developer_instructions: None,
             web_port,
+            mcp_auth_token: None,
             mcp_session_id: None,
             resume_session: None,
             codex_home: None,
@@ -6650,6 +6650,7 @@ impl ExternalAgent for CodexAgent {
             crate::project::normalize_codex_context_archive(&config.context_archive);
         self.context_seen_request_ids.clear();
         self.context_trace_fingerprint = None;
+        self.mcp_auth_token = config.mcp_auth_token;
         self.mcp_session_id = config.mcp_session_id;
         self.resume_session = config.resume_session;
         self.codex_home = config.codex_home;
@@ -12459,7 +12460,30 @@ command = "asana-mcp"
     }
 
     #[test]
-    fn intendant_ctl_env_uses_base_mcp_url_and_context_mode() {
+    fn intendant_mcp_url_carries_auth_token_when_configured() {
+        let mut agent = CodexAgent::with_options(
+            "codex".to_string(),
+            None,
+            "never".to_string(),
+            "workspace-write".to_string(),
+            Some(8765),
+            CodexAgentOptions {
+                managed_context: true,
+                ..CodexAgentOptions::default()
+            },
+        );
+        agent.mcp_session_id = Some("session with spaces".to_string());
+        agent.mcp_auth_token = Some("token with spaces&symbols".to_string());
+
+        let url = agent.intendant_mcp_url(8765);
+        assert_eq!(
+            url,
+            "http://localhost:8765/mcp?session_id=session%20with%20spaces&managed_context=managed&tool_profile=core&mcp_token=token%20with%20spaces%26symbols"
+        );
+    }
+
+    #[test]
+    fn intendant_ctl_env_uses_mcp_url_and_context_mode() {
         let agent = CodexAgent::with_options(
             "codex".to_string(),
             None,
@@ -12529,6 +12553,7 @@ command = "asana-mcp"
             writable_roots: Vec::new(),
             codex_managed_context: true,
             web_port: Some(mcp_port),
+            mcp_auth_token: None,
             mcp_session_id: Some("test-session".to_string()),
             resume_session: None,
             codex_home: None,

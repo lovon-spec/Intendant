@@ -3795,13 +3795,25 @@ fn is_mcp_request_path(request_line: &str) -> bool {
     path == "/mcp"
 }
 
-fn http_header_present(header_text: &str, header_name: &str) -> bool {
-    header_text.lines().skip(1).any(|line| {
-        let Some((name, _)) = line.split_once(':') else {
-            return false;
-        };
-        name.trim().eq_ignore_ascii_case(header_name)
+static LOOPBACK_MCP_AUTH_TOKEN: OnceLock<String> = OnceLock::new();
+
+pub(crate) fn loopback_mcp_auth_token() -> &'static str {
+    LOOPBACK_MCP_AUTH_TOKEN.get_or_init(|| uuid::Uuid::new_v4().simple().to_string())
+}
+
+fn http_header_value<'a>(header_text: &'a str, header_name: &str) -> Option<&'a str> {
+    header_text.lines().skip(1).find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        if name.trim().eq_ignore_ascii_case(header_name) {
+            Some(value.trim())
+        } else {
+            None
+        }
     })
+}
+
+fn http_header_present(header_text: &str, header_name: &str) -> bool {
+    http_header_value(header_text, header_name).is_some()
 }
 
 fn has_browser_origin_headers(header_text: &str) -> bool {
@@ -3809,6 +3821,18 @@ fn has_browser_origin_headers(header_text: &str) -> bool {
         || http_header_present(header_text, "sec-fetch-site")
         || http_header_present(header_text, "sec-fetch-mode")
         || http_header_present(header_text, "sec-fetch-dest")
+}
+
+fn loopback_mcp_auth_matches(header_text: &str) -> bool {
+    let expected = loopback_mcp_auth_token();
+    let request_line = header_text.lines().next().unwrap_or("");
+    if query_param(request_line, "mcp_token").as_deref() == Some(expected) {
+        return true;
+    }
+    if http_header_value(header_text, "x-intendant-mcp-token") == Some(expected) {
+        return true;
+    }
+    verify_bearer_token(header_text, Some(expected)).is_ok()
 }
 
 fn is_loopback_cleartext_mcp_request(
@@ -3821,6 +3845,7 @@ fn is_loopback_cleartext_mcp_request(
         && remote_addr.ip().is_loopback()
         && is_mcp_request_path(request_line)
         && !has_browser_origin_headers(header_text)
+        && loopback_mcp_auth_matches(header_text)
 }
 
 /// Whether the request head's `Accept-Encoding` admits gzip (tolerant:
@@ -30311,11 +30336,41 @@ mod tests {
 
         let loopback = SocketAddr::new(Ipv4Addr::new(127, 0, 0, 1).into(), 43210);
         let lan = SocketAddr::new(Ipv4Addr::new(192, 168, 1, 50).into(), 43210);
+        let token = loopback_mcp_auth_token();
+        let authorized_mcp = format!(
+            "POST /mcp?session_id=child&mcp_token={token} HTTP/1.1\r\nHost: localhost\r\n\r\n"
+        );
+        let authorized_mcp_header = format!(
+            "POST /mcp?session_id=child HTTP/1.1\r\nHost: localhost\r\nX-Intendant-Mcp-Token: {token}\r\n\r\n"
+        );
+        let authorized_mcp_bearer = format!(
+            "POST /mcp?session_id=child HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\n\r\n"
+        );
 
         assert!(is_loopback_cleartext_mcp_request(
             loopback,
             false,
+            &authorized_mcp
+        ));
+        assert!(is_loopback_cleartext_mcp_request(
+            loopback,
+            false,
+            &authorized_mcp_header
+        ));
+        assert!(is_loopback_cleartext_mcp_request(
+            loopback,
+            false,
+            &authorized_mcp_bearer
+        ));
+        assert!(!is_loopback_cleartext_mcp_request(
+            loopback,
+            false,
             "POST /mcp?session_id=child HTTP/1.1\r\nHost: localhost\r\n\r\n"
+        ));
+        assert!(!is_loopback_cleartext_mcp_request(
+            loopback,
+            false,
+            "POST /mcp?session_id=child&mcp_token=wrong HTTP/1.1\r\nHost: localhost\r\n\r\n"
         ));
         assert!(!is_loopback_cleartext_mcp_request(
             loopback,
@@ -30330,22 +30385,26 @@ mod tests {
         assert!(!is_loopback_cleartext_mcp_request(
             lan,
             false,
-            "POST /mcp HTTP/1.1\r\nHost: localhost\r\n\r\n"
+            &authorized_mcp
         ));
         assert!(!is_loopback_cleartext_mcp_request(
             loopback,
             true,
-            "POST /mcp HTTP/1.1\r\nHost: localhost\r\n\r\n"
+            &authorized_mcp
         ));
         assert!(!is_loopback_cleartext_mcp_request(
             loopback,
             false,
-            "POST /mcp HTTP/1.1\r\nHost: localhost\r\nOrigin: https://example.test\r\n\r\n"
+            &format!(
+                "POST /mcp?mcp_token={token} HTTP/1.1\r\nHost: localhost\r\nOrigin: https://example.test\r\n\r\n"
+            )
         ));
         assert!(!is_loopback_cleartext_mcp_request(
             loopback,
             false,
-            "POST /mcp HTTP/1.1\r\nHost: localhost\r\nSec-Fetch-Site: cross-site\r\n\r\n"
+            &format!(
+                "POST /mcp?mcp_token={token} HTTP/1.1\r\nHost: localhost\r\nSec-Fetch-Site: cross-site\r\n\r\n"
+            )
         ));
     }
 
@@ -33996,14 +34055,17 @@ mod tests {
     #[tokio::test]
     async fn test_strict_tls_allows_loopback_cleartext_mcp_when_mtls_required() {
         let (port, handle) = spawn_test_gateway_tls_with_client_cert_requirement(None, true).await;
+        let token = loopback_mcp_auth_token();
         let resp = http_request(
             port,
-            "POST /mcp?session_id=child HTTP/1.1\r\n\
-             Host: localhost\r\n\
-             Content-Type: application/json\r\n\
-             Content-Length: 2\r\n\
-             \r\n\
-             {}",
+            &format!(
+                "POST /mcp?session_id=child&mcp_token={token} HTTP/1.1\r\n\
+                 Host: localhost\r\n\
+                 Content-Type: application/json\r\n\
+                 Content-Length: 2\r\n\
+                 \r\n\
+                 {{}}"
+            ),
         )
         .await;
         assert!(
@@ -34022,17 +34084,40 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_strict_tls_rejects_browser_origin_cleartext_mcp() {
+    async fn test_strict_tls_rejects_loopback_cleartext_mcp_without_token() {
         let (port, handle) = spawn_test_gateway_tls_with_client_cert_requirement(None, true).await;
         let resp = http_request(
             port,
             "POST /mcp?session_id=child HTTP/1.1\r\n\
              Host: localhost\r\n\
-             Origin: https://example.test\r\n\
-             Content-Type: text/plain\r\n\
+             Content-Type: application/json\r\n\
              Content-Length: 2\r\n\
              \r\n\
              {}",
+        )
+        .await;
+        assert!(
+            resp.contains("426"),
+            "loopback cleartext /mcp without token should stay on the strict TLS reject path, got: {resp}"
+        );
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_strict_tls_rejects_browser_origin_cleartext_mcp() {
+        let (port, handle) = spawn_test_gateway_tls_with_client_cert_requirement(None, true).await;
+        let token = loopback_mcp_auth_token();
+        let resp = http_request(
+            port,
+            &format!(
+                "POST /mcp?session_id=child&mcp_token={token} HTTP/1.1\r\n\
+                 Host: localhost\r\n\
+                 Origin: https://example.test\r\n\
+                 Content-Type: text/plain\r\n\
+                 Content-Length: 2\r\n\
+                 \r\n\
+                 {{}}"
+            ),
         )
         .await;
         assert!(

@@ -45,6 +45,19 @@ pub(crate) fn cleanup_spawned_child_processes_now() -> Vec<u32> {
     cleaned
 }
 
+pub(super) fn encode_mcp_query_value(value: &str) -> String {
+    let mut encoded = String::new();
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                encoded.push(byte as char)
+            }
+            _ => encoded.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    encoded
+}
+
 /// Drop ANSI SGR/CSI escape sequences from a tracing-formatted stderr
 /// line so activity-log rows don't render `[31m` noise.
 pub(crate) fn strip_ansi_escapes(input: &str) -> String {
@@ -532,6 +545,9 @@ pub struct AgentConfig {
     pub codex_managed_context: bool,
     /// Web gateway port for MCP-over-HTTP config generation.
     pub web_port: Option<u16>,
+    /// Shared secret required by the web gateway's secured loopback MCP
+    /// exception. Only managed child processes receive it.
+    pub mcp_auth_token: Option<String>,
     /// Intendant session id to include in the injected MCP URL so tool
     /// exposure can be scoped to the Codex process that is calling.
     pub mcp_session_id: Option<String>,

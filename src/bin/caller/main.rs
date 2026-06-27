@@ -1294,6 +1294,8 @@ async fn create_external_agent(
     use external_agent::{AgentBackend, AgentConfig};
 
     let mcp_session_id = mcp_session_id.or_else(|| session_log_id(session_log));
+    let mcp_auth_token =
+        web_port.map(|_| crate::web_gateway::loopback_mcp_auth_token().to_string());
 
     let (mut agent, config): (Box<dyn external_agent::ExternalAgent>, AgentConfig) = match backend {
         AgentBackend::Codex => {
@@ -1345,6 +1347,7 @@ async fn create_external_agent(
                 writable_roots: cfg.writable_roots.clone(),
                 codex_managed_context,
                 web_port,
+                mcp_auth_token: mcp_auth_token.clone(),
                 mcp_session_id: mcp_session_id.clone(),
                 resume_session: resume_session.clone(),
                 codex_home,
@@ -1388,6 +1391,7 @@ async fn create_external_agent(
                 writable_roots: Vec::new(),
                 codex_managed_context: false,
                 web_port,
+                mcp_auth_token: mcp_auth_token.clone(),
                 mcp_session_id: None,
                 resume_session: resume_session.clone(),
                 codex_home: None,
@@ -1418,6 +1422,7 @@ async fn create_external_agent(
                 writable_roots: Vec::new(),
                 codex_managed_context: false,
                 web_port,
+                mcp_auth_token: mcp_auth_token.clone(),
                 mcp_session_id: None,
                 resume_session: resume_session.clone(),
                 codex_home: None,
