@@ -52462,6 +52462,7 @@ function onDebugScreenTornDown() {
 // ── Sessions Tab ──
 let worktreesRequestSerial = 0;
 let worktreesActivityClearTimeout = null;
+let worktreesLoadPromise = null;
 const pendingWorktreeRemovals = new Set();
 const SESSION_CARD_RENDER_LIMIT = 300;
 let _sessionsLoadToken = 0;
@@ -54484,9 +54485,17 @@ function loadWorktrees(options = {}) {
   const forceScan = !!options.forceScan;
   const listEl = document.getElementById('worktrees-list');
   if (!listEl) return Promise.resolve(null);
-  if (worktreesLoadInFlight === 'scan' && forceScan) {
+  if (worktreesLoadInFlight === 'scan') {
+    setWorktreesLoadPending(true, 'scan');
     setWorktreesActivityNotice('pending', 'Scanning worktrees...');
-    return Promise.resolve(null);
+    if (activeSessionsSubtab === 'worktrees') {
+      setWorktreesStatus('Scanning worktrees...');
+    }
+    return worktreesLoadPromise || Promise.resolve(_cachedWorktreeScan);
+  }
+  if (worktreesLoadInFlight === 'cache' && !forceScan) {
+    setWorktreesLoadPending(true, 'cache');
+    return worktreesLoadPromise || Promise.resolve(_cachedWorktreeScan);
   }
   const browserCachedScan = worktreeHasScannedData(_cachedWorktreeScan) ? _cachedWorktreeScan : null;
   const requestSerial = ++worktreesRequestSerial;
@@ -54508,7 +54517,7 @@ function loadWorktrees(options = {}) {
   }
   const url = forceScan ? '/api/worktrees/scan' : '/api/worktrees';
   const rpcMethod = forceScan ? 'api_worktrees_scan' : 'api_worktrees';
-  return dashboardJsonFetch(rpcMethod, {}, () => (
+  const promise = dashboardJsonFetch(rpcMethod, {}, () => (
     authedFetch(url, { method: forceScan ? 'POST' : 'GET' })
   ), rpcMethod)
     .then(r => r.ok ? r.json() : Promise.reject(new Error(`${url} returned ${r.status}`)))
@@ -54543,8 +54552,11 @@ function loadWorktrees(options = {}) {
     .finally(() => {
       if (requestSerial !== worktreesRequestSerial) return;
       worktreesLoadInFlight = '';
+      worktreesLoadPromise = null;
       setWorktreesLoadPending(false);
     });
+  worktreesLoadPromise = promise;
+  return promise;
 }
 
 function renderWorktrees(scan) {
