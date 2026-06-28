@@ -9172,8 +9172,8 @@ body.display-fullscreen-open {
     <span class="autonomy" id="sb-autonomy" style="cursor:pointer;text-decoration:underline dotted" onclick="cycleAutonomy()" title="Click to cycle: Low → Medium → High → Full">Medium</span>
     <span class="sep">|</span>
     <span class="display-toggle-wrap">
-      <span class="field-label" id="sb-display-label" style="cursor:pointer" onclick="toggleUserDisplay()" title="Your display — click to grant/revoke agent access to your screen for computer use tasks">your display</span>
-      <span id="sb-display-access" style="cursor:pointer;font-weight:600;color:#f38ba8" onclick="toggleUserDisplay()" title="Your display — click to grant/revoke agent access to your screen for computer use tasks">off</span>
+      <span class="field-label" id="sb-display-label" style="cursor:pointer" onclick="toggleUserDisplay(event)" title="Your display — click to grant/revoke agent access to your screen for computer use tasks">your display</span>
+      <span id="sb-display-access" style="cursor:pointer;font-weight:600;color:#f38ba8" onclick="toggleUserDisplay(event)" title="Your display — click to grant/revoke agent access to your screen for computer use tasks">off</span>
       <div class="display-picker" id="display-picker"></div>
     </span>
     <span class="sep">|</span>
@@ -55920,6 +55920,15 @@ function showDisplayPicker(displays) {
   displayPickerVisible = true;
 }
 
+function grantUserDisplayTarget(display) {
+  const displayId = Number(display?.id);
+  const msg = { action: 'grant_user_display' };
+  if (Number.isFinite(displayId) && displayId !== 0) msg.display_id = displayId;
+  dispatchDashboardActionMsg(msg);
+  grantedDisplayId = Number.isFinite(displayId) ? displayId : 0;
+  setUserDisplayState(true);
+}
+
 window.cycleAutonomy = function() {
   const levels = ['Low', 'Medium', 'High', 'Full'];
   const el = document.getElementById('sb-autonomy');
@@ -55930,8 +55939,9 @@ window.cycleAutonomy = function() {
   dispatchControlMsg({ action: 'set_autonomy', level: next.toLowerCase() });
 };
 
-window.toggleUserDisplay = function() {
+window.toggleUserDisplay = function(event) {
   if (!app) return;
+  if (event?.stopPropagation) event.stopPropagation();
   if (userDisplayGranted) {
     // Tear the display slot down locally before the round-trip. The
     // server processes the revoke instantly, but when the browser is
@@ -55964,12 +55974,12 @@ window.toggleUserDisplay = function() {
   // failed grant that user can retry (also benign).
   const applyDisplayList = (displays) => {
     cachedDisplays = displays;
-    if (!displays || displays.length <= 1) {
-      dispatchDashboardActionMsg({ action: 'grant_user_display' });
-      grantedDisplayId = 0;
-      setUserDisplayState(true);
+    const rows = Array.isArray(displays) ? displays : [];
+    const physicalDisplays = rows.filter((display) => display?.kind !== 'window');
+    if (rows.length <= 1 || physicalDisplays.length === 1) {
+      grantUserDisplayTarget(physicalDisplays[0] || rows[0]);
     } else {
-      showDisplayPicker(displays);
+      showDisplayPicker(rows);
     }
   };
   if (cachedDisplays && cachedDisplays.length > 0) {
@@ -55981,9 +55991,7 @@ window.toggleUserDisplay = function() {
     .then(applyDisplayList)
     .catch(() => {
       // Fetch failed: fall back to granting default display
-      dispatchDashboardActionMsg({ action: 'grant_user_display' });
-      grantedDisplayId = 0;
-      setUserDisplayState(true);
+      grantUserDisplayTarget(null);
     });
 };
 function setUserDisplayState(granted) {
