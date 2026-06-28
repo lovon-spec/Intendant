@@ -1189,6 +1189,10 @@ impl SessionSupervisor {
                     state.active_session_id = Some(existing_id);
                 }
                 self.emit_attached_status(&resume_token, &source_norm).await;
+                self.config.bus.send(AppEvent::SessionAttached {
+                    session_id: resume_token.clone(),
+                    source: source_norm.clone(),
+                });
             } else if external_backend.is_none() {
                 match session_log::SessionLog::find_session_by_id(&session_id) {
                     Some(dir) => match session_log::SessionLog::open(dir) {
@@ -2039,9 +2043,14 @@ impl SessionSupervisor {
         request: EditUserMessageRequest,
     ) {
         let supervisor = self.clone();
+        let mut attach_rx = self.config.bus.subscribe();
         tokio::spawn(async move {
             let (target_id, entry, relation) = supervisor
-                .wait_for_edit_route_target(&lookup_id, Some(&request.requested_id))
+                .wait_for_edit_route_target_after_attach(
+                    &lookup_id,
+                    Some(&request.requested_id),
+                    &mut attach_rx,
+                )
                 .await;
             let Some(target) = entry else {
                 supervisor.warn(&format!(
@@ -2062,29 +2071,67 @@ impl SessionSupervisor {
         });
     }
 
-    async fn wait_for_edit_route_target(
+    async fn wait_for_edit_route_target_after_attach(
         &self,
         primary_id: &str,
         fallback_id: Option<&str>,
+        attach_rx: &mut tokio::sync::broadcast::Receiver<AppEvent>,
     ) -> (String, Option<EditRouteTarget>, Option<RelatedSession>) {
         let started_at = std::time::Instant::now();
+        let mut attached = false;
         loop {
-            let primary = self.lookup_edit_route_target(primary_id).await;
-            if primary.1.is_some() {
-                return primary;
-            }
+            if attached {
+                let primary = self
+                    .lookup_edit_route_target_in_current_state(primary_id)
+                    .await;
+                if primary.1.is_some() {
+                    return primary;
+                }
 
-            if let Some(fallback_id) = fallback_id.filter(|id| *id != primary_id) {
-                let fallback = self.lookup_edit_route_target(fallback_id).await;
-                if fallback.1.is_some() {
-                    return fallback;
+                if let Some(fallback_id) = fallback_id.filter(|id| *id != primary_id) {
+                    let fallback = self
+                        .lookup_edit_route_target_in_current_state(fallback_id)
+                        .await;
+                    if fallback.1.is_some() {
+                        return fallback;
+                    }
                 }
             }
 
             if started_at.elapsed() >= EDIT_ATTACH_ROUTE_TIMEOUT {
-                return primary;
+                return if attached {
+                    let primary = self
+                        .lookup_edit_route_target_in_current_state(primary_id)
+                        .await;
+                    if primary.1.is_some() {
+                        primary
+                    } else if let Some(fallback_id) = fallback_id.filter(|id| *id != primary_id) {
+                        self.lookup_edit_route_target_in_current_state(fallback_id)
+                            .await
+                    } else {
+                        primary
+                    }
+                } else {
+                    (primary_id.to_string(), None, None)
+                };
             }
-            tokio::time::sleep(EDIT_ATTACH_ROUTE_POLL_INTERVAL).await;
+
+            tokio::select! {
+                event = attach_rx.recv() => {
+                    match event {
+                        Ok(event) => {
+                            if edit_attach_event_matches(&event, primary_id, fallback_id) {
+                                attached = true;
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                            attached = true;
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {}
+                    }
+                }
+                _ = tokio::time::sleep(EDIT_ATTACH_ROUTE_POLL_INTERVAL) => {}
+            }
         }
     }
 
@@ -2181,43 +2228,60 @@ impl SessionSupervisor {
             request.attachments,
         )
         .for_target(target_session_id);
-        if target.follow_up_tx.send(msg).await.is_err() {
-            self.warn(&format!(
-                "Edit dropped: {} session {} in {} is not accepting input",
-                backend,
-                short_session(&target.managed_id),
-                target.project_root.display()
-            ));
-            self.emit_edit_user_message_status(
-                Some(request.requested_id),
-                request.user_turn_index,
-                "failed",
-                format!("{} session is not accepting input", backend),
-            );
-        } else {
-            self.emit_edit_user_message_status(
-                Some(request.requested_id.clone()),
-                request.user_turn_index,
-                "queued",
-                format!(
-                    "edit queued for {} session {} user turn {}",
+        match target.follow_up_tx.try_send(msg) {
+            Ok(()) => {
+                self.emit_edit_user_message_status(
+                    Some(request.requested_id.clone()),
+                    request.user_turn_index,
+                    "queued",
+                    format!(
+                        "edit queued for {} session {} user turn {}",
+                        backend,
+                        short_session(&target.managed_id),
+                        request.user_turn_index
+                    ),
+                );
+                self.config.bus.send(AppEvent::LogEntry {
+                    session_id: Some(target.managed_id.clone()),
+                    level: "info".to_string(),
+                    source: "session-supervisor".to_string(),
+                    content: format!(
+                        "Edit queued for {} session {} user turn {}",
+                        backend,
+                        short_session(&target.managed_id),
+                        request.user_turn_index
+                    ),
+                    turn: None,
+                });
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                self.warn(&format!(
+                    "Edit dropped: {} session {} in {} is not accepting input",
                     backend,
                     short_session(&target.managed_id),
-                    request.user_turn_index
-                ),
-            );
-            self.config.bus.send(AppEvent::LogEntry {
-                session_id: Some(target.managed_id.clone()),
-                level: "info".to_string(),
-                source: "session-supervisor".to_string(),
-                content: format!(
-                    "Edit queued for {} session {} user turn {}",
+                    target.project_root.display()
+                ));
+                self.emit_edit_user_message_status(
+                    Some(request.requested_id),
+                    request.user_turn_index,
+                    "failed",
+                    format!("{} session is not accepting input", backend),
+                );
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                self.warn(&format!(
+                    "Edit dropped: {} session {} in {} input queue is full",
                     backend,
                     short_session(&target.managed_id),
-                    request.user_turn_index
-                ),
-                turn: None,
-            });
+                    target.project_root.display()
+                ));
+                self.emit_edit_user_message_status(
+                    Some(request.requested_id),
+                    request.user_turn_index,
+                    "failed",
+                    format!("{} session input queue is full", backend),
+                );
+            }
         }
     }
 
@@ -2272,6 +2336,14 @@ impl SessionSupervisor {
         }
 
         initial
+    }
+
+    async fn lookup_edit_route_target_in_current_state(
+        &self,
+        requested_id: &str,
+    ) -> (String, Option<EditRouteTarget>, Option<RelatedSession>) {
+        let state = self.state.lock().await;
+        lookup_edit_route_target_in_state(&state, requested_id)
     }
 
     async fn route_interrupt(&self, session_id: Option<String>) {
@@ -4009,6 +4081,17 @@ fn edit_attach_request(
     })
 }
 
+fn edit_attach_event_matches(
+    event: &AppEvent,
+    primary_id: &str,
+    fallback_id: Option<&str>,
+) -> bool {
+    let AppEvent::SessionAttached { session_id, .. } = event else {
+        return false;
+    };
+    session_id == primary_id || fallback_id.is_some_and(|id| session_id == id)
+}
+
 fn control_msg_can_attach_unmanaged_session(msg: &event::ControlMsg) -> bool {
     match msg {
         event::ControlMsg::EditUserMessage {
@@ -5460,7 +5543,7 @@ mod tests {
     #[tokio::test]
     async fn edit_queued_before_attach_delivers_after_session_identity() {
         let bus = EventBus::new();
-        let supervisor = test_supervisor(PathBuf::from("/tmp/project"), bus);
+        let supervisor = test_supervisor(PathBuf::from("/tmp/project"), bus.clone());
         let (tx, mut rx) = mpsc::channel(1);
 
         supervisor.queue_edit_user_message_after_attach(
@@ -5497,6 +5580,10 @@ mod tests {
                 .session_aliases
                 .insert("codex-thread".to_string(), "wrapper-session".to_string());
         }
+        bus.send(AppEvent::SessionAttached {
+            session_id: "codex-thread".to_string(),
+            source: "codex".to_string(),
+        });
 
         let msg = tokio::time::timeout(std::time::Duration::from_millis(300), rx.recv())
             .await
@@ -5507,6 +5594,64 @@ mod tests {
         assert_eq!(msg.edit_user_turn_revision, Some(5));
         assert_eq!(msg.edit_original_text.as_deref(), Some("continue"));
         assert_eq!(msg.target_session_id, None);
+    }
+
+    #[tokio::test]
+    async fn edit_queued_after_attach_waits_for_ready_signal() {
+        let bus = EventBus::new();
+        let supervisor = test_supervisor(PathBuf::from("/tmp/project"), bus.clone());
+        let (tx, mut rx) = mpsc::channel(1);
+
+        supervisor.queue_edit_user_message_after_attach(
+            "codex-thread".to_string(),
+            EditUserMessageRequest {
+                requested_id: "codex-thread".to_string(),
+                user_turn_index: 2,
+                user_turn_revision: Some(5),
+                original_text: Some("continue".to_string()),
+                text: "edited continue".to_string(),
+                attachments: Vec::new(),
+            },
+        );
+
+        {
+            let mut state = supervisor.state.lock().await;
+            state.sessions.insert(
+                "codex-thread".to_string(),
+                ManagedSession {
+                    session_id: "codex-thread".to_string(),
+                    source: "codex".to_string(),
+                    name: None,
+                    phase: "idle".to_string(),
+                    project_root: PathBuf::from("/tmp/project"),
+                    session_dir: PathBuf::from("/tmp/session"),
+                    follow_up_tx: tx,
+                    approval_registry: event::ApprovalRegistry::default(),
+                    instance_id: 0,
+                    finished_rx: None,
+                },
+            );
+        }
+
+        tokio::time::sleep(EDIT_ATTACH_ROUTE_POLL_INTERVAL * 2).await;
+        assert!(
+            rx.try_recv().is_err(),
+            "edit should wait for attach-ready event before delivery"
+        );
+
+        bus.send(AppEvent::SessionAttached {
+            session_id: "codex-thread".to_string(),
+            source: "codex".to_string(),
+        });
+
+        let msg = tokio::time::timeout(std::time::Duration::from_millis(300), rx.recv())
+            .await
+            .expect("queued edit should deliver after attach-ready event")
+            .expect("follow-up channel should stay open");
+        assert_eq!(msg.text, "edited continue");
+        assert_eq!(msg.edit_user_turn_index, Some(2));
+        assert_eq!(msg.edit_user_turn_revision, Some(5));
+        assert_eq!(msg.edit_original_text.as_deref(), Some("continue"));
     }
 
     #[tokio::test]
