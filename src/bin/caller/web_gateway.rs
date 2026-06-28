@@ -1893,10 +1893,10 @@ const WASM_STATION_BIN: &[u8] = include_bytes!("../../../static/wasm-station/sta
 const THREE_MODULE_JS: &str = include_str!("../../../static/three.module.min.js");
 const SOURCE_VIEWER_MAX_BYTES: u64 = 5 * 1024 * 1024;
 const DASHBOARD_IMAGE_MAX_BYTES: u64 = 100 * 1024 * 1024;
-// 0 means replay every renderable entry from the external audit transcript.
-// External activity replay intentionally includes only user/assistant messages
-// and explicit context-rewind markers, not tool events or tool output.
-const EXTERNAL_ACTIVITY_REPLAY_LIMIT: usize = 0;
+// Browser-facing external replay is a live UI bootstrap, not an archival export.
+// Keep it bounded; native rollout files and session search remain the audit source.
+const EXTERNAL_ACTIVITY_REPLAY_LIMIT: usize = WEBSOCKET_BOOTSTRAP_REPLAY_ENTRY_LIMIT;
+const EXTERNAL_SESSION_DETAIL_DEFAULT_ENTRY_LIMIT: usize = SESSION_DETAIL_ENTRY_LIMIT_MAX;
 const EXTERNAL_TRANSCRIPT_SEMANTICS: &str = "full_audit_transcript";
 
 /// Session-specific state that changes when a new agent session starts.
@@ -3593,7 +3593,8 @@ fn resume_session_activity_replay_from_home(
     let source_norm = source.trim().to_lowercase();
     if source_norm == "intendant" {
         let log_dir = intendant_session_dir_from_home(home, session_id)?;
-        return session_log_replay_from_dir(&log_dir);
+        return session_log_replay_payload_from_dir_with_limit(&log_dir, Some(limit))
+            .map(|(payload, _)| payload);
     }
 
     let replay_id = resume_id
@@ -3601,7 +3602,9 @@ fn resume_session_activity_replay_from_home(
         .filter(|id| !id.is_empty())
         .unwrap_or(session_id);
     if let Some(log_dir) = intendant_session_dir_from_home(home, session_id) {
-        if let Some((payload, external_id)) = session_log_replay_payload_from_dir(&log_dir) {
+        if let Some((payload, external_id)) =
+            session_log_replay_payload_from_dir_with_limit(&log_dir, Some(limit))
+        {
             if external_id.as_deref() == Some(replay_id) {
                 return Some(payload);
             }
@@ -3614,7 +3617,7 @@ fn resume_session_activity_replay_from_home(
         limit,
         false,
         true,
-        false,
+        true,
     )
 }
 
@@ -8069,7 +8072,11 @@ fn external_session_detail_from_home_with_limit(
     limit: Option<usize>,
 ) -> Option<String> {
     let mut entries = external_session_entries_from_home(home, source, session_id)?;
-    entries = limited_session_detail_entries(entries, limit);
+    let effective_limit = limit.or(Some(EXTERNAL_SESSION_DETAIL_DEFAULT_ENTRY_LIMIT));
+    entries = limited_session_detail_entries(entries, effective_limit);
+    for entry in &mut entries {
+        compact_replay_entry_text_fields_for_websocket(entry);
+    }
 
     Some(
         serde_json::json!({
@@ -29642,7 +29649,7 @@ mod tests {
     }
 
     #[test]
-    fn resume_session_open_replays_full_external_transcript() {
+    fn resume_session_open_limits_external_transcript() {
         let dir = tempfile::tempdir().unwrap();
         let sessions_dir = dir.path().join(".codex").join("sessions");
         std::fs::create_dir_all(&sessions_dir).unwrap();
@@ -29653,7 +29660,7 @@ mod tests {
             "type": "session_meta",
             "payload": { "id": session_id }
         })];
-        for n in 1..=90 {
+        for n in 1..=300 {
             lines.push(serde_json::json!({
                 "timestamp": format!("2026-05-17T16:{:02}:00Z", 49 + (n / 60)),
                 "type": "response_item",
@@ -29692,9 +29699,9 @@ mod tests {
             .filter_map(|entry| entry["content"].as_str())
             .collect();
 
-        assert_eq!(contents.len(), 90);
-        assert_eq!(contents.first(), Some(&"turn message 1"));
-        assert_eq!(contents.last(), Some(&"turn message 90"));
+        assert_eq!(contents.len(), EXTERNAL_ACTIVITY_REPLAY_LIMIT);
+        assert_eq!(contents.first(), Some(&"turn message 51"));
+        assert_eq!(contents.last(), Some(&"turn message 300"));
         assert!(replay["entries"]
             .as_array()
             .unwrap()
@@ -29748,6 +29755,125 @@ mod tests {
             .collect();
 
         assert_eq!(contents, vec!["message 2", "message 3"]);
+    }
+
+    #[test]
+    fn resume_session_open_compacts_large_external_tool_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions_dir = dir.path().join(".codex").join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+
+        let session_id = "019e37b2-compact-activity-replay";
+        let large_output = "x".repeat(WEBSOCKET_BOOTSTRAP_REPLAY_TEXT_LIMIT_BYTES + 100);
+        std::fs::write(
+            sessions_dir.join(format!("rollout-2026-05-17T16-48-52-{session_id}.jsonl")),
+            [
+                serde_json::json!({
+                    "timestamp": "2026-05-17T16:48:52Z",
+                    "type": "session_meta",
+                    "payload": { "id": session_id }
+                }),
+                serde_json::json!({
+                    "timestamp": "2026-05-17T16:49:00Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call_output",
+                        "call_id": "call_large",
+                        "output": large_output
+                    }
+                }),
+            ]
+            .into_iter()
+            .map(|v| v.to_string())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        )
+        .unwrap();
+
+        let replay = resume_session_activity_replay_from_home(
+            dir.path(),
+            "codex",
+            session_id,
+            None,
+            None,
+            EXTERNAL_ACTIVITY_REPLAY_LIMIT,
+        )
+        .expect("codex session should replay");
+        let replay: serde_json::Value = serde_json::from_str(&replay).unwrap();
+        let content = replay["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["event"] == "log_entry" && entry["kind"] == "agent_output")
+            .and_then(|entry| entry["content"].as_str())
+            .expect("large tool output should replay as compact log entry");
+
+        assert_eq!(
+            content.len(),
+            WEBSOCKET_BOOTSTRAP_REPLAY_TEXT_LIMIT_BYTES + "...".len()
+        );
+        assert!(content.ends_with("..."));
+    }
+
+    #[test]
+    fn external_session_detail_defaults_to_bounded_compact_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions_dir = dir.path().join(".codex").join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+
+        let session_id = "019e37b2-compact-detail";
+        let large_output = "x".repeat(WEBSOCKET_BOOTSTRAP_REPLAY_TEXT_LIMIT_BYTES + 100);
+        let mut lines = vec![serde_json::json!({
+            "timestamp": "2026-05-17T16:48:52Z",
+            "type": "session_meta",
+            "payload": { "id": session_id }
+        })];
+        for n in 1..=1005 {
+            lines.push(serde_json::json!({
+                "timestamp": "2026-05-17T16:49:00Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": if n % 2 == 0 { "assistant" } else { "user" },
+                    "content": [{ "type": "text", "text": format!("detail message {n}") }]
+                }
+            }));
+        }
+        lines.push(serde_json::json!({
+            "timestamp": "2026-05-17T16:50:00Z",
+            "type": "response_item",
+            "payload": {
+                "type": "function_call_output",
+                "call_id": "call_large",
+                "output": large_output
+            }
+        }));
+        std::fs::write(
+            sessions_dir.join(format!("rollout-2026-05-17T16-48-52-{session_id}.jsonl")),
+            lines
+                .into_iter()
+                .map(|v| v.to_string())
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+
+        let detail = external_session_detail_from_home(dir.path(), "codex", session_id)
+            .expect("codex session detail should load");
+        let detail: serde_json::Value = serde_json::from_str(&detail).unwrap();
+        let entries = detail["entries"].as_array().unwrap();
+
+        assert_eq!(entries.len(), EXTERNAL_SESSION_DETAIL_DEFAULT_ENTRY_LIMIT);
+        assert_eq!(entries[0]["content"], "detail message 7");
+        let stdout = entries
+            .last()
+            .and_then(|entry| entry["stdout"].as_str())
+            .expect("large tool output should be retained in compact form");
+        assert_eq!(
+            stdout.len(),
+            WEBSOCKET_BOOTSTRAP_REPLAY_TEXT_LIMIT_BYTES + "...".len()
+        );
+        assert!(stdout.ends_with("..."));
     }
 
     #[test]
