@@ -49672,6 +49672,31 @@ function filesDownloadFilenameFromPath(path) {
   return String(path || '').split(/[\\/]/).filter(Boolean).pop() || 'download.bin';
 }
 
+function dashboardParseHttpContentRange(value, expectedOffset, byteLength) {
+  const text = String(value || '').trim();
+  const match = text.match(/^bytes\s+(\d+)-(\d+)\/(\d+)$/i);
+  if (!match) throw new Error('File download returned an invalid Content-Range header');
+  const rangeStart = Number(match[1]);
+  const inclusiveEnd = Number(match[2]);
+  const totalSize = Number(match[3]);
+  const rangeEnd = inclusiveEnd + 1;
+  if (!Number.isSafeInteger(rangeStart) || rangeStart !== expectedOffset) {
+    throw new Error('File download returned an unexpected range start');
+  }
+  if (!Number.isSafeInteger(rangeEnd) || rangeEnd < rangeStart || rangeEnd - rangeStart !== byteLength) {
+    throw new Error('File download returned an inconsistent range length');
+  }
+  if (!Number.isSafeInteger(totalSize) || totalSize < rangeEnd) {
+    throw new Error('File download returned an invalid total size');
+  }
+  return { rangeStart, rangeEnd, totalSize };
+}
+
+function dashboardParseHttpUnsatisfiedRangeTotal(value) {
+  const match = String(value || '').trim().match(/^bytes\s+\*\/(\d+)$/i);
+  return match ? Number(match[1]) : null;
+}
+
 function filesTransferDb() {
   if (!('indexedDB' in window)) return Promise.reject(new Error('IndexedDB is not available'));
   if (filesTransferDbPromise) return filesTransferDbPromise;
@@ -49970,14 +49995,33 @@ function refreshFilesDownloadAvailability() {
   }
 }
 
-async function fetchDashboardFilesystemDownloadHttp(path, options = {}) {
+async function dashboardFetchHttpRangeBytes(path, offset, length, options = {}) {
   const target = String(path || '').trim();
   if (!target) throw new Error('Choose a file to download');
-  const maxBytes = Math.max(1, Math.floor(Number(options.maxBytes) || DASHBOARD_RANGED_DOWNLOAD_MAX_BYTES));
+  const rangeStart = Math.max(0, Math.floor(Number(offset) || 0));
+  const requested = Math.max(1, Math.floor(Number(length) || DASHBOARD_RANGED_DOWNLOAD_CHUNK_BYTES));
+  const rangeEndInclusive = rangeStart + requested - 1;
   const response = await authedFetch('/api/fs/read?path=' + encodeURIComponent(target), {
     cache: 'no-store',
+    headers: { Range: `bytes=${rangeStart}-${rangeEndInclusive}` },
     signal: options.signal,
   });
+  const contentType = response.headers.get('content-type') || 'application/octet-stream';
+  const filename = dashboardFilenameFromContentDisposition(response.headers.get('content-disposition')) ||
+    filesDownloadFilenameFromPath(target);
+  if (response.status === 416) {
+    const total = dashboardParseHttpUnsatisfiedRangeTotal(response.headers.get('content-range'));
+    if (rangeStart === 0 && total === 0) {
+      return {
+        bytes: new Uint8Array(),
+        rangeStart: 0,
+        rangeEnd: 0,
+        totalSize: 0,
+        filename,
+        contentType,
+      };
+    }
+  }
   if (!response.ok) {
     let message = `File download failed (${response.status})`;
     try {
@@ -49986,41 +50030,44 @@ async function fetchDashboardFilesystemDownloadHttp(path, options = {}) {
     } catch (_) {}
     throw new Error(message);
   }
-  const declaredSize = Number(response.headers.get('content-length') || 0);
-  if (declaredSize > maxBytes) {
-    throw new Error(`Download too large (${humanBytes(declaredSize)}; cap is ${humanBytes(maxBytes)})`);
-  }
-  const contentType = response.headers.get('content-type') || 'application/octet-stream';
-  const filename = dashboardFilenameFromContentDisposition(response.headers.get('content-disposition')) ||
-    filesDownloadFilenameFromPath(target);
   const blob = await response.blob();
-  if (blob.size > maxBytes) {
-    throw new Error(`Download too large (${humanBytes(blob.size)}; cap is ${humanBytes(maxBytes)})`);
-  }
   const bytes = new Uint8Array(await blob.arrayBuffer());
-  if (typeof options.onProgress === 'function') {
-    options.onProgress({
-      loaded: bytes.byteLength,
-      total: bytes.byteLength,
-      offset: bytes.byteLength,
-      rangeCount: 1,
-      filename,
-      contentType,
-    });
+  let parsed;
+  if (response.status === 206) {
+    parsed = dashboardParseHttpContentRange(response.headers.get('content-range'), rangeStart, bytes.byteLength);
+  } else if (response.status === 200 && rangeStart === 0) {
+    const declaredSize = Number(response.headers.get('content-length') || bytes.byteLength);
+    parsed = {
+      rangeStart: 0,
+      rangeEnd: bytes.byteLength,
+      totalSize: Number.isSafeInteger(declaredSize) ? declaredSize : bytes.byteLength,
+    };
+  } else {
+    throw new Error(`File download returned unexpected HTTP ${response.status}`);
   }
   return {
-    ok: true,
-    blob,
-    parts: [bytes],
+    bytes,
+    rangeStart: parsed.rangeStart,
+    rangeEnd: parsed.rangeEnd,
+    totalSize: parsed.totalSize,
     filename,
-    content_type: contentType,
-    size: blob.size,
-    total_size: blob.size,
-    range_start: 0,
-    range_end: blob.size,
-    range_count: 1,
-    resumable: false,
+    contentType,
   };
+}
+
+async function dashboardFetchHttpRangeBytesWithRetry(path, offset, length, options = {}) {
+  const retries = Number.isFinite(Number(options.retries)) ? Math.max(0, Number(options.retries)) : 2;
+  let attempt = 0;
+  for (;;) {
+    if (options.signal?.aborted) throw dashboardControlAbortError();
+    try {
+      return await dashboardFetchHttpRangeBytes(path, offset, length, options);
+    } catch (err) {
+      if (err?.name === 'AbortError' || attempt >= retries) throw err;
+      attempt += 1;
+      await new Promise(resolve => setTimeout(resolve, 200 * attempt));
+    }
+  }
 }
 
 async function fetchDashboardFilesystemDownload(path, options = {}) {
@@ -50058,7 +50105,25 @@ async function fetchDashboardFilesystemDownload(path, options = {}) {
     });
   }
   if (!dashboardConnectModeEnabled()) {
-    return fetchDashboardFilesystemDownloadHttp(target, options);
+    const transfer = queueFilesDownload(target, {
+      signal: options.signal,
+      chunkBytes: options.chunkBytes || DASHBOARD_RANGED_DOWNLOAD_CHUNK_BYTES,
+      maxBytes: options.maxBytes || DASHBOARD_RANGED_DOWNLOAD_MAX_BYTES,
+      retries: options.retries,
+      timeoutMs: options.timeoutMs,
+      onProgress: options.onProgress,
+      skipBrowserSave: true,
+    });
+    if (!transfer) throw new Error('download was not queued');
+    if (options.signal) {
+      const abortQueuedTransfer = () => {
+        transfer.cancelRequested = true;
+        transfer.abortController?.abort();
+      };
+      if (options.signal.aborted) abortQueuedTransfer();
+      else options.signal.addEventListener('abort', abortQueuedTransfer, { once: true });
+    }
+    return transfer.completion;
   }
   throw new Error(filesDownloadUnavailableMessage());
 }
@@ -50433,34 +50498,6 @@ async function runFilesDownloadTransfer(transfer) {
       const hydrated = await filesTransferLoadDownloadParts(transfer);
       if (!hydrated) resetFilesDownloadTransfer(transfer);
     }
-    if (useHttpFilesystemFallback) {
-      resetFilesDownloadTransfer(transfer);
-      transfer.status = 'running';
-      transfer.abortController = controller;
-      const result = await fetchDashboardFilesystemDownloadHttp(transfer.path, {
-        signal: controller.signal,
-        maxBytes: transfer.maxBytes,
-        onProgress: transfer.onProgress,
-      });
-      const bytes = result.parts?.[0] instanceof Uint8Array
-        ? result.parts[0]
-        : new Uint8Array(await result.blob.arrayBuffer());
-      await filesTransferPutDownloadPart(transfer, 0, bytes);
-      transfer.parts = [bytes];
-      transfer.loaded = result.size;
-      transfer.totalSize = result.total_size || result.size;
-      transfer.rangeCount = 1;
-      transfer.filename = result.filename || filesDownloadFilenameFromPath(transfer.path);
-      transfer.contentType = result.content_type || 'application/octet-stream';
-      transfer.result = result;
-      transfer.status = 'completed';
-      filesTransferPersistState();
-      setFilesDownloadProgress(result.size, result.total_size || result.size);
-      setFilesDownloadStatus('ok', `Downloaded ${transfer.filename} (${humanBytes(result.size)})`);
-      if (!transfer.skipBrowserSave) downloadDashboardBlob(result.blob, transfer.filename, transfer.contentType);
-      transfer.resolve?.(result);
-      return;
-    }
     if (useDurableTransfer && !transfer.resumeToken && !transfer.serverJobId) {
       const payload = hasArtifact
         ? {
@@ -50488,25 +50525,34 @@ async function runFilesDownloadTransfer(transfer) {
       const requested = Math.min(transfer.chunkBytes, remaining || transfer.chunkBytes);
       if (requested <= 0) break;
       const method = useDurableTransfer ? 'api_transfer_download_read' : fallbackMethod;
-      const params = useDurableTransfer
-        ? {
-            id: transfer.serverJobId || undefined,
-            resume_token: transfer.resumeToken || undefined,
-            offset: transfer.loaded,
-            length: requested,
-          }
-        : {
-            ...(transfer.directParams || {}),
-            ...(!hasArtifact ? { path: transfer.path } : {}),
-            offset: transfer.loaded,
-            length: requested,
-          };
-      const result = await dashboardRequestBytesWithRetry(method, params, {
-        signal: controller.signal,
-        retries: transfer.retries,
-        timeoutMs: transfer.timeoutMs || rangedDownloadTimeoutMs(requested),
-      });
-      const range = dashboardNormalizeByteRangeResult(method, result, transfer.loaded);
+      let range;
+      if (useHttpFilesystemFallback) {
+        range = await dashboardFetchHttpRangeBytesWithRetry(transfer.path, transfer.loaded, requested, {
+          signal: controller.signal,
+          retries: transfer.retries,
+          timeoutMs: transfer.timeoutMs || rangedDownloadTimeoutMs(requested),
+        });
+      } else {
+        const params = useDurableTransfer
+          ? {
+              id: transfer.serverJobId || undefined,
+              resume_token: transfer.resumeToken || undefined,
+              offset: transfer.loaded,
+              length: requested,
+            }
+          : {
+              ...(transfer.directParams || {}),
+              ...(!hasArtifact ? { path: transfer.path } : {}),
+              offset: transfer.loaded,
+              length: requested,
+            };
+        const raw = await dashboardRequestBytesWithRetry(method, params, {
+          signal: controller.signal,
+          retries: transfer.retries,
+          timeoutMs: transfer.timeoutMs || rangedDownloadTimeoutMs(requested),
+        });
+        range = dashboardNormalizeByteRangeResult(method, raw, transfer.loaded);
+      }
       if (range.job) filesTransferApplyServerJob(transfer, range.job);
       transfer.totalSize = range.totalSize;
       if (transfer.totalSize > transfer.maxBytes) {

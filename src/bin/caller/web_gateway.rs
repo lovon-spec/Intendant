@@ -14954,7 +14954,42 @@ pub(crate) fn dashboard_fs_list_response_body(raw: &str) -> Result<String, Strin
 struct DashboardFsReadResponse {
     filename: String,
     content_type: String,
+    total_size: u64,
+    range_start: u64,
+    range_end: u64,
+    partial: bool,
     bytes: Vec<u8>,
+}
+
+#[derive(Debug)]
+struct DashboardFsReadError {
+    status: String,
+    message: String,
+    total_size: Option<u64>,
+}
+
+impl DashboardFsReadError {
+    fn new(status: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            status: status.into(),
+            message: message.into(),
+            total_size: None,
+        }
+    }
+
+    fn range(status: impl Into<String>, message: impl Into<String>, total_size: u64) -> Self {
+        Self {
+            status: status.into(),
+            message: message.into(),
+            total_size: Some(total_size),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DashboardByteRange {
+    start: u64,
+    end: u64,
 }
 
 fn dashboard_fs_content_type(path: &Path) -> String {
@@ -14992,32 +15027,141 @@ fn dashboard_fs_io_status(error: &std::io::Error) -> &'static str {
     }
 }
 
-fn dashboard_fs_read_file(raw: &str) -> Result<DashboardFsReadResponse, (String, String)> {
-    let path = expand_dashboard_fs_path(raw).map_err(|e| ("400 Bad Request".to_string(), e))?;
+fn dashboard_http_header_value<'a>(header_text: &'a str, name: &str) -> Option<&'a str> {
+    header_text.lines().skip(1).find_map(|line| {
+        let (key, value) = line.split_once(':')?;
+        if key.trim().eq_ignore_ascii_case(name) {
+            Some(value.trim())
+        } else {
+            None
+        }
+    })
+}
+
+fn parse_dashboard_range_header(raw: &str, total_size: u64) -> Result<DashboardByteRange, String> {
+    let value = raw.trim();
+    let Some(unit) = value.get(..6) else {
+        return Err("Range must use bytes".to_string());
+    };
+    if !unit.eq_ignore_ascii_case("bytes=") {
+        return Err("Range must use bytes".to_string());
+    }
+    let spec = value[6..].trim();
+    if spec.contains(',') {
+        return Err("multiple byte ranges are not supported".to_string());
+    }
+    let (start_raw, end_raw) = spec
+        .split_once('-')
+        .ok_or_else(|| "invalid byte range".to_string())?;
+    if total_size == 0 {
+        return Err("range is not satisfiable".to_string());
+    }
+    if start_raw.trim().is_empty() {
+        let suffix_len = end_raw
+            .trim()
+            .parse::<u64>()
+            .map_err(|_| "invalid byte range suffix".to_string())?;
+        if suffix_len == 0 {
+            return Err("range is not satisfiable".to_string());
+        }
+        let start = total_size.saturating_sub(suffix_len);
+        return Ok(DashboardByteRange {
+            start,
+            end: total_size - 1,
+        });
+    }
+    let start = start_raw
+        .trim()
+        .parse::<u64>()
+        .map_err(|_| "invalid byte range start".to_string())?;
+    let end = if end_raw.trim().is_empty() {
+        total_size - 1
+    } else {
+        end_raw
+            .trim()
+            .parse::<u64>()
+            .map_err(|_| "invalid byte range end".to_string())?
+            .min(total_size - 1)
+    };
+    if start >= total_size || end < start {
+        return Err("range is not satisfiable".to_string());
+    }
+    Ok(DashboardByteRange { start, end })
+}
+
+fn dashboard_fs_read_file(
+    raw: &str,
+    range_header: Option<&str>,
+) -> Result<DashboardFsReadResponse, DashboardFsReadError> {
+    let path = expand_dashboard_fs_path(raw)
+        .map_err(|e| DashboardFsReadError::new("400 Bad Request", e))?;
     let canonical = std::fs::canonicalize(&path).map_err(|e| {
-        (
+        DashboardFsReadError::new(
             dashboard_fs_io_status(&e).to_string(),
             format!("{} is not accessible: {}", path.display(), e),
         )
     })?;
     let metadata = std::fs::metadata(&canonical).map_err(|e| {
-        (
+        DashboardFsReadError::new(
             dashboard_fs_io_status(&e).to_string(),
             format!("{} is not accessible: {}", canonical.display(), e),
         )
     })?;
     if !metadata.is_file() {
-        return Err((
+        return Err(DashboardFsReadError::new(
             "400 Bad Request".to_string(),
             format!("{} is not a file", canonical.display()),
         ));
     }
-    let bytes = std::fs::read(&canonical).map_err(|e| {
-        (
-            dashboard_fs_io_status(&e).to_string(),
-            format!("could not read {}: {}", canonical.display(), e),
+    let total_size = metadata.len();
+    let requested_range = range_header
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .filter(|_| total_size > 0)
+        .map(|value| {
+            parse_dashboard_range_header(value, total_size).map_err(|message| {
+                DashboardFsReadError::range("416 Range Not Satisfiable", message, total_size)
+            })
+        })
+        .transpose()?;
+    let (range_start, range_end, partial) = if let Some(range) = requested_range {
+        (range.start, range.end.saturating_add(1), true)
+    } else {
+        (0, total_size, false)
+    };
+    let read_len = range_end.saturating_sub(range_start);
+    let read_len_usize: usize = read_len.try_into().map_err(|_| {
+        DashboardFsReadError::new(
+            "500 Internal Server Error",
+            format!("{} is too large to read", canonical.display()),
         )
     })?;
+    let mut file = std::fs::File::open(&canonical).map_err(|e| {
+        DashboardFsReadError::new(
+            dashboard_fs_io_status(&e).to_string(),
+            format!("could not open {}: {}", canonical.display(), e),
+        )
+    })?;
+    if range_start > 0 {
+        use std::io::Seek as _;
+        file.seek(std::io::SeekFrom::Start(range_start))
+            .map_err(|e| {
+                DashboardFsReadError::new(
+                    "500 Internal Server Error",
+                    format!("could not seek {}: {}", canonical.display(), e),
+                )
+            })?;
+    }
+    let mut bytes = vec![0u8; read_len_usize];
+    if read_len_usize > 0 {
+        use std::io::Read as _;
+        file.read_exact(&mut bytes).map_err(|e| {
+            DashboardFsReadError::new(
+                dashboard_fs_io_status(&e).to_string(),
+                format!("could not read {}: {}", canonical.display(), e),
+            )
+        })?;
+    }
     let raw_name = canonical
         .file_name()
         .map(|name| name.to_string_lossy().to_string())
@@ -15026,6 +15170,10 @@ fn dashboard_fs_read_file(raw: &str) -> Result<DashboardFsReadResponse, (String,
     Ok(DashboardFsReadResponse {
         filename,
         content_type: dashboard_fs_content_type(&canonical),
+        total_size,
+        range_start,
+        range_end,
+        partial,
         bytes,
     })
 }
@@ -20062,26 +20210,67 @@ pub fn spawn_web_gateway(
                     {
                         use tokio::io::AsyncWriteExt;
                         let path = query_param(&request_line, "path").unwrap_or_default();
-                        match dashboard_fs_read_file(&path) {
+                        let range_header = dashboard_http_header_value(&header_text, "range");
+                        match dashboard_fs_read_file(&path, range_header) {
                             Ok(file) => {
+                                let status = if file.partial {
+                                    "206 Partial Content"
+                                } else {
+                                    "200 OK"
+                                };
+                                let content_range = if file.partial {
+                                    format!(
+                                        "Content-Range: bytes {}-{}/{}\r\n",
+                                        file.range_start,
+                                        file.range_end.saturating_sub(1),
+                                        file.total_size
+                                    )
+                                } else {
+                                    String::new()
+                                };
                                 let header = format!(
-                                    "HTTP/1.1 200 OK\r\n\
+                                    "HTTP/1.1 {}\r\n\
                                      Content-Type: {}\r\n\
                                      Content-Length: {}\r\n\
+                                     Accept-Ranges: bytes\r\n\
+                                     {}\
                                      Content-Disposition: attachment; filename=\"{}\"\r\n\
                                      Cache-Control: no-cache\r\n\
                                      Access-Control-Allow-Origin: *\r\n\
                                      Connection: close\r\n\
                                      \r\n",
+                                    status,
                                     file.content_type,
                                     file.bytes.len(),
+                                    content_range,
                                     file.filename.replace('"', ""),
                                 );
                                 let _ = stream.write_all(header.as_bytes()).await;
                                 let _ = stream.write_all(&file.bytes).await;
                             }
-                            Err((status, message)) => {
-                                let response = json_error(&status, message);
+                            Err(error) => {
+                                let response = if let Some(total_size) = error.total_size {
+                                    let body =
+                                        serde_json::json!({ "error": error.message }).to_string();
+                                    format!(
+                                        "HTTP/1.1 {}\r\n\
+                                         Content-Type: application/json\r\n\
+                                         Content-Length: {}\r\n\
+                                         Content-Range: bytes */{}\r\n\
+                                         Accept-Ranges: bytes\r\n\
+                                         Cache-Control: no-cache\r\n\
+                                         Access-Control-Allow-Origin: *\r\n\
+                                         Connection: close\r\n\
+                                         \r\n\
+                                         {}",
+                                        error.status,
+                                        body.len(),
+                                        total_size,
+                                        body
+                                    )
+                                } else {
+                                    json_error(&error.status, error.message)
+                                };
                                 let _ = stream.write_all(response.as_bytes()).await;
                             }
                         }
@@ -25746,20 +25935,51 @@ mod tests {
         let file = dir.path().join("hello.txt");
         std::fs::write(&file, b"hello over mtls").unwrap();
 
-        let result = dashboard_fs_read_file(file.to_str().unwrap()).unwrap();
+        let result = dashboard_fs_read_file(file.to_str().unwrap(), None).unwrap();
 
         assert_eq!(result.filename, "hello.txt");
         assert_eq!(result.content_type, "text/plain; charset=utf-8");
+        assert_eq!(result.total_size, 15);
+        assert_eq!(result.range_start, 0);
+        assert_eq!(result.range_end, 15);
+        assert!(!result.partial);
         assert_eq!(result.bytes, b"hello over mtls");
+    }
+
+    #[test]
+    fn dashboard_fs_read_file_returns_requested_byte_range() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("hello.txt");
+        std::fs::write(&file, b"hello over mtls").unwrap();
+
+        let result = dashboard_fs_read_file(file.to_str().unwrap(), Some("bytes=6-9")).unwrap();
+
+        assert_eq!(result.total_size, 15);
+        assert_eq!(result.range_start, 6);
+        assert_eq!(result.range_end, 10);
+        assert!(result.partial);
+        assert_eq!(result.bytes, b"over");
+    }
+
+    #[test]
+    fn dashboard_fs_read_file_rejects_unsatisfiable_range() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("hello.txt");
+        std::fs::write(&file, b"hello").unwrap();
+
+        let err = dashboard_fs_read_file(file.to_str().unwrap(), Some("bytes=50-60")).unwrap_err();
+
+        assert_eq!(err.status, "416 Range Not Satisfiable");
+        assert_eq!(err.total_size, Some(5));
     }
 
     #[test]
     fn dashboard_fs_read_file_rejects_directories() {
         let dir = tempfile::tempdir().unwrap();
-        let err = dashboard_fs_read_file(dir.path().to_str().unwrap()).unwrap_err();
+        let err = dashboard_fs_read_file(dir.path().to_str().unwrap(), None).unwrap_err();
 
-        assert_eq!(err.0, "400 Bad Request");
-        assert!(err.1.contains("is not a file"));
+        assert_eq!(err.status, "400 Bad Request");
+        assert!(err.message.contains("is not a file"));
     }
 
     #[test]
@@ -33895,11 +34115,67 @@ mod tests {
             head.contains("Content-Type: text/plain; charset=utf-8\r\n"),
             "got: {head}"
         );
+        assert!(head.contains("Accept-Ranges: bytes\r\n"), "got: {head}");
         assert!(
             head.contains("Content-Disposition: attachment; filename=\"download.txt\"\r\n"),
             "got: {head}"
         );
         assert_eq!(&resp[split..], b"download through dashboard");
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_dashboard_fs_read_serves_byte_ranges() {
+        let (port, handle) = spawn_test_gateway_with_registry(None).await;
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("download.txt");
+        std::fs::write(&file, b"download through dashboard").unwrap();
+        let req = format!(
+            "GET /api/fs/read?path={} HTTP/1.1\r\nHost: localhost\r\nRange: bytes=9-15\r\n\r\n",
+            file.display()
+        );
+
+        let resp = http_request_bytes(port, &req).await;
+        let split = resp.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+        let head = String::from_utf8_lossy(&resp[..split]).into_owned();
+
+        assert!(
+            head.starts_with("HTTP/1.1 206 Partial Content\r\n"),
+            "got: {head}"
+        );
+        assert!(
+            head.contains("Content-Range: bytes 9-15/26\r\n"),
+            "got: {head}"
+        );
+        assert!(head.contains("Accept-Ranges: bytes\r\n"), "got: {head}");
+        assert_eq!(&resp[split..], b"through");
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_dashboard_fs_read_rejects_unsatisfiable_byte_range() {
+        let (port, handle) = spawn_test_gateway_with_registry(None).await;
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("download.txt");
+        std::fs::write(&file, b"download").unwrap();
+        let req = format!(
+            "GET /api/fs/read?path={} HTTP/1.1\r\nHost: localhost\r\nRange: bytes=99-100\r\n\r\n",
+            file.display()
+        );
+
+        let resp = http_request_bytes(port, &req).await;
+        let split = resp.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+        let head = String::from_utf8_lossy(&resp[..split]).into_owned();
+        let body = String::from_utf8_lossy(&resp[split..]).into_owned();
+
+        assert!(
+            head.starts_with("HTTP/1.1 416 Range Not Satisfiable\r\n"),
+            "got: {head}"
+        );
+        assert!(head.contains("Content-Range: bytes */8\r\n"), "got: {head}");
+        assert!(body.contains("range is not satisfiable"), "body: {body}");
 
         handle.abort();
     }
