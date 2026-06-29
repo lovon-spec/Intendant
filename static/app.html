@@ -9743,6 +9743,7 @@ body.display-fullscreen-open {
                   <button class="control-action-btn" data-codex-action="rename" title="Rename the current Codex thread (/rename)">Rename…</button>
                   <button class="control-action-btn" data-codex-action="goal" title="Create or update the persisted Codex thread goal (/goal)">Goal…</button>
                   <button class="control-action-btn" data-codex-action="goal-get" title="Fetch the current persisted Codex thread goal (/goal)">Goal status</button>
+                  <button class="control-action-btn" data-codex-action="goal-edit" title="Edit the current Codex thread goal objective (/goal edit)">Edit goal…</button>
                   <button class="control-action-btn" data-codex-action="goal-pause" title="Pause the current Codex thread goal (/goal pause)">Pause goal</button>
                   <button class="control-action-btn" data-codex-action="goal-resume" title="Resume the current Codex thread goal (/goal resume)">Resume goal</button>
                   <button class="control-action-btn" data-codex-action="goal-clear" title="Clear the current persisted Codex thread goal (/goal clear)">Clear goal</button>
@@ -21201,6 +21202,7 @@ function parseGoalSlash(rest) {
     paused: 'goal-pause',
     resume: 'goal-resume',
     active: 'goal-resume',
+    edit: 'goal-edit',
     complete: 'goal-complete',
     completed: 'goal-complete',
     done: 'goal-complete',
@@ -21362,6 +21364,11 @@ function dispatchCodexSlashCommand(parsed) {
     }
     showControlToast('error', `/${parsed.op}: select a Codex session first`);
     return false;
+  }
+  if (parsed.op === 'goal-edit') {
+    const spec = codexThreadActionSpec('goal-edit');
+    runCodexThreadActionFromUi('goal-edit', spec || {}, sid);
+    return true;
   }
   if (dispatchCodexThreadAction(parsed.op, parsed.params || {}, sid)) {
     markActionPending(parsed.op, sid);
@@ -21568,6 +21575,16 @@ function handleSessionRenameResult(evt) {
   );
 }
 
+function currentGoalForSessionAction(sessionId) {
+  const sid = String(sessionId || '').trim();
+  for (const id of relatedSessionIdsForSession(sid)) {
+    const meta = sessionMetadataById.get(id) || {};
+    const goal = normalizeSessionGoal(meta.goal || meta.session_goal || meta.sessionGoal || null);
+    if (goal) return goal;
+  }
+  return null;
+}
+
 async function promptCodexThreadActionParams(opts = {}) {
   let params = {};
   if (opts.promptName) {
@@ -21649,6 +21666,33 @@ async function promptCodexThreadActionParams(opts = {}) {
       }
       params.tokenBudget = parsed;
     }
+  } else if (opts.promptGoalEdit) {
+    const goal = currentGoalForSessionAction(opts.sessionId);
+    if (!goal?.objective) {
+      showControlToast('error', '/goal edit failed: no goal is currently set');
+      return null;
+    }
+    const objective = await showDashboardPrompt({
+      title: 'Edit goal',
+      label: 'Goal objective',
+      rows: 5,
+      maxLength: 4000,
+      submitLabel: 'Update goal',
+      initialValue: goal.objective,
+    });
+    if (objective === null) return null;
+    if (!objective.trim()) {
+      showControlToast('error', '/goal edit failed: objective is required');
+      return null;
+    }
+    if ([...objective.trim()].length > 4000) {
+      showControlToast('error', '/goal edit failed: objective must be 4000 characters or fewer');
+      return null;
+    }
+    params.objective = objective.trim();
+    if (goal.status === 'budget-limited' || goal.status === 'complete') {
+      params.status = 'active';
+    }
   } else if (opts.turns) {
     const n = parseInt(opts.turns, 10);
     if (!isNaN(n) && n > 0) params.turns = n;
@@ -21678,12 +21722,15 @@ async function onControlActionBtnClick(ev) {
 }
 
 async function runCodexThreadActionFromUi(op, opts = {}, sessionId = '') {
+  const sid = String(sessionId || '').trim() || resolvePromptTargetSessionId();
   const params = await promptCodexThreadActionParams({
     promptName: opts.promptName,
     promptSide: opts.promptSide,
     promptReview: opts.promptReview,
     promptRename: opts.promptRename,
     promptGoal: opts.promptGoal,
+    promptGoalEdit: opts.promptGoalEdit,
+    sessionId: sid,
     turns: opts.turns,
     confirm: opts.confirm,
     confirmTitle: opts.confirmTitle,
@@ -21701,9 +21748,9 @@ async function runCodexThreadActionFromUi(op, opts = {}, sessionId = '') {
     }
     return;
   }
-  const sid = String(sessionId || '').trim() || resolvePromptTargetSessionId();
-  if (dispatchCodexThreadAction(op, params, sid)) {
-    markActionPending(op, sid);
+  const dispatchOp = opts.dispatchOp || op;
+  if (dispatchCodexThreadAction(dispatchOp, params, sid)) {
+    markActionPending(dispatchOp, sid);
   }
 }
 
@@ -26956,6 +27003,7 @@ const CODEX_THREAD_ACTION_SPECS = Object.freeze({
   rename: Object.freeze({ promptRename: true }),
   goal: Object.freeze({ promptGoal: true }),
   'goal-get': Object.freeze({}),
+  'goal-edit': Object.freeze({ promptGoalEdit: true }),
   'goal-pause': Object.freeze({}),
   'goal-resume': Object.freeze({}),
   'goal-clear': Object.freeze({ confirm: 'Clear the current Codex goal?' }),
@@ -26976,10 +27024,13 @@ const SESSION_WINDOW_CODEX_ACTIONS = [
     title: 'Configure this thread goal',
     children: [
       { op: 'goal', label: 'Set goal...', title: 'Create or update this thread goal', ...CODEX_THREAD_ACTION_SPECS.goal },
+      { op: 'goal-get', label: 'Goal status', title: 'Fetch this thread goal' },
+      { op: 'goal-edit', label: 'Edit goal...', title: 'Edit this thread goal objective', ...CODEX_THREAD_ACTION_SPECS['goal-edit'] },
+      { op: 'goal-pause', label: 'Pause goal', title: 'Pause this thread goal' },
+      { op: 'goal-resume', label: 'Resume goal', title: 'Resume this thread goal' },
       { op: 'goal-clear', label: 'Clear goal', title: 'Clear this thread goal', ...CODEX_THREAD_ACTION_SPECS['goal-clear'] },
     ],
   },
-  { op: 'goal-get', label: 'Goal status', title: 'Fetch this thread goal' },
   { op: 'compact', label: 'Compact', title: 'Compact this thread history' },
 ];
 

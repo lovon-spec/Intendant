@@ -196,7 +196,7 @@ impl CodexAgent {
             "rename" | "name-set" | "name_set" | "thread-name-set" | "thread_name_set" => {
                 self.set_thread_name(params).await
             }
-            "goal" | "goal-set" | "goal_get" | "goal-get" | "goal-status" => {
+            "goal" | "goal-set" | "goal-edit" | "goal_get" | "goal-get" | "goal-status" => {
                 self.dispatch_goal_action(op, params).await
             }
             "goal-clear" | "goal_clear" => self.clear_goal(params).await,
@@ -825,6 +825,8 @@ fn normalize_goal_status(status: &str) -> Result<String, CallerError> {
     let normalized = match status.trim() {
         "active" | "resume" | "resumed" => "active",
         "paused" | "pause" => "paused",
+        "blocked" | "block" => "blocked",
+        "usageLimited" | "usage-limited" | "usage_limited" => "usageLimited",
         "budgetLimited" | "budget-limited" | "budget_limited" => "budgetLimited",
         "complete" | "completed" | "done" => "complete",
         other => {
@@ -11140,9 +11142,12 @@ error: build failed
             "rename",
             "goal",
             "goal-set",
+            "goal-edit",
             "goal-clear",
             "goal-pause",
             "goal-resume",
+            "goal-complete",
+            "goal-budget-limited",
             "memory-reset",
         ] {
             let mut agent = test_agent();
@@ -12709,6 +12714,11 @@ command = "asana-mcp"
     fn goal_status_normalization_accepts_cli_style_aliases() {
         assert_eq!(normalize_goal_status("pause").unwrap(), "paused");
         assert_eq!(normalize_goal_status("resume").unwrap(), "active");
+        assert_eq!(normalize_goal_status("blocked").unwrap(), "blocked");
+        assert_eq!(
+            normalize_goal_status("usage-limited").unwrap(),
+            "usageLimited"
+        );
         assert_eq!(
             normalize_goal_status("budget-limited").unwrap(),
             "budgetLimited"

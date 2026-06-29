@@ -6770,10 +6770,13 @@ fn codex_thread_action_capabilities() -> Vec<String> {
         "rename",
         "goal",
         "goal-set",
+        "goal-edit",
         "goal-get",
         "goal-clear",
         "goal-pause",
         "goal-resume",
+        "goal-complete",
+        "goal-budget-limited",
         "memory-reset",
     ]
     .into_iter()
@@ -13810,9 +13813,12 @@ mod tests {
             "side-close",
             "goal",
             "goal-get",
+            "goal-edit",
             "goal-clear",
             "goal-pause",
             "goal-resume",
+            "goal-complete",
+            "goal-budget-limited",
         ] {
             assert!(
                 actions.iter().any(|candidate| candidate == action),

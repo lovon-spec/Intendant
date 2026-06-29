@@ -309,8 +309,9 @@ features they lack.
 
 - **Rich `thread_action` ops** (`codex.rs`): `compact`, `fast`, `fork`,
   `side`/`btw` (open a side conversation) and `side-close`, `review`,
-  `goal`/`goal-set`/`goal-clear`/`goal-pause`/`goal-resume`/`goal-complete`, and
-  `memory-reset`. Side threads can be steered and rolled back independently of the
+  `goal`/`goal-set`/`goal-get`/`goal-edit`/`goal-clear`/`goal-pause`/`goal-resume`/
+  `goal-complete`/`goal-budget-limited`, and `memory-reset`. Side threads can be
+  steered and rolled back independently of the
   parent (`rollback_thread_turns`, `activate_thread`). Codex also reports native
   **sub-agent** activity (`AgentEvent::SubAgentToolCall`) and per-fork token
   accounting.

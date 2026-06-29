@@ -3893,6 +3893,7 @@ fn parse_goal_slash_command(args: &str) -> Result<CodexSlashCommand, String> {
     let exact = args.trim().to_ascii_lowercase();
     let exact_op = match exact.as_str() {
         "" | "status" | "show" | "get" => Some("goal"),
+        "edit" => Some("goal-edit"),
         "clear" | "reset" => Some("goal-clear"),
         "pause" | "paused" => Some("goal-pause"),
         "resume" | "active" => Some("goal-resume"),
@@ -3922,6 +3923,7 @@ fn parse_goal_slash_command(args: &str) -> Result<CodexSlashCommand, String> {
             }
             "--pause" => op = "goal-pause".to_string(),
             "--resume" => op = "goal-resume".to_string(),
+            "--edit" => op = "goal-edit".to_string(),
             "--complete" => op = "goal-complete".to_string(),
             "--budget-limited" => op = "goal-budget-limited".to_string(),
             "--clear-budget" | "--no-budget" => {
@@ -5855,6 +5857,7 @@ mod tests {
     #[test]
     fn parses_goal_status_aliases() {
         assert_eq!(slash("/goal clear").op, "goal-clear");
+        assert_eq!(slash("/goal edit").op, "goal-edit");
         assert_eq!(slash("/goal pause").op, "goal-pause");
         assert_eq!(slash("/goal resume").op, "goal-resume");
         assert_eq!(slash("/goal done").op, "goal-complete");
