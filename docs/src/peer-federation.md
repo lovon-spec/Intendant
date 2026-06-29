@@ -392,19 +392,20 @@ relationships, not raw endpoints. A daemon relationship has identity, a server
 certificate pin, a peer-scoped client certificate, capability metadata, and local
 policy that can later be changed or revoked.
 
-The dashboard's **Settings → Network → Daemons** panel exposes two pairing
-flows.
+The dashboard's **Access** tab exposes peer relationship management:
+**Invitations** contains onboarding flows, **Grants** shows inbound identities,
+and **Targets** shows configured outbound peers.
 
 #### Invite flow
 
 Use an invite when the accepting daemon's operator can copy a secret directly to
 the connecting daemon:
 
-1. On the daemon that will accept inbound peer connections, click
-   **Create Invite**.
+1. On the daemon that will accept inbound peer connections, open
+   **Access → Invitations → Grant Invite** and click **Create**.
 2. Copy the generated `intendant-peer-v1...` invite.
 3. On the daemon that should connect to it, paste the invite into
-   **Join Invite**.
+   **Access → Invitations → Join Invite**.
 
 Joining from the dashboard writes or updates the local daemon's outbound
 `[[peer]]` entry in `intendant.toml`, stores the peer-issued client
@@ -446,7 +447,8 @@ Use an access request when a primary daemon wants to add another Intendant
 without first copying a private-key-bearing invite, or when the target daemon is
 headless and should be approved from its own CLI/logs.
 
-1. On the daemon that wants access, use **Request Access** in the dashboard or:
+1. On the daemon that wants access, use
+   **Access → Invitations → Request Access** in the dashboard or:
 
    ```bash
    intendant peer request https://target.example:8765 --profile peer-daemon
@@ -456,7 +458,8 @@ headless and should be approved from its own CLI/logs.
    public request to the target: requester label, public key, nonce, requested
    profile, and optional requester card URL.
 3. The target records a short-lived pending request and shows it in
-   **Inbound Access Requests**, `intendant peer requests`, and the daemon log.
+   **Access → Invitations → Inbound Access Requests**,
+   `intendant peer requests`, and the daemon log.
 4. The target operator approves, denies, or approves with a downgraded profile:
 
    ```bash

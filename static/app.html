@@ -141,7 +141,7 @@ html {
 }
 /* Aggregate multi-host connection state: one dot summarizing all
    configured secondaries. Hidden on single-host setups. Click jumps
-   to Settings → Network → Daemons. */
+   to Access targets. */
 .hosts-aggregate-dot {
   width: 8px;
   height: 8px;
@@ -393,7 +393,7 @@ html {
 /* Glass chip band above the canvas (own flex row inside #tab-station, so it
    never overlaps the canvases — backdrop-filter is safe here). Hidden until
    a display-capable peer exists. One chip per peer, wired to the same
-   openPeerDisplay flow as Settings → Network daemons "View display". */
+   openPeerDisplay flow as Access targets "View display". */
 .station-peer-chips {
   display: flex;
   align-items: center;
@@ -581,6 +581,112 @@ html {
    optimised 640px. */
 .settings-pane-body--wide {
   max-width: 1024px;
+}
+.access-pane-body {
+  padding: 18px 20px;
+  max-width: 1120px;
+  overflow-y: auto;
+  flex: 1;
+}
+.access-overview-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 10px;
+  margin: 0 0 14px;
+}
+.access-card {
+  min-width: 0;
+  border: 1px solid var(--surface1);
+  border-radius: 6px;
+  padding: 10px 12px;
+  background: var(--base);
+}
+.access-card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-width: 0;
+}
+.access-card-title {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+.access-card-kind {
+  flex: 0 0 auto;
+  color: var(--overlay0);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+.access-card-detail {
+  margin-top: 5px;
+  min-height: 16px;
+  color: var(--subtext0);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+.access-card-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
+}
+.access-card-actions button,
+.access-moved-note button {
+  padding: 5px 9px;
+  border: 1px solid var(--surface1);
+  border-radius: 4px;
+  background: var(--surface0);
+  color: var(--text);
+  cursor: pointer;
+  font-family: inherit;
+  font-size: 12px;
+}
+.access-card-actions button.primary {
+  border-color: var(--blue);
+  background: var(--blue);
+  color: var(--crust);
+  font-weight: 700;
+}
+.access-card-actions button:hover,
+.access-moved-note button:hover {
+  border-color: var(--blue);
+}
+.access-section {
+  border: 1px solid var(--surface1);
+  border-radius: 6px;
+  padding: 12px 16px;
+  margin: 0 0 16px;
+}
+.access-section > .access-section-title {
+  margin: 0 0 8px;
+  color: var(--blue);
+  font-size: 13px;
+  font-weight: 700;
+}
+.access-empty {
+  color: var(--subtext0);
+  font-size: 12px;
+  padding: 8px 0;
+}
+.access-moved-note {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 14px;
+  border: 1px solid var(--surface1);
+  border-radius: 6px;
+  background: var(--base);
+  color: var(--subtext0);
+  font-size: 12px;
 }
 .settings-save-row {
   display: flex;
@@ -1814,7 +1920,7 @@ html {
 }
 .daemons-status.error { color: var(--red); }
 .daemons-status.ok { color: var(--green); }
-/* Coordinator panel — sibling of the Daemons panel. Two stacked
+/* Coordinator panel - sibling of the Access target list. Two stacked
    sub-sections: "Find eligible peers" (GET /api/peers/eligible) and
    "Route a task" (POST /api/coordinator/route). Looks like a
    per-peer .daemon-controls panel but lives at the panel level
@@ -9402,7 +9508,7 @@ body.display-fullscreen-open {
       <span class="voice-dot" id="sb-voice"></span>
       <span style="font-size:11px;color:var(--overlay0)" id="sb-voice-label"></span>
     </span>
-    <span class="sb-dot-group clickable" id="sb-hosts-group" style="display:none" title="Aggregate state of configured secondary daemons — click to open the Daemons panel">
+    <span class="sb-dot-group clickable" id="sb-hosts-group" style="display:none" title="Aggregate state of configured secondary daemons - click to open Access targets">
       <span class="sep" style="margin:0 2px">|</span>
       <span class="field-label">hosts</span>
       <span class="hosts-aggregate-dot" id="sb-hosts-dot"></span>
@@ -9462,8 +9568,9 @@ body.display-fullscreen-open {
     <button class="tab-btn" data-tab="station" title="Station — the rendered control center (WebGPU canvas)">Station</button>
     <button class="tab-btn" data-tab="sessions" title="Browse, search, resume, and launch sessions">Sessions</button>
     <button class="tab-btn" data-tab="files" title="Browse and download files from this daemon or a peer">Files</button>
+    <button class="tab-btn" data-tab="access" title="Targets, grants, invitations, sharing, and connection diagnostics">Access</button>
     <button class="tab-btn" data-tab="debug" title="Daemon diagnostics and raw event streams">Debug</button>
-    <button class="tab-btn" data-tab="settings" title="Account, agent, network daemons, and debug settings">Settings</button>
+    <button class="tab-btn" data-tab="settings" title="Account, agent, and runtime settings">Settings</button>
   </nav>
 
   <!-- Tab Content -->
@@ -10808,12 +10915,54 @@ body.display-fullscreen-open {
       </div>
     </div>
 
+    <!-- Access Tab -->
+    <div id="tab-access" class="tab-pane">
+      <div class="subtabs" id="access-subtabs">
+        <button class="subtab-btn active" data-access-tab="targets">Targets</button>
+        <button class="subtab-btn" data-access-tab="grants">Grants</button>
+        <button class="subtab-btn" data-access-tab="invitations">Invitations</button>
+        <button class="subtab-btn" data-access-tab="public">Public Shares</button>
+        <button class="subtab-btn" data-access-tab="diagnostics">Diagnostics</button>
+      </div>
+
+      <div class="subtab-panes">
+        <div class="subtab-pane active" id="access-pane-targets">
+          <div class="access-pane-body">
+            <div id="access-target-overview" class="access-overview-grid"></div>
+            <div id="access-targets-mount"></div>
+            <div id="access-coordinator-mount"></div>
+          </div>
+        </div>
+        <div class="subtab-pane" id="access-pane-grants">
+          <div class="access-pane-body">
+            <div id="access-grants-overview" class="access-overview-grid"></div>
+            <div id="access-grants-mount"></div>
+          </div>
+        </div>
+        <div class="subtab-pane" id="access-pane-invitations">
+          <div class="access-pane-body">
+            <div id="access-invitations-mount"></div>
+          </div>
+        </div>
+        <div class="subtab-pane" id="access-pane-public">
+          <div class="access-pane-body">
+            <div id="access-public-shares" class="access-overview-grid"></div>
+          </div>
+        </div>
+        <div class="subtab-pane" id="access-pane-diagnostics">
+          <div class="access-pane-body">
+            <div id="access-diagnostics-overview" class="access-overview-grid"></div>
+            <div id="access-diagnostics-mount"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+
     <!-- Settings Tab -->
     <div id="tab-settings" class="tab-pane">
       <div class="subtabs">
         <button class="subtab-btn active" data-settings-tab="account">Account</button>
         <button class="subtab-btn" data-settings-tab="agent">Agent</button>
-        <button class="subtab-btn" data-settings-tab="network">Network</button>
         <button class="subtab-btn" data-settings-tab="debug">Debug</button>
       </div>
 
@@ -11067,6 +11216,10 @@ body.display-fullscreen-open {
         <!-- Network pane: anything about how this daemon talks to others -->
         <div class="subtab-pane" id="settings-pane-network">
           <div class="settings-pane-body settings-pane-body--wide">
+            <div class="access-moved-note">
+              <span>Network access moved to Access.</span>
+              <button id="settings-open-access-btn" type="button">Open Access</button>
+            </div>
             <fieldset class="settings-group">
               <legend>Daemons</legend>
               <div id="daemons-list" class="daemons-list"></div>
@@ -12177,7 +12330,7 @@ function applyAgentCardIdentity(card) {
   selfHostLabel = card.label;
   const el = document.getElementById('sb-host-label');
   if (el) el.textContent = card.label;
-  // Version + git SHA are used by the Daemons panel to flag
+  // Version + git SHA are used by Access targets to flag
   // version skew across multi-host connections.
   selfVersion = card.version || '';
   selfGitSha = card.git_sha || '';
@@ -31563,6 +31716,275 @@ function renderDashboardTargetSummary(elementId, hostId, context = '') {
 function renderDashboardTargetSummaries() {
   renderDashboardTargetSummary('files-target-summary', filesDownloadSelectedPeerId(), 'files');
   renderDashboardTargetSummary('shell-target-summary', currentShellHostId(), 'shell');
+  renderAccessAdminSummaries();
+}
+
+function accessOpenStats(hostId) {
+  const target = String(hostId || '').trim();
+  routeTo('stats');
+  requestAnimationFrame(() => switchStatsHost(target));
+}
+
+function accessOpenFiles(hostId) {
+  const target = String(hostId || '').trim();
+  routeTo('files');
+  requestAnimationFrame(() => {
+    const select = document.getElementById('files-download-host');
+    if (select) {
+      const hasOption = Array.from(select.options).some(option => option.value === target);
+      if (hasOption) {
+        select.value = target;
+        onFilesDownloadHostChanged({ preserveStatus: true });
+      }
+    }
+  });
+}
+
+function accessOpenShell(hostId) {
+  const target = String(hostId || '').trim();
+  routeTo('terminal', 'shell');
+  requestAnimationFrame(() => setShellHost(target || SHELL_HOST_ID));
+}
+
+function accessCreateCard(card) {
+  const node = document.createElement('div');
+  node.className = 'access-card';
+  if (card.title) node.title = card.title;
+
+  const head = document.createElement('div');
+  head.className = 'access-card-head';
+  const title = document.createElement('div');
+  title.className = 'access-card-title';
+  title.textContent = card.title || 'Access';
+  const kind = document.createElement('div');
+  kind.className = 'access-card-kind';
+  kind.textContent = card.kind || '';
+  head.append(title, kind);
+
+  const detail = document.createElement('div');
+  detail.className = 'access-card-detail';
+  detail.textContent = card.detail || '';
+  node.append(head, detail);
+
+  const actions = Array.isArray(card.actions) ? card.actions.filter(Boolean) : [];
+  if (actions.length) {
+    const actionRow = document.createElement('div');
+    actionRow.className = 'access-card-actions';
+    for (const action of actions) {
+      const button = document.createElement('button');
+      button.type = 'button';
+      if (action.primary) button.classList.add('primary');
+      button.textContent = action.label || 'Open';
+      button.addEventListener('click', action.onClick);
+      actionRow.appendChild(button);
+    }
+    node.appendChild(actionRow);
+  }
+
+  return node;
+}
+
+function accessRenderCards(containerId, cards) {
+  const el = document.getElementById(containerId);
+  if (!el) return;
+  el.innerHTML = '';
+  if (!cards.length) {
+    const empty = document.createElement('div');
+    empty.className = 'access-empty';
+    empty.textContent = 'Nothing configured';
+    el.appendChild(empty);
+    return;
+  }
+  for (const card of cards) el.appendChild(accessCreateCard(card));
+}
+
+function accessTargetCards() {
+  const selfSummary = dashboardTargetSummary('', 'files');
+  const status = dashboardTransport?.status
+    ? dashboardTransport.status()
+    : { enabled: dashboardControlTransportEnabled(), connected: false };
+  const selfRoute = dashboardConnectModeEnabled()
+    ? 'Connect'
+    : (location.protocol === 'https:' ? 'mTLS/local' : 'Local');
+  const cards = [{
+    title: selfSummary.name || selfHostLabel || 'This daemon',
+    kind: selfRoute,
+    detail: selfSummary.detail || 'Owner dashboard access',
+    actions: [
+      { label: 'Stats', onClick: () => accessOpenStats('') },
+      { label: 'Files', onClick: () => accessOpenFiles('') },
+      { label: 'Shell', primary: true, onClick: () => accessOpenShell('') },
+    ],
+  }];
+
+  for (const peer of daemons) {
+    const peerId = peer.host_id || '';
+    const summary = dashboardTargetSummary(peerId, 'files');
+    const conn = peerDashboardControlConnectionsByHost.get(peerId);
+    const profile = conn?.lastStatus?.grant_profile || '';
+    const role = profile ? dashboardProfileLabel(profile) : 'Peer relationship';
+    cards.push({
+      title: summary.name || peer.label || peerId,
+      kind: peer.connected === false ? 'Offline peer' : 'Peer',
+      detail: `${role} - ${summary.detail || peer.url || peerId}`,
+      actions: [
+        { label: 'Stats', onClick: () => accessOpenStats(peerId) },
+        { label: 'Files', onClick: () => accessOpenFiles(peerId) },
+        { label: 'Shell', primary: true, onClick: () => accessOpenShell(peerId) },
+      ],
+    });
+  }
+
+  if (status.enabled && !status.connected) {
+    cards[0].detail = `${cards[0].detail} - ${dashboardTransportStatusSummary(status).label || 'connecting'}`;
+  }
+  return cards;
+}
+
+function accessGrantCards() {
+  const transportLabel = dashboardConnectModeEnabled()
+    ? 'Connect owner session'
+    : (location.protocol === 'https:' ? 'Trusted browser certificate' : 'Local dashboard session');
+  const cards = [{
+    title: 'Current browser',
+    kind: 'Owner',
+    detail: `${transportLabel} has full dashboard access to this daemon.`,
+    actions: [{ label: 'Diagnostics', onClick: () => routeTo('access', 'diagnostics') }],
+  }];
+
+  const inboundCards = Array.from(document.querySelectorAll('#daemon-peer-identities-list .daemon-identity-card'));
+  const approved = inboundCards.filter(card => card.classList.contains('approved')).length;
+  cards.push({
+    title: 'Inbound peer grants',
+    kind: approved > 0 ? `${approved} approved` : 'None',
+    detail: approved > 0
+      ? `${approved} peer identity grant${approved === 1 ? '' : 's'} can access this daemon.`
+      : 'No peer identities currently have approved inbound access.',
+    actions: [{ label: 'Manage', primary: true, onClick: () => routeTo('access', 'grants') }],
+  });
+
+  cards.push({
+    title: 'Outbound peer targets',
+    kind: daemons.length ? `${daemons.length} target${daemons.length === 1 ? '' : 's'}` : 'None',
+    detail: daemons.length
+      ? 'This daemon can open direct browser channels to configured peer targets when grants allow it.'
+      : 'No peer targets are configured yet.',
+    actions: [{ label: 'Add', onClick: () => routeTo('access', 'invitations') }],
+  });
+
+  return cards;
+}
+
+function accessPublicShareCards() {
+  return [{
+    title: 'Public shares',
+    kind: 'Disabled',
+    detail: 'No daemon data is currently shared publicly or with the hosted service.',
+  }, {
+    title: 'Stats publishing',
+    kind: 'Off',
+    detail: 'Usage and health stats stay local unless a future explicit share grant enables them.',
+  }];
+}
+
+function accessDiagnosticsCards() {
+  const state = connectHealthState();
+  return [
+    {
+      title: 'Dashboard route',
+      kind: state.summary.kind === 'ok' ? 'Ready' : state.summary.label,
+      detail: `${state.modeLabel} - ${state.summary.title || state.summary.label}`,
+      actions: [{ label: 'Open', primary: true, onClick: () => routeTo('access', 'diagnostics') }],
+    },
+    {
+      title: 'Event stream',
+      kind: state.status.eventsActive ? 'Active' : 'Inactive',
+      detail: state.status.eventsActive
+        ? 'Dashboard events are flowing over the selected route.'
+        : 'Event delivery is not active on the selected route.',
+    },
+    {
+      title: 'Peer targets',
+      kind: daemons.length ? `${daemons.length}` : 'None',
+      detail: daemons.length
+        ? `${daemons.filter(d => d.connected !== false).length} of ${daemons.length} configured peer target${daemons.length === 1 ? '' : 's'} online.`
+        : 'No peer targets configured.',
+    },
+  ];
+}
+
+function renderAccessAdminSummaries() {
+  if (!document.getElementById('tab-access')) return;
+  accessRenderCards('access-target-overview', accessTargetCards());
+  accessRenderCards('access-grants-overview', accessGrantCards());
+  accessRenderCards('access-public-shares', accessPublicShareCards());
+  accessRenderCards('access-diagnostics-overview', accessDiagnosticsCards());
+}
+
+function accessEnsureSection(mountId, sectionId, title) {
+  const mount = document.getElementById(mountId);
+  if (!mount) return null;
+  let section = document.getElementById(sectionId);
+  if (!section) {
+    section = document.createElement('div');
+    section.id = sectionId;
+    section.className = 'access-section';
+    const titleEl = document.createElement('div');
+    titleEl.className = 'access-section-title';
+    titleEl.textContent = title || 'Access';
+    const body = document.createElement('div');
+    body.className = 'access-section-body';
+    section.append(titleEl, body);
+  }
+  if (section.parentElement !== mount) mount.appendChild(section);
+  return section.querySelector('.access-section-body');
+}
+
+function accessMoveIntoSection(node, mountId, sectionId, title) {
+  if (!node) return false;
+  const body = accessEnsureSection(mountId, sectionId, title);
+  if (!body) return false;
+  if (node.parentElement !== body) body.appendChild(node);
+  return true;
+}
+
+function accessMoveToMount(node, mountId) {
+  const mount = document.getElementById(mountId);
+  if (!node || !mount) return false;
+  if (node.parentElement !== mount) mount.appendChild(node);
+  return true;
+}
+
+function mountAccessAdminSurface() {
+  accessMoveIntoSection(
+    document.getElementById('daemons-list'),
+    'access-targets-mount',
+    'access-targets-list-section',
+    'Daemon targets'
+  );
+  accessMoveIntoSection(
+    document.querySelector('.daemon-pairing-grid'),
+    'access-invitations-mount',
+    'access-invitations-section',
+    'Invitations and requests'
+  );
+  accessMoveToMount(
+    document.querySelector('.daemon-relationships-panel'),
+    'access-grants-mount'
+  );
+  accessMoveToMount(
+    document.getElementById('coord-eligible-btn')?.closest('fieldset.settings-group'),
+    'access-coordinator-mount'
+  );
+  accessMoveToMount(
+    document.getElementById('connect-health-panel'),
+    'access-diagnostics-mount'
+  );
+  const openAccessBtn = document.getElementById('settings-open-access-btn');
+  if (openAccessBtn && openAccessBtn.dataset.wired !== 'true') {
+    openAccessBtn.dataset.wired = 'true';
+    openAccessBtn.addEventListener('click', () => routeTo('access', 'targets'));
+  }
 }
 
 function setShellHostStatus(text = '', kind = '') {
@@ -37421,9 +37843,14 @@ document.getElementById('shell-host-select')?.addEventListener('change', ev => {
   setShellHost(ev.target?.value || SHELL_HOST_ID);
 });
 
-// Settings sub-tab switching (Account | Agent | Network | Debug).
+// Settings sub-tab switching (Account | Agent | Debug).
 document.querySelectorAll('#tab-settings .subtab-btn[data-settings-tab]').forEach(btn => {
   btn.addEventListener('click', () => routeTo('settings', btn.dataset.settingsTab));
+});
+
+// Access sub-tab switching (Targets | Grants | Invitations | Public Shares | Diagnostics).
+document.querySelectorAll('#access-subtabs .subtab-btn[data-access-tab]').forEach(btn => {
+  btn.addEventListener('click', () => routeTo('access', btn.dataset.accessTab));
 });
 
 // Sessions sub-tab switching (Recent | Deep Search | Worktrees | New Session).
@@ -37443,6 +37870,7 @@ document.querySelectorAll('#activity-subtabs .subtab-btn[data-activity-tab]').fo
 //   #stats
 //   #terminal           → defaults to TUI sub-tab
 //   #terminal/shell     → opens the Shell sub-tab directly
+//   #access/targets     → opens unified access administration
 //   #settings/agent     → opens the Settings tab on the Agent sub-tab
 //
 // This gives us three things for free:
@@ -37450,16 +37878,17 @@ document.querySelectorAll('#activity-subtabs .subtab-btn[data-activity-tab]').fo
 //   2. Refresh preserves the current tab (no localStorage hack needed
 //      for main/sub-tab persistence)
 //   3. Deep links like `http://host:8765#stats` or
-//      `http://host:8765#settings/network` open the dashboard at a
-//      specific view — useful for bookmarking multi-host daemons.
+//      `http://host:8765#access/targets` open the dashboard at a
+//      specific view - useful for bookmarking multi-host daemons.
 //
 // We still use localStorage for preferences that aren't navigation
 // (verbosity, direct-mode, host filter, sessions filters).
 
-const VALID_TABS = ['activity', 'stats', 'terminal', 'displays', 'station', 'sessions', 'files', 'debug', 'settings'];
+const VALID_TABS = ['activity', 'stats', 'terminal', 'displays', 'station', 'sessions', 'files', 'access', 'debug', 'settings'];
 const VALID_ACTIVITY_SUBTABS = ['log', 'context', 'managed', 'changes', 'control'];
 const VALID_TERM_SUBTABS = ['tui', 'shell'];
 const VALID_SETTINGS_SUBTABS = ['account', 'agent', 'network', 'debug'];
+const VALID_ACCESS_SUBTABS = ['targets', 'grants', 'invitations', 'public', 'diagnostics'];
 const VALID_SESSIONS_SUBTABS = ['recent', 'deep', 'worktrees', 'new'];
 
 function parseRoute() {
@@ -37467,6 +37896,9 @@ function parseRoute() {
   if (!raw) return { tab: 'activity', subtab: null };
   const [tab, subtab] = raw.split('/');
   if (!VALID_TABS.includes(tab)) return { tab: 'activity', subtab: null };
+  if (tab === 'settings' && subtab === 'network') {
+    return { tab: 'access', subtab: 'targets' };
+  }
   if (tab === 'activity' && subtab && !VALID_ACTIVITY_SUBTABS.includes(subtab)) {
     return { tab, subtab: null };
   }
@@ -37474,6 +37906,9 @@ function parseRoute() {
     return { tab, subtab: null };
   }
   if (tab === 'settings' && subtab && !VALID_SETTINGS_SUBTABS.includes(subtab)) {
+    return { tab, subtab: null };
+  }
+  if (tab === 'access' && subtab && !VALID_ACCESS_SUBTABS.includes(subtab)) {
     return { tab, subtab: null };
   }
   if (tab === 'sessions' && subtab && !VALID_SESSIONS_SUBTABS.includes(subtab)) {
@@ -37513,6 +37948,8 @@ function routeTo(tab, subtab) {
     switchActivitySubtab(subtab);
   } else if (tab === 'terminal' && subtab) {
     switchTerminalSubtab(subtab);
+  } else if (tab === 'access') {
+    switchAccessSubtab(subtab || activeAccessSubtab || 'targets');
   } else if (tab === 'settings' && subtab) {
     switchSettingsSubtab(subtab);
   } else if (tab === 'sessions') {
@@ -37544,6 +37981,8 @@ function applyCurrentRoute() {
     switchActivitySubtab(subtab);
   } else if (tab === 'terminal' && subtab) {
     switchTerminalSubtab(subtab);
+  } else if (tab === 'access') {
+    switchAccessSubtab(subtab || activeAccessSubtab || 'targets');
   } else if (tab === 'settings' && subtab) {
     switchSettingsSubtab(subtab);
   } else if (tab === 'sessions') {
@@ -37608,6 +38047,12 @@ function switchTab(tabId) {
   if (tabId === 'settings') {
     // Always re-render so connection states reflect current WASM state.
     renderDaemonsList();
+  }
+  if (tabId === 'access') {
+    mountAccessAdminSurface();
+    renderDaemonsList();
+    renderAccessAdminSummaries();
+    if (activeAccessSubtab === 'diagnostics') renderConnectHealthPanel();
   }
 }
 
@@ -39237,10 +39682,42 @@ function openNewSessionFromPrompt() {
 window.openNewSessionFromPrompt = openNewSessionFromPrompt;
 
 const SETTINGS_SUBTAB_KEY = 'intendant_settings_subtab';
+const ACCESS_SUBTAB_KEY = 'intendant_access_subtab';
 let activeSettingsSubtab =
   localStorage.getItem(SETTINGS_SUBTAB_KEY) || 'account';
+if (activeSettingsSubtab === 'network') {
+  activeSettingsSubtab = 'account';
+  localStorage.setItem(SETTINGS_SUBTAB_KEY, activeSettingsSubtab);
+}
+let activeAccessSubtab =
+  localStorage.getItem(ACCESS_SUBTAB_KEY) || 'targets';
+if (!VALID_ACCESS_SUBTABS.includes(activeAccessSubtab)) {
+  activeAccessSubtab = 'targets';
+  localStorage.setItem(ACCESS_SUBTAB_KEY, activeAccessSubtab);
+}
+
+function switchAccessSubtab(name) {
+  const next = VALID_ACCESS_SUBTABS.includes(name) ? name : 'targets';
+  if (activeAccessSubtab !== next) {
+    activeAccessSubtab = next;
+    localStorage.setItem(ACCESS_SUBTAB_KEY, activeAccessSubtab);
+  }
+  document.querySelectorAll('#access-subtabs .subtab-btn').forEach(btn => {
+    btn.classList.toggle('active', btn.dataset.accessTab === activeAccessSubtab);
+  });
+  document.querySelectorAll('#tab-access .subtab-pane').forEach(pane => {
+    pane.classList.toggle('active', pane.id === `access-pane-${activeAccessSubtab}`);
+  });
+  mountAccessAdminSurface();
+  renderAccessAdminSummaries();
+  if (activeAccessSubtab === 'diagnostics') renderConnectHealthPanel();
+}
 
 function switchSettingsSubtab(name) {
+  if (name === 'network') {
+    routeTo('access', 'targets');
+    return;
+  }
   if (activeSettingsSubtab === name) return;
   activeSettingsSubtab = name;
   localStorage.setItem(SETTINGS_SUBTAB_KEY, name);
@@ -43699,7 +44176,7 @@ function resolveBrowserTcpViaUrl(d) {
 
 /// Fetch the peer list from /api/peers and update the in-memory
 /// `daemons` array, re-register with WASM for live event streaming,
-/// and re-render the Daemons panel. Single source of truth for
+/// and re-render Access targets. Single source of truth for
 /// peer state: called from initDaemons(), after addDaemon(), after
 /// removeDaemon(), and on reconnect. No localStorage fallback —
 /// the server-side PeerRegistry owns the peer list now.
@@ -43867,7 +44344,7 @@ async function refreshPeersFromApi() {
     renderDaemonsList();
   } catch (e) {
     // Silently ignore fetch failures — the dashboard still works
-    // from whatever state daemons was in before. The Daemons panel
+    // from whatever state daemons was in before. Access targets
     // shows stale data until the next refresh, which is better than
     // blanking the panel on a transient network blip.
   }
@@ -47944,6 +48421,7 @@ function renderPeerAccessRequests(requests) {
   if (!list) return;
   if (!requests.length) {
     list.innerHTML = '<div class="daemon-access-request-meta">No incoming requests.</div>';
+    renderAccessAdminSummaries();
     return;
   }
 
@@ -47984,6 +48462,7 @@ function renderPeerAccessRequests(requests) {
       decidePeerAccessRequest(requestId, action);
     });
   });
+  renderAccessAdminSummaries();
 }
 
 async function decidePeerAccessRequest(requestId, op) {
@@ -48044,6 +48523,7 @@ function renderPeerIdentities(identities) {
   if (!list) return;
   if (!identities.length) {
     list.innerHTML = '<div class="daemon-access-request-meta">No inbound access grants.</div>';
+    renderAccessAdminSummaries();
     return;
   }
 
@@ -48075,6 +48555,7 @@ function renderPeerIdentities(identities) {
   list.querySelectorAll('[data-peer-identity-revoke]').forEach(button => {
     button.addEventListener('click', () => revokePeerIdentity(button.getAttribute('data-peer-identity-revoke') || ''));
   });
+  renderAccessAdminSummaries();
 }
 
 async function revokePeerIdentity(identity) {
@@ -48341,6 +48822,8 @@ async function routeTask() {
 }
 
 async function initDaemons() {
+  mountAccessAdminSurface();
+
   // Hydrate the peer list from the server-side PeerRegistry via
   // GET /api/peers. The server already loaded [[peer]] sections
   // from intendant.toml at startup; peers added through the
@@ -58527,10 +59010,10 @@ document.getElementById('stats-host-select').addEventListener('change', (e) => {
 });
 
 // Hosts aggregate dot (and its surrounding label group) in the status
-// bar — click jumps to the Daemons panel so the user can investigate
+// bar - click jumps to Access targets so the user can investigate
 // which host is disconnected/skewed.
 document.getElementById('sb-hosts-group').addEventListener('click', () => {
-  routeTo('settings', 'network');
+  routeTo('access', 'targets');
 });
 
 // Auto-scroll detection

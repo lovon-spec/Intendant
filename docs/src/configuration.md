@@ -549,7 +549,7 @@ is required.
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `card_url` | string | (required) | URL of the peer's Agent Card (`.../.well-known/agent-card.json`) |
-| `label` | string | from card | Display label override in the dashboard's Daemons panel |
+| `label` | string | from card | Display label override in the dashboard's Access targets |
 | `bearer_token` | string | none | Legacy/advanced outbound token for peers that still require `[server.auth] bearer_token` |
 | `via_urls` | array | `[]` | Connecting-side WebSocket URL overrides; when set, these replace the transports advertised by the peer's Agent Card |
 | `client_cert` | string | installed access client cert when present | Peer-issued client certificate PEM for outbound mTLS; must be paired with `client_key` |

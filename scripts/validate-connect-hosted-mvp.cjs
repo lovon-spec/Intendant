@@ -394,8 +394,8 @@ async function main() {
       await click(page, '.tab-btn[data-tab="files"]');
     }
 
-    await click(page, '.tab-btn[data-tab="settings"]');
-    await click(page, '#tab-settings .subtab-btn[data-settings-tab="debug"]');
+    await click(page, '.tab-btn[data-tab="access"]');
+    await click(page, '#access-subtabs .subtab-btn[data-access-tab="diagnostics"]');
     const healthPanel = await page.evaluate(() => window.intendantDashboardControl._debugProbeConnectHealthPanel());
     assert.strictEqual(healthPanel.state.connectMode, true, `Connect health panel did not detect hosted Connect mode: ${JSON.stringify(healthPanel)}`);
     assert.strictEqual(healthPanel.state.verifiedBindingOk, true, `Connect health panel did not show a verified binding: ${JSON.stringify(healthPanel)}`);
@@ -411,7 +411,7 @@ async function main() {
       ['Ready', 'Relay'].includes(filesAccessUi.statusLabel),
       `dashboard access status should be user-facing: ${JSON.stringify(filesAccessUi)}`
     );
-    assert.strictEqual(filesAccessUi.diagnosticsLegend, 'Connection Diagnostics', `debug panel should own transport details: ${JSON.stringify(filesAccessUi)}`);
+    assert.strictEqual(filesAccessUi.diagnosticsLegend, 'Connection Diagnostics', `Access Diagnostics should own transport details: ${JSON.stringify(filesAccessUi)}`);
     assert(filesAccessUi.files.text.includes('This daemon'), `Files target summary did not identify the local daemon: ${JSON.stringify(filesAccessUi)}`);
     assert(filesAccessUi.files.text.includes('Hosted Connect'), `Files target summary did not name Hosted Connect mode: ${JSON.stringify(filesAccessUi)}`);
     assert(filesAccessUi.files.text.includes('full dashboard access'), `Files target summary did not summarize access: ${JSON.stringify(filesAccessUi)}`);

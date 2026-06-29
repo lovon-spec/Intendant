@@ -590,7 +590,7 @@ async function main() {
     );
     await selectPeerTargetInDashboard(page, browserPeer.id);
     const accessUi = await dashboardAccessUi(page);
-    assert.strictEqual(accessUi.diagnosticsLegend, 'Connection Diagnostics', `debug panel should own transport details: ${JSON.stringify(accessUi)}`);
+    assert.strictEqual(accessUi.diagnosticsLegend, 'Connection Diagnostics', `Access Diagnostics should own transport details: ${JSON.stringify(accessUi)}`);
     assert(accessUi.files.text.includes('e2e-peer'), `Files target summary did not identify the selected peer: ${JSON.stringify(accessUi)}`);
     assert(accessUi.files.text.includes('Peer daemon'), `Files target summary did not label the peer target: ${JSON.stringify(accessUi)}`);
     assert(accessUi.files.text.includes('Grant: Admin peer'), `Files target summary did not show the granted role: ${JSON.stringify(accessUi)}`);
