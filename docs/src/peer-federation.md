@@ -12,6 +12,14 @@ the transport stack (native WebSocket, multi-URL probing, cert pinning), the
 cross-machine display path, and dashboard TLS/mTLS setup. For the local display pipeline
 those federated displays plug into, see [Display Pipeline](./display-pipeline.md).
 
+Peer federation is **not** the same security domain as a browser dashboard login.
+Hosted Connect passkeys and browser mTLS client certificates authenticate a
+human/client route to one daemon and are root dashboard access for the owner
+today. Peer federation authenticates a daemon route to another daemon and should
+use peer-scoped mTLS identities plus peer profiles. Future coworker/team access
+belongs in user-scoped IAM unless the federation trust model is deliberately
+expanded.
+
 ## Federation vs. External Agents
 
 These are two orthogonal relationships, and they compose:
@@ -361,6 +369,11 @@ compatibility path. Subcommands:
 intendant access setup --name nicks-mac --port 8765
 ```
 
+`--name` is the daemon display label. Use a stable human name; transport
+addresses belong in SANs and advertised URLs, not in the label. When setup is
+run without `--name`, Intendant uses the system hostname when available and uses
+the primary IP only as a last resort.
+
 The interactive `intendant access` setup/enrollment flow is currently validated on
 Unix hosts. Cert *generation* and native HTTPS/WSS are cross-platform, so a
 Windows daemon can still use native HTTPS/mTLS and
@@ -394,7 +407,9 @@ policy that can later be changed or revoked.
 
 The dashboard's **Access** tab exposes peer relationship management:
 **Invitations** contains onboarding flows, **Grants** shows inbound identities,
-and **Targets** shows configured outbound peers.
+and **Targets** shows configured outbound peers. Targets are a dashboard
+navigation abstraction backed by `/api/dashboard/targets`; the security decision
+is still the peer profile on the daemon-to-daemon mTLS identity.
 
 #### Invite flow
 
@@ -402,7 +417,7 @@ Use an invite when the accepting daemon's operator can copy a secret directly to
 the connecting daemon:
 
 1. On the daemon that will accept inbound peer connections, open
-   **Access → Invitations → Grant Invite** and click **Create**.
+   **Access → Invitations → Grant Peer Invite** and click **Create**.
 2. Copy the generated `intendant-peer-v1...` invite.
 3. On the daemon that should connect to it, paste the invite into
    **Access → Invitations → Join Invite**.
@@ -448,17 +463,17 @@ without first copying a private-key-bearing invite, or when the target daemon is
 headless and should be approved from its own CLI/logs.
 
 1. On the daemon that wants access, use
-   **Access → Invitations → Request Access** in the dashboard or:
+   **Access → Invitations → Request Peer Access** in the dashboard or:
 
    ```bash
-   intendant peer request https://target.example:8765 --profile peer-daemon
+   intendant peer request https://target.example:8765 --profile peer-operator
    ```
 
 2. The requester generates a client keypair locally and sends only a bounded
    public request to the target: requester label, public key, nonce, requested
    profile, and optional requester card URL.
 3. The target records a short-lived pending request and shows it in
-   **Access → Invitations → Inbound Access Requests**,
+   **Access → Invitations → Inbound Peer Access Requests**,
    `intendant peer requests`, and the daemon log.
 4. The target operator approves, denies, or approves with a downgraded profile:
 
@@ -514,10 +529,14 @@ waits until `/api/peers` reports the VM connected.
 ### How auth maps to the Agent Card
 
 The human model is certificate-first: the server certificate proves the daemon
-you reached, a client certificate is the peer's keycard, and role/capability
-metadata decides which doors that keycard opens. The card's `auth` field tells
-connecting peers what proof to send. Construct it via the `AuthRequirements`
-helpers:
+you reached, a client certificate is the peer's keycard, and peer
+profile/capability metadata decides which doors that keycard opens. Use
+`peer-operator` for ordinary delegated display/task/approval work and
+`peer-root` only when the other daemon should have all peer operations,
+including settings, shell, files, and runtime control. Older profile names such
+as `operator`, `admin-peer`, and `peer-daemon` remain compatibility aliases.
+The card's `auth` field tells connecting peers what proof to send. Construct it
+via the `AuthRequirements` helpers:
 
 | Helper | `transport` | `application` | Use when |
 |---|---|---|---|

@@ -284,19 +284,42 @@ targets with their available capabilities rather than as transport internals.
 
 Unified administration for how dashboards and daemons reach each other:
 
-- **Targets** lists this daemon and configured peer daemons, with direct jumps
-  to Stats, Files, and Shell for each target. It also hosts the coordinator
-  controls for capability-based peer discovery and task routing.
-- **Grants** shows current browser ownership, outbound peer target count, and
-  inbound peer identities this daemon accepts, including their granted
-  role/profile.
-- **Invitations** contains peer onboarding flows: Grant Invite, Join Invite,
-  Request Access, Manual Add, and inbound access requests.
+- **Targets** lists daemon targets, not raw transports. A target can be this
+  daemon over user/client access, a hosted Connect daemon, a direct browser-mTLS
+  daemon, or a peer-routed daemon. Each row shows the access domain, route, and
+  available capabilities, then links to Stats, Files, and Shell.
+- **Grants** separates user/client access from peer access. The current browser
+  is user/client access and is root dashboard access in the single-user product.
+  Inbound peer identities are daemon-to-daemon grants with peer profiles.
+- **Invitations** contains peer onboarding flows: Grant Peer Invite, Join Invite,
+  Request Peer Access, Manual Add, and inbound peer access requests.
 - **Public Shares** is the placeholder surface for future explicit public or
   hosted-service grants; by default nothing is shared publicly.
 - **Diagnostics** owns dashboard route health, including hosted Connect,
   local/mTLS, local WebRTC control, event delivery, byte streams, uploads, and
   self-tests.
+
+The important split is:
+
+- **User/client daemon access** means a human-operated dashboard can control a
+  daemon. Hosted Connect passkey access and browser mTLS client certificates are
+  both in this domain. Today that is intentionally root dashboard access for the
+  owner. Future coworker/team access should be user-scoped IAM here, not peer
+  federation.
+- **Peer access** means one daemon can call capabilities on another daemon. That
+  uses daemon-to-daemon mTLS identities and peer profiles such as `peer-operator`
+  or `peer-root`. Peer access does not imply that the human's browser can open
+  the remote daemon directly, and browser access does not imply that two daemons
+  can federate.
+
+The target list is backend-backed. `GET /api/dashboard/targets` and the
+dashboard-control `api_dashboard_targets` method return the canonical target
+model: target id/host id, display label, access domain (`user_client` or
+`peer`), route (`current_dashboard` or `peer_route`), effective role
+(`root` or `peer_profile`), connection state, and capability hints. The browser
+still refines the local route label to **Hosted Connect**, **Browser mTLS**, or
+**Local/debug** because only the browser knows how the current page was reached,
+but it should not invent the target/security-domain vocabulary.
 
 ### Debug
 
@@ -1328,6 +1351,11 @@ still use Intendant-issued peer-scoped mTLS certificates unless the federation
 trust model is deliberately redesigned. In user-facing copy, that should appear
 as "grant access to this daemon" and "revoke access," not as manual certificate
 management.
+
+In other words, Connect and browser mTLS authenticate a **user/client route to a
+daemon**. Peer mTLS authenticates a **daemon route to another daemon**. The
+dashboard can present both as targets, but target selection is only a product
+abstraction; it does not collapse the two security domains.
 
 #### Status and Remaining Rollout
 

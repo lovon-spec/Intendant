@@ -152,6 +152,7 @@ const CONTROL_FEATURES: &[&str] = &[
     "api_peer_pairing_request_decision",
     "api_peer_pairing_identities",
     "api_peer_pairing_identity_revoke",
+    "api_dashboard_targets",
     "api_coordinator_route",
 ];
 const UDP_BUF_LEN: usize = 2000;
@@ -1915,6 +1916,7 @@ fn dashboard_control_method_operation(
         }
         "config" => Some(PeerOperation::RuntimeControl),
         "api_peers"
+        | "api_dashboard_targets"
         | "api_peer_add"
         | "api_peer_remove"
         | "api_peer_eligible"
@@ -2164,6 +2166,15 @@ fn control_frame_response(
                         "error": "peer registry unavailable",
                     })),
                 },
+                "api_dashboard_targets" => Some(serde_json::json!({
+                    "t": "response",
+                    "id": id,
+                    "ok": true,
+                    "result": crate::web_gateway::dashboard_targets_response_value(
+                        &runtime.agent_card,
+                        runtime.peer_registry.as_ref(),
+                    ),
+                })),
                 "subscribe_events" => {
                     runtime.events_subscribed = true;
                     Some(serde_json::json!({
@@ -3761,6 +3772,7 @@ fn status_response_frame(id: String, runtime: &ControlRuntime) -> serde_json::Va
         runtime_allows_operation(runtime, crate::peer::access_policy::PeerOperation::Message);
     let capabilities = [
         ("api_peers_available", peer_registry_available && peer_manage),
+        ("api_dashboard_targets_available", peer_manage),
         ("api_agent_card_available", presence_read),
         ("api_cached_bootstrap_events_available", session_inspect),
         ("api_browser_workspace_snapshot_available", session_inspect),

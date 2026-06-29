@@ -1,8 +1,8 @@
 //! Peer relationship policy.
 //!
-//! Pairing produces an mTLS identity; this module gives that identity human
-//! meaning. Approved peer client certificates are recorded by fingerprint with
-//! a trust profile. The gateway can then authorize daemon-mode HTTP/WS
+//! Pairing produces a daemon-to-daemon mTLS identity; this module gives that
+//! identity human meaning. Approved peer client certificates are recorded by
+//! fingerprint with a peer profile. The gateway can then authorize daemon-mode HTTP/WS
 //! operations from the certificate fingerprint instead of treating every cert
 //! signed by the access CA as equivalent.
 
@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use crate::error::CallerError;
 use crate::event::ControlMsg;
 
-pub const DEFAULT_PROFILE: &str = "peer-daemon";
+pub const DEFAULT_PROFILE: &str = "peer-operator";
 const POLICY_DIR: &str = "peer-access-identities";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -127,10 +127,12 @@ pub fn profile_class(profile: &str) -> ProfileClass {
         "shared-session-spectator" | "spectator" => ProfileClass::SharedSessionSpectator,
         "file-reader" | "files-read" | "filesystem-read-only" => ProfileClass::FileReader,
         "file-operator" | "files" | "filesystem-operator" => ProfileClass::FileOperator,
-        "terminal-operator" | "terminal" | "shell" => ProfileClass::TerminalOperator,
+        "terminal-operator" | "peer-terminal-operator" | "terminal" | "shell" => {
+            ProfileClass::TerminalOperator
+        }
         "task-runner" => ProfileClass::TaskRunner,
-        "operator" => ProfileClass::Operator,
-        "admin-peer" | "admin" | DEFAULT_PROFILE => ProfileClass::AdminPeer,
+        "operator" | "peer-operator" => ProfileClass::Operator,
+        "peer-root" | "admin-peer" | "admin" | "peer-daemon" => ProfileClass::AdminPeer,
         _ => ProfileClass::PresenceOnly,
     }
 }
@@ -529,6 +531,21 @@ mod tests {
         assert!(!profile_allows_control_msg("read-only-display", &input));
         assert!(!profile_allows_federated_display_input("read-only-display"));
         assert!(profile_allows_federated_display_input("operator"));
+    }
+
+    #[test]
+    fn peer_prefixed_profile_aliases_keep_legacy_permissions() {
+        assert_eq!(profile_class("peer-operator"), ProfileClass::Operator);
+        assert_eq!(profile_class("peer-root"), ProfileClass::AdminPeer);
+        assert_eq!(profile_class("peer-daemon"), ProfileClass::AdminPeer);
+        assert!(profile_allows_operation(
+            "peer-root",
+            PeerOperation::RuntimeControl
+        ));
+        assert!(!profile_allows_operation(
+            "peer-operator",
+            PeerOperation::RuntimeControl
+        ));
     }
 
     #[test]

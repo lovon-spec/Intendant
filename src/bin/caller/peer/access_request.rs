@@ -986,6 +986,36 @@ mod tests {
     }
 
     #[test]
+    fn approve_request_without_profile_uses_peer_operator_default() {
+        let certs = tempfile::TempDir::new().unwrap();
+        setup_certs(certs.path());
+        let key = access::certs::generate_client_key_material().unwrap();
+        let request = AccessRequestCreate {
+            version: 1,
+            requester_label: "primary".into(),
+            public_key_pem: key.public_key_pem,
+            nonce: "0123456789abcdef".into(),
+            requested_profile: None,
+            requester_card_url: None,
+        };
+
+        let created = create_pending_request(
+            certs.path(),
+            request,
+            "https://target/.well-known/agent-card.json".into(),
+            Some("127.0.0.1".into()),
+            &PeerAccessRequestConfig::default(),
+        )
+        .unwrap();
+        let approved = approve_request(certs.path(), &created.code, None).unwrap();
+
+        assert_eq!(
+            approved.approved_profile.as_deref(),
+            Some(crate::peer::access_policy::DEFAULT_PROFILE)
+        );
+    }
+
+    #[test]
     fn install_approved_identity_writes_peer_config_and_key() {
         let root = tempfile::TempDir::new().unwrap();
         std::fs::write(root.path().join("intendant.toml"), "").unwrap();

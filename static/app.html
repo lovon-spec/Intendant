@@ -11225,11 +11225,11 @@ body.display-fullscreen-open {
               <div id="daemons-list" class="daemons-list"></div>
               <div class="daemon-pairing-grid">
                 <div class="daemon-pairing-panel daemon-add-wizard">
-                  <div class="daemon-pairing-title">Outbound Connections</div>
-                  <div class="daemon-pairing-mode-tabs" role="tablist" aria-label="Connect daemon mode">
-                    <button type="button" class="active" data-daemon-pairing-mode="request">Request Access</button>
+                  <div class="daemon-pairing-title">Peer Routes</div>
+                  <div class="daemon-pairing-mode-tabs" role="tablist" aria-label="Peer access mode">
+                    <button type="button" class="active" data-daemon-pairing-mode="request">Request Peer Access</button>
                     <button type="button" data-daemon-pairing-mode="join">Join Invite</button>
-                    <button type="button" data-daemon-pairing-mode="invite">Grant Invite</button>
+                    <button type="button" data-daemon-pairing-mode="invite">Grant Peer Invite</button>
                     <button type="button" data-daemon-pairing-mode="manual">Manual Add</button>
                   </div>
 
@@ -11240,7 +11240,7 @@ body.display-fullscreen-open {
                     </div>
                     <div class="daemon-pairing-row">
                       <select id="daemon-request-profile">
-                        <option value="operator" title="Display input, messages, tasks, and approvals.">Operator</option>
+                        <option value="peer-operator" title="Daemon-to-daemon display input, messages, tasks, and approvals. No settings or runtime control.">Peer operator</option>
                         <option value="terminal-operator" title="Session reading plus interactive shell access.">Terminal operator</option>
                         <option value="session-reader" title="Presence, stats, and session history. No shell, task, settings, or display input.">Session reader</option>
                         <option value="read-only-display" title="Presence, stats, and display viewing. No input control.">Read-only display</option>
@@ -11248,7 +11248,7 @@ body.display-fullscreen-open {
                         <option value="task-runner" title="Presence, stats, messages, and task delegation.">Task runner</option>
                         <option value="stats" title="Presence and usage statistics only.">Stats</option>
                         <option value="presence-only" title="Basic presence only.">Presence only</option>
-                        <option value="peer-daemon" title="All peer operations, including settings, sessions, and runtime control.">Admin peer</option>
+                        <option value="peer-root" title="All daemon-to-daemon peer operations, including settings, sessions, files, shell, and runtime control.">Peer root</option>
                       </select>
                       <button id="daemon-request-btn" type="button">Request</button>
                     </div>
@@ -11307,7 +11307,7 @@ body.display-fullscreen-open {
                 </div>
 
                 <div class="daemon-pairing-panel">
-                  <div class="daemon-pairing-title">Inbound Access Requests</div>
+                  <div class="daemon-pairing-title">Inbound Peer Access Requests</div>
                   <div id="daemon-access-requests-list" class="daemons-list"></div>
                   <div class="daemon-pairing-actions">
                     <button id="daemon-access-requests-refresh-btn" type="button">Refresh</button>
@@ -11317,7 +11317,7 @@ body.display-fullscreen-open {
               </div>
 
               <div class="daemon-pairing-panel daemon-relationships-panel">
-                <div class="daemon-pairing-title">Inbound Access Grants</div>
+                <div class="daemon-pairing-title">Inbound Peer Grants</div>
                 <div id="daemon-peer-identities-list" class="daemons-list"></div>
                 <div class="daemon-pairing-actions">
                   <button id="daemon-peer-identities-refresh-btn" type="button">Refresh</button>
@@ -11968,6 +11968,7 @@ const DASHBOARD_CONNECT_SIGNALING_BASE = String(
   dashboardUrlParams.get('connect_base') || ''
 ).trim().replace(/\/+$/, '');
 let daemons = [];
+let dashboardAccessTargets = [];
 let dashboardControlTransport = null;
 let dashboardTransport = null;
 let dashboardServerMessageDispatcher = null;
@@ -12341,6 +12342,23 @@ function applyAgentCardIdentity(card) {
   // version skew across multi-host connections.
   selfVersion = card.version || '';
   selfGitSha = card.git_sha || '';
+  upsertDashboardAccessTarget({
+    id: card.id,
+    host_id: card.id,
+    label: card.label,
+    local: true,
+    source: 'agent-card',
+    access_domain: 'user_client',
+    access_domain_label: 'User/client access',
+    route: 'current_dashboard',
+    route_label: 'Current dashboard',
+    auth: 'trusted_dashboard',
+    auth_label: 'Trusted dashboard session',
+    effective_role: 'root',
+    effective_role_label: 'Root',
+    connected: true,
+    capabilities: card.capabilities || [],
+  });
   return true;
 }
 
@@ -31764,6 +31782,114 @@ function shellHostLabel(hostId = currentShellHostId()) {
   return peer?.label || id;
 }
 
+function normalizeDashboardAccessTarget(target) {
+  if (!target || typeof target !== 'object') return null;
+  const id = String(target.host_id || target.hostId || target.id || '').trim();
+  if (!id) return null;
+  const local = target.local === true || id === selfPeerId || id === SHELL_HOST_ID;
+  const route = String(target.route || target.route_key || '').trim();
+  const accessDomain = String(target.access_domain || target.accessDomain || '').trim();
+  const capabilities = Array.isArray(target.capabilities) ? target.capabilities : [];
+  return {
+    ...target,
+    id: String(target.id || id).trim() || id,
+    host_id: id,
+    local,
+    label: String(target.label || '').trim() || (local ? (selfHostLabel || 'This daemon') : id),
+    access_domain: accessDomain,
+    access_domain_label: String(target.access_domain_label || target.accessDomainLabel || '').trim(),
+    route,
+    route_label: String(target.route_label || target.routeLabel || '').trim(),
+    auth: String(target.auth || '').trim(),
+    auth_label: String(target.auth_label || target.authLabel || '').trim(),
+    effective_role: String(target.effective_role || target.effectiveRole || '').trim(),
+    effective_role_label: String(target.effective_role_label || target.effectiveRoleLabel || '').trim(),
+    profile: String(target.profile || '').trim(),
+    connected: target.connected !== false,
+    capabilities,
+  };
+}
+
+function applyDashboardAccessTargets(payload) {
+  const rawTargets = Array.isArray(payload?.targets) ? payload.targets : [];
+  dashboardAccessTargets = rawTargets
+    .map(normalizeDashboardAccessTarget)
+    .filter(Boolean);
+  renderDashboardTargetSummaries();
+}
+
+function upsertDashboardAccessTarget(target) {
+  const normalized = normalizeDashboardAccessTarget(target);
+  if (!normalized) return;
+  const idx = dashboardAccessTargets.findIndex(t =>
+    t.host_id === normalized.host_id || t.id === normalized.id
+  );
+  if (idx >= 0) dashboardAccessTargets[idx] = normalized;
+  else dashboardAccessTargets.push(normalized);
+}
+
+function removeDashboardAccessTarget(hostId) {
+  const id = String(hostId || '').trim();
+  if (!id) return;
+  dashboardAccessTargets = dashboardAccessTargets.filter(t =>
+    t.local || (t.host_id !== id && t.id !== id)
+  );
+}
+
+function dashboardAccessTargetFromPeerSnapshot(snap) {
+  if (!snap || !snap.id) return null;
+  const connected = snap.connection_state && snap.connection_state.state === 'connected';
+  return {
+    id: snap.id,
+    host_id: snap.id,
+    label: snap.label || snap.id,
+    local: false,
+    source: 'peer-registry',
+    access_domain: 'peer',
+    access_domain_label: 'Peer access',
+    route: 'peer_route',
+    route_label: 'Peer route',
+    auth: 'daemon_mutual_tls',
+    auth_label: 'Daemon mTLS grant',
+    effective_role: 'peer_profile',
+    effective_role_label: 'Peer profile',
+    connected,
+    connection_state: snap.connection_state,
+    operational_status: snap.status,
+    url: snap.browser_tcp_via_url || snap.ws_url || '',
+    ws_url: snap.ws_url || '',
+    browser_tcp_via_url: snap.browser_tcp_via_url || '',
+    capabilities: snap.capabilities || [],
+  };
+}
+
+function dashboardAccessTargetForHost(hostId) {
+  const id = String(hostId || '').trim();
+  if (!id || id === SHELL_HOST_ID || id === selfPeerId) {
+    return dashboardAccessTargets.find(t => t.local) || null;
+  }
+  return dashboardAccessTargets.find(t => t.host_id === id || t.id === id) || null;
+}
+
+async function refreshDashboardTargetsFromApi(options = {}) {
+  try {
+    const resp = await dashboardJsonFetch('api_dashboard_targets', {}, () => authedFetch('/api/dashboard/targets', {
+      cache: 'no-store',
+      signal: options.signal,
+    }), 'api_dashboard_targets', { signal: options.signal });
+    if (!resp.ok) throw new Error(`/api/dashboard/targets returned ${resp.status}`);
+    const payload = await resp.json();
+    applyDashboardAccessTargets(payload);
+    return payload;
+  } catch (err) {
+    if (err?.name === 'AbortError') throw err;
+    if (!options.silent) {
+      console.warn('[dashboard-targets] refresh failed; using derived targets', err);
+    }
+    return null;
+  }
+}
+
 function dashboardTargetIsLocal(hostId) {
   const id = String(hostId || '').trim();
   return !id || id === SHELL_HOST_ID || id === selfPeerId;
@@ -31775,12 +31901,79 @@ function dashboardTargetLabel(hostId) {
   return peer?.label || String(hostId || '').trim();
 }
 
+function dashboardTargetAccessRoute(hostId) {
+  const model = dashboardAccessTargetForHost(hostId);
+  if (dashboardTargetIsLocal(hostId)) {
+    if (dashboardConnectModeEnabled()) {
+      return {
+        domain: 'User access',
+        route: 'Hosted Connect',
+        role: 'Root',
+        detail: 'passkey/account grant to this daemon',
+      };
+    }
+    if (location.protocol === 'https:') {
+      return {
+        domain: 'User access',
+        route: 'Browser mTLS',
+        role: 'Root',
+        detail: 'trusted browser client certificate',
+      };
+    }
+    return {
+      domain: 'User access',
+      route: 'Local/debug',
+      role: 'Root',
+      detail: 'local browser session',
+    };
+  }
+  if (model) {
+    return {
+      domain: model.access_domain_label || 'Peer access',
+      route: model.route_label || 'Peer route',
+      role: model.effective_role_label || 'Peer profile',
+      detail: model.auth_label || 'daemon-to-daemon grant',
+    };
+  }
+  return {
+    domain: 'Peer access',
+    route: 'Peer route',
+    role: 'Peer profile',
+    detail: 'daemon-to-daemon grant',
+  };
+}
+
+function dashboardTargetDescriptor(hostId) {
+  const local = dashboardTargetIsLocal(hostId);
+  const peerId = local ? '' : String(hostId || '').trim();
+  const model = dashboardAccessTargetForHost(peerId);
+  const route = dashboardTargetAccessRoute(peerId);
+  const peer = local ? null : daemons.find(d => d.host_id === peerId) || null;
+  return {
+    targetId: model?.id || (local ? (selfPeerId || SHELL_HOST_ID) : peerId),
+    hostId: peerId,
+    displayName: model?.label || dashboardTargetLabel(peerId),
+    local,
+    peer,
+    accessDomain: route.domain,
+    routeType: route.route,
+    accessRole: route.role,
+    routeDetail: route.detail,
+    model,
+  };
+}
+
 function dashboardProfileLabel(profile) {
   const key = String(profile || '').trim().toLowerCase().replace(/_/g, '-');
   return {
-    'peer-daemon': 'Admin peer',
-    operator: 'Operator',
+    'peer-root': 'Peer root',
+    'peer-daemon': 'Peer root',
+    'admin-peer': 'Peer root',
+    admin: 'Peer root',
+    operator: 'Peer operator',
+    'peer-operator': 'Peer operator',
     'terminal-operator': 'Terminal operator',
+    'peer-terminal-operator': 'Terminal operator',
     terminal: 'Terminal operator',
     shell: 'Terminal operator',
     'session-reader': 'Session reader',
@@ -31858,31 +32051,29 @@ function dashboardTargetFeatureChips(hostId, context = '') {
 }
 
 function dashboardTargetSummary(hostId, context = '') {
-  const local = dashboardTargetIsLocal(hostId);
+  const target = dashboardTargetDescriptor(hostId);
+  const local = target.local;
   if (local) {
     const status = dashboardTransport?.status
       ? dashboardTransport.status()
       : { enabled: dashboardControlTransportEnabled(), connected: false };
     const transport = dashboardTransportStatusSummary(status);
     const connected = !status.enabled || Boolean(status.connected && status.verifiedBinding?.ok);
-    const mode = dashboardConnectModeEnabled()
-      ? 'Hosted Connect'
-      : (!status.enabled ? (location.protocol === 'https:' ? 'Trusted browser access' : 'Local browser access') : 'Local verified access');
     const detail = connected
-      ? `${mode} · full dashboard access`
-      : `${mode} · ${transport.label || 'connecting'}`;
+      ? `${target.accessDomain}: ${target.accessRole} via ${target.routeType}`
+      : `${target.accessDomain}: ${target.routeType} · ${transport.label || 'connecting'}`;
     return {
       state: transport.kind === 'err' ? 'err' : (connected ? 'ok' : 'checking'),
-      name: dashboardTargetLabel(''),
-      kind: 'This daemon',
+      name: target.displayName,
+      kind: target.routeType,
       detail,
       chips: dashboardTargetFeatureChips('', context),
       title: transport.title || detail,
     };
   }
 
-  const peerId = String(hostId || '').trim();
-  const peer = daemons.find(d => d.host_id === peerId);
+  const peerId = target.hostId;
+  const peer = target.peer;
   if (!peer) {
     return {
       state: 'err',
@@ -31900,7 +32091,7 @@ function dashboardTargetSummary(hostId, context = '') {
   const grantKind = status.grant_kind || '';
   const hasExactGrant = Boolean(profile || grantKind);
   const access = hasExactGrant
-    ? `Grant: ${dashboardProfileLabel(profile)}`
+    ? `Peer profile: ${dashboardProfileLabel(profile)}`
     : (online ? 'Approved peer access · connects when needed' : 'Peer offline');
   const via = conn?.canUseRpc?.()
     ? 'direct browser access'
@@ -31908,8 +32099,8 @@ function dashboardTargetSummary(hostId, context = '') {
   return {
     state: online ? (conn?.canUseRpc?.() ? 'ok' : 'checking') : 'err',
     name: dashboardTargetLabel(peerId),
-    kind: 'Peer daemon',
-    detail: `${access} · ${via}`,
+    kind: target.routeType,
+    detail: `${target.accessDomain}: ${access} · ${via}`,
     chips: dashboardTargetFeatureChips(peerId, context),
     title: online
       ? `${access}. ${peer.url || peer.ws_url || ''}`.trim()
@@ -32040,18 +32231,60 @@ function accessRenderCards(containerId, cards) {
   for (const card of cards) el.appendChild(accessCreateCard(card));
 }
 
+function dashboardPeerAccessTargets() {
+  const modeled = dashboardAccessTargets.filter(t => !t.local);
+  if (modeled.length) return modeled;
+  return daemons.map(peer => ({
+    id: peer.host_id || peer.id || '',
+    host_id: peer.host_id || peer.id || '',
+    label: peer.label || peer.host_id || peer.id || '',
+    local: false,
+    access_domain_label: 'Peer access',
+    route_label: 'Peer route',
+    effective_role_label: 'Peer profile',
+    connected: peer.connected !== false,
+    url: peer.url || peer.ws_url || '',
+  })).filter(t => t.host_id);
+}
+
+function syncDashboardAccessTargetsFromDaemons() {
+  const localTargets = dashboardAccessTargets.filter(t => t.local);
+  const peerTargets = daemons
+    .map(peer => normalizeDashboardAccessTarget({
+      id: peer.host_id || peer.id || '',
+      host_id: peer.host_id || peer.id || '',
+      label: peer.label || peer.host_id || peer.id || '',
+      local: false,
+      source: 'peer-registry',
+      access_domain: 'peer',
+      access_domain_label: 'Peer access',
+      route: 'peer_route',
+      route_label: 'Peer route',
+      auth: 'daemon_mutual_tls',
+      auth_label: 'Daemon mTLS grant',
+      effective_role: 'peer_profile',
+      effective_role_label: 'Peer profile',
+      connected: peer.connected !== false,
+      url: peer.browser_tcp_via_url || peer.url || peer.ws_url || '',
+      ws_url: peer.ws_url || '',
+      browser_tcp_via_url: peer.browser_tcp_via_url || '',
+      capabilities: peer.capabilities || [],
+    }))
+    .filter(Boolean);
+  dashboardAccessTargets = [...localTargets, ...peerTargets];
+  renderDashboardTargetSummaries();
+}
+
 function accessTargetCards() {
   const selfSummary = dashboardTargetSummary('', 'files');
   const status = dashboardTransport?.status
     ? dashboardTransport.status()
     : { enabled: dashboardControlTransportEnabled(), connected: false };
-  const selfRoute = dashboardConnectModeEnabled()
-    ? 'Connect'
-    : (location.protocol === 'https:' ? 'mTLS/local' : 'Local');
+  const selfTarget = dashboardTargetDescriptor('');
   const cards = [{
-    title: selfSummary.name || selfHostLabel || 'This daemon',
-    kind: selfRoute,
-    detail: selfSummary.detail || 'Owner dashboard access',
+    title: selfTarget.displayName || selfSummary.name || selfHostLabel || 'This daemon',
+    kind: `${selfTarget.accessDomain}: ${selfTarget.routeType}`,
+    detail: selfSummary.detail || `${selfTarget.accessRole} dashboard access`,
     actions: [
       { label: 'Stats', onClick: () => accessOpenStats('') },
       { label: 'Files', onClick: () => accessOpenFiles('') },
@@ -32059,16 +32292,21 @@ function accessTargetCards() {
     ],
   }];
 
-  for (const peer of daemons) {
-    const peerId = peer.host_id || '';
+  for (const target of dashboardPeerAccessTargets()) {
+    const peerId = target.host_id || target.id || '';
+    const peer = daemons.find(d => d.host_id === peerId) || {};
     const summary = dashboardTargetSummary(peerId, 'files');
     const conn = peerDashboardControlConnectionsByHost.get(peerId);
-    const profile = conn?.lastStatus?.grant_profile || '';
-    const role = profile ? dashboardProfileLabel(profile) : 'Peer relationship';
+    const profile = conn?.lastStatus?.grant_profile || target.profile || '';
+    const role = profile
+      ? dashboardProfileLabel(profile)
+      : (target.effective_role_label || 'Peer profile');
+    const route = target.route_label || summary.kind || 'Peer route';
+    const online = peer.connected === false || target.connected === false ? false : true;
     cards.push({
-      title: summary.name || peer.label || peerId,
-      kind: peer.connected === false ? 'Offline peer' : 'Peer',
-      detail: `${role} - ${summary.detail || peer.url || peerId}`,
+      title: summary.name || target.label || peer.label || peerId,
+      kind: online ? route : `${route} offline`,
+      detail: `${role} - ${summary.detail || target.url || peer.url || peerId}`,
       actions: [
         { label: 'Stats', onClick: () => accessOpenStats(peerId) },
         { label: 'Files', onClick: () => accessOpenFiles(peerId) },
@@ -32088,28 +32326,28 @@ function accessGrantCards() {
     ? 'Connect owner session'
     : (location.protocol === 'https:' ? 'Trusted browser certificate' : 'Local dashboard session');
   const cards = [{
-    title: 'Current browser',
-    kind: 'Owner',
-    detail: `${transportLabel} has full dashboard access to this daemon.`,
+    title: 'Current browser access',
+    kind: 'Root',
+    detail: `${transportLabel} gives this browser root dashboard access to this daemon. This is user/client access, not peer federation.`,
     actions: [{ label: 'Diagnostics', onClick: () => routeTo('access', 'diagnostics') }],
   }];
 
   const inboundCards = Array.from(document.querySelectorAll('#daemon-peer-identities-list .daemon-identity-card'));
   const approved = inboundCards.filter(card => card.classList.contains('approved')).length;
   cards.push({
-    title: 'Inbound peer grants',
+    title: 'Inbound peer access',
     kind: approved > 0 ? `${approved} approved` : 'None',
     detail: approved > 0
-      ? `${approved} peer identity grant${approved === 1 ? '' : 's'} can access this daemon.`
+      ? `${approved} daemon-to-daemon mTLS grant${approved === 1 ? '' : 's'} can access this daemon with peer profiles.`
       : 'No peer identities currently have approved inbound access.',
     actions: [{ label: 'Manage', primary: true, onClick: () => routeTo('access', 'grants') }],
   });
 
   cards.push({
-    title: 'Outbound peer targets',
+    title: 'Outbound peer routes',
     kind: daemons.length ? `${daemons.length} target${daemons.length === 1 ? '' : 's'}` : 'None',
     detail: daemons.length
-      ? 'This daemon can open direct browser channels to configured peer targets when grants allow it.'
+      ? 'This daemon can reach configured peer targets through daemon-to-daemon grants; this is separate from browser root access.'
       : 'No peer targets are configured yet.',
     actions: [{ label: 'Add', onClick: () => routeTo('access', 'invitations') }],
   });
@@ -40959,16 +41197,18 @@ async function hydrateDashboardFromControl() {
   if (!dashboardTransport?.canUseRpc?.()) {
     throw new Error('dashboard Connect transport is not connected');
   }
-  const [status, config, card] = await Promise.all([
+  const [status, config, card, targets] = await Promise.all([
     dashboardTransport.request('status', {}, { timeoutMs: 15000 }).catch(() => null),
     dashboardTransport.request('config', {}, { timeoutMs: 15000 }).catch(() => ({})),
     dashboardTransport.request('api_agent_card', {}, { timeoutMs: 15000 }).catch(() => null),
+    dashboardTransport.request('api_dashboard_targets', {}, { timeoutMs: 15000 }).catch(() => null),
   ]);
   if (status && typeof status === 'object' && dashboardControlTransport) {
     dashboardControlTransport.lastStatus = status;
   }
   applyGatewayConfig(config || {});
   applyAgentCardIdentity(card);
+  if (targets) applyDashboardAccessTargets(targets);
   const bootstrap = await dashboardTransport.request('api_dashboard_bootstrap', {}, {
     timeoutMs: 60000,
   }).catch(err => {
@@ -42457,6 +42697,9 @@ class DashboardControlTransport {
         console.info('[dashboard-control] agent card RPC ok', card.id || '');
       }
     }).catch(err => console.warn('[dashboard-control] agent card RPC failed', err));
+    this.request('api_dashboard_targets').then(targets => {
+      if (targets) applyDashboardAccessTargets(targets);
+    }).catch(err => console.warn('[dashboard-control] dashboard targets RPC failed', err));
     this.request('subscribe_events').then(result => {
       if (result?.subscribed) {
         dashboardControlEventsActive = true;
@@ -44620,6 +44863,7 @@ function upsertDaemonFromSnapshot(snap) {
   } else {
     daemons.push(entry);
   }
+  upsertDashboardAccessTarget(dashboardAccessTargetFromPeerSnapshot(snap));
   renderDaemonsList();
 }
 
@@ -44632,6 +44876,7 @@ function updateDaemonSnapshot(snap) {
   const idx = daemons.findIndex(d => d.host_id === snap.id);
   if (idx < 0) return;
   daemons[idx] = snapshotToDaemonEntry(snap);
+  upsertDashboardAccessTarget(dashboardAccessTargetFromPeerSnapshot(snap));
   renderDaemonsList();
 }
 
@@ -44641,8 +44886,12 @@ function updateDaemonSnapshot(snap) {
 function removeDaemonById(id) {
   if (!id) return;
   const idx = daemons.findIndex(d => d.host_id === id);
-  if (idx < 0) return;
+  if (idx < 0) {
+    removeDashboardAccessTarget(id);
+    return;
+  }
   daemons.splice(idx, 1);
+  removeDashboardAccessTarget(id);
   // Drop the expanded-state record so it doesn't get reapplied
   // against a row that no longer exists. Same for any pending
   // approvals — once the peer is gone there's nothing to resolve.
@@ -44686,6 +44935,12 @@ async function refreshPeersFromApi() {
     // per-peer events come through the primary /ws push pipeline.
     daemons = newDaemons;
     renderDaemonsList();
+    if (data.targets) {
+      applyDashboardAccessTargets(data);
+    } else {
+      const targets = await refreshDashboardTargetsFromApi({ silent: true });
+      if (!targets) syncDashboardAccessTargetsFromDaemons();
+    }
   } catch (e) {
     // Silently ignore fetch failures — the dashboard still works
     // from whatever state daemons was in before. Access targets
@@ -48459,9 +48714,9 @@ function setDaemonPairingStatus(id, msg, kind) {
 
 const PEER_PROFILE_OPTIONS = [
   {
-    profile: 'operator',
-    label: 'Operator',
-    summary: 'Display input, messages, tasks, and approvals.',
+    profile: 'peer-operator',
+    label: 'Peer operator',
+    summary: 'Daemon-to-daemon display input, messages, tasks, and approvals. No settings or runtime control.',
   },
   {
     profile: 'read-only-display',
@@ -48489,9 +48744,9 @@ const PEER_PROFILE_OPTIONS = [
     summary: 'Basic presence only.',
   },
   {
-    profile: 'peer-daemon',
-    label: 'Admin peer',
-    summary: 'All peer operations, including settings, sessions, and runtime control.',
+    profile: 'peer-root',
+    label: 'Peer root',
+    summary: 'All daemon-to-daemon peer operations, including settings, sessions, files, shell, and runtime control.',
   },
 ];
 
@@ -48502,8 +48757,10 @@ function peerProfileMeta(profile) {
     'stats-only': 'stats',
     'display-read-only': 'read-only-display',
     spectator: 'shared-session-spectator',
-    admin: 'peer-daemon',
-    'admin-peer': 'peer-daemon',
+    operator: 'peer-operator',
+    admin: 'peer-root',
+    'admin-peer': 'peer-root',
+    'peer-daemon': 'peer-root',
   };
   const canonical = aliases[value] || value;
   return PEER_PROFILE_OPTIONS.find(item => item.profile === canonical) || {
@@ -48514,7 +48771,7 @@ function peerProfileMeta(profile) {
 }
 
 function renderPeerProfileOptions(selected) {
-  const value = String(selected || 'operator').toLowerCase();
+  const value = String(selected || 'peer-operator').toLowerCase();
   const selectedMeta = peerProfileMeta(value);
   return PEER_PROFILE_OPTIONS.map(({ profile, label, summary }) => (
     `<option value="${escapeHtml(profile)}" ${profile === selectedMeta.profile ? 'selected' : ''} title="${escapeHtml(summary)}">${escapeHtml(label)}</option>`
@@ -48774,13 +49031,13 @@ function renderPeerAccessRequests(requests) {
     const label = escapeHtml(req.requester_label || 'Unnamed daemon');
     const code = escapeHtml(req.code || '');
     const status = String(req.status || 'unknown').toLowerCase();
-    const role = peerProfileMeta(req.approved_profile || req.requested_profile || 'peer-daemon');
+    const role = peerProfileMeta(req.approved_profile || req.requested_profile || 'peer-operator');
     const source = req.source_hint ? `Source ${escapeHtml(req.source_hint)}` : '';
     const expires = req.expires_at_unix ? `Expires ${escapeHtml(accessRequestTimeLabel(req.expires_at_unix))}` : '';
     const timing = [source, expires].filter(Boolean).join(' - ');
     const pending = status === 'pending';
-    const requestedProfile = req.approved_profile || req.requested_profile || 'operator';
-    const roleLabel = req.approved_profile ? 'Approved role' : 'Requested role';
+    const requestedProfile = req.approved_profile || req.requested_profile || 'peer-operator';
+    const roleLabel = req.approved_profile ? 'Approved peer profile' : 'Requested peer profile';
     return `
       <div class="daemon-access-request-card">
         <div class="daemon-access-request-head">
@@ -48885,7 +49142,7 @@ function renderPeerIdentities(identities) {
           <span>${label}</span>
           <span class="daemon-identity-status ${escapeHtml(status)}">${escapeHtml(status)}</span>
         </div>
-        <div class="daemon-identity-role" title="Profile ${escapeHtml(identity.profile || 'presence-only')}">Role ${escapeHtml(role.label)}</div>
+        <div class="daemon-identity-role" title="Peer profile ${escapeHtml(identity.profile || 'presence-only')}">Peer profile ${escapeHtml(role.label)}</div>
         <div class="daemon-identity-profile">${escapeHtml(role.summary)}${request ? ` - ${request}` : ''}</div>
         ${card ? `<div class="daemon-identity-profile">${card}</div>` : ''}
         <div class="daemon-identity-fingerprint" title="${escapeHtml(fingerprint)}">${escapeHtml(fingerprint)}</div>

@@ -361,6 +361,12 @@ Useful flags: `--port <N>` (native dashboard HTTPS port to advertise, default
 `--no-serve-certs`. Removed LAN/proxy flags are rejected; certificate setup no
 longer configures an upstream proxy.
 
+`--name` is the daemon display label used by the Agent Card and dashboard
+targets. If omitted, setup now uses the system hostname when available and falls
+back to the primary IP only as a last resort. Existing IP-based labels continue
+to work, but the dashboard prefers a human label or hostname over a stale IP
+when both are present.
+
 Client certificate enrollment is deliberately strict. The temporary enrollment
 server is HTTPS, using the same access server certificate as the dashboard. Before
 the CLI reveals the one-time enrollment secret, the operator must copy the

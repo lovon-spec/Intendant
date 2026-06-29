@@ -287,7 +287,7 @@ fn print_help() {
     println!("    --port <N>           Port for the default Agent Card URL (default 8765)");
     println!("    --label <NAME>       Display label for this peer in the joining daemon");
     println!("    --client-name <NAME> Common name hint for the issued client certificate");
-    println!("    --profile <NAME>     Requested or approved access profile (default peer-daemon)");
+    println!("    --profile <NAME>     Requested or approved peer profile (default peer-operator; use peer-root for full peer access)");
     println!("    --requester-card-url <URL>  Optional Agent Card URL for the requesting daemon");
     println!();
     println!("NOTES:");
@@ -391,7 +391,7 @@ fn cmd_requests() -> Result<(), CallerError> {
             request
                 .requested_profile
                 .as_deref()
-                .unwrap_or("peer-daemon"),
+                .unwrap_or(crate::peer::access_policy::DEFAULT_PROFILE),
             request.expires_at_unix
         );
     }
@@ -411,7 +411,10 @@ fn cmd_approve(args: PeerArgs) -> Result<(), CallerError> {
     );
     println!(
         ":: approved profile: {}",
-        request.approved_profile.as_deref().unwrap_or("peer-daemon")
+        request
+            .approved_profile
+            .as_deref()
+            .unwrap_or(crate::peer::access_policy::DEFAULT_PROFILE)
     );
     Ok(())
 }

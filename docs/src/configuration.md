@@ -575,6 +575,11 @@ mTLS daemons, configure `client_cert` / `client_key` with a client identity
 issued by the peer's access CA. The installed local access client cert fallback
 is only sufficient when the peer trusts the same issuing CA.
 
+These entries describe daemon-to-daemon peer routes. They do not grant browser
+or Connect user access by themselves. Peer profiles use names such as
+`peer-operator` and `peer-root`; older `operator`, `admin-peer`, and
+`peer-daemon` values are still accepted as aliases.
+
 ### `mcp_servers`
 
 External MCP servers to connect to as a client (see

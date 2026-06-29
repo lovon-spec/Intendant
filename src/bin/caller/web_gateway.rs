@@ -17078,6 +17078,7 @@ pub fn spawn_web_gateway(
     let agent_card_json = serde_json::to_string(&agent_card).unwrap_or_else(|_| "{}".to_string());
     let agent_card_value =
         serde_json::to_value(&agent_card).unwrap_or_else(|_| serde_json::json!({}));
+    let agent_card_value_for_targets = agent_card_value.clone();
     let bootstrap_caches = crate::dashboard_control::DashboardBootstrapCaches::default();
 
     // Pre-build ICE config for WebRTC display sessions from the gateway config.
@@ -17644,6 +17645,7 @@ pub fn spawn_web_gateway(
             let broadcast_tx = broadcast_tx.clone();
             let config_json = config_json.clone();
             let agent_card_json = agent_card_json.clone();
+            let agent_card_value_for_targets = agent_card_value_for_targets.clone();
             let peer_access_request_config = peer_access_request_config.clone();
             let peer_registry = peer_registry.clone();
             let dashboard_control = Arc::clone(&dashboard_control);
@@ -22466,6 +22468,14 @@ pub fn spawn_web_gateway(
                             };
                         let response = json_response(status_reason(status), body);
                         let _ = stream.write_all(response.as_bytes()).await;
+                    } else if request_line.contains(" /api/dashboard/targets") {
+                        use tokio::io::AsyncWriteExt;
+                        let body = dashboard_targets_response_body(
+                            &agent_card_value_for_targets,
+                            peer_registry.as_ref(),
+                        );
+                        let response = json_response("200 OK", body);
+                        let _ = stream.write_all(response.as_bytes()).await;
                     } else if request_line.contains(" /api/peers") {
                         // Peer registry endpoints. Dispatch:
                         //   GET    /api/peers                  → list
@@ -23306,6 +23316,106 @@ pub(crate) fn peers_list_response_body(registry: &crate::peer::PeerRegistry) -> 
     let peers: Vec<crate::peer::PeerSnapshot> = handles.iter().map(|h| h.snapshot()).collect();
     serde_json::to_string(&PeerListResponse { peers })
         .unwrap_or_else(|_| "{\"peers\":[]}".to_string())
+}
+
+/// Build the canonical dashboard target list.
+///
+/// A dashboard target is a daemon the browser can select for operator
+/// workflows. This deliberately separates the product-level target from the
+/// underlying security domain:
+///
+/// - the local daemon is user/client dashboard access and carries root
+///   operator authority for the current browser session;
+/// - registry entries are daemon-to-daemon peer routes and carry peer-profile
+///   authority, refined by the peer dashboard-control handshake when opened.
+pub(crate) fn dashboard_targets_response_value(
+    agent_card: &serde_json::Value,
+    registry: Option<&crate::peer::PeerRegistry>,
+) -> serde_json::Value {
+    let local_id = agent_card
+        .get("id")
+        .and_then(|v| v.as_str())
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or("local");
+    let local_label = agent_card
+        .get("label")
+        .and_then(|v| v.as_str())
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or("This daemon");
+    let local_capabilities = agent_card
+        .get("capabilities")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    let mut targets = vec![serde_json::json!({
+        "id": local_id,
+        "host_id": local_id,
+        "label": local_label,
+        "local": true,
+        "source": "agent-card",
+        "access_domain": "user_client",
+        "access_domain_label": "User/client access",
+        "route": "current_dashboard",
+        "route_label": "Current dashboard",
+        "auth": "trusted_dashboard",
+        "auth_label": "Trusted dashboard session",
+        "effective_role": "root",
+        "effective_role_label": "Root",
+        "connected": true,
+        "connection_state": { "state": "connected" },
+        "capabilities": local_capabilities,
+    })];
+
+    if let Some(registry) = registry {
+        for handle in registry.list() {
+            let snapshot = handle.snapshot();
+            let connected = matches!(
+                snapshot.connection_state,
+                crate::peer::ConnectionState::Connected
+            );
+            let id = snapshot.id.clone();
+            let url = snapshot
+                .browser_tcp_via_url
+                .clone()
+                .or_else(|| snapshot.ws_url.clone());
+            targets.push(serde_json::json!({
+                "id": id,
+                "host_id": snapshot.id,
+                "label": snapshot.label,
+                "local": false,
+                "source": "peer-registry",
+                "access_domain": "peer",
+                "access_domain_label": "Peer access",
+                "route": "peer_route",
+                "route_label": "Peer route",
+                "auth": "daemon_mutual_tls",
+                "auth_label": "Daemon mTLS grant",
+                "effective_role": "peer_profile",
+                "effective_role_label": "Peer profile",
+                "profile": serde_json::Value::Null,
+                "connected": connected,
+                "connection_state": snapshot.connection_state,
+                "operational_status": snapshot.status,
+                "url": url,
+                "ws_url": snapshot.ws_url,
+                "browser_tcp_via_url": snapshot.browser_tcp_via_url,
+                "capabilities": snapshot.capabilities,
+            }));
+        }
+    }
+
+    serde_json::json!({
+        "schema_version": 1,
+        "targets": targets,
+    })
+}
+
+pub(crate) fn dashboard_targets_response_body(
+    agent_card: &serde_json::Value,
+    registry: Option<&crate::peer::PeerRegistry>,
+) -> String {
+    dashboard_targets_response_value(agent_card, registry).to_string()
 }
 
 /// Handle a `POST /api/peers` body: parse, call `PeerRegistry::add_peer`,
@@ -35317,6 +35427,40 @@ mod tests {
     /// because the /api/peers tests all make a handful of these.
     async fn http_request(port: u16, request: &str) -> String {
         String::from_utf8_lossy(&http_request_bytes(port, request).await).into_owned()
+    }
+
+    #[tokio::test]
+    async fn test_api_dashboard_targets_lists_local_root_target() {
+        let (port, handle) = spawn_test_gateway_with_registry(None).await;
+        let resp = http_request(
+            port,
+            "GET /api/dashboard/targets HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        )
+        .await;
+        let (head, body) = resp
+            .split_once("\r\n\r\n")
+            .expect("HTTP response has header/body split");
+        assert!(
+            head.starts_with("HTTP/1.1 200 OK\r\n"),
+            "dashboard targets should return 200: {head}"
+        );
+        assert!(
+            head.contains("Content-Type: application/json"),
+            "dashboard targets should return JSON: {head}"
+        );
+
+        let payload: serde_json::Value =
+            serde_json::from_str(body).expect("dashboard targets body is JSON");
+        let targets = payload["targets"].as_array().expect("targets array");
+        assert_eq!(targets.len(), 1, "test gateway has only the local target");
+        let local = &targets[0];
+        assert_eq!(local["local"], true);
+        assert_eq!(local["access_domain"], "user_client");
+        assert_eq!(local["route"], "current_dashboard");
+        assert_eq!(local["effective_role"], "root");
+        assert_eq!(local["connected"], true);
+
+        handle.abort();
     }
 
     /// End-to-end exercise of the static-asset arms through a real

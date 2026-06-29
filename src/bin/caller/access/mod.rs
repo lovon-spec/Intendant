@@ -9,7 +9,7 @@
 //! p12-keystore), client cert distribution, and import instructions.
 //! Platform differences are isolated behind the `AccessBackend` trait.
 
-use std::fmt;
+use std::{fmt, net::IpAddr, path::PathBuf};
 
 pub mod backend;
 // `certs` is pure-Rust (rcgen + p12-keystore) and compiles on every
@@ -25,12 +25,13 @@ pub mod state;
 #[cfg(not(target_os = "windows"))]
 pub mod wizard;
 
-/// Resolve the multi-host `HostId` for this machine.
+/// Resolve the display label for this daemon.
 ///
-/// Checks the platform cert dir's `host_label` file first (written by
-/// `intendant access setup --name …`), then falls back to the system
-/// hostname. Returns `"local"` only if both fail, so the dashboard
-/// always has *some* label to display.
+/// The access cert store can outlive IP changes. Older setups also defaulted
+/// `host_label` to the primary IP address, which made browser/client access
+/// labels look like transport coordinates instead of daemon identity. Prefer a
+/// human-readable stored label, then the system hostname, and use an IP address
+/// only as the last real fallback.
 ///
 /// Callable from `intendant --web` without running any `access` action,
 /// because the backend's `cert_dir()` is a pure path accessor with no
@@ -38,18 +39,8 @@ pub mod wizard;
 pub fn resolve_host_label() -> String {
     let be = backend::select_backend();
     let cert_dir = be.cert_dir();
-    if let Ok(label) = state::read_host_label(&cert_dir) {
-        if !label.is_empty() {
-            return label;
-        }
-    }
-    // Fallback: system hostname (gethostname, not HOSTNAME env).
-    if let Ok(h) = hostname() {
-        if !h.is_empty() {
-            return h;
-        }
-    }
-    "local".to_string()
+    let candidates = host_label_candidates(&cert_dir);
+    choose_host_label(candidates, hostname().ok().as_deref())
 }
 
 /// Read the system hostname via the POSIX `gethostname` call.
@@ -57,6 +48,63 @@ fn hostname() -> Result<String, std::io::Error> {
     let output = std::process::Command::new("hostname").output()?;
     let s = String::from_utf8_lossy(&output.stdout).trim().to_string();
     Ok(s)
+}
+
+fn host_label_candidates(primary_cert_dir: &std::path::Path) -> Vec<String> {
+    let mut paths = vec![primary_cert_dir.to_path_buf()];
+    if let Some(data_dir) = dirs::data_dir() {
+        paths.push(data_dir.join("intendant").join("access-certs"));
+    }
+    if let Some(home) = dirs::home_dir() {
+        paths.push(home.join(".intendant").join("access-certs"));
+    }
+
+    let mut out = Vec::new();
+    for path in dedup_paths(paths) {
+        if let Ok(label) = state::read_host_label(&path) {
+            out.push(label);
+        }
+    }
+    out
+}
+
+fn dedup_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for path in paths {
+        if !out.iter().any(|existing| existing == &path) {
+            out.push(path);
+        }
+    }
+    out
+}
+
+fn choose_host_label(candidates: Vec<String>, system_hostname: Option<&str>) -> String {
+    let cleaned: Vec<String> = candidates
+        .into_iter()
+        .map(|label| label.trim().to_string())
+        .filter(|label| !label.is_empty())
+        .collect();
+
+    if let Some(label) = cleaned.iter().find(|label| !is_ip_label(label)) {
+        return label.clone();
+    }
+
+    let hostname = system_hostname.unwrap_or("").trim();
+    if !hostname.is_empty() && !is_ip_label(hostname) {
+        return hostname.to_string();
+    }
+
+    if let Some(label) = cleaned.first() {
+        return label.clone();
+    }
+    if !hostname.is_empty() {
+        return hostname.to_string();
+    }
+    "local".to_string()
+}
+
+fn is_ip_label(label: &str) -> bool {
+    label.parse::<IpAddr>().is_ok()
 }
 
 /// Enumerate the local machine's routable IP addresses (one entry per
@@ -383,10 +431,13 @@ async fn cmd_setup(args: AccessArgs) -> AccessResult<()> {
     let cert_dir = be.cert_dir();
     std::fs::create_dir_all(&cert_dir)?;
 
-    let label = args
-        .name
-        .clone()
-        .unwrap_or_else(|| server_names.primary_ip.to_string());
+    let label = args.name.clone().unwrap_or_else(|| {
+        hostname()
+            .ok()
+            .map(|host| host.trim().to_string())
+            .filter(|host| !host.is_empty() && !is_ip_label(host))
+            .unwrap_or_else(|| server_names.primary_ip.to_string())
+    });
 
     print_public_ip_warnings(&server_names);
 
@@ -613,6 +664,21 @@ mod tests {
                 "0.0.0.0 / :: are not real bind targets: {addrs:?}"
             );
         }
+    }
+
+    #[test]
+    fn host_label_prefers_human_label_over_ip_label() {
+        let label = choose_host_label(
+            vec!["192.168.64.61".into(), "vortex-deb-x11-intendant".into()],
+            Some("fallback-host"),
+        );
+        assert_eq!(label, "vortex-deb-x11-intendant");
+    }
+
+    #[test]
+    fn host_label_uses_hostname_before_stale_ip_label() {
+        let label = choose_host_label(vec!["192.168.64.61".into()], Some("vortex-deb-x11"));
+        assert_eq!(label, "vortex-deb-x11");
     }
 
     // Windows-specific: the GetAdaptersAddresses-backed enumeration must
