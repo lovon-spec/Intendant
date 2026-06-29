@@ -19900,11 +19900,14 @@ function processCommands(cmds) {
         maybeFailNewSessionSpawnFromLog(c);
         stationPushLogEvent(c);
         renderLogEntry(c);
+        applyThreadHistoryChangeSet(c);
         stationScheduleUpdate();
         break;
       case 'mark_activity_context_rewind':
         flushLogReplayAppendBatch();
-        markActivityContextRewind(c.session_id, c.user_turn_index, c.turns_removed);
+        if (!applyThreadHistoryChangeSet(c)) {
+          markActivityContextRewind(c.session_id, c.user_turn_index, c.turns_removed);
+        }
         break;
       case 'user_message_edit_status':
         handleUserMessageEditStatus(c);
@@ -21897,7 +21900,9 @@ function handleUserMessageRewind(evt = {}) {
   const turn = Number(evt.user_turn_index ?? evt.userTurnIndex ?? 0);
   const turnsRemoved = Number(evt.turns_removed ?? evt.turnsRemoved ?? 0);
   if (sid && Number.isInteger(turn) && turn > 0) {
-    markActivityContextRewind(sid, turn, turnsRemoved);
+    if (!applyThreadHistoryChangeSet(evt)) {
+      markActivityContextRewind(sid, turn, turnsRemoved);
+    }
     stationUpsertUserMessageEditActivity(
       sid,
       turn,
@@ -25519,6 +25524,18 @@ function sessionWindowRecordFromReplayEntry(entry = {}, fallbackSessionId = '') 
     ...entry,
     session_id: sessionId,
     ts: entry.ts || entry.timestamp || '',
+    ts_ms: entry.ts_ms ?? entry.tsMs,
+    event_id: entry.event_id || entry.eventId || '',
+    delivery: entry.delivery || entry.delivery_class || entry.deliveryClass || '',
+    turn_id: entry.turn_id || entry.turnId || '',
+    item_type: entry.item_type || entry.itemType || '',
+    command_item_id: entry.command_item_id || entry.commandItemId || '',
+    thread_item: entry.thread_item || entry.threadItem || null,
+    thread_history_change: entry.thread_history_change || entry.threadHistoryChange || null,
+    changed_items: entry.changed_items || entry.changedItems || [],
+    changed_turns: entry.changed_turns || entry.changedTurns || [],
+    removed_turn_ids: entry.removed_turn_ids || entry.removedTurnIds || [],
+    command_execution: entry.command_execution || entry.commandExecution || null,
     user_turn_index: entry.user_turn_index ?? entry.userTurnIndex,
     user_turn_revision: entry.user_turn_revision ?? entry.userTurnRevision,
     replacement_for_user_turn_index: entry.replacement_for_user_turn_index ?? entry.replacementForUserTurnIndex,
@@ -25689,17 +25706,26 @@ function sessionWindowTranscriptSignatureParts(record = {}, fallbackSessionId = 
   const sessionId = String(record.session_id || record.sessionId || fallbackSessionId || '').trim();
   const contentAliases = sessionWindowTranscriptContentAliasesForRecord(record);
   const content = contentAliases[0] || '';
+  const eventId = String(record.event_id || record.eventId || '').trim();
   const itemId = String(record.item_id || record.itemId || '').trim();
   const outputId = String(record.output_id || record.outputId || '').trim();
-  if (!sessionId || (!content && !itemId && !outputId)) return null;
+  const commandItemId = String(record.command_item_id || record.commandItemId || record.command_execution?.id || record.commandExecution?.id || '').trim();
+  const turnId = String(record.turn_id || record.turnId || '').trim();
+  const itemType = String(record.item_type || record.itemType || record.thread_item?.type || record.threadItem?.type || '').trim().toLowerCase();
+  if (!sessionId || (!content && !eventId && !itemId && !outputId && !commandItemId)) return null;
   return {
     sessionId,
     ts: String(record.ts || record.timestamp || '').trim(),
+    tsMs: record.ts_ms ?? record.tsMs,
     level: String(record.level || '').trim().toLowerCase(),
     source: String(record.source || '').trim().toLowerCase(),
     kind: String(record.kind || '').trim().toLowerCase(),
+    eventId,
     itemId,
     outputId,
+    commandItemId,
+    turnId,
+    itemType,
     userTurnIndex: record.user_turn_index ?? record.userTurnIndex ?? '',
     userTurnRevision: record.user_turn_revision ?? record.userTurnRevision ?? '',
     replacementTurnIndex: record.replacement_for_user_turn_index ?? record.replacementForUserTurnIndex ?? '',
@@ -25711,8 +25737,13 @@ function sessionWindowTranscriptSignatureParts(record = {}, fallbackSessionId = 
 function sessionWindowTranscriptSignaturesFromParts(parts, options = {}) {
   if (!parts) return [];
   const signatures = [];
+  if (parts.eventId) signatures.push(['event', parts.sessionId, parts.eventId].join('\u001f'));
+  if (parts.commandItemId) signatures.push(['command-item', parts.sessionId, parts.commandItemId].join('\u001f'));
   if (parts.itemId) signatures.push(['item', parts.sessionId, parts.itemId].join('\u001f'));
   if (parts.outputId) signatures.push(['output', parts.sessionId, parts.kind, parts.outputId].join('\u001f'));
+  if (parts.turnId && parts.itemType && parts.itemId) {
+    signatures.push(['thread-item', parts.sessionId, parts.turnId, parts.itemType, parts.itemId].join('\u001f'));
+  }
   const hasUserTurn = String(parts.userTurnIndex || '').trim() !== '';
   const isUserMessage = parts.source === 'user' || parts.level === 'user';
   const canUseTextSignature = parts.level === 'model' ||
@@ -25737,6 +25768,9 @@ function sessionWindowTranscriptSignaturesFromParts(parts, options = {}) {
       signatures.push(['text', ...textParts].join('\u001f'));
     }
     if (parts.ts) signatures.push(['exact', parts.ts, ...textParts].join('\u001f'));
+    if (parts.tsMs !== undefined && parts.tsMs !== null && parts.tsMs !== '') {
+      signatures.push(['exact-ms', String(parts.tsMs), ...textParts].join('\u001f'));
+    }
     if (isUserMessage && options.includeUserNearTime) {
       const timeBucket = sessionWindowTranscriptTimeBucket(parts.ts);
       if (timeBucket) {
@@ -25786,11 +25820,16 @@ function sessionWindowTranscriptSignaturesForNode(node, fallbackSessionId = '') 
   const parts = sessionWindowTranscriptSignatureParts({
     session_id: node.dataset?.sessionId || fallbackSessionId,
     ts: node.querySelector?.('.log-ts')?.title || node.querySelector?.('.log-ts')?.textContent || '',
+    ts_ms: node.dataset?.tsMs || '',
     level: node.dataset?.level || '',
     source: node.querySelector?.('.log-level')?.textContent || '',
     kind: node.dataset?.kind || '',
+    event_id: node.dataset?.eventId || '',
     item_id: node.dataset?.itemId || '',
     output_id: node.dataset?.outputId || '',
+    command_item_id: node.dataset?.commandItemId || '',
+    turn_id: node.dataset?.turnId || '',
+    item_type: node.dataset?.itemType || '',
     user_turn_index: node.dataset?.userTurnIndex,
     user_turn_revision: node.dataset?.userTurnRevision,
     replacement_for_user_turn_index: node.dataset?.replacementForUserTurnIndex,
@@ -25817,8 +25856,13 @@ function findSessionWindowHistoryIndexBySignatures(history, signatures, fallback
 }
 
 function sessionWindowTranscriptTimestampMs(value) {
+  if (typeof value === 'number' && Number.isFinite(value)) return value;
   const raw = String(value || '').trim();
   if (!raw) return null;
+  if (/^\d+$/.test(raw)) {
+    const numeric = Number(raw);
+    if (Number.isFinite(numeric) && numeric > 0) return numeric;
+  }
   const parenthetical = raw.match(/\(([^()]+)\)\s*$/);
   if (parenthetical) {
     const parsed = Date.parse(parenthetical[1]);
@@ -25845,11 +25889,12 @@ function sessionWindowTranscriptTimestampMs(value) {
 function sessionWindowTranscriptTimestampForHistoryItem(item) {
   const node = sessionWindowHistoryNode(item);
   if (node) {
+    if (node.dataset?.tsMs) return sessionWindowTranscriptTimestampMs(node.dataset.tsMs);
     const ts = node.querySelector?.('.log-ts');
     return sessionWindowTranscriptTimestampMs(ts?.title || ts?.textContent || '');
   }
   const record = sessionWindowHistoryRecord(item);
-  return sessionWindowTranscriptTimestampMs(record?.ts || record?.timestamp || '');
+  return sessionWindowTranscriptTimestampMs(record?.ts_ms ?? record?.tsMs ?? record?.ts ?? record?.timestamp ?? '');
 }
 
 function sessionWindowTranscriptTimeBucket(value) {
@@ -25872,7 +25917,7 @@ function insertSessionWindowHistoryRecords(win, records, shouldFollow) {
     );
     if (sessionWindowHistoryHasMatchingSignature(signatures, item, win.sessionId)) continue;
     stationTrackSessionWindowHistoryAnchor(item, win.sessionId);
-    const recordTs = sessionWindowTranscriptTimestampMs(record.ts || record.timestamp || '');
+    const recordTs = sessionWindowTranscriptTimestampMs(record.ts_ms ?? record.tsMs ?? record.ts ?? record.timestamp ?? '');
     let index = history.length;
     if (recordTs !== null) {
       for (let i = 0; i < history.length; i++) {
@@ -27478,6 +27523,13 @@ function sessionWindowHistoryUserTurnIndex(item) {
   return sessionWindowHistoryRecord(item)?.user_turn_index;
 }
 
+function sessionWindowHistoryTurnId(item) {
+  const node = sessionWindowHistoryNode(item);
+  if (node) return node.dataset?.turnId || '';
+  const record = sessionWindowHistoryRecord(item);
+  return String(record?.turn_id || record?.turnId || '').trim();
+}
+
 function markSessionWindowHistoryItemSuperseded(item) {
   const node = sessionWindowHistoryNode(item);
   if (node) {
@@ -27508,7 +27560,14 @@ function retargetSessionWindowHistoryItem(item, sessionId) {
 }
 
 function isSessionWindowCommandOutputRecord(c) {
-  return !!c && (c.kind === 'agent_output' || !!c.output_id);
+  return !!c && (
+    c.kind === 'agent_output' ||
+    c.kind === 'command_execution' ||
+    c.item_type === 'command_execution' ||
+    c.itemType === 'command_execution' ||
+    !!(c.command_execution || c.commandExecution) ||
+    !!c.output_id
+  );
 }
 
 function commandOutputRecordOutputIds(c = {}) {
@@ -27518,6 +27577,7 @@ function commandOutputRecordOutputIds(c = {}) {
     if (id && !ids.includes(id)) ids.push(id);
   };
   add(c.output_id || c.outputId);
+  add(c.command_execution?.output_id || c.commandExecution?.outputId);
   if (Array.isArray(c.output_ids || c.outputIds)) {
     for (const id of (c.output_ids || c.outputIds)) add(id);
   }
@@ -29727,10 +29787,22 @@ function sessionWindowRecordFromLogCommand(c) {
   return {
     session_id: sid,
     ts: c?.ts || c?.timestamp || '',
+    ts_ms: c?.ts_ms ?? c?.tsMs,
+    event_id: c?.event_id || c?.eventId || '',
+    delivery: c?.delivery || c?.delivery_class || c?.deliveryClass || '',
     level: c?.level || 'info',
     source: c?.source || c?.event || c?.level || 'system',
     content,
     kind: c?.kind || '',
+    turn_id: c?.turn_id || c?.turnId || '',
+    item_type: c?.item_type || c?.itemType || '',
+    command_item_id: c?.command_item_id || c?.commandItemId || c?.command_execution?.id || c?.commandExecution?.id || '',
+    thread_item: c?.thread_item || c?.threadItem || null,
+    thread_history_change: c?.thread_history_change || c?.threadHistoryChange || null,
+    changed_items: c?.changed_items || c?.changedItems || [],
+    changed_turns: c?.changed_turns || c?.changedTurns || [],
+    removed_turn_ids: c?.removed_turn_ids || c?.removedTurnIds || [],
+    command_execution: c?.command_execution || c?.commandExecution || null,
     output_id: c?.output_id || c?.outputId || '',
     output_session_id: c?.output_session_id || c?.outputSessionId || sid,
     output_source: c?.output_source || c?.outputSource || c?.source || '',
@@ -30145,7 +30217,15 @@ function formatCompactBytes(bytes) {
 
 function isCommandOutputLog(c) {
   if (!c) return false;
-  if (c.kind === 'agent_output' || c.output_id) return true;
+  if (
+    c.kind === 'agent_output' ||
+    c.kind === 'command_execution' ||
+    c.item_type === 'command_execution' ||
+    c.itemType === 'command_execution' ||
+    c.command_execution ||
+    c.commandExecution ||
+    c.output_id
+  ) return true;
   const level = String(c.level || '').toLowerCase();
   if (level !== 'agent' && level !== 'warn') return false;
   if (detectCommandLog(c.content)) return false;
@@ -30242,8 +30322,17 @@ function parseTimestampWithoutExplicitZone(value) {
 }
 
 function formatLogTimestampLabel(value) {
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return formatActivityTimestampDate(new Date(value));
+  }
   const raw = String(value || '').trim();
   if (!raw) return '';
+  if (/^\d+$/.test(raw)) {
+    const numeric = Number(raw);
+    if (Number.isFinite(numeric) && numeric > 0) {
+      return formatActivityTimestampDate(new Date(numeric));
+    }
+  }
   const zoned = parseTimestampWithExplicitZone(raw);
   if (zoned) return formatActivityTimestampDate(zoned);
   const local = parseTimestampWithoutExplicitZone(raw);
@@ -30254,8 +30343,21 @@ function formatLogTimestampLabel(value) {
   return raw.length > 12 ? raw.substring(0, 12) : raw;
 }
 
-function formatLogTimestampTitle(value) {
+function formatLogTimestampTitle(value, rawValue = '') {
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    const date = new Date(value);
+    const raw = String(rawValue || '').trim();
+    const title = `${formatLocalTimestamp(date, { includeYear: true, includeSeconds: true, includeMillis: true })} ${localTimestampOffsetLabel(date)}`;
+    return raw ? `${title} (${raw})` : title;
+  }
   const raw = String(value || '').trim();
+  if (/^\d+$/.test(raw)) {
+    const numeric = Number(raw);
+    if (Number.isFinite(numeric) && numeric > 0) {
+      const date = new Date(numeric);
+      return `${formatLocalTimestamp(date, { includeYear: true, includeSeconds: true, includeMillis: true })} ${localTimestampOffsetLabel(date)}`;
+    }
+  }
   const zoned = parseTimestampWithExplicitZone(raw);
   if (zoned) {
     return `${formatLocalTimestamp(zoned, { includeYear: true, includeSeconds: true, includeMillis: true })} ${localTimestampOffsetLabel(zoned)} (${raw})`;
@@ -30268,6 +30370,16 @@ function createLogScaffold(c, extraClass) {
   entry.className = 'log-entry level-' + c.level + (extraClass ? ' ' + extraClass : '');
   entry.dataset.level = c.level;
   if (c.kind) entry.dataset.kind = c.kind;
+  if (c.event_id || c.eventId) entry.dataset.eventId = c.event_id || c.eventId;
+  if (c.delivery || c.delivery_class || c.deliveryClass) {
+    entry.dataset.delivery = c.delivery || c.delivery_class || c.deliveryClass;
+  }
+  if (c.ts_ms !== undefined && c.ts_ms !== null) entry.dataset.tsMs = String(c.ts_ms);
+  if (c.turn_id || c.turnId) entry.dataset.turnId = c.turn_id || c.turnId;
+  if (c.item_type || c.itemType) entry.dataset.itemType = c.item_type || c.itemType;
+  if (c.command_item_id || c.commandItemId || c.command_execution?.id || c.commandExecution?.id) {
+    entry.dataset.commandItemId = c.command_item_id || c.commandItemId || c.command_execution?.id || c.commandExecution?.id;
+  }
   if (c.superseded) {
     entry.classList.add('superseded');
     entry.dataset.superseded = 'true';
@@ -30296,8 +30408,9 @@ function createLogScaffold(c, extraClass) {
 
   const ts = document.createElement('span');
   ts.className = 'log-ts';
-  ts.textContent = formatLogTimestampLabel(c.ts);
-  ts.title = formatLogTimestampTitle(c.ts);
+  const timestampValue = c.ts_ms ?? c.tsMs ?? c.ts;
+  ts.textContent = formatLogTimestampLabel(timestampValue);
+  ts.title = formatLogTimestampTitle(timestampValue, c.ts);
 
   const host = document.createElement('span');
   host.className = 'log-host';
@@ -30423,6 +30536,18 @@ function commandOutputGroupKey(c) {
   const sid = String(c?.session_id || '').trim();
   const targetSid = sid ? sessionWindowTargetForLogSession(sid) : '';
   const source = String(c?.source || '').trim().toLowerCase();
+  const commandItemId = String(
+    c?.command_item_id ||
+    c?.commandItemId ||
+    c?.command_execution?.id ||
+    c?.commandExecution?.id ||
+    c?.item_id ||
+    c?.itemId ||
+    ''
+  ).trim();
+  if (commandItemId) {
+    return `${targetSid || sid || 'global'}\u001f${source}\u001f${commandItemId}`;
+  }
   return `${targetSid || sid || 'global'}\u001f${source}`;
 }
 
@@ -30847,6 +30972,55 @@ function markLogEntrySuperseded(entry) {
     }
   });
   ensureLogStateBadge(entry.querySelector('.log-content'), 'overwritten', 'overwritten');
+}
+
+function normalizedThreadHistoryChangeSet(c = {}) {
+  const change = c.thread_history_change || c.threadHistoryChange || {};
+  const removed = c.removed_turn_ids || c.removedTurnIds || change.removed_turn_ids || change.removedTurnIds || [];
+  const changedItems = c.changed_items || c.changedItems || change.changed_items || change.changedItems || [];
+  const changedTurns = c.changed_turns || c.changedTurns || change.changed_turns || change.changedTurns || [];
+  return {
+    removedTurnIds: Array.isArray(removed)
+      ? removed.map(id => String(id || '').trim()).filter(Boolean)
+      : [],
+    changedItems: Array.isArray(changedItems) ? changedItems : [],
+    changedTurns: Array.isArray(changedTurns) ? changedTurns : [],
+  };
+}
+
+function markActivityContextRewindByTurnIds(sessionId, removedTurnIds) {
+  const sid = String(sessionId || '').trim();
+  const ids = new Set((removedTurnIds || []).map(id => String(id || '').trim()).filter(Boolean));
+  if (!sid || ids.size === 0) return false;
+  let marked = false;
+  const streams = mainLogContainers();
+  for (const win of sessionWindows.values()) {
+    if (win?.log) streams.push(win.log);
+  }
+  for (const stream of streams.filter(Boolean)) {
+    for (const entry of Array.from(stream.querySelectorAll('.log-entry'))) {
+      if (entry.dataset.sessionId !== sid) continue;
+      const turnId = String(entry.dataset.turnId || '').trim();
+      if (!ids.has(turnId)) continue;
+      markLogEntrySuperseded(entry);
+      marked = true;
+    }
+  }
+  for (const win of sessionWindows.values()) {
+    for (const entry of ensureSessionWindowHistory(win)) {
+      if (sessionWindowHistorySessionId(entry) !== sid) continue;
+      if (!ids.has(sessionWindowHistoryTurnId(entry))) continue;
+      markSessionWindowHistoryItemSuperseded(entry);
+      marked = true;
+    }
+  }
+  return marked;
+}
+
+function applyThreadHistoryChangeSet(c = {}) {
+  const change = normalizedThreadHistoryChangeSet(c);
+  if (!change.removedTurnIds.length) return false;
+  return markActivityContextRewindByTurnIds(c.session_id || c.sessionId, change.removedTurnIds);
 }
 
 function markActivityContextRewind(sessionId, userTurnIndex, turnsRemoved) {
@@ -39986,6 +40160,8 @@ function dashboardShouldDropDuplicateServerMessage(message) {
 
 function dashboardMessageCanBeDeduped(message) {
   if (!message || typeof message !== 'object') return false;
+  const delivery = String(message.delivery || message.delivery_class || message.deliveryClass || '').trim().toLowerCase();
+  if (delivery === 'lossless') return false;
   // Dedupe only serde-tagged OutboundEvent payloads. Transport/control frames
   // use `t` and may be streams or signaling messages where identical payloads
   // are meaningful.
@@ -39995,6 +40171,12 @@ function dashboardMessageCanBeDeduped(message) {
 }
 
 function dashboardServerMessageDedupeKey(message) {
+  const eventId = String(message?.event_id || message?.eventId || '').trim();
+  if (eventId) {
+    const eventName = String(message?.event || '');
+    const sessionId = String(message?.session_id || message?.sessionId || '');
+    return ['event-id', eventName, sessionId, eventId].join('\u001f');
+  }
   try {
     return JSON.stringify(message);
   } catch {

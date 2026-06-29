@@ -158,7 +158,6 @@ const WORKTREE_OBSERVED_SESSION_FILE_LIMIT: usize = 1_000;
 const WORKTREE_OBSERVED_HINT_LIMIT: usize = 1_000;
 const WORKTREE_OBSERVED_PATHS_PER_SESSION: usize = 32;
 const EXTERNAL_TRANSCRIPT_CACHE_LIMIT: usize = 32;
-const EXTERNAL_TRANSCRIPT_DEDUPE_WINDOW_MILLIS: i64 = 2_000;
 const SESSION_LIST_ROW_CACHE_LIMIT: usize = 8_192;
 const SESSION_LIST_LIMIT: usize = 5_000;
 const SESSION_LIST_RESPONSE_CACHE_TTL_SECS: u64 = 30;
@@ -2178,6 +2177,11 @@ fn replay_jsonl_to_outbound_entries_inner(
         "provider": provider,
         "model": model,
         "autonomy": autonomy,
+        "event_id": format!(
+            "session-log:{}:replay_start",
+            replay_session_id.as_deref().unwrap_or("unknown")
+        ),
+        "delivery": "state",
     }));
     if let (Some((source, backend_session_id)), Some(wrapper_session_id)) = (
         external_replay_session.as_ref(),
@@ -2193,6 +2197,10 @@ fn replay_jsonl_to_outbound_entries_inner(
                 "session_id": wrapper_session_id,
                 "source": source,
                 "backend_session_id": backend_session_id,
+                "event_id": format!(
+                    "session-log:{wrapper_session_id}:session_identity:{backend_session_id}"
+                ),
+                "delivery": "state",
             }));
         }
     }
@@ -2375,6 +2383,26 @@ fn inject_replay_entry_metadata(
         .unwrap_or("")
         .to_string();
     obj.insert("ts".to_string(), serde_json::Value::String(ts));
+    if let Some(ts_ms) = timestamp_millis_from_str(
+        obj.get("ts")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default(),
+    ) {
+        obj.insert("ts_ms".to_string(), serde_json::Value::from(ts_ms));
+    }
+    if !obj.contains_key("event_id") {
+        obj.insert(
+            "event_id".to_string(),
+            serde_json::Value::String(session_log_replay_event_id(entry_json, replay_session_id)),
+        );
+    }
+    if !obj.contains_key("delivery") {
+        let delivery = delivery_class_for_replay_object(obj);
+        obj.insert(
+            "delivery".to_string(),
+            serde_json::Value::String(delivery.to_string()),
+        );
+    }
     if obj.get("event").and_then(|v| v.as_str()) == Some("context_snapshot") {
         if let Some(file) = entry_json.get("file").and_then(|v| v.as_str()) {
             obj.insert(
@@ -2409,6 +2437,170 @@ fn inject_replay_entry_metadata(
             );
         }
     }
+}
+
+fn timestamp_millis_from_str(value: &str) -> Option<i64> {
+    let raw = value.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(raw) {
+        return Some(dt.timestamp_millis());
+    }
+
+    for fmt in [
+        "%Y-%m-%dT%H:%M:%S%.f",
+        "%Y-%m-%dT%H:%M",
+        "%Y-%m-%d %H:%M:%S%.f",
+        "%Y-%m-%d %H:%M",
+    ] {
+        if let Ok(naive) = chrono::NaiveDateTime::parse_from_str(raw, fmt) {
+            use chrono::TimeZone as _;
+            return chrono::Local
+                .from_local_datetime(&naive)
+                .single()
+                .map(|dt| dt.timestamp_millis())
+                .or_else(|| Some(naive.and_utc().timestamp_millis()));
+        }
+    }
+
+    let raw_with_year = format!("{}-{raw}", chrono::Local::now().format("%Y"));
+    for fmt in ["%Y-%m-%d %H:%M:%S%.f", "%Y-%m-%d %H:%M"] {
+        if let Ok(naive) = chrono::NaiveDateTime::parse_from_str(&raw_with_year, fmt) {
+            use chrono::TimeZone as _;
+            return chrono::Local
+                .from_local_datetime(&naive)
+                .single()
+                .map(|dt| dt.timestamp_millis())
+                .or_else(|| Some(naive.and_utc().timestamp_millis()));
+        }
+    }
+
+    for fmt in ["%H:%M:%S%.f", "%H:%M"] {
+        if let Ok(naive_time) = chrono::NaiveTime::parse_from_str(raw, fmt) {
+            let date = chrono::Local::now().date_naive();
+            let naive = date.and_time(naive_time);
+            use chrono::TimeZone as _;
+            return chrono::Local
+                .from_local_datetime(&naive)
+                .single()
+                .map(|dt| dt.timestamp_millis())
+                .or_else(|| Some(naive.and_utc().timestamp_millis()));
+        }
+    }
+
+    None
+}
+
+fn short_stable_hash(parts: &[&str]) -> String {
+    let mut input = String::new();
+    for part in parts {
+        input.push_str(part);
+        input.push('\0');
+    }
+    let hash = crate::file_watcher::hex_encode(&crate::file_watcher::sha256_hash(input.as_bytes()));
+    hash.chars().take(16).collect()
+}
+
+fn delivery_class_for_replay_object(
+    obj: &serde_json::Map<String, serde_json::Value>,
+) -> &'static str {
+    let event = obj.get("event").and_then(|v| v.as_str()).unwrap_or("");
+    let kind = obj.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+    let item_type = obj
+        .get("item_type")
+        .or_else(|| obj.get("itemType"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    match (event, kind, item_type) {
+        (
+            "log_entry"
+            | "model_response"
+            | "agent_output"
+            | "agent_started"
+            | "presence_log"
+            | "context_snapshot"
+            | "thread_history_change",
+            _,
+            _,
+        ) => "lossless",
+        (_, "agent_output" | "rollback_marker", _) => "lossless",
+        (_, _, "command_execution" | "user_message" | "agent_message") => "lossless",
+        _ => "state",
+    }
+}
+
+fn session_log_replay_event_id(
+    entry_json: &serde_json::Value,
+    replay_session_id: Option<&str>,
+) -> String {
+    if let Some(id) = entry_json
+        .get("event_id")
+        .or_else(|| entry_json.get("eventId"))
+        .or_else(|| entry_json.pointer("/data/event_id"))
+        .or_else(|| entry_json.pointer("/data/eventId"))
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+    {
+        return id.to_string();
+    }
+
+    let event = entry_json
+        .get("event")
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+    let ts = entry_json
+        .get("ts")
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+    let file = entry_json
+        .get("file")
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+    let model_offset = entry_json
+        .pointer("/data/model_offset")
+        .and_then(|value| value.as_u64())
+        .map(|value| value.to_string())
+        .unwrap_or_default();
+    let model_bytes = entry_json
+        .pointer("/data/model_bytes")
+        .and_then(|value| value.as_u64())
+        .map(|value| value.to_string())
+        .unwrap_or_default();
+    let output_id = entry_json
+        .pointer("/data/output_id")
+        .or_else(|| entry_json.pointer("/data/outputId"))
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+    let seq = entry_json
+        .get("seq")
+        .or_else(|| entry_json.get("sequence"))
+        .and_then(|value| value.as_u64())
+        .map(|value| value.to_string())
+        .unwrap_or_default();
+
+    if !file.is_empty() || !model_offset.is_empty() || !output_id.is_empty() || !seq.is_empty() {
+        return format!(
+            "session-log:{}",
+            short_stable_hash(&[
+                replay_session_id.unwrap_or(""),
+                event,
+                ts,
+                file,
+                &model_offset,
+                &model_bytes,
+                output_id,
+                &seq,
+            ])
+        );
+    }
+
+    let normalized = serde_json::to_string(entry_json).unwrap_or_default();
+    format!(
+        "session-log:{}",
+        short_stable_hash(&[replay_session_id.unwrap_or(""), event, ts, &normalized])
+    )
 }
 
 fn latest_context_snapshot_files_by_session(
@@ -5944,6 +6136,67 @@ fn codex_payload_text(payload: &serde_json::Value) -> Option<(String, String)> {
     message_content_text(content).map(|text| (role, text))
 }
 
+fn codex_function_call_id(payload: &serde_json::Value) -> Option<String> {
+    value_str(payload, "call_id")
+        .or_else(|| value_str(payload, "callId"))
+        .or_else(|| value_str(payload, "id"))
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+fn codex_function_call_arguments(payload: &serde_json::Value) -> Option<serde_json::Value> {
+    let arguments = payload.get("arguments")?;
+    if let Some(raw) = arguments.as_str() {
+        serde_json::from_str::<serde_json::Value>(raw).ok()
+    } else {
+        Some(arguments.clone())
+    }
+}
+
+fn codex_function_call_command(payload: &serde_json::Value) -> Option<String> {
+    let name = value_str(payload, "name")?;
+    if name != "exec_command" {
+        return Some(name);
+    }
+    let arguments = codex_function_call_arguments(payload)?;
+    value_str(&arguments, "cmd")
+        .or_else(|| value_str(&arguments, "command"))
+        .or_else(|| value_str(&arguments, "script"))
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .or(Some(name))
+}
+
+fn codex_function_call_projection(
+    payload: &serde_json::Value,
+    response_item_id: Option<&str>,
+    current_turn_id: Option<&str>,
+) -> Option<(String, serde_json::Value)> {
+    if payload.get("type").and_then(|v| v.as_str()) != Some("function_call") {
+        return None;
+    }
+    let call_id = codex_function_call_id(payload)?;
+    let item_id = response_item_id
+        .map(str::to_string)
+        .or_else(|| value_str(payload, "id"))
+        .unwrap_or_else(|| call_id.clone());
+    let command = codex_function_call_command(payload);
+    let cwd = codex_exec_command_workdir(payload);
+    let turn_id = current_turn_id.map(str::to_string);
+    Some((
+        call_id.clone(),
+        serde_json::json!({
+            "id": item_id,
+            "call_id": call_id,
+            "type": "command_execution",
+            "status": "started",
+            "command": command,
+            "cwd": cwd,
+            "turn_id": turn_id,
+        }),
+    ))
+}
+
 fn codex_function_call_output(payload: &serde_json::Value) -> Option<(Option<String>, String)> {
     if payload.get("type").and_then(|v| v.as_str()) != Some("function_call_output") {
         return None;
@@ -5953,11 +6206,7 @@ fn codex_function_call_output(payload: &serde_json::Value) -> Option<(Option<Str
     if output.trim().is_empty() {
         return None;
     }
-    let output_id = value_str(payload, "call_id")
-        .or_else(|| value_str(payload, "callId"))
-        .or_else(|| value_str(payload, "id"))
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
+    let output_id = codex_function_call_id(payload);
     Some((output_id, output))
 }
 
@@ -6161,16 +6410,6 @@ fn push_external_transcript_entry(
     if role == "user" && is_codex_injected_user_text(&text) {
         return false;
     }
-    if entries.last().is_some_and(|entry| {
-        external_transcript_entry_role(entry) == Some(role.as_str())
-            && entry.get("content").and_then(|v| v.as_str()) == Some(text.as_str())
-            && external_transcript_entries_are_temporal_duplicates(
-                entry.get("ts").and_then(|v| v.as_str()),
-                ts,
-            )
-    }) {
-        return false;
-    }
     entries.push(serde_json::json!({
         "ts": ts,
         "level": if role == "assistant" || role == "model" { "model" } else { "info" },
@@ -6178,28 +6417,6 @@ fn push_external_transcript_entry(
         "content": text,
     }));
     true
-}
-
-fn external_transcript_entries_are_temporal_duplicates(
-    previous_ts: Option<&str>,
-    current_ts: &str,
-) -> bool {
-    let Some(previous_ts) = previous_ts else {
-        return false;
-    };
-    if previous_ts == current_ts {
-        return true;
-    }
-    let Ok(previous) = chrono::DateTime::parse_from_rfc3339(previous_ts) else {
-        return false;
-    };
-    let Ok(current) = chrono::DateTime::parse_from_rfc3339(current_ts) else {
-        return false;
-    };
-    previous
-        .timestamp_millis()
-        .abs_diff(current.timestamp_millis())
-        <= EXTERNAL_TRANSCRIPT_DEDUPE_WINDOW_MILLIS as u64
 }
 
 fn external_transcript_entry_role(entry: &serde_json::Value) -> Option<&'static str> {
@@ -8382,6 +8599,99 @@ fn store_external_transcript_entries(
     );
 }
 
+fn stable_external_transcript_event_id(
+    source: &str,
+    session_id: &str,
+    entry: &serde_json::Value,
+    index: usize,
+) -> String {
+    if let Some(id) = entry
+        .get("event_id")
+        .or_else(|| entry.get("eventId"))
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+    {
+        return id.to_string();
+    }
+    let prefix = format!("external:{source}:{session_id}");
+    if let Some(item_id) = entry
+        .get("item_id")
+        .or_else(|| entry.get("itemId"))
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+    {
+        return format!("{prefix}:item:{item_id}");
+    }
+    if let Some(output_id) = entry
+        .get("output_id")
+        .or_else(|| entry.get("outputId"))
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+    {
+        return format!("{prefix}:output:{output_id}");
+    }
+    if entry.get("kind").and_then(|value| value.as_str()) == Some("rollback_marker") {
+        let ts = entry
+            .get("ts")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
+        let removed = entry
+            .get("removed_turn_ids")
+            .and_then(|value| value.as_array())
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|value| value.as_str())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            })
+            .unwrap_or_default();
+        return format!(
+            "{prefix}:rollback:{}",
+            short_stable_hash(&[ts, &removed, &index.to_string()])
+        );
+    }
+    let normalized = serde_json::to_string(entry).unwrap_or_default();
+    format!(
+        "{prefix}:entry:{}",
+        short_stable_hash(&[&index.to_string(), &normalized])
+    )
+}
+
+fn annotate_external_transcript_entries(
+    source: &str,
+    session_id: &str,
+    entries: &mut [serde_json::Value],
+) {
+    for (index, entry) in entries.iter_mut().enumerate() {
+        let ts = entry
+            .get("ts")
+            .and_then(|value| value.as_str())
+            .unwrap_or("")
+            .to_string();
+        let event_id = stable_external_transcript_event_id(source, session_id, entry, index);
+        let Some(obj) = entry.as_object_mut() else {
+            continue;
+        };
+        obj.entry("transcript_index".to_string())
+            .or_insert_with(|| serde_json::Value::from(index as u64));
+        if !ts.is_empty() {
+            if let Some(ts_ms) = timestamp_millis_from_str(&ts) {
+                obj.entry("ts_ms".to_string())
+                    .or_insert_with(|| serde_json::Value::from(ts_ms));
+            }
+        }
+        obj.entry("event_id".to_string())
+            .or_insert_with(|| serde_json::Value::String(event_id));
+        let delivery = delivery_class_for_replay_object(obj);
+        obj.entry("delivery".to_string())
+            .or_insert_with(|| serde_json::Value::String(delivery.to_string()));
+    }
+}
+
 #[derive(Debug, Default)]
 struct ReplayUserTurnRevisionState {
     active_count: u32,
@@ -8408,33 +8718,176 @@ impl ReplayUserTurnRevisionState {
         }
         self.active_count = first_user_turn_index.saturating_sub(1);
     }
+
+    fn current_turn(&self) -> Option<u32> {
+        (self.active_count > 0).then_some(self.active_count)
+    }
+}
+
+fn codex_synthetic_turn_id(user_turn_index: u32, user_turn_revision: u32) -> String {
+    format!("turn-{user_turn_index}-r{user_turn_revision}")
+}
+
+fn codex_next_synthetic_item_id(
+    synthetic_item_seq: &mut u64,
+    turn_id: &str,
+    item_type: &str,
+) -> String {
+    *synthetic_item_seq = synthetic_item_seq.saturating_add(1);
+    format!("synthetic:{turn_id}:{item_type}:{}", *synthetic_item_seq)
+}
+
+fn codex_thread_item_value(item_id: &str, item_type: &str, turn_id: &str) -> serde_json::Value {
+    serde_json::json!({
+        "id": item_id,
+        "type": item_type,
+        "turn_id": turn_id,
+        "status": "completed",
+    })
+}
+
+fn codex_thread_turn_value(
+    turn_id: &str,
+    user_turn_index: Option<u32>,
+    user_turn_revision: Option<u32>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "id": turn_id,
+        "user_turn_index": user_turn_index,
+        "user_turn_revision": user_turn_revision,
+    })
+}
+
+fn codex_thread_history_change_value(
+    changed_item: Option<serde_json::Value>,
+    changed_turn: Option<serde_json::Value>,
+    removed_turn_ids: Vec<String>,
+) -> serde_json::Value {
+    let changed_items = changed_item.into_iter().collect::<Vec<_>>();
+    let changed_turns = changed_turn.into_iter().collect::<Vec<_>>();
+    serde_json::json!({
+        "changed_items": changed_items,
+        "changed_turns": changed_turns,
+        "removed_turn_ids": removed_turn_ids,
+    })
+}
+
+fn apply_codex_thread_projection(
+    entry: &mut serde_json::Value,
+    item_id: &str,
+    item_type: &str,
+    turn_id: &str,
+    user_turn_index: Option<u32>,
+    user_turn_revision: Option<u32>,
+) {
+    let thread_item = codex_thread_item_value(item_id, item_type, turn_id);
+    let changed_turn = codex_thread_turn_value(turn_id, user_turn_index, user_turn_revision);
+    entry["item_id"] = serde_json::json!(item_id);
+    entry["item_type"] = serde_json::json!(item_type);
+    entry["turn_id"] = serde_json::json!(turn_id);
+    entry["thread_item"] = thread_item.clone();
+    entry["thread_history_change"] = codex_thread_history_change_value(
+        Some(thread_item.clone()),
+        Some(changed_turn.clone()),
+        Vec::new(),
+    );
+    entry["changed_items"] = serde_json::json!([thread_item]);
+    entry["changed_turns"] = serde_json::json!([changed_turn]);
+    entry["removed_turn_ids"] = serde_json::json!([]);
+}
+
+fn codex_removed_turn_ids_for_user_turns(
+    entries: &[serde_json::Value],
+    user_turns: &[u32],
+) -> Vec<String> {
+    let wanted = user_turns.iter().copied().collect::<BTreeSet<_>>();
+    let mut removed = BTreeSet::new();
+    for entry in entries {
+        let Some(turn_index) = entry
+            .get("user_turn_index")
+            .and_then(|value| value.as_u64())
+            .and_then(|value| u32::try_from(value).ok())
+        else {
+            continue;
+        };
+        if !wanted.contains(&turn_index) {
+            continue;
+        }
+        if let Some(turn_id) = entry
+            .get("turn_id")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            removed.insert(turn_id.to_string());
+        }
+    }
+    removed.into_iter().collect()
 }
 
 fn push_codex_transcript_message(
     entries: &mut Vec<serde_json::Value>,
     user_turn_revisions: &mut ReplayUserTurnRevisionState,
     pending_replacement_for_user_turn: &mut Option<u32>,
+    synthetic_item_seq: &mut u64,
     item_id: Option<&str>,
+    current_turn_id: Option<&str>,
     ts: &str,
     role: &str,
     text: String,
 ) {
+    let normalized_role = match role.trim().to_lowercase().as_str() {
+        "model" => "assistant".to_string(),
+        other => other.to_string(),
+    };
     if push_external_transcript_entry(entries, "codex", ts, role, text) {
-        if let (Some(item_id), Some(entry)) = (item_id, entries.last_mut()) {
-            entry["item_id"] = serde_json::json!(item_id);
-        }
     } else {
         return;
     }
-    if role == "user" {
-        let (user_turn_index, user_turn_revision) = user_turn_revisions.record_next_turn();
+    let mut user_turn_index = None;
+    let mut user_turn_revision = None;
+    if normalized_role == "user" {
+        let (recorded_turn_index, recorded_turn_revision) = user_turn_revisions.record_next_turn();
+        user_turn_index = Some(recorded_turn_index);
+        user_turn_revision = Some(recorded_turn_revision);
         if let Some(entry) = entries.last_mut() {
-            entry["user_turn_index"] = serde_json::json!(user_turn_index);
-            entry["user_turn_revision"] = serde_json::json!(user_turn_revision);
+            entry["user_turn_index"] = serde_json::json!(recorded_turn_index);
+            entry["user_turn_revision"] = serde_json::json!(recorded_turn_revision);
             if let Some(turn) = pending_replacement_for_user_turn.take() {
                 entry["replacement_for_user_turn_index"] = serde_json::json!(turn);
             }
         }
+    }
+    let item_type = if normalized_role == "user" {
+        "user_message"
+    } else {
+        "agent_message"
+    };
+    let derived_turn_id = current_turn_id
+        .map(str::to_string)
+        .or_else(|| {
+            user_turn_index
+                .zip(user_turn_revision)
+                .map(|(turn, revision)| codex_synthetic_turn_id(turn, revision))
+        })
+        .or_else(|| {
+            user_turn_revisions
+                .current_turn()
+                .map(|turn| codex_synthetic_turn_id(turn, 1))
+        })
+        .unwrap_or_else(|| "turn-unknown".to_string());
+    let derived_item_id = item_id.map(str::to_string).unwrap_or_else(|| {
+        codex_next_synthetic_item_id(synthetic_item_seq, &derived_turn_id, item_type)
+    });
+    if let Some(entry) = entries.last_mut() {
+        apply_codex_thread_projection(
+            entry,
+            &derived_item_id,
+            item_type,
+            &derived_turn_id,
+            user_turn_index,
+            user_turn_revision,
+        );
     }
 }
 
@@ -8445,7 +8898,11 @@ fn parse_codex_session_entries(path: &Path) -> Option<Vec<serde_json::Value>> {
     let mut user_turn_revisions = ReplayUserTurnRevisionState::default();
     let mut pending_replacement_for_user_turn: Option<u32> = None;
     let mut rollout_session_id: Option<String> = None;
+    let mut current_turn_id: Option<String> = None;
+    let mut synthetic_item_seq = 0_u64;
+    let mut command_calls: HashMap<String, serde_json::Value> = HashMap::new();
     let canonical_user_message_events = codex_session_has_user_message_events(path);
+    let canonical_assistant_response_items = codex_session_has_assistant_response_items(path);
     // (count_before, count_after) entry-count boundaries for each rollout item id,
     // so an item-anchor rewind can supersede exactly the entries after the anchor.
     let mut item_entry_boundaries: std::collections::HashMap<String, (usize, usize)> =
@@ -8470,6 +8927,12 @@ fn parse_codex_session_entries(path: &Path) -> Option<Vec<serde_json::Value>> {
         if obj.get("type").and_then(|v| v.as_str()) == Some("event_msg") {
             if let Some(payload) = obj.get("payload") {
                 let payload_type = payload.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                if payload_type == "task_started" {
+                    current_turn_id = value_str(payload, "turn_id")
+                        .or_else(|| value_str(payload, "turnId"))
+                        .or(current_turn_id);
+                    continue;
+                }
                 if payload_type == "thread_goal_updated" {
                     if let Some(session_id) =
                         codex_thread_goal_session_id(payload, rollout_session_id.as_deref())
@@ -8540,6 +9003,10 @@ fn parse_codex_session_entries(path: &Path) -> Option<Vec<serde_json::Value>> {
                         pending_replacement_for_user_turn = Some(replacement_turn);
                     }
                     if turns > 0 || anchor.is_some() {
+                        let removed_turn_ids =
+                            codex_removed_turn_ids_for_user_turns(&entries, &superseded_user_turns);
+                        let thread_history_change =
+                            codex_thread_history_change_value(None, None, removed_turn_ids.clone());
                         let content = match (turns, anchor.as_ref()) {
                             // Item-anchor rewinds carry num_turns==0 and do not mark
                             // any rendered entry superseded (entries are not item-id
@@ -8569,6 +9036,11 @@ fn parse_codex_session_entries(path: &Path) -> Option<Vec<serde_json::Value>> {
                             "content": content,
                             "kind": "rollback_marker",
                             "rollback_turns": turns,
+                            "turns_removed": turns,
+                            "removed_turn_ids": removed_turn_ids,
+                            "thread_history_change": thread_history_change,
+                            "changed_items": [],
+                            "changed_turns": [],
                         });
                         if let Some((item_id, position)) = anchor {
                             marker["rollback_anchor_item_id"] = serde_json::json!(item_id);
@@ -8576,6 +9048,7 @@ fn parse_codex_session_entries(path: &Path) -> Option<Vec<serde_json::Value>> {
                         }
                         entries.push(marker);
                     }
+                    current_turn_id = None;
                     continue;
                 }
             }
@@ -8584,16 +9057,35 @@ fn parse_codex_session_entries(path: &Path) -> Option<Vec<serde_json::Value>> {
         let response_item_id = codex_response_item_id(&obj);
         let entries_before = entries.len();
         if let Some(payload) = obj.get("payload") {
+            if let Some((call_id, command_projection)) = codex_function_call_projection(
+                payload,
+                response_item_id.as_deref(),
+                current_turn_id.as_deref(),
+            ) {
+                command_calls.insert(call_id, command_projection);
+            }
             if let Some((role, text)) = codex_event_message_text(payload) {
+                if canonical_assistant_response_items && role == "assistant" {
+                    continue;
+                }
                 push_codex_transcript_message(
                     &mut entries,
                     &mut user_turn_revisions,
                     &mut pending_replacement_for_user_turn,
+                    &mut synthetic_item_seq,
                     response_item_id.as_deref(),
+                    current_turn_id.as_deref(),
                     &ts,
                     &role,
                     text,
                 );
+                if role == "user" {
+                    current_turn_id = entries
+                        .last()
+                        .and_then(|entry| entry.get("turn_id"))
+                        .and_then(|value| value.as_str())
+                        .map(str::to_string);
+                }
             }
             if let Some((role, text)) = codex_payload_text(payload) {
                 if canonical_user_message_events && role == "user" {
@@ -8607,28 +9099,95 @@ fn parse_codex_session_entries(path: &Path) -> Option<Vec<serde_json::Value>> {
                     &mut entries,
                     &mut user_turn_revisions,
                     &mut pending_replacement_for_user_turn,
+                    &mut synthetic_item_seq,
                     response_item_id.as_deref(),
+                    current_turn_id.as_deref(),
                     &ts,
                     &role,
                     text,
                 );
+                if role == "user" {
+                    current_turn_id = entries
+                        .last()
+                        .and_then(|entry| entry.get("turn_id"))
+                        .and_then(|value| value.as_str())
+                        .map(str::to_string);
+                }
             }
             if let Some((output_id, output)) = codex_function_call_output(payload) {
+                let output_id_for_lookup = output_id.clone();
+                let command_projection = output_id_for_lookup
+                    .as_deref()
+                    .and_then(|id| command_calls.get(id))
+                    .cloned();
                 let mut entry = serde_json::json!({
                     "ts": ts,
                     "event": "agent_output",
                     "level": "agent",
                     "source": "codex",
                     "kind": "agent_output",
+                    "item_type": "command_execution",
                     "stdout": output,
                     "stderr": "",
                 });
                 if let Some(session_id) = rollout_session_id.as_deref() {
                     entry["session_id"] = serde_json::json!(session_id);
                 }
-                if let Some(output_id) = output_id {
+                if let Some(output_id) = output_id.as_deref() {
                     entry["output_id"] = serde_json::json!(output_id);
                 }
+                let command_item_id = command_projection
+                    .as_ref()
+                    .and_then(|projection| projection.get("id"))
+                    .and_then(|value| value.as_str())
+                    .map(str::to_string)
+                    .or_else(|| response_item_id.clone())
+                    .or_else(|| output_id.clone())
+                    .unwrap_or_else(|| {
+                        codex_next_synthetic_item_id(
+                            &mut synthetic_item_seq,
+                            current_turn_id.as_deref().unwrap_or("turn-unknown"),
+                            "command_execution",
+                        )
+                    });
+                let command_turn_id = command_projection
+                    .as_ref()
+                    .and_then(|projection| projection.get("turn_id"))
+                    .and_then(|value| value.as_str())
+                    .map(str::to_string)
+                    .or_else(|| current_turn_id.clone())
+                    .unwrap_or_else(|| "turn-unknown".to_string());
+                let thread_item = codex_thread_item_value(
+                    &command_item_id,
+                    "command_execution",
+                    &command_turn_id,
+                );
+                let changed_turn = codex_thread_turn_value(&command_turn_id, None, None);
+                let mut command_execution = command_projection.unwrap_or_else(|| {
+                    serde_json::json!({
+                        "id": command_item_id.clone(),
+                        "call_id": output_id.clone(),
+                        "type": "command_execution",
+                    })
+                });
+                command_execution["id"] = serde_json::json!(command_item_id.clone());
+                command_execution["status"] = serde_json::json!("completed");
+                command_execution["output_id"] = serde_json::json!(output_id.clone());
+                command_execution["completed_at_ms"] =
+                    serde_json::json!(timestamp_millis_from_str(&ts));
+                entry["item_id"] = serde_json::json!(command_item_id.clone());
+                entry["command_item_id"] = serde_json::json!(command_item_id);
+                entry["turn_id"] = serde_json::json!(command_turn_id);
+                entry["thread_item"] = thread_item.clone();
+                entry["thread_history_change"] = codex_thread_history_change_value(
+                    Some(thread_item.clone()),
+                    Some(changed_turn.clone()),
+                    Vec::new(),
+                );
+                entry["changed_items"] = serde_json::json!([thread_item]);
+                entry["changed_turns"] = serde_json::json!([changed_turn]);
+                entry["removed_turn_ids"] = serde_json::json!([]);
+                entry["command_execution"] = command_execution;
                 entries.push(entry);
             }
         }
@@ -8665,6 +9224,41 @@ fn codex_session_has_user_message_events(path: &Path) -> bool {
                 .and_then(|v| v.as_str())
                 == Some("user_message")
         {
+            return true;
+        }
+    }
+    false
+}
+
+fn codex_session_has_assistant_response_items(path: &Path) -> bool {
+    let Ok(file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let reader = std::io::BufReader::new(file);
+    for line in reader.lines() {
+        let Ok(line) = line else {
+            continue;
+        };
+        let trimmed = line.trim();
+        if trimmed.is_empty() || !trimmed.contains("\"assistant\"") {
+            continue;
+        }
+        let Ok(obj) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+            continue;
+        };
+        if obj.get("type").and_then(|v| v.as_str()) != Some("response_item") {
+            continue;
+        }
+        let Some(payload) = obj.get("payload") else {
+            continue;
+        };
+        if payload.get("type").and_then(|v| v.as_str()) != Some("message") {
+            continue;
+        }
+        if payload.get("role").and_then(|v| v.as_str()) != Some("assistant") {
+            continue;
+        }
+        if codex_payload_text(payload).is_some() {
             return true;
         }
     }
@@ -8803,7 +9397,8 @@ fn external_session_entries_from_file(
         return Some(entries);
     }
 
-    let entries = parse_external_session_entries_from_file(source, session_id, path)?;
+    let mut entries = parse_external_session_entries_from_file(source, session_id, path)?;
+    annotate_external_transcript_entries(source, session_id, &mut entries);
     store_external_transcript_entries(key, &entries);
     Some(entries)
 }
@@ -8876,6 +9471,8 @@ fn external_session_activity_replay_from_home_with_attach(
         "session_id": session_id,
         "source": source,
         "replay_semantics": EXTERNAL_TRANSCRIPT_SEMANTICS,
+        "event_id": format!("external:{source}:{session_id}:replay_start"),
+        "delivery": "state",
     }));
     if include_attached {
         entries.push(serde_json::json!({
@@ -8883,6 +9480,8 @@ fn external_session_activity_replay_from_home_with_attach(
             "session_id": session_id,
             "source": source,
             "replay_semantics": EXTERNAL_TRANSCRIPT_SEMANTICS,
+            "event_id": format!("external:{source}:{session_id}:session_attached"),
+            "delivery": "state",
         }));
     }
 
@@ -8917,10 +9516,14 @@ fn external_session_activity_replay_from_home_with_attach(
             "event": "log_entry",
             "session_id": session_id,
             "ts": entry.get("ts").and_then(|v| v.as_str()).unwrap_or(""),
+            "ts_ms": entry.get("ts_ms").and_then(|v| v.as_i64()),
+            "event_id": entry.get("event_id").and_then(|v| v.as_str()),
+            "delivery": entry.get("delivery").and_then(|v| v.as_str()),
             "level": entry.get("level").and_then(|v| v.as_str()).unwrap_or("info"),
             "source": entry.get("source").and_then(|v| v.as_str()).unwrap_or(source.as_str()),
             "content": content,
             "replay_semantics": EXTERNAL_TRANSCRIPT_SEMANTICS,
+            "transcript_index": entry.get("transcript_index").and_then(|v| v.as_u64()),
             "user_turn_index": entry.get("user_turn_index").and_then(|v| v.as_u64()),
             "user_turn_revision": entry
                 .get("user_turn_revision")
@@ -8937,8 +9540,20 @@ fn external_session_activity_replay_from_home_with_attach(
                 .and_then(|v| v.as_str()),
             "kind": entry.get("kind").and_then(|v| v.as_str()),
             "item_id": entry.get("item_id").and_then(|v| v.as_str()),
+            "item_type": entry.get("item_type").and_then(|v| v.as_str()),
+            "turn_id": entry.get("turn_id").and_then(|v| v.as_str()),
             "output_id": entry.get("output_id").and_then(|v| v.as_str()),
+            "command_item_id": entry
+                .get("command_item_id")
+                .and_then(|v| v.as_str()),
+            "command_execution": entry.get("command_execution").cloned(),
+            "thread_item": entry.get("thread_item").cloned(),
+            "thread_history_change": entry.get("thread_history_change").cloned(),
+            "changed_items": entry.get("changed_items").cloned(),
+            "changed_turns": entry.get("changed_turns").cloned(),
+            "removed_turn_ids": entry.get("removed_turn_ids").cloned(),
             "rollback_turns": entry.get("rollback_turns").and_then(|v| v.as_u64()),
+            "turns_removed": entry.get("turns_removed").and_then(|v| v.as_u64()),
             "rollback_anchor_item_id": entry
                 .get("rollback_anchor_item_id")
                 .and_then(|v| v.as_str()),
@@ -30111,6 +30726,17 @@ mod tests {
                     }
                 }),
                 serde_json::json!({
+                    "timestamp": "2026-05-17T16:49:00.500Z",
+                    "type": "response_item",
+                    "payload": {
+                        "id": "call-item-output",
+                        "type": "function_call",
+                        "call_id": "call_output",
+                        "name": "exec_command",
+                        "arguments": "{\"cmd\":\"echo actual\",\"workdir\":\"/tmp\"}"
+                    }
+                }),
+                serde_json::json!({
                     "timestamp": "2026-05-17T16:49:01Z",
                     "type": "response_item",
                     "payload": {
@@ -30140,6 +30766,20 @@ mod tests {
         assert_eq!(outputs[0]["kind"], "agent_output");
         assert_eq!(outputs[0]["output_id"], "call_output");
         assert_eq!(outputs[0]["stdout"], "actual command output\n");
+        assert_eq!(outputs[0]["item_id"], "call-item-output");
+        assert_eq!(outputs[0]["item_type"], "command_execution");
+        assert_eq!(outputs[0]["command_item_id"], "call-item-output");
+        assert_eq!(outputs[0]["turn_id"], "turn-unknown");
+        assert_eq!(outputs[0]["delivery"], "lossless");
+        assert!(outputs[0]["ts_ms"].as_i64().is_some());
+        assert_eq!(outputs[0]["command_execution"]["status"], "completed");
+        assert_eq!(outputs[0]["command_execution"]["command"], "echo actual");
+        assert_eq!(outputs[0]["command_execution"]["cwd"], "/tmp");
+        assert_eq!(outputs[0]["thread_item"]["type"], "command_execution");
+        assert_eq!(
+            outputs[0]["thread_history_change"]["changed_items"][0]["id"],
+            "call-item-output"
+        );
 
         let replay =
             external_session_activity_replay_from_home(dir.path(), "codex", session_id, 80)
@@ -30153,6 +30793,18 @@ mod tests {
             .expect("command output should replay as a log entry");
         assert_eq!(replay_output["content"], "actual command output\n");
         assert_eq!(replay_output["output_id"], "call_output");
+        assert_eq!(
+            replay_output["event_id"],
+            format!("external:codex:{session_id}:item:call-item-output")
+        );
+        assert_eq!(replay_output["delivery"], "lossless");
+        assert!(replay_output["ts_ms"].as_i64().is_some());
+        assert_eq!(replay_output["item_type"], "command_execution");
+        assert_eq!(replay_output["command_execution"]["id"], "call-item-output");
+        assert_eq!(
+            replay_output["thread_history_change"]["changed_items"][0]["id"],
+            "call-item-output"
+        );
     }
 
     #[test]
@@ -30366,13 +31018,19 @@ mod tests {
             .expect("old answer should remain visible");
         assert_eq!(old_answer["superseded"], true);
 
-        assert!(entries.iter().any(|entry| {
-            entry["event"] == "log_entry"
-                && entry["kind"] == "rollback_marker"
-                && entry["content"]
-                    .as_str()
-                    .is_some_and(|content| content.contains("Rewound 1 user turn"))
-        }));
+        let marker = entries
+            .iter()
+            .find(|entry| entry["event"] == "log_entry" && entry["kind"] == "rollback_marker")
+            .expect("rollback marker should replay");
+        assert!(marker["content"]
+            .as_str()
+            .is_some_and(|content| content.contains("Rewound 1 user turn")));
+        assert_eq!(marker["removed_turn_ids"], serde_json::json!(["turn-1-r1"]));
+        assert_eq!(
+            marker["thread_history_change"]["removed_turn_ids"],
+            serde_json::json!(["turn-1-r1"])
+        );
+        assert_eq!(marker["delivery"], "lossless");
 
         let new_prompt = entries
             .iter()
