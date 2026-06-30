@@ -22474,6 +22474,11 @@ pub fn spawn_web_gateway(
                             };
                         let response = json_response(status_reason(status), body);
                         let _ = stream.write_all(response.as_bytes()).await;
+                    } else if request_line.contains(" /api/access/iam/state") {
+                        use tokio::io::AsyncWriteExt;
+                        let body = access_iam_state_response_body();
+                        let response = json_response("200 OK", body);
+                        let _ = stream.write_all(response.as_bytes()).await;
                     } else if request_line.contains(" /api/access/overview") {
                         use tokio::io::AsyncWriteExt;
                         let body = access_overview_response_body(
@@ -23443,7 +23448,14 @@ pub(crate) fn access_overview_response_value(
     registry: Option<&crate::peer::PeerRegistry>,
 ) -> serde_json::Value {
     let inbound_peer_identities = access_overview_inbound_peer_identities();
-    access_overview_response_value_with_identities(agent_card, registry, &inbound_peer_identities)
+    let cert_dir = crate::access::backend::select_backend().cert_dir();
+    let iam_state = crate::access::iam::load_state_for_overview(&cert_dir);
+    access_overview_response_value_with_identities_and_iam(
+        agent_card,
+        registry,
+        &inbound_peer_identities,
+        &iam_state,
+    )
 }
 
 fn access_overview_inbound_peer_identities(
@@ -23458,10 +23470,30 @@ fn access_overview_inbound_peer_identities(
     }
 }
 
+#[cfg(test)]
 fn access_overview_response_value_with_identities(
     agent_card: &serde_json::Value,
     registry: Option<&crate::peer::PeerRegistry>,
     inbound_peer_identities: &[crate::peer::access_policy::PeerIdentityRecord],
+) -> serde_json::Value {
+    let iam_state = crate::access::iam::LoadedIamState {
+        path: std::path::PathBuf::from(crate::access::iam::IAM_STATE_FILE),
+        state: crate::access::iam::LocalIamState::default(),
+        status: crate::access::iam::IamStateStatus::Missing,
+    };
+    access_overview_response_value_with_identities_and_iam(
+        agent_card,
+        registry,
+        inbound_peer_identities,
+        &iam_state,
+    )
+}
+
+fn access_overview_response_value_with_identities_and_iam(
+    agent_card: &serde_json::Value,
+    registry: Option<&crate::peer::PeerRegistry>,
+    inbound_peer_identities: &[crate::peer::access_policy::PeerIdentityRecord],
+    iam_state: &crate::access::iam::LoadedIamState,
 ) -> serde_json::Value {
     let targets_value = dashboard_targets_response_value(agent_card, registry);
     let targets = targets_value
@@ -23645,6 +23677,25 @@ fn access_overview_response_value_with_identities(
         }));
     }
 
+    principals.extend(crate::access::iam::principal_overview_values(
+        &iam_state.state,
+    ));
+    grants.extend(crate::access::iam::grant_overview_values(
+        &iam_state.state,
+        &local_target_id,
+    ));
+    if iam_state.state.managed_grant_count() > 0 {
+        transports.push(serde_json::json!({
+            "id": "transport:future-user-client-binding",
+            "kind": "future_user_client_binding",
+            "kind_label": "Future user/client binding",
+            "label": "Future user/client binding",
+            "status": "planned",
+            "implementation": "future Connect account or per-device browser mTLS principal binding",
+            "target_id": local_target_id.clone()
+        }));
+    }
+
     serde_json::json!({
         "schema_version": 1,
         "scope": {
@@ -23723,6 +23774,10 @@ fn access_overview_response_value_with_identities(
             "label": "Browser certificate",
             "status": "current_self_hosted_transport"
         }, {
+            "kind": "human_user",
+            "label": "Human user",
+            "status": "planned_local_iam"
+        }, {
             "kind": "peer_daemon",
             "label": "Peer daemon",
             "status": "current"
@@ -23737,7 +23792,8 @@ fn access_overview_response_value_with_identities(
                 "organization ownership, billing, and recovery semantics",
                 "final IAM policy language and editing UX"
             ]
-        }
+        },
+        "iam": crate::access::iam::overview_metadata(iam_state)
     })
 }
 
@@ -23746,6 +23802,20 @@ pub(crate) fn access_overview_response_body(
     registry: Option<&crate::peer::PeerRegistry>,
 ) -> String {
     access_overview_response_value(agent_card, registry).to_string()
+}
+
+pub(crate) fn access_iam_state_response_value() -> serde_json::Value {
+    let cert_dir = crate::access::backend::select_backend().cert_dir();
+    let iam_state = crate::access::iam::load_state_for_overview(&cert_dir);
+    serde_json::json!({
+        "schema_version": 1,
+        "iam": crate::access::iam::overview_metadata(&iam_state),
+        "state": iam_state.state
+    })
+}
+
+pub(crate) fn access_iam_state_response_body() -> String {
+    access_iam_state_response_value().to_string()
 }
 
 /// Handle a `POST /api/peers` body: parse, call `PeerRegistry::add_peer`,
@@ -35858,6 +35928,14 @@ mod tests {
                 "{expected} permission should be visible in the overview"
             );
         }
+        assert_eq!(
+            payload["iam"]["capabilities"]["enforce_user_client_grants"],
+            false
+        );
+        assert_eq!(
+            payload["iam"]["enforcement"]["principal_binding"],
+            "root_session_only"
+        );
 
         handle.abort();
     }
@@ -35913,6 +35991,64 @@ mod tests {
                     && transport["status"].as_str() == Some("active")),
             "inbound peer mTLS transport should be visible"
         );
+    }
+
+    #[test]
+    fn test_access_overview_merges_local_iam_state_as_unenforced() {
+        let agent_card = serde_json::json!({
+            "id": "local-daemon",
+            "label": "Local daemon",
+            "capabilities": [],
+        });
+        let mut state = crate::access::iam::LocalIamState::default();
+        state.principals.push(crate::access::iam::IamPrincipal {
+            id: "principal:human:alice".to_string(),
+            kind: "human_user".to_string(),
+            label: "Alice".to_string(),
+            status: "draft".to_string(),
+            source: "local_iam_state".to_string(),
+            account: None,
+            organization: None,
+            authn: Vec::new(),
+            notes: None,
+            created_at_unix_ms: None,
+        });
+        state.grants.push(crate::access::iam::IamGrant {
+            id: "grant:alice:local:scoped".to_string(),
+            principal_id: "principal:human:alice".to_string(),
+            target_id: "local-daemon".to_string(),
+            role_id: "role:scoped-human".to_string(),
+            policy_id: "policy:scoped-human".to_string(),
+            status: "draft".to_string(),
+            source: "local_iam_state".to_string(),
+            reason: "example future grant".to_string(),
+            created_at_unix_ms: None,
+            revoked_at_unix_ms: None,
+        });
+        let loaded = crate::access::iam::LoadedIamState {
+            path: std::path::PathBuf::from("iam.json"),
+            state,
+            status: crate::access::iam::IamStateStatus::Loaded,
+        };
+
+        let payload =
+            access_overview_response_value_with_identities_and_iam(&agent_card, None, &[], &loaded);
+
+        let principals = payload["principals"].as_array().expect("principals");
+        assert!(principals.iter().any(|principal| {
+            principal["id"] == "principal:human:alice"
+                && principal["source"] == "local_iam_state"
+                && principal["status"] == "draft"
+        }));
+        let grants = payload["grants"].as_array().expect("grants");
+        assert!(grants.iter().any(|grant| {
+            grant["id"] == "grant:alice:local:scoped"
+                && grant["kind"] == "user_client_local_iam"
+                && grant["enforced"] == false
+        }));
+        assert_eq!(payload["iam"]["load_status"], "loaded");
+        assert_eq!(payload["iam"]["managed_principals"], 1);
+        assert_eq!(payload["iam"]["managed_grants"], 1);
     }
 
     /// End-to-end exercise of the static-asset arms through a real

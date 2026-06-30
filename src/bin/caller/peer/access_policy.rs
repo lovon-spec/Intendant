@@ -314,6 +314,7 @@ pub fn filesystem_access_allowed(
 
 pub fn profile_allows_federation_http(profile: &str, request_line: &str) -> bool {
     if request_line.contains(" /api/access/overview")
+        || request_line.contains(" /api/access/iam/state")
         || request_line.contains(" /api/dashboard/targets")
     {
         return profile_allows_operation(profile, PeerOperation::AccessInspect);
@@ -588,6 +589,14 @@ mod tests {
         assert!(!profile_allows_operation(
             "peer-operator",
             PeerOperation::PeerInspect
+        ));
+        assert!(profile_allows_federation_http(
+            "peer-root",
+            "GET /api/access/iam/state HTTP/1.1"
+        ));
+        assert!(!profile_allows_federation_http(
+            "peer-operator",
+            "GET /api/access/iam/state HTTP/1.1"
         ));
     }
 

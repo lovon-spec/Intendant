@@ -21,6 +21,7 @@ pub mod backend;
 pub mod cert_server;
 #[cfg_attr(target_os = "windows", allow(dead_code))]
 pub mod certs;
+pub mod iam;
 pub mod state;
 #[cfg(not(target_os = "windows"))]
 pub mod wizard;

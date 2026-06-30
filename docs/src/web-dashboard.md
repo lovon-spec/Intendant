@@ -295,12 +295,12 @@ Unified administration for how dashboards and daemons reach each other:
   available capabilities, then links to Stats, Files, and Shell.
 - **Peer Trust** focuses on daemon-to-daemon relationships: approved inbound
   identities and configured outbound peer routes, both bounded by peer profiles.
-- **Policies** shows the role/policy model and the permission matrix used by
-  dashboard-control and peer auth. This is read-only until editable IAM is
-  deliberately designed.
+- **Policies** shows the role/policy model, local IAM role templates, and the
+  permission matrix used by dashboard-control and peer auth. This is read-only
+  until editable IAM is deliberately designed.
 - **Audit** renders the overview-backed grant detail: principal, target, policy,
-  transport, status, and why the access exists. It also keeps the legacy trusted
-  relationship panel during the transition.
+  transport, enforcement status, and why the access exists. It also keeps the
+  legacy trusted relationship panel during the transition.
 - **Invitations** contains peer onboarding flows: Grant Peer Invite, Join Invite,
   Request Peer Access, Manual Add, and inbound peer access requests.
 - **Public Shares** is the placeholder surface for future explicit public or
@@ -320,7 +320,9 @@ and peer federation:
   current browser has a root user/client grant to the local daemon. A peer route
   has a daemon peer-profile grant. An approved inbound peer identity appears as
   a peer-daemon principal with a peer-profile grant to this daemon; revoked
-  identities remain visible as revoked grants for audit clarity.
+  identities remain visible as revoked grants for audit clarity. Local IAM
+  draft grants loaded from `iam.json` are visible as `enforced: false` until
+  stable user/client principal binding exists.
 - A **policy** defines the shape of authority behind a grant. `root` and
   `peer-profile` are enforced today. Scoped human IAM, directory-scoped file
   access, and public shares are design targets, not hidden enforcement.
@@ -351,10 +353,20 @@ The important security-domain split is:
 The model is backend-backed. `GET /api/access/overview` and the
 dashboard-control `api_access_overview` method return schema version 1 with
 `scope`, `targets`, `principals`, `grants`, `policies`, `permissions`,
-`transports`, `supported_principal_kinds`, and explicit unresolved architecture
-notes. This overview is descriptive for now: it exposes one product model over
-the current enforcement paths rather than replacing mTLS, Connect account
-checks, or peer profiles.
+`transports`, `supported_principal_kinds`, `iam`, and explicit unresolved
+architecture notes. This overview is descriptive for now: it exposes one
+product model over the current enforcement paths rather than replacing mTLS,
+Connect account checks, or peer profiles.
+
+The local IAM foundation lives beside the native access cert store as
+`iam.json` and is also available at `GET /api/access/iam/state` or
+dashboard-control `api_access_iam_state`. Its schema contains `principals`,
+`roles`, `grants`, and `audit_events`. The daemon currently exposes this state
+for inspection and merges managed principals/grants into the unified overview,
+but it does not enforce scoped user/client grants yet. The `iam.enforcement`
+object reports `user_client_grants: false` and `principal_binding:
+root_session_only` until browser mTLS or Connect requests can be bound to stable
+human/device principals.
 
 `GET /api/dashboard/targets` and `api_dashboard_targets` remain the compatibility
 target model used by older UI paths: target id/host id, display label, access
@@ -381,7 +393,7 @@ system Chrome/Chromium apps require choosing `system_cdp` or setting
 The configuration panel for the current session: API keys, external-agent
 backend settings, computer-use/provider options, presence, transcription,
 recording, and live audio. Peer/network administration moved to **Access**.
-Old `#settings/network` deep links are redirected to `#access/targets`.
+Old `#settings/network` deep links are redirected to `#access/overview`.
 
 ## Late-join and session replay
 

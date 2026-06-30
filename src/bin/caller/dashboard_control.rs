@@ -1916,7 +1916,9 @@ fn dashboard_control_method_operation(
             Some(PeerOperation::SessionInspect)
         }
         "config" => Some(PeerOperation::RuntimeControl),
-        "api_access_overview" | "api_dashboard_targets" => Some(PeerOperation::AccessInspect),
+        "api_access_overview" | "api_access_iam_state" | "api_dashboard_targets" => {
+            Some(PeerOperation::AccessInspect)
+        }
         "api_peer_pairing_requests" | "api_peer_pairing_identities" => {
             Some(PeerOperation::AccessInspect)
         }
@@ -2185,6 +2187,12 @@ fn control_frame_response(
                         &runtime.agent_card,
                         runtime.peer_registry.as_ref(),
                     ),
+                })),
+                "api_access_iam_state" => Some(serde_json::json!({
+                    "t": "response",
+                    "id": id,
+                    "ok": true,
+                    "result": crate::web_gateway::access_iam_state_response_value(),
                 })),
                 "subscribe_events" => {
                     runtime.events_subscribed = true;
@@ -3800,6 +3808,7 @@ fn status_response_frame(id: String, runtime: &ControlRuntime) -> serde_json::Va
         ("peer_manage_available", peer_manage),
         ("api_peers_available", peer_registry_available && peer_inspect),
         ("api_access_overview_available", access_inspect),
+        ("api_access_iam_state_available", access_inspect),
         ("api_dashboard_targets_available", access_inspect),
         ("api_agent_card_available", presence_read),
         ("api_cached_bootstrap_events_available", session_inspect),
@@ -9725,6 +9734,7 @@ mod tests {
         assert_eq!(status["result"]["peer_inspect_available"], true);
         assert_eq!(status["result"]["peer_manage_available"], true);
         assert_eq!(status["result"]["api_access_overview_available"], true);
+        assert_eq!(status["result"]["api_access_iam_state_available"], true);
         assert_eq!(status["result"]["api_dashboard_targets_available"], true);
         assert_eq!(
             status["result"]["api_peer_pairing_invite_available"],
@@ -9749,6 +9759,20 @@ mod tests {
         )
         .unwrap();
         assert_eq!(overview["ok"], true);
+
+        let iam_state = test_control_frame_response(
+            r#"{"t":"request","id":"iam1","method":"api_access_iam_state"}"#,
+            &mut peer_root,
+            &tx,
+            &mut pending,
+            &mut outbound,
+        )
+        .unwrap();
+        assert_eq!(iam_state["ok"], true);
+        assert_eq!(
+            iam_state["result"]["iam"]["capabilities"]["enforce_user_client_grants"],
+            false
+        );
 
         let revoke = test_control_frame_response(
             r#"{"t":"request","id":"r1","method":"api_peer_pairing_identity_revoke","params":{"identity":"peer-a"}}"#,
