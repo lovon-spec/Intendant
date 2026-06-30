@@ -6,27 +6,66 @@
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
-/// Ensure platform tool directories are in PATH.
+/// Ensure user/tool bin directories are in PATH.
 ///
-/// On macOS, Homebrew installs to `/opt/homebrew/bin` (Apple Silicon) or
-/// `/usr/local/bin` (Intel), but these may not be in PATH when launched
-/// from SSH, launchd, or other non-login contexts. This ensures tools
-/// like ffmpeg, cliclick, and wasm-pack are discoverable.
+/// When Intendant is launched from a non-login context — launchd, a GUI app
+/// bundle, a systemd unit, or a bare `ssh host cmd` — the shell profile that
+/// normally extends `PATH` is never sourced, so per-user installs are
+/// invisible. This prepends the standard locations (skipping any already
+/// present) so tools like the external coding agents (`claude`, `codex`,
+/// `gemini`), `ffmpeg`, `cliclick`, and `wasm-pack` stay discoverable:
+///
+/// - `~/.local/bin` — where the external agents' native installers place their
+///   launcher; applies on every Unix platform (macOS and Linux).
+/// - `/opt/homebrew/bin` (Apple Silicon) and `/usr/local/bin` (Intel) — the
+///   Homebrew prefixes; macOS only.
 pub fn ensure_tool_paths() {
-    #[cfg(target_os = "macos")]
+    #[cfg(unix)]
     {
-        let path = std::env::var("PATH").unwrap_or_default();
-        let mut additions = Vec::new();
-        for dir in &["/opt/homebrew/bin", "/usr/local/bin"] {
-            if !path.contains(dir) && std::path::Path::new(dir).is_dir() {
-                additions.push(*dir);
-            }
+        use std::path::PathBuf;
+
+        // Directories that hold user-installed CLIs but are commonly absent
+        // from PATH in non-login launch contexts. Order = search priority.
+        let mut candidates: Vec<PathBuf> = vec![home_dir().join(".local/bin")];
+        #[cfg(target_os = "macos")]
+        {
+            candidates.push(PathBuf::from("/opt/homebrew/bin"));
+            candidates.push(PathBuf::from("/usr/local/bin"));
         }
-        if !additions.is_empty() {
-            let new_path = format!("{}:{}", additions.join(":"), path);
-            std::env::set_var("PATH", &new_path);
+
+        let current = std::env::var_os("PATH").unwrap_or_default();
+        let additions: Vec<PathBuf> = candidates
+            .into_iter()
+            .filter(|dir| dir.is_dir() && !path_contains_dir(&current, dir))
+            .collect();
+        if additions.is_empty() {
+            return;
+        }
+
+        // Prepend the missing dirs ahead of the existing PATH. Guard the empty
+        // case so we never synthesize a bare separator — an empty PATH entry
+        // resolves to the current directory, a footgun.
+        let existing: Vec<PathBuf> = if current.is_empty() {
+            Vec::new()
+        } else {
+            std::env::split_paths(&current).collect()
+        };
+        if let Ok(joined) = std::env::join_paths(additions.into_iter().chain(existing)) {
+            std::env::set_var("PATH", joined);
         }
     }
+}
+
+/// Is `dir` present in `path` (a `PATH`-style `OsStr`) as an exact entry?
+///
+/// Splits on the platform separator and compares whole paths, so `~/.local/bin`
+/// is *not* reported present when only `~/.local/bin-wrap` is on `PATH`. A
+/// naive `str::contains` substring test gets this wrong and would skip adding a
+/// directory that only resembles one already there — hiding user-installed
+/// external agents (e.g. `claude`) from non-login launches of Intendant.
+#[cfg(unix)]
+fn path_contains_dir(path: &std::ffi::OsStr, dir: &std::path::Path) -> bool {
+    std::env::split_paths(path).any(|entry| entry == dir)
 }
 
 /// Check whether a process with the given PID is currently running.
@@ -1013,6 +1052,33 @@ mod tests {
     #[test]
     fn home_dir_is_nonempty() {
         assert!(!home_dir().as_os_str().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn path_membership_is_exact_segment_not_substring() {
+        use std::ffi::OsStr;
+        use std::path::Path;
+
+        let target = Path::new("/home/u/.local/bin");
+
+        // The regression that hid `claude` from launchd-spawned Intendant: a
+        // substring neighbor must NOT count as the directory being present.
+        assert!(!path_contains_dir(
+            OsStr::new("/home/u/.local/bin-wrap:/usr/bin"),
+            target,
+        ));
+        // Exact entries count — with or without a trailing slash.
+        assert!(path_contains_dir(
+            OsStr::new("/usr/bin:/home/u/.local/bin"),
+            target,
+        ));
+        assert!(path_contains_dir(
+            OsStr::new("/home/u/.local/bin/:/usr/bin"),
+            target,
+        ));
+        // Absent entirely.
+        assert!(!path_contains_dir(OsStr::new("/usr/bin:/bin"), target));
     }
 
     #[test]
