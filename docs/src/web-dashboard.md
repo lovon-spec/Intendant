@@ -284,6 +284,9 @@ targets with their available capabilities rather than as transport internals.
 
 Unified administration for how dashboards and daemons reach each other:
 
+- Access is available as both the in-dashboard **Access** tab and a first-class
+  `/access` page on daemon origins. The page opens the same Access surface
+  without task/session chrome so it can act as a local fleet-admin home.
 - **Overview** shows the current access scope, the local daemon identity, and
   the boundary between authority models and transports.
 - **People & Devices** lists user/client principals separately from peer daemon
@@ -345,6 +348,13 @@ and peer federation:
 - A **transport** is only how the route is carried: browser mTLS, hosted
   Connect/WebRTC tunnel, local/debug HTTP, or daemon-to-daemon peer mTLS. The
   product UI should not make Connect a separate access system.
+
+The browser may also maintain a local fleet registry for navigation: daemon ids,
+labels, remembered URLs, and the route/auth summary last seen from a daemon. This
+registry is client-side metadata, not an authorization source. If a remembered
+target is no longer configured on the current daemon, Access shows it as a
+browser-local record with operation buttons disabled. The daemon still owns IAM
+enforcement for every request.
 
 The important security-domain split is:
 
@@ -823,6 +833,10 @@ original `INTENDANT_CONNECT_RP_ID=connect.intendant.dev`; changing that value is
 a credential migration and existing users must register new passkeys. Browsers
 also allow `http://localhost:<port>` as a secure context for local development,
 so the same binary can be E2E-tested without public TLS.
+
+The hosted service also serves `/access` as the account/fleet entry point.
+`/connect` remains a compatibility alias for the same passkey, claim, daemon
+list, open-dashboard, label, revoke, and audit workflows.
 
 The daemon side still uses the normal `[connect]` outbound rendezvous client:
 

@@ -274,6 +274,21 @@ html {
   margin-left: 0;
   flex-shrink: 0;
 }
+.status-bar .access-nav-link {
+  color: var(--blue);
+  font-size: 11px;
+  font-weight: 700;
+}
+
+body.access-page .ticker-bar,
+body.access-page .global-task-bar,
+body.access-page .tab-bar {
+  display: none;
+}
+
+body.access-page #tab-access {
+  padding-top: 0;
+}
 
 /* ── Active/Passive Badge ── */
 .active-badge {
@@ -10145,6 +10160,11 @@ body.display-fullscreen-open {
       <span class="field-label">hosts</span>
       <span class="hosts-aggregate-dot" id="sb-hosts-dot"></span>
     </span>
+    <span class="sb-dot-group clickable" id="sb-access-page-link" title="Open fleet access administration">
+      <span class="sep" style="margin:0 2px">|</span>
+      <span class="field-label" id="sb-access-page-prefix">admin</span>
+      <span class="access-nav-link" id="sb-access-page-label">Access</span>
+    </span>
     <span class="active-badge is-active" id="sb-active-badge" title="This browser controls voice/video — click to switch to passive (observe-only) mode">Active</span>
   </div>
 
@@ -12654,12 +12674,18 @@ let activeStatsHost = '';
 // and always rendered first in the UI.
 const DAEMONS_KEY = 'intendant_daemons';
 const DASHBOARD_TRANSPORT_KEY = 'intendant_dashboard_transport';
+const ACCESS_FLEET_KEY = 'intendant_access_fleet_v1';
 const dashboardUrlParams = new URLSearchParams(window.location.search);
+const DASHBOARD_ACCESS_PAGE_MODE = /^\/access\/?$/i.test(window.location.pathname || '');
 const DASHBOARD_CONNECT_MODE = dashboardUrlParams.get('connect') === '1';
 const DASHBOARD_CONNECT_DAEMON_ID = String(dashboardUrlParams.get('daemon_id') || '').trim();
 const DASHBOARD_CONNECT_SIGNALING_BASE = String(
   dashboardUrlParams.get('connect_base') || ''
 ).trim().replace(/\/+$/, '');
+if (DASHBOARD_ACCESS_PAGE_MODE) {
+  document.body?.classList.add('access-page');
+  document.title = 'Intendant Access';
+}
 let daemons = [];
 let dashboardAccessTargets = [];
 let dashboardAccessOverview = null;
@@ -32506,12 +32532,157 @@ function normalizeDashboardAccessTarget(target) {
   };
 }
 
+function accessFleetRead() {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(ACCESS_FLEET_KEY) || '{}');
+    if (!parsed || typeof parsed !== 'object') return { schema_version: 1, targets: [] };
+    const targets = Array.isArray(parsed.targets) ? parsed.targets : [];
+    return { schema_version: 1, targets };
+  } catch (_) {
+    return { schema_version: 1, targets: [] };
+  }
+}
+
+function accessFleetWrite(targets) {
+  const normalized = [];
+  const seen = new Set();
+  for (const target of targets || []) {
+    const item = normalizeDashboardAccessTarget(target);
+    if (!item) continue;
+    const key = item.host_id || item.id;
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    normalized.push(item);
+  }
+  normalized.sort((a, b) => {
+    if (a.local !== b.local) return a.local ? -1 : 1;
+    return String(a.label || a.host_id).localeCompare(String(b.label || b.host_id));
+  });
+  localStorage.setItem(ACCESS_FLEET_KEY, JSON.stringify({
+    schema_version: 1,
+    updated_unix_ms: Date.now(),
+    targets: normalized.slice(0, 100),
+  }));
+}
+
+function accessFleetTargetUrl(target) {
+  const explicit = target?.url || target?.browser_tcp_via_url || target?.ws_url || '';
+  if (explicit) return explicit;
+  if (target?.local && DASHBOARD_CONNECT_MODE && DASHBOARD_CONNECT_DAEMON_ID) {
+    return `/app?connect=1&daemon_id=${encodeURIComponent(DASHBOARD_CONNECT_DAEMON_ID)}`;
+  }
+  if (target?.local && window.location.origin) return window.location.origin;
+  return '';
+}
+
+function accessFleetRecordFromTarget(target) {
+  const normalized = normalizeDashboardAccessTarget(target);
+  if (!normalized) return null;
+  const now = Date.now();
+  return {
+    id: normalized.id,
+    host_id: normalized.host_id,
+    label: normalized.label,
+    local: normalized.local,
+    source: normalized.source || 'dashboard',
+    access_domain: normalized.access_domain,
+    access_domain_label: normalized.access_domain_label,
+    route: normalized.route,
+    route_label: normalized.route_label,
+    auth: normalized.auth,
+    auth_label: normalized.auth_label,
+    effective_role: normalized.effective_role,
+    effective_role_label: normalized.effective_role_label,
+    profile: normalized.profile,
+    connected: normalized.connected,
+    url: accessFleetTargetUrl(normalized),
+    ws_url: normalized.ws_url || '',
+    browser_tcp_via_url: normalized.browser_tcp_via_url || '',
+    capabilities: normalized.capabilities || [],
+    origin: window.location.origin || '',
+    connect_daemon_id: normalized.local && DASHBOARD_CONNECT_MODE ? DASHBOARD_CONNECT_DAEMON_ID : '',
+    first_seen_unix_ms: normalized.first_seen_unix_ms || now,
+    last_seen_unix_ms: now,
+  };
+}
+
+function accessFleetRememberTargets(targets) {
+  const store = accessFleetRead();
+  const byId = new Map();
+  for (const target of store.targets || []) {
+    const normalized = normalizeDashboardAccessTarget(target);
+    if (!normalized) continue;
+    byId.set(normalized.host_id || normalized.id, { ...target, ...normalized });
+  }
+  for (const target of targets || []) {
+    const record = accessFleetRecordFromTarget(target);
+    if (!record) continue;
+    const key = record.host_id || record.id;
+    const previous = byId.get(key) || {};
+    byId.set(key, {
+      ...previous,
+      ...record,
+      first_seen_unix_ms: previous.first_seen_unix_ms || record.first_seen_unix_ms,
+    });
+  }
+  accessFleetWrite(Array.from(byId.values()));
+}
+
+function accessFleetTargets() {
+  return accessFleetRead().targets
+    .map(target => normalizeDashboardAccessTarget({
+      ...target,
+      source: target.source || 'browser_fleet',
+      connected: target.connected === true,
+    }))
+    .filter(Boolean);
+}
+
+function accessFleetForgetTarget(hostId) {
+  const id = String(hostId || '').trim();
+  if (!id) return;
+  const store = accessFleetRead();
+  accessFleetWrite((store.targets || []).filter(target => {
+    const normalized = normalizeDashboardAccessTarget(target);
+    return normalized && normalized.host_id !== id && normalized.id !== id;
+  }));
+}
+
+function accessMergeRememberedTargets(liveTargets) {
+  const out = [];
+  const seen = new Set();
+  for (const target of liveTargets || []) {
+    const normalized = normalizeDashboardAccessTarget(target);
+    if (!normalized) continue;
+    const key = normalized.host_id || normalized.id;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(normalized);
+  }
+  for (const target of accessFleetTargets()) {
+    const key = target.host_id || target.id;
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    out.push({
+      ...target,
+      source: 'browser_fleet',
+      connected: false,
+      route_label: target.route_label || 'Remembered route',
+      auth_label: target.auth_label || 'Browser-local fleet record',
+      effective_role_label: target.effective_role_label || 'Unknown',
+    });
+  }
+  return out;
+}
+
 function applyDashboardAccessTargets(payload) {
   const rawTargets = Array.isArray(payload?.targets) ? payload.targets : [];
-  dashboardAccessTargets = rawTargets
+  const liveTargets = rawTargets
     .map(normalizeDashboardAccessTarget)
     .map(decorateDashboardAccessTarget)
     .filter(Boolean);
+  accessFleetRememberTargets(liveTargets);
+  dashboardAccessTargets = accessMergeRememberedTargets(liveTargets);
   renderDashboardTargetSummaries();
 }
 
@@ -32578,12 +32749,14 @@ function upsertDashboardAccessTarget(target) {
   );
   if (idx >= 0) dashboardAccessTargets[idx] = normalized;
   else dashboardAccessTargets.push(normalized);
+  accessFleetRememberTargets([normalized]);
 }
 
 function removeDashboardAccessTarget(hostId) {
   const id = String(hostId || '').trim();
   if (!id) return;
   invalidateAccessOverview();
+  accessFleetForgetTarget(id);
   dashboardAccessTargets = dashboardAccessTargets.filter(t =>
     t.local || (t.host_id !== id && t.id !== id)
   );
@@ -33193,7 +33366,9 @@ function syncDashboardAccessTargetsFromDaemons() {
       capabilities: peer.capabilities || [],
     }))
     .filter(Boolean);
-  dashboardAccessTargets = [...localTargets, ...peerTargets];
+  const liveTargets = [...localTargets, ...peerTargets];
+  accessFleetRememberTargets(liveTargets);
+  dashboardAccessTargets = accessMergeRememberedTargets(liveTargets);
   renderDashboardTargetSummaries();
 }
 
@@ -33229,6 +33404,19 @@ function accessTargetRecords() {
     const id = target.host_id || target.id || '';
     if (!id || seen.has(id)) continue;
     records.push(target);
+    seen.add(id);
+  }
+  for (const target of accessFleetTargets()) {
+    const id = target.host_id || target.id || '';
+    if (!id || seen.has(id)) continue;
+    records.push({
+      ...target,
+      source: 'browser_fleet',
+      connected: false,
+      route_label: target.route_label || 'Remembered route',
+      auth_label: target.auth_label || 'Browser-local fleet record',
+      effective_role_label: target.effective_role_label || 'Unknown',
+    });
     seen.add(id);
   }
   return records;
@@ -33667,6 +33855,7 @@ function accessCreateTargetRow(target) {
   const descriptor = dashboardTargetDescriptor(hostId);
   const summary = dashboardTargetSummary(hostId, 'files');
   const connection = accessTargetConnection(target, descriptor, summary);
+  const rememberedOnly = target.source === 'browser_fleet' && !descriptor.local && !descriptor.peer;
   const state = connection.state || summary.state || 'checking';
   const row = document.createElement('div');
   row.className = `access-target-row ${state}`;
@@ -33679,9 +33868,11 @@ function accessCreateTargetRow(target) {
   dot.setAttribute('aria-hidden', 'true');
   const titleRow = document.createElement('div');
   titleRow.className = 'access-target-title-row';
-  accessAppendText(titleRow, 'access-target-title', descriptor.displayName || target.label || 'Target');
+  accessAppendText(titleRow, 'access-target-title', rememberedOnly ? (target.label || hostId || 'Remembered target') : (descriptor.displayName || target.label || 'Target'));
   if (descriptor.local) {
     accessAppendText(titleRow, 'access-target-badge', 'this daemon', 'span');
+  } else if (rememberedOnly) {
+    accessAppendText(titleRow, 'access-target-badge', 'browser record', 'span');
   }
   const subtitle = accessAppendText(main, 'access-target-subtitle', accessTargetSubtitle(target, descriptor));
   subtitle.title = subtitle.textContent;
@@ -33695,8 +33886,8 @@ function accessCreateTargetRow(target) {
   );
   const routeCell = accessCreateTargetCell(
     'Route',
-    connection.route || target.route_label || 'Route',
-    connection.detail || summary.detail || ''
+    rememberedOnly ? 'Remembered target' : (connection.route || target.route_label || 'Route'),
+    rememberedOnly ? 'Not configured on this daemon' : (connection.detail || summary.detail || '')
   );
 
   const chips = document.createElement('div');
@@ -33710,7 +33901,7 @@ function accessCreateTargetRow(target) {
 
   const actions = document.createElement('div');
   actions.className = 'access-target-actions';
-  const disabled = !descriptor.local && state === 'err';
+  const disabled = rememberedOnly || (!descriptor.local && state === 'err');
   actions.append(
     accessCreateTargetButton('Stats', () => accessOpenStats(hostId), { disabled }),
     accessCreateTargetButton('Files', () => accessOpenFiles(hostId), { disabled }),
@@ -34550,10 +34741,16 @@ function accessDaemonCards() {
   const targets = accessOverviewArray(accessOverviewModel(), 'targets');
   const peers = targets.filter(target => !target.local);
   const online = peers.filter(target => target.connected !== false).length;
+  const remembered = accessFleetTargets();
   return [{
     title: 'Daemon targets',
     kind: accessPlural(targets.length, 'target'),
     detail: 'Each target is a daemon the dashboard can operate or inspect.',
+  }, {
+    title: 'Browser fleet registry',
+    kind: remembered.length ? accessPlural(remembered.length, 'target') : 'Empty',
+    detail: 'Stored in this browser for navigation and labels. Each daemon still enforces its own IAM locally.',
+    actions: [{ label: DASHBOARD_ACCESS_PAGE_MODE ? 'Current page' : 'Open page', onClick: () => window.location.href = accessHomeHref('daemons') }],
   }, {
     title: 'Peer daemons',
     kind: peers.length ? `${online}/${peers.length} online` : 'None',
@@ -40773,8 +40970,15 @@ function normalizeAccessSubtab(name) {
 
 function parseRoute() {
   const raw = window.location.hash.slice(1); // strip leading '#'
-  if (!raw) return { tab: 'activity', subtab: null };
+  if (!raw) {
+    return DASHBOARD_ACCESS_PAGE_MODE
+      ? { tab: 'access', subtab: 'overview' }
+      : { tab: 'activity', subtab: null };
+  }
   const [tab, subtab] = raw.split('/');
+  if (DASHBOARD_ACCESS_PAGE_MODE && tab !== 'access') {
+    return { tab: 'access', subtab: 'overview' };
+  }
   if (!VALID_TABS.includes(tab)) return { tab: 'activity', subtab: null };
   if (tab === 'settings' && subtab === 'network') {
     return { tab: 'access', subtab: 'overview' };
@@ -40797,6 +41001,42 @@ function parseRoute() {
   return { tab, subtab: tab === 'access' && subtab ? normalizeAccessSubtab(subtab) : (subtab || null) };
 }
 
+function daemonDashboardHref(hash = '#activity') {
+  if (DASHBOARD_CONNECT_MODE && DASHBOARD_CONNECT_DAEMON_ID) {
+    return `/app?connect=1&daemon_id=${encodeURIComponent(DASHBOARD_CONNECT_DAEMON_ID)}${hash || ''}`;
+  }
+  return `/${hash || ''}`;
+}
+
+function accessHomeHref(subtab = 'overview') {
+  if (DASHBOARD_CONNECT_MODE) return '/access';
+  return `/access#access/${normalizeAccessSubtab(subtab)}`;
+}
+
+function openAccessHome() {
+  if (DASHBOARD_ACCESS_PAGE_MODE) {
+    window.location.href = daemonDashboardHref('#activity');
+  } else {
+    window.location.href = accessHomeHref(activeAccessSubtab || 'overview');
+  }
+}
+
+function syncAccessPageNavLink() {
+  const prefix = document.getElementById('sb-access-page-prefix');
+  const label = document.getElementById('sb-access-page-label');
+  const group = document.getElementById('sb-access-page-link');
+  if (!prefix || !label || !group) return;
+  if (DASHBOARD_ACCESS_PAGE_MODE) {
+    prefix.textContent = 'back';
+    label.textContent = 'Dashboard';
+    group.title = 'Return to the daemon dashboard';
+  } else {
+    prefix.textContent = 'admin';
+    label.textContent = 'Access';
+    group.title = 'Open fleet access administration';
+  }
+}
+
 function tabDomMatches(tab) {
   const pane = document.getElementById('tab-' + tab);
   const activeButton = document.querySelector('.tab-btn.active');
@@ -40816,6 +41056,10 @@ function tabDomMatches(tab) {
 function routeTo(tab, subtab) {
   if (tab === 'access' && subtab) subtab = normalizeAccessSubtab(subtab);
   const target = subtab ? `${tab}/${subtab}` : tab;
+  if (DASHBOARD_ACCESS_PAGE_MODE && tab !== 'access') {
+    window.location.href = daemonDashboardHref(`#${target}`);
+    return;
+  }
   const nextHash = `#${target}`;
   if (window.location.hash !== nextHash) {
     history.pushState(null, '', nextHash);
@@ -51718,6 +51962,7 @@ async function removeDaemon(hostId) {
       body: JSON.stringify({ peer_id: hostId }),
     }), 'api_peer_remove', { fallbackAfterRpcFailure: false });
   } catch { /* best-effort */ }
+  removeDashboardAccessTarget(hostId);
   await refreshPeersFromApi();
   setDaemonsStatus(`Removed ${hostId}`, '');
 }
@@ -62391,8 +62636,11 @@ document.getElementById('stats-host-select').addEventListener('change', (e) => {
 // bar - click jumps to Access targets so the user can investigate
 // which host is disconnected/skewed.
 document.getElementById('sb-hosts-group').addEventListener('click', () => {
-  routeTo('access', 'overview');
+  if (DASHBOARD_ACCESS_PAGE_MODE) routeTo('access', 'daemons');
+  else window.location.href = accessHomeHref('daemons');
 });
+document.getElementById('sb-access-page-link')?.addEventListener('click', openAccessHome);
+syncAccessPageNavLink();
 
 // Auto-scroll detection
 (function() {

@@ -62,6 +62,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let app = Router::new()
         .route("/", get(connect_ui))
         .route("/connect", get(connect_ui))
+        .route("/access", get(access_ui))
         .route("/app", get(app_html))
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
@@ -536,7 +537,19 @@ async fn readyz(State(state): State<Arc<AppState>>) -> Response {
 }
 
 async fn connect_ui(State(state): State<Arc<AppState>>) -> Html<String> {
-    Html(connect_ui_html(&state.config.public_origin))
+    Html(connect_ui_html(
+        &state.config.public_origin,
+        "Intendant Connect",
+        "Passkey access",
+    ))
+}
+
+async fn access_ui(State(state): State<Arc<AppState>>) -> Html<String> {
+    Html(connect_ui_html(
+        &state.config.public_origin,
+        "Intendant Access",
+        "Fleet access",
+    ))
 }
 
 async fn app_html(State(state): State<Arc<AppState>>, uri: Uri) -> ApiResult<Response> {
@@ -2159,14 +2172,14 @@ async fn ensure_owned_daemon(state: &AppState, user_id: Uuid, daemon_id: &str) -
     }
 }
 
-fn connect_ui_html(origin: &str) -> String {
+fn connect_ui_html(origin: &str, product_title: &str, account_subtitle: &str) -> String {
     format!(
         r#"<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Intendant Connect</title>
+  <title>{product_title}</title>
   <style>
     :root {{
       color-scheme: dark;
@@ -2286,7 +2299,7 @@ fn connect_ui_html(origin: &str) -> String {
       <div class="brand">
         <div class="brand-mark" aria-hidden="true">IC</div>
         <div>
-        <h1>Intendant Connect</h1>
+        <h1>{product_title}</h1>
           <div class="origin-chip"><span>Origin</span><code>{origin}</code></div>
         </div>
       </div>
@@ -2298,7 +2311,7 @@ fn connect_ui_html(origin: &str) -> String {
       <div class="panel-header">
         <div class="panel-title">
           <h2>Account</h2>
-          <div class="sub">Passkey access</div>
+          <div class="sub">{account_subtitle}</div>
         </div>
       </div>
       <div class="panel-body stack">
@@ -2748,6 +2761,14 @@ mod tests {
         assert!(!valid_connect_app_query(Some("connect=1")));
         assert!(!valid_connect_app_query(Some("connect=0&daemon_id=daemon")));
         assert!(!valid_connect_app_query(Some("connect=1&daemon_id=%20")));
+    }
+
+    #[test]
+    fn access_ui_uses_access_branding() {
+        let html = connect_ui_html("https://intendant.dev", "Intendant Access", "Fleet access");
+        assert!(html.contains("<title>Intendant Access</title>"));
+        assert!(html.contains("<h1>Intendant Access</h1>"));
+        assert!(html.contains(">Fleet access</div>"));
     }
 
     #[test]
