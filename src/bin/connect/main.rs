@@ -33,6 +33,11 @@ const CLAIM_CODE_ENTROPY_BYTES: usize = 16;
 const CLAIM_CODE_GENERATION_ATTEMPTS: usize = 32;
 const ACTIVE_DASHBOARD_SESSION_TTL_MS: u64 = 24 * 60 * 60 * 1000;
 const CSRF_HEADER: &str = "x-intendant-csrf";
+const FLEET_TARGET_LIMIT: usize = 100;
+const FLEET_TEXT_MAX: usize = 160;
+const FLEET_LABEL_MAX: usize = 120;
+const FLEET_URL_MAX: usize = 2048;
+const FLEET_CAPABILITY_LIMIT: usize = 64;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -75,6 +80,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/daemons", get(api_daemons))
         .route("/api/daemons/{daemon_id}/revoke", post(api_daemon_revoke))
         .route("/api/daemons/{daemon_id}/label", post(api_daemon_label))
+        .route("/api/fleet/targets", get(api_fleet_targets))
+        .route("/api/fleet/targets/sync", post(api_fleet_targets_sync))
+        .route(
+            "/api/fleet/targets/{target_id}/forget",
+            post(api_fleet_target_forget),
+        )
         .route("/api/claims/claim", post(api_claim_start))
         .route("/api/claims/{claim_id}", get(api_claim_status))
         .route("/api/audit", get(api_audit))
@@ -250,6 +261,8 @@ struct Store {
     #[serde(default)]
     daemons: Vec<DaemonRecord>,
     #[serde(default)]
+    fleet_targets: Vec<FleetTargetRecord>,
+    #[serde(default)]
     audit: Vec<AuditEvent>,
 }
 
@@ -273,6 +286,50 @@ struct DaemonRecord {
     claim_code_hash: Option<String>,
     claim_code_created_unix_ms: Option<u64>,
     registered_unix_ms: u64,
+    last_seen_unix_ms: u64,
+    updated_unix_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct FleetTargetRecord {
+    user_id: Uuid,
+    id: String,
+    host_id: String,
+    label: String,
+    #[serde(default)]
+    local: bool,
+    source: String,
+    #[serde(default)]
+    access_domain: String,
+    #[serde(default)]
+    access_domain_label: String,
+    #[serde(default)]
+    route: String,
+    #[serde(default)]
+    route_label: String,
+    #[serde(default)]
+    auth: String,
+    #[serde(default)]
+    auth_label: String,
+    #[serde(default)]
+    effective_role: String,
+    #[serde(default)]
+    effective_role_label: String,
+    #[serde(default)]
+    profile: String,
+    #[serde(default)]
+    url: String,
+    #[serde(default)]
+    ws_url: String,
+    #[serde(default)]
+    browser_tcp_via_url: String,
+    #[serde(default)]
+    origin: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    connect_daemon_id: Option<String>,
+    #[serde(default)]
+    capabilities: Vec<String>,
+    first_seen_unix_ms: u64,
     last_seen_unix_ms: u64,
     updated_unix_ms: u64,
 }
@@ -481,6 +538,81 @@ fn daemon_view(daemon: &DaemonRecord) -> serde_json::Value {
         "online": now.saturating_sub(daemon.last_seen_unix_ms) < 45_000,
         "registered_unix_ms": daemon.registered_unix_ms,
         "last_seen_unix_ms": daemon.last_seen_unix_ms,
+    })
+}
+
+fn daemon_fleet_target_view(config: &ServiceConfig, daemon: &DaemonRecord) -> serde_json::Value {
+    let now = now_unix_ms();
+    let label = daemon
+        .label
+        .as_deref()
+        .filter(|label| !label.trim().is_empty())
+        .unwrap_or(&daemon.daemon_id);
+    let url = format!(
+        "/app?connect=1&daemon_id={}",
+        form_urlencoded::byte_serialize(daemon.daemon_id.as_bytes()).collect::<String>()
+    );
+    let online = now.saturating_sub(daemon.last_seen_unix_ms) < 45_000;
+    json!({
+        "id": daemon.daemon_id,
+        "host_id": daemon.daemon_id,
+        "label": label,
+        "local": false,
+        "source": "connect_daemon",
+        "access_domain": "user_client",
+        "access_domain_label": "User/client access",
+        "route": "hosted_connect",
+        "route_label": "Hosted Connect",
+        "auth": "connect_account",
+        "auth_label": "Connect account",
+        "effective_role": "root",
+        "effective_role_label": "Root",
+        "profile": "",
+        "connected": online,
+        "online": online,
+        "claimed_daemon": true,
+        "daemon_public_key": daemon.daemon_public_key,
+        "url": url,
+        "ws_url": "",
+        "browser_tcp_via_url": "",
+        "origin": config.public_origin,
+        "connect_daemon_id": daemon.daemon_id,
+        "capabilities": [],
+        "first_seen_unix_ms": daemon.registered_unix_ms,
+        "last_seen_unix_ms": daemon.last_seen_unix_ms,
+        "updated_unix_ms": daemon.updated_unix_ms,
+    })
+}
+
+fn fleet_target_view(target: &FleetTargetRecord) -> serde_json::Value {
+    json!({
+        "id": target.id,
+        "host_id": target.host_id,
+        "label": target.label,
+        "local": target.local,
+        "source": target.source,
+        "access_domain": target.access_domain,
+        "access_domain_label": target.access_domain_label,
+        "route": target.route,
+        "route_label": target.route_label,
+        "auth": target.auth,
+        "auth_label": target.auth_label,
+        "effective_role": target.effective_role,
+        "effective_role_label": target.effective_role_label,
+        "profile": target.profile,
+        "connected": false,
+        "online": false,
+        "claimed_daemon": false,
+        "daemon_public_key": "",
+        "url": target.url,
+        "ws_url": target.ws_url,
+        "browser_tcp_via_url": target.browser_tcp_via_url,
+        "origin": target.origin,
+        "connect_daemon_id": target.connect_daemon_id,
+        "capabilities": target.capabilities,
+        "first_seen_unix_ms": target.first_seen_unix_ms,
+        "last_seen_unix_ms": target.last_seen_unix_ms,
+        "updated_unix_ms": target.updated_unix_ms,
     })
 }
 
@@ -1106,6 +1238,339 @@ async fn api_daemons(
     })))
 }
 
+async fn api_fleet_targets(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> ApiResult<Json<serde_json::Value>> {
+    let user = require_user(&state, &headers).await?;
+    let store = state.store.lock().await;
+    let targets = fleet_targets_for_user(&state.config, &store, user.id);
+    Ok(Json(json!({
+        "ok": true,
+        "schema_version": 1,
+        "targets": targets,
+    })))
+}
+
+#[derive(Debug, Deserialize)]
+struct FleetTargetsSyncRequest {
+    #[serde(default)]
+    targets: Vec<FleetTargetInput>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FleetTargetInput {
+    #[serde(default)]
+    id: String,
+    #[serde(default, alias = "hostId")]
+    host_id: String,
+    #[serde(default)]
+    label: String,
+    #[serde(default)]
+    local: bool,
+    #[serde(default)]
+    source: String,
+    #[serde(default, alias = "accessDomain")]
+    access_domain: String,
+    #[serde(default, alias = "accessDomainLabel")]
+    access_domain_label: String,
+    #[serde(default)]
+    route: String,
+    #[serde(default)]
+    route_key: String,
+    #[serde(default, alias = "routeLabel")]
+    route_label: String,
+    #[serde(default)]
+    auth: String,
+    #[serde(default, alias = "authLabel")]
+    auth_label: String,
+    #[serde(default, alias = "effectiveRole")]
+    effective_role: String,
+    #[serde(default, alias = "effectiveRoleLabel")]
+    effective_role_label: String,
+    #[serde(default)]
+    profile: String,
+    #[serde(default)]
+    url: String,
+    #[serde(default)]
+    ws_url: String,
+    #[serde(default)]
+    browser_tcp_via_url: String,
+    #[serde(default)]
+    origin: String,
+    #[serde(default, alias = "connectDaemonId")]
+    connect_daemon_id: String,
+    #[serde(default)]
+    capabilities: Vec<serde_json::Value>,
+    #[serde(default, alias = "firstSeenUnixMs")]
+    first_seen_unix_ms: u64,
+    #[serde(default, alias = "lastSeenUnixMs")]
+    last_seen_unix_ms: u64,
+}
+
+async fn api_fleet_targets_sync(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<FleetTargetsSyncRequest>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let user = require_user(&state, &headers).await?;
+    require_csrf(&state, &headers).await?;
+    check_rate_limit(&state, &headers, "fleet_targets_sync", 60, 60_000).await?;
+    let now = now_unix_ms();
+    let mut incoming = Vec::new();
+    for input in body.targets.into_iter().take(FLEET_TARGET_LIMIT) {
+        if let Some(target) = normalize_fleet_target_input(user.id, input, now) {
+            incoming.push(target);
+        }
+    }
+    let mut store = state.store.lock().await;
+    let mut by_host: HashMap<String, FleetTargetRecord> = store
+        .fleet_targets
+        .iter()
+        .filter(|target| target.user_id == user.id)
+        .map(|target| (target.host_id.clone(), target.clone()))
+        .collect();
+    for target in incoming {
+        let previous = by_host.get(&target.host_id).cloned();
+        let first_seen_unix_ms = previous
+            .as_ref()
+            .map(|record| record.first_seen_unix_ms)
+            .filter(|value| *value > 0)
+            .unwrap_or(target.first_seen_unix_ms);
+        by_host.insert(
+            target.host_id.clone(),
+            FleetTargetRecord {
+                first_seen_unix_ms,
+                ..target
+            },
+        );
+    }
+    let mut user_targets = by_host.into_values().collect::<Vec<_>>();
+    user_targets.sort_by(|a, b| {
+        b.updated_unix_ms
+            .cmp(&a.updated_unix_ms)
+            .then_with(|| a.label.cmp(&b.label))
+    });
+    user_targets.truncate(FLEET_TARGET_LIMIT);
+    store
+        .fleet_targets
+        .retain(|target| target.user_id != user.id);
+    store.fleet_targets.extend(user_targets);
+    persist_locked(&state, &store)?;
+    let targets = fleet_targets_for_user(&state.config, &store, user.id);
+    Ok(Json(json!({
+        "ok": true,
+        "schema_version": 1,
+        "targets": targets,
+    })))
+}
+
+async fn api_fleet_target_forget(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    AxumPath(target_id): AxumPath<String>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let user = require_user(&state, &headers).await?;
+    require_csrf(&state, &headers).await?;
+    check_rate_limit(&state, &headers, "fleet_target_forget", 60, 60_000).await?;
+    let target_id = clean_fleet_text(&target_id, FLEET_TEXT_MAX);
+    if target_id.is_empty() {
+        return Err(ApiError::bad_request("target_id is required"));
+    }
+    let mut store = state.store.lock().await;
+    let before = store.fleet_targets.len();
+    store.fleet_targets.retain(|target| {
+        !(target.user_id == user.id && (target.host_id == target_id || target.id == target_id))
+    });
+    let removed = before.saturating_sub(store.fleet_targets.len());
+    if removed > 0 {
+        audit(
+            &mut store,
+            "fleet_target_forgotten",
+            Some(user.id),
+            Some(target_id.clone()),
+            json!({ "removed": removed }),
+        );
+        persist_locked(&state, &store)?;
+    }
+    let targets = fleet_targets_for_user(&state.config, &store, user.id);
+    Ok(Json(json!({
+        "ok": true,
+        "removed": removed,
+        "schema_version": 1,
+        "targets": targets,
+    })))
+}
+
+fn fleet_targets_for_user(
+    config: &ServiceConfig,
+    store: &Store,
+    user_id: Uuid,
+) -> Vec<serde_json::Value> {
+    let mut by_host: HashMap<String, serde_json::Value> = HashMap::new();
+    for target in store
+        .fleet_targets
+        .iter()
+        .filter(|target| target.user_id == user_id)
+    {
+        by_host.insert(target.host_id.clone(), fleet_target_view(target));
+    }
+    for daemon in store
+        .daemons
+        .iter()
+        .filter(|daemon| daemon.owner_user_id == Some(user_id))
+    {
+        by_host.insert(
+            daemon.daemon_id.clone(),
+            daemon_fleet_target_view(config, daemon),
+        );
+    }
+    let mut targets = by_host.into_values().collect::<Vec<_>>();
+    targets.sort_by(|a, b| {
+        let a_label = a.get("label").and_then(|v| v.as_str()).unwrap_or("");
+        let b_label = b.get("label").and_then(|v| v.as_str()).unwrap_or("");
+        a_label.cmp(b_label)
+    });
+    targets
+}
+
+fn normalize_fleet_target_input(
+    user_id: Uuid,
+    input: FleetTargetInput,
+    now: u64,
+) -> Option<FleetTargetRecord> {
+    let host_id = clean_fleet_text(
+        first_non_empty(&[input.host_id.as_str(), input.id.as_str()]),
+        FLEET_TEXT_MAX,
+    );
+    if host_id.is_empty() {
+        return None;
+    }
+    let id = clean_fleet_text(
+        first_non_empty(&[input.id.as_str(), host_id.as_str()]),
+        FLEET_TEXT_MAX,
+    );
+    let label = clean_fleet_text(&input.label, FLEET_LABEL_MAX);
+    let source = clean_fleet_token(
+        first_non_empty(&[input.source.as_str(), "browser_fleet"]),
+        FLEET_TEXT_MAX,
+    );
+    let route = clean_fleet_token(
+        first_non_empty(&[input.route.as_str(), input.route_key.as_str()]),
+        FLEET_TEXT_MAX,
+    );
+    let connect_daemon_id = clean_fleet_text(&input.connect_daemon_id, FLEET_TEXT_MAX);
+    let first_seen_unix_ms = nonzero_past_or_now(input.first_seen_unix_ms, now);
+    let last_seen_unix_ms = nonzero_past_or_now(input.last_seen_unix_ms, now);
+    Some(FleetTargetRecord {
+        user_id,
+        id: if id.is_empty() { host_id.clone() } else { id },
+        host_id: host_id.clone(),
+        label: if label.is_empty() {
+            host_id.clone()
+        } else {
+            label
+        },
+        local: input.local,
+        source: if source.is_empty() {
+            "browser_fleet".to_string()
+        } else {
+            source
+        },
+        access_domain: clean_fleet_token(&input.access_domain, FLEET_TEXT_MAX),
+        access_domain_label: clean_fleet_text(&input.access_domain_label, FLEET_LABEL_MAX),
+        route,
+        route_label: clean_fleet_text(&input.route_label, FLEET_LABEL_MAX),
+        auth: clean_fleet_token(&input.auth, FLEET_TEXT_MAX),
+        auth_label: clean_fleet_text(&input.auth_label, FLEET_LABEL_MAX),
+        effective_role: clean_fleet_token(&input.effective_role, FLEET_TEXT_MAX),
+        effective_role_label: clean_fleet_text(&input.effective_role_label, FLEET_LABEL_MAX),
+        profile: clean_fleet_token(&input.profile, FLEET_TEXT_MAX),
+        url: clean_fleet_url(&input.url),
+        ws_url: clean_fleet_url(&input.ws_url),
+        browser_tcp_via_url: clean_fleet_url(&input.browser_tcp_via_url),
+        origin: clean_fleet_url(&input.origin),
+        connect_daemon_id: if connect_daemon_id.is_empty() {
+            None
+        } else {
+            Some(connect_daemon_id)
+        },
+        capabilities: clean_fleet_capabilities(input.capabilities),
+        first_seen_unix_ms,
+        last_seen_unix_ms,
+        updated_unix_ms: now,
+    })
+}
+
+fn first_non_empty<'a>(values: &[&'a str]) -> &'a str {
+    values
+        .iter()
+        .copied()
+        .map(str::trim)
+        .find(|value| !value.is_empty())
+        .unwrap_or("")
+}
+
+fn clean_fleet_text(value: &str, max_chars: usize) -> String {
+    value
+        .trim()
+        .chars()
+        .filter(|ch| !ch.is_control())
+        .take(max_chars)
+        .collect::<String>()
+}
+
+fn clean_fleet_token(value: &str, max_chars: usize) -> String {
+    clean_fleet_text(value, max_chars)
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | ':'))
+        .collect()
+}
+
+fn clean_fleet_url(value: &str) -> String {
+    let value = clean_fleet_text(value, FLEET_URL_MAX);
+    if value.is_empty() {
+        return String::new();
+    }
+    if value.starts_with('/') && !value.starts_with("//") {
+        return value;
+    }
+    let Ok(url) = Url::parse(&value) else {
+        return String::new();
+    };
+    match url.scheme() {
+        "http" | "https" | "ws" | "wss" => value,
+        _ => String::new(),
+    }
+}
+
+fn clean_fleet_capabilities(values: Vec<serde_json::Value>) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for value in values.into_iter().take(FLEET_CAPABILITY_LIMIT * 2) {
+        let Some(text) = value.as_str() else {
+            continue;
+        };
+        let capability = clean_fleet_token(text, FLEET_TEXT_MAX);
+        if capability.is_empty() || !seen.insert(capability.clone()) {
+            continue;
+        }
+        out.push(capability);
+        if out.len() >= FLEET_CAPABILITY_LIMIT {
+            break;
+        }
+    }
+    out
+}
+
+fn nonzero_past_or_now(value: u64, now: u64) -> u64 {
+    if value == 0 || value > now {
+        now
+    } else {
+        value
+    }
+}
+
 async fn api_daemon_revoke(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -1132,6 +1597,9 @@ async fn api_daemon_revoke(
     daemon.claim_code_hash = None;
     daemon.claim_code_created_unix_ms = None;
     daemon.updated_unix_ms = now_unix_ms();
+    store
+        .fleet_targets
+        .retain(|target| !(target.user_id == user.id && target.host_id == daemon_id));
     audit(
         &mut store,
         "daemon_revoked",
@@ -1190,6 +1658,20 @@ async fn api_daemon_label(
     };
     daemon.updated_unix_ms = now_unix_ms();
     let view = daemon_view(daemon);
+    let target_label = if label.is_empty() {
+        daemon_id.as_str()
+    } else {
+        label
+    };
+    let now = now_unix_ms();
+    for target in store
+        .fleet_targets
+        .iter_mut()
+        .filter(|target| target.user_id == user.id && target.host_id == daemon_id)
+    {
+        target.label = target_label.to_string();
+        target.updated_unix_ms = now;
+    }
     audit(
         &mut store,
         "daemon_label_updated",
@@ -2259,6 +2741,7 @@ fn connect_ui_html(origin: &str, product_title: &str, account_subtitle: &str) ->
     .daemon-name {{ display: grid; gap: 3px; min-width: 220px; }}
     .daemon-name strong {{ font-size: 14px; }}
     .daemon-activity {{ display: grid; gap: 6px; min-width: 116px; }}
+    .target-route {{ display: grid; gap: 4px; min-width: 180px; }}
     .action-cell .actions {{ justify-content: flex-end; flex-wrap: nowrap; }}
     .pill {{ display: inline-flex; align-items: center; width: fit-content; min-height: 24px; padding: 0 9px; border-radius: 999px; background: var(--surface-2); color: var(--muted); border: 1px solid var(--line); font-size: 12px; font-weight: 750; }}
     .pill.ok {{ color: var(--ok); border-color: rgba(126, 220, 143, .4); background: rgba(126, 220, 143, .09); }}
@@ -2360,6 +2843,23 @@ fn connect_ui_html(origin: &str, product_title: &str, account_subtitle: &str) ->
       </div>
     </section>
 
+    <section id="fleet-section" class="wide hidden">
+      <div class="panel-header">
+        <div class="panel-title">
+          <h2>Access Targets</h2>
+          <div class="sub">Account-backed fleet navigation; each daemon still enforces its own access locally</div>
+        </div>
+      </div>
+      <div class="panel-body">
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Target</th><th>Route</th><th>Authority</th><th></th></tr></thead>
+            <tbody id="fleet-rows"></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
     <section id="audit-section" class="wide hidden">
       <div class="panel-header">
         <div class="panel-title">
@@ -2374,7 +2874,7 @@ fn connect_ui_html(origin: &str, product_title: &str, account_subtitle: &str) ->
   </main>
 <script>
 const $ = id => document.getElementById(id);
-const state = {{ user: null, daemons: [], csrfToken: '' }};
+const state = {{ user: null, daemons: [], fleetTargets: [], csrfToken: '' }};
 
 function setStatus(id, text, kind = '') {{
   const el = $(id);
@@ -2542,12 +3042,15 @@ async function refreshAll() {{
     state.user = me.authenticated ? me.user : null;
     renderAuth();
     if (!state.user) return;
-    const [daemons, audit] = await Promise.all([
+    const [daemons, fleet, audit] = await Promise.all([
       api('/api/daemons'),
+      api('/api/fleet/targets'),
       api('/api/audit'),
     ]);
     state.daemons = daemons.daemons || [];
+    state.fleetTargets = fleet.targets || [];
     renderDaemons();
+    renderFleetTargets();
     renderAudit(audit.events || []);
   }} finally {{
     setBusy('refresh', false);
@@ -2559,6 +3062,7 @@ function renderAuth() {{
   document.body.classList.toggle('signed-out', !authed);
   document.body.classList.toggle('signed-in', authed);
   $('manage').classList.toggle('hidden', !authed);
+  $('fleet-section').classList.toggle('hidden', !authed);
   $('audit-section').classList.toggle('hidden', !authed);
   $('logout').classList.toggle('hidden', !authed);
   $('auth-actions').classList.toggle('hidden', authed);
@@ -2623,6 +3127,50 @@ function renderDaemons() {{
         method: 'POST',
         body: JSON.stringify({{ label: next }}),
       }});
+      await refreshAll();
+    }});
+  }});
+}}
+
+function renderFleetTargets() {{
+  const rows = $('fleet-rows');
+  rows.innerHTML = '';
+  if (state.fleetTargets.length === 0) {{
+    rows.innerHTML = '<tr><td colspan="4" class="empty-state">No access targets</td></tr>';
+    return;
+  }}
+  for (const target of state.fleetTargets) {{
+    const tr = document.createElement('tr');
+    const id = String(target.host_id || target.id || '');
+    const label = String(target.label || id || 'Target');
+    const source = String(target.source || 'browser_fleet');
+    const route = String(target.route_label || target.route || target.url || 'Remembered route');
+    const auth = String(target.auth_label || target.auth || target.effective_role_label || 'Account record');
+    const statusClass = target.online || target.connected ? 'ok' : 'warn';
+    const statusText = target.online || target.connected ? 'online' : 'remembered';
+    const url = String(target.url || '');
+    const canForget = target.claimed_daemon !== true;
+    tr.innerHTML = `
+      <td data-cell-label="Target"><div class="daemon-name"><strong>${{escapeHtml(label)}}</strong><code>${{escapeHtml(id)}}</code></div></td>
+      <td data-cell-label="Route"><div class="target-route"><span class="pill ${{statusClass}}">${{escapeHtml(statusText)}}</span><span class="sub">${{escapeHtml(route)}}</span></div></td>
+      <td data-cell-label="Authority"><div class="target-route"><span class="pill">${{escapeHtml(source.replaceAll('_', ' '))}}</span><span class="sub">${{escapeHtml(auth)}}</span></div></td>
+      <td class="action-cell" data-cell-label="Actions"><div class="actions">
+        <button data-fleet-open="${{escapeAttr(url)}}" ${{url ? '' : 'disabled'}}>Open</button>
+        <button class="secondary" data-fleet-forget="${{escapeAttr(id)}}" ${{canForget ? '' : 'disabled'}}>Forget</button>
+      </div></td>`;
+    rows.appendChild(tr);
+  }}
+  rows.querySelectorAll('[data-fleet-open]').forEach(button => {{
+    button.addEventListener('click', () => {{
+      const url = button.getAttribute('data-fleet-open');
+      if (url) window.location.href = url;
+    }});
+  }});
+  rows.querySelectorAll('[data-fleet-forget]').forEach(button => {{
+    button.addEventListener('click', async () => {{
+      const id = button.getAttribute('data-fleet-forget');
+      if (!id) return;
+      await api(`/api/fleet/targets/${{encodeURIComponent(id)}}/forget`, {{ method: 'POST', body: '{{}}' }});
       await refreshAll();
     }});
   }});
@@ -2791,6 +3339,7 @@ mod tests {
                 ),
                 daemon_record("claimed", Some(Uuid::new_v4()), Some(claimed), Some(now)),
             ],
+            fleet_targets: Vec::new(),
             audit: Vec::new(),
         };
         let hashes = active_claim_code_hashes(&store, "current", now);
@@ -2834,6 +3383,169 @@ mod tests {
         assert_eq!(
             daemon.claim_code_hash.as_deref(),
             Some(expected_hash.as_str())
+        );
+    }
+
+    #[test]
+    fn fleet_target_input_is_sanitized_and_capped() {
+        let user_id = Uuid::new_v4();
+        let now = now_unix_ms();
+        let target = normalize_fleet_target_input(
+            user_id,
+            FleetTargetInput {
+                id: " target\nid ".to_string(),
+                host_id: " target\nid ".to_string(),
+                label: " My target ".to_string(),
+                local: true,
+                source: "browser fleet!".to_string(),
+                access_domain: "user_client".to_string(),
+                access_domain_label: " User/client ".to_string(),
+                route: "hosted_connect".to_string(),
+                route_key: String::new(),
+                route_label: " Hosted Connect ".to_string(),
+                auth: "connect_account".to_string(),
+                auth_label: " Connect account ".to_string(),
+                effective_role: "root".to_string(),
+                effective_role_label: " Root ".to_string(),
+                profile: "root".to_string(),
+                url: "javascript:alert(1)".to_string(),
+                ws_url: "wss://example.test/ws".to_string(),
+                browser_tcp_via_url: "/app?connect=1&daemon_id=daemon".to_string(),
+                origin: "https://intendant.dev".to_string(),
+                connect_daemon_id: " daemon ".to_string(),
+                capabilities: vec![
+                    json!("display"),
+                    json!("display"),
+                    json!("custom:files"),
+                    json!(42),
+                ],
+                first_seen_unix_ms: now.saturating_add(10_000),
+                last_seen_unix_ms: now.saturating_add(10_000),
+            },
+            now,
+        )
+        .expect("target should normalize");
+
+        assert_eq!(target.user_id, user_id);
+        assert_eq!(target.host_id, "targetid");
+        assert_eq!(target.label, "My target");
+        assert_eq!(target.source, "browserfleet");
+        assert_eq!(target.url, "");
+        assert_eq!(target.ws_url, "wss://example.test/ws");
+        assert_eq!(
+            target.browser_tcp_via_url,
+            "/app?connect=1&daemon_id=daemon"
+        );
+        assert_eq!(target.origin, "https://intendant.dev");
+        assert_eq!(target.connect_daemon_id.as_deref(), Some("daemon"));
+        assert_eq!(target.capabilities, vec!["display", "custom:files"]);
+        assert_eq!(target.first_seen_unix_ms, now);
+        assert_eq!(target.last_seen_unix_ms, now);
+    }
+
+    #[test]
+    fn fleet_targets_merge_claimed_daemons_over_remembered_records() {
+        let user_id = Uuid::new_v4();
+        let store = Store {
+            users: Vec::new(),
+            daemons: vec![DaemonRecord {
+                daemon_id: "daemon-1".to_string(),
+                label: Some("Live daemon".to_string()),
+                daemon_public_key: "daemon-key".to_string(),
+                owner_user_id: Some(user_id),
+                claim_code_hash: None,
+                claim_code_created_unix_ms: None,
+                registered_unix_ms: 10,
+                last_seen_unix_ms: now_unix_ms(),
+                updated_unix_ms: 20,
+            }],
+            fleet_targets: vec![
+                FleetTargetRecord {
+                    user_id,
+                    id: "daemon-1".to_string(),
+                    host_id: "daemon-1".to_string(),
+                    label: "Stale label".to_string(),
+                    local: false,
+                    source: "browser_fleet".to_string(),
+                    access_domain: "user_client".to_string(),
+                    access_domain_label: "User/client access".to_string(),
+                    route: "hosted_connect".to_string(),
+                    route_label: "Hosted Connect".to_string(),
+                    auth: "connect_account".to_string(),
+                    auth_label: "Connect account".to_string(),
+                    effective_role: "root".to_string(),
+                    effective_role_label: "Root".to_string(),
+                    profile: String::new(),
+                    url: "/app?connect=1&daemon_id=daemon-1".to_string(),
+                    ws_url: String::new(),
+                    browser_tcp_via_url: String::new(),
+                    origin: "https://intendant.dev".to_string(),
+                    connect_daemon_id: Some("daemon-1".to_string()),
+                    capabilities: Vec::new(),
+                    first_seen_unix_ms: 1,
+                    last_seen_unix_ms: 1,
+                    updated_unix_ms: 1,
+                },
+                FleetTargetRecord {
+                    user_id,
+                    id: "manual".to_string(),
+                    host_id: "manual".to_string(),
+                    label: "Manual target".to_string(),
+                    local: false,
+                    source: "browser_fleet".to_string(),
+                    access_domain: String::new(),
+                    access_domain_label: String::new(),
+                    route: String::new(),
+                    route_label: "Remembered route".to_string(),
+                    auth: String::new(),
+                    auth_label: String::new(),
+                    effective_role: String::new(),
+                    effective_role_label: String::new(),
+                    profile: String::new(),
+                    url: "https://manual.example".to_string(),
+                    ws_url: String::new(),
+                    browser_tcp_via_url: String::new(),
+                    origin: "https://intendant.dev".to_string(),
+                    connect_daemon_id: None,
+                    capabilities: Vec::new(),
+                    first_seen_unix_ms: 1,
+                    last_seen_unix_ms: 1,
+                    updated_unix_ms: 1,
+                },
+            ],
+            audit: Vec::new(),
+        };
+        let config = ServiceConfig {
+            listen: SocketAddr::from(([127, 0, 0, 1], 9876)),
+            public_origin: "https://intendant.dev".to_string(),
+            rp_id: "intendant.dev".to_string(),
+            static_root: PathBuf::from("static"),
+            data_file: PathBuf::from("state.json"),
+            daemon_token: None,
+            cookie_secure: true,
+        };
+
+        let targets = fleet_targets_for_user(&config, &store, user_id);
+        assert_eq!(targets.len(), 2);
+        let live = targets
+            .iter()
+            .find(|target| target.get("host_id").and_then(|v| v.as_str()) == Some("daemon-1"))
+            .expect("live daemon target");
+        assert_eq!(
+            live.get("label").and_then(|v| v.as_str()),
+            Some("Live daemon")
+        );
+        assert_eq!(
+            live.get("source").and_then(|v| v.as_str()),
+            Some("connect_daemon")
+        );
+        let manual = targets
+            .iter()
+            .find(|target| target.get("host_id").and_then(|v| v.as_str()) == Some("manual"))
+            .expect("manual target");
+        assert_eq!(
+            manual.get("source").and_then(|v| v.as_str()),
+            Some("browser_fleet")
         );
     }
 }

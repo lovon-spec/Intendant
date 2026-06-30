@@ -356,6 +356,20 @@ target is no longer configured on the current daemon, Access shows it as a
 browser-local record with operation buttons disabled. The daemon still owns IAM
 enforcement for every request.
 
+When the dashboard is loaded from the hosted Connect/Access origin in
+`?connect=1` mode, that browser-local fleet registry is also synced to the
+signed-in account through `GET /api/fleet/targets`,
+`POST /api/fleet/targets/sync`, and
+`POST /api/fleet/targets/{target_id}/forget`. The hosted service stores only
+navigation metadata: target ids, labels, route labels, URLs, capability hints,
+and last-seen timestamps. It does not store browser mTLS private keys, daemon
+IAM grants, peer secrets, dashboard session grants, or passkey private material.
+Claimed Connect daemons are merged into the same target list as live
+`connect_daemon` records and override stale remembered labels. Direct mTLS
+dashboards on daemon origins remain local-first; cross-origin sync to
+`intendant.dev` is a separate explicit-consent design problem, not something the
+current cookie model does silently.
+
 The important security-domain split is:
 
 - **User/client daemon access** means a human-operated dashboard can control a
@@ -873,10 +887,11 @@ The hosted MVP flow is:
    sending dashboard RPC over the DataChannel.
 
 The state file durably stores users, passkeys, daemon ownership, hashed claim
-phrases, and a capped audit log. Plain claim phrases, WebAuthn challenge state,
-browser offers, and dashboard grants are memory-only. The service exposes a
-minimal account/daemon UI today: passkey registration/login, claim-phrase entry,
-daemon list, daemon labels, open dashboard, revoke ownership, and audit events.
+phrases, account-scoped fleet navigation metadata, and a capped audit log. Plain
+claim phrases, WebAuthn challenge state, browser offers, and dashboard grants
+are memory-only. The service exposes a minimal account/fleet UI today: passkey
+registration/login, claim-phrase entry, daemon list, daemon labels, open
+dashboard, revoke ownership, fleet target listing/forget, and audit events.
 The visible account identity is the globally unique account name/handle; the
 internal WebAuthn display-name field is derived from that handle and is not a
 separate user-facing profile field in the MVP UI.

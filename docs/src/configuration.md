@@ -346,10 +346,11 @@ INTENDANT_CONNECT_TOKEN="shared daemon bearer token" \
 
 `intendant-connect` is intended to sit behind public TLS for the configured
 origin. It handles passkey-only account sessions, claim-phrase ownership proof,
-daemon list/open/revoke/label UI, short-lived dashboard grants, WebRTC
-signaling, active-session close on revoke, and a capped audit log. The state
-file durably stores users/passkeys, daemon ownership, labels, hashed claim
-phrases, and audit events. Plain claim phrases, WebAuthn challenge state,
+daemon list/open/revoke/label UI, account-backed fleet target metadata,
+short-lived dashboard grants, WebRTC signaling, active-session close on revoke,
+and a capped audit log. The state file durably stores users/passkeys, daemon
+ownership, labels, hashed claim phrases, account-scoped fleet navigation
+records, and audit events. Plain claim phrases, WebAuthn challenge state,
 pending offers, issued dashboard grants, rate limits, web sessions, and active
 dashboard session tracking are memory-only. The claim API field remains named
 `claim_code` for compatibility, but newly generated claims are standard 12-word
@@ -371,7 +372,9 @@ and store `INTENDANT_CONNECT_TOKEN` in the deployment secret store.
 
 Cookie-backed user mutations require a same-origin request and the per-session
 CSRF token returned by `/api/me`. The bundled Connect UI and dashboard
-`connect=1` mode set that header automatically.
+`connect=1` mode set that header automatically, including hosted fleet sync
+through `/api/fleet/targets/sync` and fleet-record deletion through
+`/api/fleet/targets/{target_id}/forget`.
 
 Production-alpha operations are intentionally boring and repeatable, but live
 target details are intentionally not tracked in this public repository. Keep the

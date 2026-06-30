@@ -12691,6 +12691,10 @@ let dashboardAccessTargets = [];
 let dashboardAccessOverview = null;
 let accessUserClientGrantSubmitting = false;
 const accessGrantLifecycleSubmitting = new Set();
+let accessFleetHostedSyncTimer = null;
+let accessFleetHostedSyncInFlight = false;
+let accessFleetHostedSyncDirty = false;
+let accessFleetHostedCsrfToken = '';
 let dashboardControlTransport = null;
 let dashboardTransport = null;
 let dashboardServerMessageDispatcher = null;
@@ -20460,6 +20464,7 @@ async function main() {
       await maybeStartDashboardControlTransport();
       await waitForDashboardControlReady(30000);
       await hydrateDashboardFromControl();
+      await accessFleetHydrateFromHosted();
       connectBootstrapReady = true;
       setConnectEventStatus('ok', 'Dashboard events are live through verified Hosted Connect');
     } catch (err) {
@@ -32543,7 +32548,7 @@ function accessFleetRead() {
   }
 }
 
-function accessFleetWrite(targets) {
+function accessFleetWrite(targets, options = {}) {
   const normalized = [];
   const seen = new Set();
   for (const target of targets || []) {
@@ -32563,6 +32568,129 @@ function accessFleetWrite(targets) {
     updated_unix_ms: Date.now(),
     targets: normalized.slice(0, 100),
   }));
+  if (!options.skipHostedSync) accessFleetScheduleHostedSync();
+}
+
+function accessFleetHostedSyncEnabled() {
+  return DASHBOARD_CONNECT_MODE;
+}
+
+function accessFleetHostedUrl(path) {
+  const normalized = String(path || '');
+  if (!DASHBOARD_CONNECT_SIGNALING_BASE) return normalized;
+  return `${DASHBOARD_CONNECT_SIGNALING_BASE}${normalized.startsWith('/') ? '' : '/'}${normalized}`;
+}
+
+async function accessFleetHostedHeaders() {
+  if (!accessFleetHostedCsrfToken) {
+    const resp = await fetch(accessFleetHostedUrl('/api/me'));
+    const body = await resp.json().catch(() => ({}));
+    if (!resp.ok || body.authenticated !== true) return null;
+    accessFleetHostedCsrfToken = String(body.csrf_token || '');
+  }
+  const headers = { 'content-type': 'application/json' };
+  if (accessFleetHostedCsrfToken) headers['x-intendant-csrf'] = accessFleetHostedCsrfToken;
+  return headers;
+}
+
+function accessFleetMergeHostedTargets(targets) {
+  if (!Array.isArray(targets) || targets.length === 0) return;
+  const byId = new Map();
+  for (const target of accessFleetRead().targets || []) {
+    const normalized = normalizeDashboardAccessTarget(target);
+    if (!normalized) continue;
+    byId.set(normalized.host_id || normalized.id, { ...target, ...normalized });
+  }
+  for (const target of targets) {
+    const normalized = normalizeDashboardAccessTarget({
+      ...target,
+      source: target.source || 'hosted_access',
+      connected: target.connected === true || target.online === true,
+    });
+    if (!normalized) continue;
+    const key = normalized.host_id || normalized.id;
+    const previous = byId.get(key) || {};
+    const previousUpdated = Number(previous.updated_unix_ms || 0);
+    const nextUpdated = Number(target.updated_unix_ms || Date.now());
+    byId.set(key, {
+      ...previous,
+      ...target,
+      ...normalized,
+      connected: target.connected === true || target.online === true,
+      source: target.source || normalized.source || 'hosted_access',
+      updated_unix_ms: Math.max(previousUpdated, nextUpdated),
+      first_seen_unix_ms: previous.first_seen_unix_ms || target.first_seen_unix_ms || Date.now(),
+    });
+  }
+  accessFleetWrite(Array.from(byId.values()), { skipHostedSync: true });
+  const liveTargets = dashboardAccessTargets.filter(target => target.source !== 'browser_fleet');
+  dashboardAccessTargets = accessMergeRememberedTargets(liveTargets);
+  renderDashboardTargetSummaries();
+}
+
+async function accessFleetHydrateFromHosted() {
+  if (!accessFleetHostedSyncEnabled()) return;
+  try {
+    const resp = await fetch(accessFleetHostedUrl('/api/fleet/targets'));
+    const body = await resp.json().catch(() => ({}));
+    if (resp.ok && body.ok !== false) accessFleetMergeHostedTargets(body.targets || []);
+  } catch (err) {
+    console.warn('[access] hosted fleet hydrate failed', err);
+  }
+}
+
+function accessFleetScheduleHostedSync() {
+  if (!accessFleetHostedSyncEnabled()) return;
+  accessFleetHostedSyncDirty = true;
+  if (accessFleetHostedSyncTimer || accessFleetHostedSyncInFlight) return;
+  accessFleetHostedSyncTimer = window.setTimeout(() => {
+    accessFleetHostedSyncTimer = null;
+    accessFleetPushToHosted().catch(err => {
+      console.warn('[access] hosted fleet sync failed', err);
+    });
+  }, 400);
+}
+
+async function accessFleetPushToHosted() {
+  if (!accessFleetHostedSyncEnabled()) return;
+  if (accessFleetHostedSyncInFlight) {
+    accessFleetHostedSyncDirty = true;
+    return;
+  }
+  accessFleetHostedSyncInFlight = true;
+  accessFleetHostedSyncDirty = false;
+  try {
+    const headers = await accessFleetHostedHeaders();
+    if (!headers) return;
+    const targets = accessFleetRead().targets || [];
+    const resp = await fetch(accessFleetHostedUrl('/api/fleet/targets/sync'), {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ targets }),
+    });
+    const body = await resp.json().catch(() => ({}));
+    if (!resp.ok || body.ok === false) throw new Error(body.error || `HTTP ${resp.status}`);
+    accessFleetMergeHostedTargets(body.targets || []);
+  } finally {
+    accessFleetHostedSyncInFlight = false;
+    if (accessFleetHostedSyncDirty) accessFleetScheduleHostedSync();
+  }
+}
+
+function accessFleetForgetHostedTarget(hostId) {
+  if (!accessFleetHostedSyncEnabled()) return;
+  const id = String(hostId || '').trim();
+  if (!id) return;
+  accessFleetHostedHeaders()
+    .then(headers => {
+      if (!headers) return null;
+      return fetch(accessFleetHostedUrl(`/api/fleet/targets/${encodeURIComponent(id)}/forget`), {
+        method: 'POST',
+        headers,
+        body: '{}',
+      });
+    })
+    .catch(err => console.warn('[access] hosted fleet forget failed', err));
 }
 
 function accessFleetTargetUrl(target) {
@@ -32646,6 +32774,7 @@ function accessFleetForgetTarget(hostId) {
     const normalized = normalizeDashboardAccessTarget(target);
     return normalized && normalized.host_id !== id && normalized.id !== id;
   }));
+  accessFleetForgetHostedTarget(id);
 }
 
 function accessMergeRememberedTargets(liveTargets) {
