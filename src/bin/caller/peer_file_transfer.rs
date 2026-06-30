@@ -7,8 +7,7 @@
 use crate::error::CallerError;
 use crate::event::AppEvent;
 use crate::peer::access_policy::{
-    filesystem_access_allowed, profile_allows_operation, FilesystemAccessKind,
-    FilesystemAccessPolicy, PeerOperation,
+    filesystem_access_allowed, FilesystemAccessKind, FilesystemAccessPolicy, PeerOperation,
 };
 use bytes::BytesMut;
 use rtc::peer_connection::configuration::setting_engine::SettingEngine;
@@ -49,6 +48,17 @@ pub struct PeerFileTransferAuthorization {
     pub label: String,
     pub profile: String,
     pub filesystem: FilesystemAccessPolicy,
+}
+
+impl PeerFileTransferAuthorization {
+    fn access_principal(&self) -> crate::access::iam::AccessPrincipal {
+        crate::access::iam::AccessPrincipal::peer_daemon(
+            self.fingerprint.clone(),
+            self.label.clone(),
+            self.profile.clone(),
+            "peer-file-transfer",
+        )
+    }
 }
 
 #[derive(Clone)]
@@ -815,12 +825,11 @@ fn authorize_path(
     authorization: &PeerFileTransferAuthorization,
     raw_path: &str,
 ) -> Result<(), String> {
-    if !profile_allows_operation(&authorization.profile, PeerOperation::FilesystemRead) {
-        return Err(format!(
-            "peer profile {} does not allow filesystem reads",
-            authorization.profile
-        ));
-    }
+    crate::access::iam::evaluate_principal_operation(
+        &authorization.access_principal(),
+        PeerOperation::FilesystemRead,
+    )
+    .ensure_allowed()?;
     let path = crate::web_gateway::expand_dashboard_fs_path(raw_path)?;
     filesystem_access_allowed(&authorization.filesystem, FilesystemAccessKind::Read, &path)
 }
@@ -973,7 +982,7 @@ mod tests {
             },
         };
         let err = authorize_path(&auth, file.to_str().unwrap()).unwrap_err();
-        assert!(err.contains("does not allow filesystem reads"));
+        assert!(err.contains("does not allow filesystem.read"));
     }
 
     #[test]
