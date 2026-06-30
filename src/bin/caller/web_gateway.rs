@@ -16943,6 +16943,36 @@ fn hex_value(byte: u8) -> Option<u8> {
     }
 }
 
+fn should_continue_after_accept_error(error: &std::io::Error) -> bool {
+    match error.kind() {
+        std::io::ErrorKind::Interrupted
+        | std::io::ErrorKind::WouldBlock
+        | std::io::ErrorKind::ConnectionAborted
+        | std::io::ErrorKind::ConnectionReset
+        | std::io::ErrorKind::TimedOut => return true,
+        std::io::ErrorKind::InvalidInput
+        | std::io::ErrorKind::InvalidData
+        | std::io::ErrorKind::NotFound
+        | std::io::ErrorKind::PermissionDenied => return false,
+        _ => {}
+    }
+
+    match error.raw_os_error() {
+        // The listener file descriptor/socket is invalid or no longer a
+        // listening socket. Retrying would spin forever without restoring
+        // reachability.
+        Some(9 | 22 | 38) => false,
+        // Process/system descriptor pressure and socket buffer pressure are
+        // recoverable after current connections close. Keep the gateway alive
+        // so the dashboard recovers instead of becoming half-alive.
+        Some(23 | 24 | 55) => true,
+        // Unknown accept errors are safer to treat as per-connection failures:
+        // losing one inbound connection is better than dropping the dashboard
+        // listener while existing WebSocket tasks make the UI look alive.
+        _ => true,
+    }
+}
+
 async fn handle_mcp_http_request(
     body: &str,
     server: &crate::mcp::IntendantServer,
@@ -17680,7 +17710,22 @@ pub fn spawn_web_gateway(
         loop {
             let (stream, peer_addr) = match listener.accept().await {
                 Ok(conn) => conn,
-                Err(_) => break,
+                Err(e) => {
+                    let should_continue = should_continue_after_accept_error(&e);
+                    eprintln!(
+                        "[web_gateway] accept failed on port {port}: {e}{}",
+                        if should_continue {
+                            " (continuing)"
+                        } else {
+                            " (listener task exiting)"
+                        }
+                    );
+                    if should_continue {
+                        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                        continue;
+                    }
+                    break;
+                }
             };
 
             let bus = bus.clone();
@@ -36007,6 +36052,19 @@ mod tests {
                 .get("preview")
                 .and_then(|v| v.as_str())
                 .is_some_and(|preview| preview.contains("from raw trace")))));
+    }
+
+    #[test]
+    fn accept_error_classifier_keeps_listener_alive_for_transient_errors() {
+        assert!(should_continue_after_accept_error(&std::io::Error::from(
+            std::io::ErrorKind::ConnectionAborted
+        )));
+        assert!(should_continue_after_accept_error(
+            &std::io::Error::from_raw_os_error(24)
+        ));
+        assert!(!should_continue_after_accept_error(
+            &std::io::Error::from_raw_os_error(9)
+        ));
     }
 
     #[tokio::test]
