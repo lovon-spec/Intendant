@@ -18086,12 +18086,6 @@ pub fn spawn_web_gateway(
                         finalize_http_stream(&mut stream).await;
                         return;
                     }
-                    let peer_profile_for_ws = peer_connection_identity
-                        .as_ref()
-                        .map(|identity| identity.profile.clone());
-                    let peer_label_for_ws = peer_connection_identity
-                        .as_ref()
-                        .map(|identity| identity.label.clone());
                     let peer_identity_for_ws = peer_connection_identity.clone();
                     let ws_stream = match tokio_tungstenite::accept_async(stream).await {
                         Ok(ws) => ws,
@@ -18412,8 +18406,6 @@ pub fn spawn_web_gateway(
                     let dashboard_control_inbound = Arc::clone(&dashboard_control);
                     let peer_file_transfer_registry_inbound =
                         Arc::clone(&peer_file_transfer_registry);
-                    let peer_profile_inbound = peer_profile_for_ws.clone();
-                    let peer_label_inbound = peer_label_for_ws.clone();
                     let peer_identity_inbound = peer_identity_for_ws.clone();
                     let inbound = tokio::spawn(async move {
                         // Track whether this connection has an active presence model,
@@ -20196,9 +20188,8 @@ pub fn spawn_web_gateway(
                                             // for the agent loop / TUI / MCP consumers.
                                             match serde_json::from_value::<ControlMsg>(json) {
                                                 Ok(ctrl)
-                                                    if !peer_profile_allows_ws_control(
-                                                        peer_profile_inbound.as_deref(),
-                                                        peer_label_inbound.as_deref(),
+                                                    if !peer_identity_allows_ws_control(
+                                                        peer_identity_inbound.as_ref(),
                                                         &ctrl,
                                                         &bus_inbound,
                                                     ) => {}
@@ -20208,14 +20199,15 @@ pub fn spawn_web_gateway(
                                                     signal,
                                                 }) => {
                                                     let federated_display_input_allowed =
-                                                        peer_profile_inbound
-                                                            .as_deref()
-                                                            .map(crate::peer::access_policy::profile_allows_federated_display_input)
-                                                            .unwrap_or(true);
+                                                                peer_identity_allows_operation(
+                                                                    peer_identity_inbound.as_ref(),
+                                                                    crate::peer::access_policy::PeerOperation::DisplayInput,
+                                                                    "peer-webrtc-display",
+                                                                );
                                                     handle_federated_webrtc_signal(
-                                                        display_id,
-                                                        session_id,
-                                                        signal,
+                                                                display_id,
+                                                                session_id,
+                                                                signal,
                                                         session_registry_inbound.as_ref(),
                                                         &ice_config,
                                                         Arc::clone(&tcp_peer_registry),
@@ -26360,12 +26352,7 @@ fn http_access_principal(
     is_tls: bool,
 ) -> crate::access::iam::AccessPrincipal {
     if let Some(identity) = identity {
-        return crate::access::iam::AccessPrincipal::peer_daemon(
-            identity.fingerprint.clone(),
-            identity.label.clone(),
-            identity.profile.clone(),
-            "peer-http",
-        );
+        return peer_identity_access_principal(identity, "peer-http");
     }
     let source = if tls_client_cert_present {
         "browser-mtls"
@@ -26374,6 +26361,33 @@ fn http_access_principal(
     };
     let transport = if is_tls { "https" } else { "http" };
     crate::access::iam::AccessPrincipal::root_dashboard_session(source, transport)
+}
+
+fn peer_identity_access_principal(
+    identity: &PeerConnectionIdentity,
+    transport: &str,
+) -> crate::access::iam::AccessPrincipal {
+    crate::access::iam::AccessPrincipal::peer_daemon(
+        identity.fingerprint.clone(),
+        identity.label.clone(),
+        identity.profile.clone(),
+        transport,
+    )
+}
+
+fn peer_identity_allows_operation(
+    identity: Option<&PeerConnectionIdentity>,
+    op: crate::peer::access_policy::PeerOperation,
+    transport: &str,
+) -> bool {
+    let Some(identity) = identity else {
+        return true;
+    };
+    crate::access::iam::evaluate_principal_operation(
+        &peer_identity_access_principal(identity, transport),
+        op,
+    )
+    .allowed
 }
 
 fn authorize_http_filesystem_access(
@@ -26548,24 +26562,26 @@ fn resolve_peer_connection_identity_from_cert_dir(
     }
 }
 
-fn peer_profile_allows_ws_control(
-    profile: Option<&str>,
-    label: Option<&str>,
+fn peer_identity_allows_ws_control(
+    identity: Option<&PeerConnectionIdentity>,
     ctrl: &ControlMsg,
     bus: &EventBus,
 ) -> bool {
-    let Some(profile) = profile else {
+    let Some(identity) = identity else {
         return true;
     };
-    if crate::peer::access_policy::profile_allows_control_msg(profile, ctrl) {
+    let op = crate::peer::access_policy::control_msg_operation(ctrl);
+    let decision = crate::access::iam::evaluate_principal_operation(
+        &peer_identity_access_principal(identity, "peer-ws"),
+        op,
+    );
+    if decision.allowed {
         return true;
     }
     bus.send(AppEvent::PresenceLog {
         message: format!(
-            "[ws] denied peer control frame from {}: profile={} op={:?}",
-            label.unwrap_or("<unknown peer>"),
-            profile,
-            crate::peer::access_policy::control_msg_operation(ctrl),
+            "[ws] denied peer control frame from {}: profile={} permission={} reason={}",
+            identity.label, identity.profile, decision.permission, decision.reason,
         ),
         level: Some(LogLevel::Warn),
         turn: None,
@@ -36722,6 +36738,16 @@ mod tests {
         let peer = http_access_principal(Some(&peer_identity), true, true);
         assert_eq!(peer.kind, "peer_daemon");
         assert_eq!(peer.peer_profile.as_deref(), Some("peer-operator"));
+        assert!(peer_identity_allows_operation(
+            Some(&peer_identity),
+            crate::peer::access_policy::PeerOperation::DisplayView,
+            "peer-test",
+        ));
+        assert!(!peer_identity_allows_operation(
+            Some(&peer_identity),
+            crate::peer::access_policy::PeerOperation::AccessInspect,
+            "peer-test",
+        ));
         assert!(
             crate::access::iam::evaluate_principal_operation(
                 &peer,
