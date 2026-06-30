@@ -32554,10 +32554,17 @@ function accessFleetWrite(targets, options = {}) {
   for (const target of targets || []) {
     const item = normalizeDashboardAccessTarget(target);
     if (!item) continue;
-    const key = item.host_id || item.id;
+    const key = accessFleetCanonicalTargetId({ ...target, ...item });
     if (!key || seen.has(key)) continue;
     seen.add(key);
-    normalized.push(item);
+    const connectDaemonId = String(target?.connect_daemon_id || target?.connectDaemonId || '').trim() ||
+      (item.local && DASHBOARD_CONNECT_MODE ? DASHBOARD_CONNECT_DAEMON_ID : '');
+    normalized.push({
+      ...item,
+      id: key,
+      host_id: key,
+      connect_daemon_id: connectDaemonId,
+    });
   }
   normalized.sort((a, b) => {
     if (a.local !== b.local) return a.local ? -1 : 1;
@@ -32573,6 +32580,19 @@ function accessFleetWrite(targets, options = {}) {
 
 function accessFleetHostedSyncEnabled() {
   return DASHBOARD_CONNECT_MODE;
+}
+
+function accessFleetCanonicalTargetId(target) {
+  const connectDaemonId = String(
+    target?.connect_daemon_id ||
+    target?.connectDaemonId ||
+    ''
+  ).trim();
+  if (connectDaemonId) return connectDaemonId;
+  if (target?.local && DASHBOARD_CONNECT_MODE && DASHBOARD_CONNECT_DAEMON_ID) {
+    return DASHBOARD_CONNECT_DAEMON_ID;
+  }
+  return String(target?.host_id || target?.hostId || target?.id || '').trim();
 }
 
 function accessFleetHostedUrl(path) {
@@ -32599,7 +32619,7 @@ function accessFleetMergeHostedTargets(targets) {
   for (const target of accessFleetRead().targets || []) {
     const normalized = normalizeDashboardAccessTarget(target);
     if (!normalized) continue;
-    byId.set(normalized.host_id || normalized.id, { ...target, ...normalized });
+    byId.set(accessFleetCanonicalTargetId({ ...target, ...normalized }), { ...target, ...normalized });
   }
   for (const target of targets) {
     const normalized = normalizeDashboardAccessTarget({
@@ -32608,7 +32628,7 @@ function accessFleetMergeHostedTargets(targets) {
       connected: target.connected === true || target.online === true,
     });
     if (!normalized) continue;
-    const key = normalized.host_id || normalized.id;
+    const key = accessFleetCanonicalTargetId({ ...target, ...normalized });
     const previous = byId.get(key) || {};
     const previousUpdated = Number(previous.updated_unix_ms || 0);
     const nextUpdated = Number(target.updated_unix_ms || Date.now());
@@ -32616,6 +32636,10 @@ function accessFleetMergeHostedTargets(targets) {
       ...previous,
       ...target,
       ...normalized,
+      id: key,
+      host_id: key,
+      connect_daemon_id: String(target.connect_daemon_id || target.connectDaemonId || '').trim() ||
+        (normalized.local && DASHBOARD_CONNECT_MODE ? DASHBOARD_CONNECT_DAEMON_ID : ''),
       connected: target.connected === true || target.online === true,
       source: target.source || normalized.source || 'hosted_access',
       updated_unix_ms: Math.max(previousUpdated, nextUpdated),
@@ -32707,9 +32731,16 @@ function accessFleetRecordFromTarget(target) {
   const normalized = normalizeDashboardAccessTarget(target);
   if (!normalized) return null;
   const now = Date.now();
+  const connectDaemonId = normalized.local && DASHBOARD_CONNECT_MODE
+    ? DASHBOARD_CONNECT_DAEMON_ID
+    : String(normalized.connect_daemon_id || normalized.connectDaemonId || '').trim();
+  const canonicalId = accessFleetCanonicalTargetId({
+    ...normalized,
+    connect_daemon_id: connectDaemonId,
+  });
   return {
-    id: normalized.id,
-    host_id: normalized.host_id,
+    id: canonicalId || normalized.id,
+    host_id: canonicalId || normalized.host_id,
     label: normalized.label,
     local: normalized.local,
     source: normalized.source || 'dashboard',
@@ -32728,7 +32759,7 @@ function accessFleetRecordFromTarget(target) {
     browser_tcp_via_url: normalized.browser_tcp_via_url || '',
     capabilities: normalized.capabilities || [],
     origin: window.location.origin || '',
-    connect_daemon_id: normalized.local && DASHBOARD_CONNECT_MODE ? DASHBOARD_CONNECT_DAEMON_ID : '',
+    connect_daemon_id: connectDaemonId,
     first_seen_unix_ms: normalized.first_seen_unix_ms || now,
     last_seen_unix_ms: now,
   };
@@ -32740,12 +32771,12 @@ function accessFleetRememberTargets(targets) {
   for (const target of store.targets || []) {
     const normalized = normalizeDashboardAccessTarget(target);
     if (!normalized) continue;
-    byId.set(normalized.host_id || normalized.id, { ...target, ...normalized });
+    byId.set(accessFleetCanonicalTargetId({ ...target, ...normalized }), { ...target, ...normalized });
   }
   for (const target of targets || []) {
     const record = accessFleetRecordFromTarget(target);
     if (!record) continue;
-    const key = record.host_id || record.id;
+    const key = accessFleetCanonicalTargetId(record);
     const previous = byId.get(key) || {};
     byId.set(key, {
       ...previous,

@@ -1324,13 +1324,19 @@ async fn api_fleet_targets_sync(
         }
     }
     let mut store = state.store.lock().await;
+    let owned_daemon_ids = owned_daemon_ids(&store, user.id);
     let mut by_host: HashMap<String, FleetTargetRecord> = store
         .fleet_targets
         .iter()
         .filter(|target| target.user_id == user.id)
-        .map(|target| (target.host_id.clone(), target.clone()))
+        .map(|target| {
+            let mut target = target.clone();
+            canonicalize_fleet_target_for_owned_daemon(&mut target, &owned_daemon_ids);
+            (target.host_id.clone(), target)
+        })
         .collect();
-    for target in incoming {
+    for mut target in incoming {
+        canonicalize_fleet_target_for_owned_daemon(&mut target, &owned_daemon_ids);
         let previous = by_host.get(&target.host_id).cloned();
         let first_seen_unix_ms = previous
             .as_ref()
@@ -1380,7 +1386,10 @@ async fn api_fleet_target_forget(
     let mut store = state.store.lock().await;
     let before = store.fleet_targets.len();
     store.fleet_targets.retain(|target| {
-        !(target.user_id == user.id && (target.host_id == target_id || target.id == target_id))
+        !(target.user_id == user.id
+            && (target.host_id == target_id
+                || target.id == target_id
+                || target.connect_daemon_id.as_deref() == Some(target_id.as_str())))
     });
     let removed = before.saturating_sub(store.fleet_targets.len());
     if removed > 0 {
@@ -1407,13 +1416,15 @@ fn fleet_targets_for_user(
     store: &Store,
     user_id: Uuid,
 ) -> Vec<serde_json::Value> {
+    let owned_daemon_ids = owned_daemon_ids(store, user_id);
     let mut by_host: HashMap<String, serde_json::Value> = HashMap::new();
     for target in store
         .fleet_targets
         .iter()
         .filter(|target| target.user_id == user_id)
     {
-        by_host.insert(target.host_id.clone(), fleet_target_view(target));
+        let key = fleet_target_storage_key(target, &owned_daemon_ids);
+        by_host.insert(key, fleet_target_view(target));
     }
     for daemon in store
         .daemons
@@ -1432,6 +1443,43 @@ fn fleet_targets_for_user(
         a_label.cmp(b_label)
     });
     targets
+}
+
+fn owned_daemon_ids(store: &Store, user_id: Uuid) -> HashSet<String> {
+    store
+        .daemons
+        .iter()
+        .filter(|daemon| daemon.owner_user_id == Some(user_id))
+        .map(|daemon| daemon.daemon_id.clone())
+        .collect()
+}
+
+fn fleet_target_storage_key(
+    target: &FleetTargetRecord,
+    owned_daemon_ids: &HashSet<String>,
+) -> String {
+    target
+        .connect_daemon_id
+        .as_ref()
+        .filter(|daemon_id| owned_daemon_ids.contains(*daemon_id))
+        .cloned()
+        .unwrap_or_else(|| target.host_id.clone())
+}
+
+fn canonicalize_fleet_target_for_owned_daemon(
+    target: &mut FleetTargetRecord,
+    owned_daemon_ids: &HashSet<String>,
+) {
+    let Some(connect_daemon_id) = target
+        .connect_daemon_id
+        .as_ref()
+        .filter(|daemon_id| owned_daemon_ids.contains(*daemon_id))
+        .cloned()
+    else {
+        return;
+    };
+    target.id = connect_daemon_id.clone();
+    target.host_id = connect_daemon_id;
 }
 
 fn normalize_fleet_target_input(
@@ -1597,9 +1645,12 @@ async fn api_daemon_revoke(
     daemon.claim_code_hash = None;
     daemon.claim_code_created_unix_ms = None;
     daemon.updated_unix_ms = now_unix_ms();
-    store
-        .fleet_targets
-        .retain(|target| !(target.user_id == user.id && target.host_id == daemon_id));
+    store.fleet_targets.retain(|target| {
+        !(target.user_id == user.id
+            && (target.host_id == daemon_id
+                || target.id == daemon_id
+                || target.connect_daemon_id.as_deref() == Some(daemon_id.as_str())))
+    });
     audit(
         &mut store,
         "daemon_revoked",
@@ -1664,11 +1715,12 @@ async fn api_daemon_label(
         label
     };
     let now = now_unix_ms();
-    for target in store
-        .fleet_targets
-        .iter_mut()
-        .filter(|target| target.user_id == user.id && target.host_id == daemon_id)
-    {
+    for target in store.fleet_targets.iter_mut().filter(|target| {
+        target.user_id == user.id
+            && (target.host_id == daemon_id
+                || target.id == daemon_id
+                || target.connect_daemon_id.as_deref() == Some(daemon_id.as_str()))
+    }) {
         target.label = target_label.to_string();
         target.updated_unix_ms = now;
     }
@@ -3480,6 +3532,32 @@ mod tests {
                     ws_url: String::new(),
                     browser_tcp_via_url: String::new(),
                     origin: "https://intendant.dev".to_string(),
+                    connect_daemon_id: Some("daemon-1".to_string()),
+                    capabilities: Vec::new(),
+                    first_seen_unix_ms: 1,
+                    last_seen_unix_ms: 1,
+                    updated_unix_ms: 1,
+                },
+                FleetTargetRecord {
+                    user_id,
+                    id: "intendant:192.168.64.61".to_string(),
+                    host_id: "intendant:192.168.64.61".to_string(),
+                    label: "192.168.64.61".to_string(),
+                    local: true,
+                    source: "dashboard".to_string(),
+                    access_domain: "user_client".to_string(),
+                    access_domain_label: "User/client access".to_string(),
+                    route: "current_dashboard".to_string(),
+                    route_label: "Current dashboard".to_string(),
+                    auth: "trusted_dashboard".to_string(),
+                    auth_label: "Trusted dashboard session".to_string(),
+                    effective_role: "root".to_string(),
+                    effective_role_label: "Root".to_string(),
+                    profile: String::new(),
+                    url: "/app?connect=1&daemon_id=daemon-1".to_string(),
+                    ws_url: String::new(),
+                    browser_tcp_via_url: String::new(),
+                    origin: "https://connect.intendant.dev".to_string(),
                     connect_daemon_id: Some("daemon-1".to_string()),
                     capabilities: Vec::new(),
                     first_seen_unix_ms: 1,
