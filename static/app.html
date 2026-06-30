@@ -694,6 +694,111 @@ html {
   gap: 8px;
   margin: 0 0 14px;
 }
+.access-model-details {
+  display: grid;
+  gap: 12px;
+  margin: 0 0 16px;
+}
+.access-model-section {
+  min-width: 0;
+  border: 1px solid var(--surface1);
+  border-radius: 6px;
+  background: var(--base);
+}
+.access-model-section-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 9px 11px;
+  border-bottom: 1px solid var(--surface1);
+}
+.access-model-section-title {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 800;
+}
+.access-model-section-count {
+  flex: 0 0 auto;
+  color: var(--overlay0);
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0;
+  text-transform: uppercase;
+}
+.access-model-table {
+  display: grid;
+}
+.access-model-row {
+  display: grid;
+  grid-template-columns: minmax(170px, 1.1fr) minmax(130px, 0.85fr) minmax(190px, 1.2fr) minmax(90px, auto);
+  gap: 8px 12px;
+  align-items: center;
+  min-width: 0;
+  padding: 9px 11px;
+}
+.access-model-row + .access-model-row {
+  border-top: 1px solid rgba(205, 214, 244, 0.1);
+}
+.access-model-main,
+.access-model-meta,
+.access-model-detail {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.access-model-main {
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 800;
+}
+.access-model-meta {
+  color: var(--subtext0);
+  font-size: 11px;
+}
+.access-model-detail {
+  color: var(--overlay0);
+  font-family: 'JetBrains Mono', 'Fira Code', monospace;
+  font-size: 10px;
+}
+.access-model-status {
+  justify-self: end;
+  padding: 2px 7px;
+  border: 1px solid var(--surface1);
+  border-radius: 999px;
+  color: var(--overlay0);
+  background: var(--surface0);
+  font-size: 10px;
+  font-weight: 800;
+  line-height: 1.45;
+  text-transform: uppercase;
+}
+.access-model-status.active,
+.access-model-status.connected,
+.access-model-status.enforced,
+.access-model-status.current {
+  border-color: rgba(166, 227, 161, 0.28);
+  color: var(--green);
+  background: rgba(166, 227, 161, 0.08);
+}
+.access-model-status.offline,
+.access-model-status.planned {
+  border-color: rgba(249, 226, 175, 0.28);
+  color: var(--yellow);
+  background: rgba(249, 226, 175, 0.08);
+}
+.access-model-status.revoked,
+.access-model-status.disabled,
+.access-model-status.failed {
+  border-color: rgba(243, 139, 168, 0.28);
+  color: var(--red);
+  background: rgba(243, 139, 168, 0.08);
+}
 .access-target-row {
   --access-target-accent: var(--blue);
   display: grid;
@@ -9255,13 +9360,22 @@ body.display-fullscreen-open {
   .access-target-row {
     grid-template-columns: 1fr;
   }
+  .access-model-row {
+    grid-template-columns: 1fr;
+  }
+  .access-model-status {
+    justify-self: flex-start;
+  }
   .access-target-actions {
     justify-content: flex-start;
     min-width: 0;
   }
   .access-target-value,
   .access-target-detail,
-  .access-target-subtitle {
+  .access-target-subtitle,
+  .access-model-main,
+  .access-model-meta,
+  .access-model-detail {
     white-space: normal;
   }
   .files-upload-config {
@@ -11097,6 +11211,7 @@ body.display-fullscreen-open {
         <div class="subtab-pane" id="access-pane-grants">
           <div class="access-pane-body">
             <div id="access-grants-overview" class="access-overview-grid"></div>
+            <div id="access-model-details" class="access-model-details"></div>
             <div id="access-grants-mount"></div>
           </div>
         </div>
@@ -32903,6 +33018,144 @@ function accessGrantCards() {
   return cards;
 }
 
+function accessModelStatusText(value) {
+  return String(value || 'active').trim().toLowerCase().replace(/_/g, '-') || 'active';
+}
+
+function accessModelLabel(value, fallback = '') {
+  return String(value || fallback || '').trim();
+}
+
+function accessOverviewTargetLabelMap(overview) {
+  const map = new Map();
+  for (const target of Array.isArray(overview.targets) ? overview.targets : []) {
+    const id = accessModelLabel(target.id || target.host_id);
+    if (id) map.set(id, accessModelLabel(target.label, id));
+    const hostId = accessModelLabel(target.host_id);
+    if (hostId && !map.has(hostId)) map.set(hostId, accessModelLabel(target.label, hostId));
+  }
+  return map;
+}
+
+function accessOverviewPrincipalLabelMap(overview) {
+  const map = new Map();
+  for (const principal of Array.isArray(overview.principals) ? overview.principals : []) {
+    const id = accessModelLabel(principal.id);
+    if (id) map.set(id, accessModelLabel(principal.label, id));
+  }
+  return map;
+}
+
+function accessModelCreateStatus(status) {
+  const value = accessModelStatusText(status);
+  const node = document.createElement('span');
+  node.className = `access-model-status ${value}`;
+  node.textContent = value;
+  return node;
+}
+
+function accessModelCreateRow({ main, meta, detail, status, title }) {
+  const row = document.createElement('div');
+  row.className = 'access-model-row';
+  if (title) row.title = title;
+  const mainEl = document.createElement('div');
+  mainEl.className = 'access-model-main';
+  mainEl.textContent = main || '';
+  const metaEl = document.createElement('div');
+  metaEl.className = 'access-model-meta';
+  metaEl.textContent = meta || '';
+  const detailEl = document.createElement('div');
+  detailEl.className = 'access-model-detail';
+  detailEl.textContent = detail || '';
+  row.append(mainEl, metaEl, detailEl, accessModelCreateStatus(status));
+  return row;
+}
+
+function accessModelCreateSection(title, rows) {
+  const section = document.createElement('div');
+  section.className = 'access-model-section';
+  const head = document.createElement('div');
+  head.className = 'access-model-section-head';
+  const titleEl = document.createElement('div');
+  titleEl.className = 'access-model-section-title';
+  titleEl.textContent = title || 'Access';
+  const count = document.createElement('div');
+  count.className = 'access-model-section-count';
+  count.textContent = accessPlural(rows.length, 'item');
+  head.append(titleEl, count);
+  const table = document.createElement('div');
+  table.className = 'access-model-table';
+  if (!rows.length) {
+    const empty = document.createElement('div');
+    empty.className = 'access-empty';
+    empty.textContent = 'None';
+    table.appendChild(empty);
+  } else {
+    for (const row of rows) table.appendChild(accessModelCreateRow(row));
+  }
+  section.append(head, table);
+  return section;
+}
+
+function accessPrincipalRow(principal) {
+  const authn = Array.isArray(principal.authn) ? principal.authn : [];
+  const authLabel = authn
+    .map(item => accessModelLabel(item.label || item.kind))
+    .filter(Boolean)
+    .join(', ');
+  return {
+    main: accessModelLabel(principal.label, principal.id || 'Principal'),
+    meta: accessModelLabel(principal.kind_label || principal.kind, 'Principal'),
+    detail: authLabel || accessModelLabel(principal.source, principal.id),
+    status: principal.status || (principal.local ? 'current' : 'active'),
+    title: accessModelLabel(principal.id),
+  };
+}
+
+function accessGrantRow(grant, principalLabels, targetLabels) {
+  const principal = principalLabels.get(accessModelLabel(grant.principal_id))
+    || accessModelLabel(grant.principal_id, 'Principal');
+  const target = targetLabels.get(accessModelLabel(grant.target_id))
+    || accessModelLabel(grant.target_id, 'Target');
+  const role = accessModelLabel(grant.role_label || grant.profile || grant.role, 'Role');
+  return {
+    main: principal,
+    meta: `${role} -> ${target}`,
+    detail: accessModelLabel(grant.kind_label || grant.source || grant.policy_id, grant.id),
+    status: grant.status || 'active',
+    title: accessModelLabel(grant.id),
+  };
+}
+
+function accessTransportRow(transport, targetLabels) {
+  const target = targetLabels.get(accessModelLabel(transport.target_id))
+    || accessModelLabel(transport.target_id, 'Target');
+  return {
+    main: accessModelLabel(transport.label, transport.id || 'Transport'),
+    meta: accessModelLabel(transport.kind_label || transport.kind, 'Transport'),
+    detail: `${target} - ${accessModelLabel(transport.implementation, transport.id)}`,
+    status: transport.status || 'connected',
+    title: accessModelLabel(transport.id),
+  };
+}
+
+function renderAccessModelDetails() {
+  const el = document.getElementById('access-model-details');
+  if (!el) return;
+  el.innerHTML = '';
+  const overview = accessOverviewModel();
+  const targetLabels = accessOverviewTargetLabelMap(overview);
+  const principalLabels = accessOverviewPrincipalLabelMap(overview);
+  const principals = Array.isArray(overview.principals) ? overview.principals : [];
+  const grants = Array.isArray(overview.grants) ? overview.grants : [];
+  const transports = Array.isArray(overview.transports) ? overview.transports : [];
+  el.append(
+    accessModelCreateSection('Principals', principals.map(accessPrincipalRow)),
+    accessModelCreateSection('Grants', grants.map(grant => accessGrantRow(grant, principalLabels, targetLabels))),
+    accessModelCreateSection('Transports', transports.map(transport => accessTransportRow(transport, targetLabels)))
+  );
+}
+
 function accessPublicShareCards() {
   return [{
     title: 'Public shares',
@@ -32946,6 +33199,7 @@ function renderAccessAdminSummaries() {
   accessRenderCards('access-model-overview', accessOverviewCards());
   renderAccessTargetsSurface();
   accessRenderCards('access-grants-overview', accessGrantCards());
+  renderAccessModelDetails();
   accessRenderCards('access-public-shares', accessPublicShareCards());
   accessRenderCards('access-diagnostics-overview', accessDiagnosticsCards());
 }
