@@ -908,7 +908,8 @@ html {
   background: rgba(166, 227, 161, 0.08);
 }
 .access-model-status.offline,
-.access-model-status.planned {
+.access-model-status.planned,
+.access-model-status.draft {
   border-color: rgba(249, 226, 175, 0.28);
   color: var(--yellow);
   background: rgba(249, 226, 175, 0.08);
@@ -32419,6 +32420,9 @@ function normalizeAccessOverview(payload) {
     architecture: payload.architecture && typeof payload.architecture === 'object'
       ? payload.architecture
       : {},
+    iam: payload.iam && typeof payload.iam === 'object'
+      ? payload.iam
+      : {},
   };
 }
 
@@ -33041,6 +33045,25 @@ function accessPlural(count, singular, plural = `${singular}s`) {
   return `${count} ${count === 1 ? singular : plural}`;
 }
 
+function accessIamModel(overview = accessOverviewModel()) {
+  return overview?.iam && typeof overview.iam === 'object' ? overview.iam : {};
+}
+
+function accessIamLoadLabel(iam) {
+  const status = accessModelLabel(iam.load_status || iam.loadStatus, 'missing');
+  return {
+    loaded: 'Loaded',
+    missing: 'Empty',
+    error: 'Error',
+    derived: 'Derived',
+  }[status] || status;
+}
+
+function accessIamEnforcementReason(iam) {
+  const enforcement = iam.enforcement && typeof iam.enforcement === 'object' ? iam.enforcement : {};
+  return accessModelLabel(enforcement.reason, 'Scoped user/client grants are model data until stable human/device principal binding is available.');
+}
+
 function accessOverviewModel() {
   if (dashboardAccessOverview) return dashboardAccessOverview;
   const targets = accessTargetRecords();
@@ -33189,6 +33212,40 @@ function accessOverviewModel() {
         'final IAM policy language and editing UX',
       ],
     },
+    iam: {
+      schema_version: 1,
+      load_status: 'derived',
+      state_path: '',
+      managed_principals: 0,
+      managed_grants: 0,
+      roles: [{
+        id: 'role:root',
+        label: 'Root',
+        status: 'enforced',
+        summary: 'Current owner/root dashboard authority.',
+        permissions: ['access.inspect', 'access.manage', 'peer.inspect', 'peer.manage'],
+        source: 'builtin',
+      }, {
+        id: 'role:scoped-human',
+        label: 'Scoped human',
+        status: 'planned',
+        summary: 'Future user/client IAM role once stable browser/passkey principals are bound to daemon requests.',
+        permissions: ['access.inspect'],
+        source: 'builtin',
+      }],
+      audit_events: [],
+      capabilities: {
+        state_file_supported: true,
+        read_local_state: true,
+        write_api_available: false,
+        enforce_user_client_grants: false,
+      },
+      enforcement: {
+        user_client_grants: false,
+        principal_binding: 'root_session_only',
+        reason: 'The daemon currently distinguishes trusted owner/root dashboard sessions and daemon peer identities, but not stable scoped human/device principals.',
+      },
+    },
   };
 }
 
@@ -33200,6 +33257,8 @@ function accessOverviewCards() {
   const policies = Array.isArray(overview.policies) ? overview.policies : [];
   const permissions = Array.isArray(overview.permissions) ? overview.permissions : [];
   const transports = Array.isArray(overview.transports) ? overview.transports : [];
+  const iam = accessIamModel(overview);
+  const iamCapabilities = iam.capabilities && typeof iam.capabilities === 'object' ? iam.capabilities : {};
   const unresolved = Array.isArray(overview.architecture?.unresolved)
     ? overview.architecture.unresolved.length
     : 0;
@@ -33207,7 +33266,7 @@ function accessOverviewCards() {
     /browser|human|passkey|certificate/.test(String(p.kind || ''))
   ).length;
   const peerPrincipals = principals.filter(p => String(p.kind || '') === 'peer_daemon').length;
-  const activeGrants = grants.filter(g => !/planned|offline|revoked|disabled/.test(String(g.status || 'active'))).length;
+  const activeGrants = grants.filter(g => !/planned|draft|offline|revoked|disabled|failed/.test(String(g.status || 'active'))).length;
   const enforcedPolicies = policies.filter(p => String(p.status || '') === 'enforced').length;
   const plannedPolicies = policies.filter(p => String(p.status || '') === 'planned').length;
   const enforcedPermissions = permissions.filter(p => String(p.status || '') === 'enforced').length;
@@ -33229,6 +33288,13 @@ function accessOverviewCards() {
     kind: `${activeGrants}/${grants.length || activeGrants} active`,
     detail: 'Root owner access and peer-profile access now use the same grant vocabulary.',
     actions: [{ label: 'Review', onClick: () => routeTo('access', 'audit') }],
+  }, {
+    title: 'IAM foundation',
+    kind: accessIamLoadLabel(iam),
+    detail: iamCapabilities.enforce_user_client_grants
+      ? 'Scoped user/client grants are enforceable on this daemon.'
+      : `Local IAM state is visible, but scoped user/client grants are not enforced yet. ${accessIamEnforcementReason(iam)}`,
+    actions: [{ label: 'Policies', onClick: () => routeTo('access', 'policies') }],
   }, {
     title: 'Policies',
     kind: `${enforcedPolicies} enforced`,
@@ -33611,6 +33677,27 @@ function accessPermissionRow(permission) {
   };
 }
 
+function accessIamRoleRow(role) {
+  const permissions = Array.isArray(role.permissions) ? role.permissions.filter(Boolean) : [];
+  return {
+    main: accessModelLabel(role.label, role.id || 'IAM role'),
+    meta: accessModelLabel(role.id, 'IAM role'),
+    detail: permissions.length ? permissions.join(', ') : accessModelLabel(role.summary),
+    status: role.status || 'planned',
+    title: accessModelLabel(role.summary || role.id),
+  };
+}
+
+function accessIamAuditRow(event) {
+  return {
+    main: accessModelLabel(event.action, 'IAM event'),
+    meta: accessModelLabel(event.actor_principal_id, event.id || 'actor'),
+    detail: accessModelLabel(event.summary || event.target_id),
+    status: event.status || 'active',
+    title: accessModelLabel(event.id),
+  };
+}
+
 function accessTransportRow(transport, targetLabels) {
   const target = targetLabels.get(accessModelLabel(transport.target_id))
     || accessModelLabel(transport.target_id, 'Target');
@@ -33645,6 +33732,9 @@ function accessGrantWhy(grant) {
   }
   if (kind === 'inbound_daemon_peer_profile') {
     return 'This inbound daemon mTLS identity was approved for this daemon. The peer profile bounds what the remote daemon may do here.';
+  }
+  if (kind === 'user_client_local_iam') {
+    return 'This grant is stored in local IAM state, but it is not enforced until requests can be bound to stable human/device principals.';
   }
   return source ? `Authority comes from ${source}.` : 'Authority is described by this grant.';
 }
@@ -33756,6 +33846,8 @@ function accessAuditGrantCards() {
       ['Kind', accessModelLabel(grant.kind_label || grant.kind)],
       ['Policy', accessModelLabel(grant.policy_id)],
       ['Transport', accessModelLabel(grant.transport_id)],
+      ['Enforced', grant.enforced === false ? 'No' : 'Yes'],
+      ['Reason', accessModelLabel(grant.reason)],
       ['Why access exists', accessGrantWhy(grant)],
       ['Grant id', accessModelLabel(grant.id)],
     ],
@@ -33802,7 +33894,7 @@ function accessDaemonCards() {
 
 function accessAuditCards() {
   const grants = accessOverviewArray(accessOverviewModel(), 'grants');
-  const active = grants.filter(grant => !/planned|offline|revoked|disabled/.test(accessModelLabel(grant.status, 'active'))).length;
+  const active = grants.filter(grant => !/planned|draft|offline|revoked|disabled|failed/.test(accessModelLabel(grant.status, 'active'))).length;
   const revoked = grants.filter(grant => accessModelLabel(grant.status) === 'revoked').length;
   return [{
     title: 'Grant audit',
@@ -33815,6 +33907,8 @@ function accessPolicyCards() {
   const overview = accessOverviewModel();
   const policies = accessOverviewArray(overview, 'policies');
   const permissions = accessOverviewArray(overview, 'permissions');
+  const iam = accessIamModel(overview);
+  const roles = Array.isArray(iam.roles) ? iam.roles : [];
   const enforcedPolicies = policies.filter(policy => accessModelLabel(policy.status) === 'enforced').length;
   const enforcedPermissions = permissions.filter(permission => accessModelLabel(permission.status) === 'enforced').length;
   return [{
@@ -33825,12 +33919,19 @@ function accessPolicyCards() {
     title: 'Permissions',
     kind: `${enforcedPermissions}/${permissions.length || enforcedPermissions} enforced`,
     detail: 'Permissions are concrete operation gates used by dashboard-control and peer auth.',
+  }, {
+    title: 'IAM roles',
+    kind: roles.length ? accessPlural(roles.length, 'role') : 'None',
+    detail: accessIamEnforcementReason(iam),
   }];
 }
 
 function renderAccessOverviewDetails() {
   const overview = accessOverviewModel();
   const scope = overview.scope || {};
+  const iam = accessIamModel(overview);
+  const iamCapabilities = iam.capabilities && typeof iam.capabilities === 'object' ? iam.capabilities : {};
+  const iamEnforcement = iam.enforcement && typeof iam.enforcement === 'object' ? iam.enforcement : {};
   const unresolved = accessOverviewArray(overview.architecture || {}, 'unresolved');
   accessRenderDetailCards('access-overview-details', [{
     title: accessModelLabel(scope.label, 'This daemon'),
@@ -33851,6 +33952,19 @@ function renderAccessOverviewDetails() {
       ['Browser mTLS', 'Transport/auth credential for user-client authority'],
       ['Peer mTLS', 'Daemon-to-daemon authority only'],
       ['Open decisions', unresolved.join('; ') || 'None reported'],
+    ],
+  }, {
+    title: 'Local IAM state',
+    status: iam.load_status === 'error' ? 'failed' : (iamCapabilities.enforce_user_client_grants ? 'enforced' : 'planned'),
+    lines: [
+      ['State', accessIamLoadLabel(iam)],
+      ['Store', accessModelLabel(iam.state_path, 'Default access store')],
+      ['Managed principals', accessModelLabel(iam.managed_principals, '0')],
+      ['Managed grants', accessModelLabel(iam.managed_grants, '0')],
+      ['Write API', iamCapabilities.write_api_available ? 'Available' : 'Not exposed'],
+      ['User grant enforcement', iamEnforcement.user_client_grants ? 'Enabled' : 'Not enabled'],
+      ['Binding', accessModelLabel(iamEnforcement.principal_binding, 'root_session_only')],
+      ['Reason', accessIamEnforcementReason(iam)],
     ],
   }]);
 }
@@ -33939,13 +34053,18 @@ function renderAccessModelDetails() {
   const policies = Array.isArray(overview.policies) ? overview.policies : [];
   const permissions = Array.isArray(overview.permissions) ? overview.permissions : [];
   const transports = Array.isArray(overview.transports) ? overview.transports : [];
+  const iam = accessIamModel(overview);
+  const iamRoles = Array.isArray(iam.roles) ? iam.roles : [];
+  const iamAuditEvents = Array.isArray(iam.audit_events) ? iam.audit_events : [];
   el.append(
     accessModelCreateSection('Principals', principals.map(accessPrincipalRow)),
     accessModelCreateSection('Principal types', principalKinds.map(accessPrincipalKindRow)),
     accessModelCreateSection('Grants', grants.map(grant => accessGrantRow(grant, principalLabels, targetLabels))),
     accessModelCreateSection('Policies', policies.map(accessPolicyRow)),
     accessModelCreateSection('Permissions', permissions.map(accessPermissionRow)),
-    accessModelCreateSection('Transports', transports.map(transport => accessTransportRow(transport, targetLabels)))
+    accessModelCreateSection('Transports', transports.map(transport => accessTransportRow(transport, targetLabels))),
+    accessModelCreateSection('IAM roles', iamRoles.map(accessIamRoleRow)),
+    accessModelCreateSection('IAM audit', iamAuditEvents.map(accessIamAuditRow))
   );
 }
 

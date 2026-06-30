@@ -588,6 +588,30 @@ route and its daemon-to-daemon credentials. Peer profiles are not human IAM:
 `peer-root` maps to peer inspection/management and access inspection, while
 human/account access management remains owner/root user-client authority.
 
+### Local Access/IAM state
+
+Local IAM foundation state is stored beside the native access certificates,
+normally `~/.intendant/access-certs/iam.json` on Unix-like platforms. It is not
+part of `intendant.toml` because it belongs to the local daemon identity and may
+later contain per-device/user audit metadata rather than project configuration.
+
+Schema version 1 contains:
+
+| Field | Meaning |
+|---|---|
+| `schema_version` | State schema version; currently `1` |
+| `principals` | Local managed human/device principal records |
+| `roles` | Built-in or local role templates |
+| `grants` | Local IAM grant records targeting daemon IDs |
+| `audit_events` | Local IAM audit metadata |
+
+The daemon loads this file into `/api/access/overview` under the `iam` object
+and exposes the raw state through `GET /api/access/iam/state`. Current local IAM
+records are inspection/model data only: scoped user/client grants are marked
+`enforced: false` until browser mTLS or Connect requests can be bound to stable
+human/device principals. Peer profiles and owner/root access keep their existing
+enforcement paths.
+
 ### `mcp_servers`
 
 External MCP servers to connect to as a client (see
