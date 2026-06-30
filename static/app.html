@@ -32106,6 +32106,7 @@ function normalizeAccessOverview(payload) {
     principals: normalizeArray('principals'),
     grants: normalizeArray('grants'),
     policies: normalizeArray('policies'),
+    permissions: normalizeArray('permissions'),
     transports: normalizeArray('transports'),
     supported_principal_kinds: normalizeArray('supported_principal_kinds'),
     architecture: payload.architecture && typeof payload.architecture === 'object'
@@ -32735,6 +32736,31 @@ function accessOverviewModel() {
       id: 'policy:scoped-human',
       status: 'planned',
     }],
+    permissions: [{
+      id: 'access.inspect',
+      label: 'Access inspect',
+      domain: 'access',
+      status: 'enforced',
+      summary: 'Read targets, principals, grants, policies, transports, and access architecture notes.',
+    }, {
+      id: 'access.manage',
+      label: 'Access manage',
+      domain: 'access',
+      status: 'enforced',
+      summary: 'Approve, revoke, or change access grants. Currently reserved for trusted owner/root sessions.',
+    }, {
+      id: 'peer.inspect',
+      label: 'Peer inspect',
+      domain: 'peer',
+      status: 'enforced',
+      summary: 'Read configured peer routes and peer eligibility without changing them.',
+    }, {
+      id: 'peer.manage',
+      label: 'Peer manage',
+      domain: 'peer',
+      status: 'enforced',
+      summary: 'Create, remove, pair, and use daemon peer routes.',
+    }],
     architecture: {
       unresolved: [
         'external identity provider and Sybil-resistance policy',
@@ -32751,6 +32777,7 @@ function accessOverviewCards() {
   const principals = Array.isArray(overview.principals) ? overview.principals : [];
   const grants = Array.isArray(overview.grants) ? overview.grants : [];
   const policies = Array.isArray(overview.policies) ? overview.policies : [];
+  const permissions = Array.isArray(overview.permissions) ? overview.permissions : [];
   const transports = Array.isArray(overview.transports) ? overview.transports : [];
   const unresolved = Array.isArray(overview.architecture?.unresolved)
     ? overview.architecture.unresolved.length
@@ -32762,6 +32789,7 @@ function accessOverviewCards() {
   const activeGrants = grants.filter(g => !/planned|offline|revoked|disabled/.test(String(g.status || 'active'))).length;
   const enforcedPolicies = policies.filter(p => String(p.status || '') === 'enforced').length;
   const plannedPolicies = policies.filter(p => String(p.status || '') === 'planned').length;
+  const enforcedPermissions = permissions.filter(p => String(p.status || '') === 'enforced').length;
   const activeTransports = transports.filter(t => !/offline|failed|disabled/.test(String(t.status || 'connected'))).length;
   const scopeLabel = String(scope.label || selfHostLabel || 'This daemon');
   const accountState = scope.account || scope.organization || scope.hosted_account_configured
@@ -32786,6 +32814,10 @@ function accessOverviewCards() {
     detail: plannedPolicies === 1
       ? '1 planned policy area remains a design target, including scoped human IAM.'
       : `${plannedPolicies} planned policy areas remain design targets, including scoped human IAM.`,
+  }, {
+    title: 'Permissions',
+    kind: `${enforcedPermissions}/${permissions.length || enforcedPermissions} enforced`,
+    detail: 'Access inspect/manage and peer inspect/manage are separate gates; Connect and mTLS remain transports.',
   }, {
     title: 'Transports',
     kind: `${activeTransports}/${transports.length || activeTransports} active`,
@@ -33147,6 +33179,17 @@ function accessPolicyRow(policy) {
   };
 }
 
+function accessPermissionRow(permission) {
+  const domain = accessModelLabel(permission.domain, 'permission');
+  return {
+    main: accessModelLabel(permission.label, permission.id || 'Permission'),
+    meta: `${domain} - ${accessModelLabel(permission.id, 'permission')}`,
+    detail: accessModelLabel(permission.summary),
+    status: permission.status || 'enforced',
+    title: accessModelLabel(permission.id),
+  };
+}
+
 function accessTransportRow(transport, targetLabels) {
   const target = targetLabels.get(accessModelLabel(transport.target_id))
     || accessModelLabel(transport.target_id, 'Target');
@@ -33170,12 +33213,14 @@ function renderAccessModelDetails() {
   const principalKinds = Array.isArray(overview.supported_principal_kinds) ? overview.supported_principal_kinds : [];
   const grants = Array.isArray(overview.grants) ? overview.grants : [];
   const policies = Array.isArray(overview.policies) ? overview.policies : [];
+  const permissions = Array.isArray(overview.permissions) ? overview.permissions : [];
   const transports = Array.isArray(overview.transports) ? overview.transports : [];
   el.append(
     accessModelCreateSection('Principals', principals.map(accessPrincipalRow)),
     accessModelCreateSection('Principal types', principalKinds.map(accessPrincipalKindRow)),
     accessModelCreateSection('Grants', grants.map(grant => accessGrantRow(grant, principalLabels, targetLabels))),
     accessModelCreateSection('Policies', policies.map(accessPolicyRow)),
+    accessModelCreateSection('Permissions', permissions.map(accessPermissionRow)),
     accessModelCreateSection('Transports', transports.map(transport => accessTransportRow(transport, targetLabels)))
   );
 }
@@ -44413,6 +44458,10 @@ class DashboardControlTransport {
       presenceFramesAvailable: this.lastStatus?.presence_frames_available ?? null,
       presenceActiveHandoffAvailable: this.lastStatus?.presence_active_handoff_available ?? null,
       presenceToolRequestAvailable: this.lastStatus?.presence_tool_request_available ?? null,
+      accessInspectAvailable: this.lastStatus?.access_inspect_available ?? null,
+      accessManageAvailable: this.lastStatus?.access_manage_available ?? null,
+      peerInspectAvailable: this.lastStatus?.peer_inspect_available ?? null,
+      peerManageAvailable: this.lastStatus?.peer_manage_available ?? null,
       apiPresenceVideoFrameAvailable: this.lastStatus?.api_presence_video_frame_available ?? null,
       apiSessionDetailAvailable: this.lastStatus?.api_session_detail_available ?? null,
       apiSessionReportAvailable: this.lastStatus?.api_session_report_available ?? null,
@@ -44470,6 +44519,13 @@ class DashboardControlTransport {
       apiMcpToolCallAvailable: this.lastStatus?.api_mcp_tool_call_available ?? null,
       apiPeerMutationsAvailable: this.lastStatus?.api_peer_mutations_available ?? null,
       apiPeerPairingAvailable: this.lastStatus?.api_peer_pairing_available ?? null,
+      apiPeerPairingInviteAvailable: this.lastStatus?.api_peer_pairing_invite_available ?? null,
+      apiPeerPairingJoinAvailable: this.lastStatus?.api_peer_pairing_join_available ?? null,
+      apiPeerPairingRequestAccessAvailable: this.lastStatus?.api_peer_pairing_request_access_available ?? null,
+      apiPeerPairingRequestDecisionAvailable: this.lastStatus?.api_peer_pairing_request_decision_available ?? null,
+      apiPeerPairingRequestsAvailable: this.lastStatus?.api_peer_pairing_requests_available ?? null,
+      apiPeerPairingIdentitiesAvailable: this.lastStatus?.api_peer_pairing_identities_available ?? null,
+      apiPeerPairingIdentityRevokeAvailable: this.lastStatus?.api_peer_pairing_identity_revoke_available ?? null,
       apiPeerWebRtcSignalAvailable: this.lastStatus?.api_peer_webrtc_signal_available ?? null,
       apiPeerFileTransferSignalAvailable: this.lastStatus?.api_peer_file_transfer_signal_available ?? null,
       apiPeerDashboardControlSignalAvailable: this.lastStatus?.api_peer_dashboard_control_signal_available ?? null,

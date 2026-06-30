@@ -79,6 +79,9 @@ pub enum PeerOperation {
     Message,
     Task,
     Approval,
+    AccessInspect,
+    AccessManage,
+    PeerInspect,
     PeerManage,
     SessionInspect,
     SessionManage,
@@ -167,7 +170,7 @@ pub fn profile_allows_operation(profile: &str, op: PeerOperation) -> bool {
                 | Task
                 | Approval
         ),
-        AdminPeer => true,
+        AdminPeer => !matches!(op, AccessManage),
     }
 }
 
@@ -310,12 +313,28 @@ pub fn filesystem_access_allowed(
 }
 
 pub fn profile_allows_federation_http(profile: &str, request_line: &str) -> bool {
+    if request_line.contains(" /api/access/overview")
+        || request_line.contains(" /api/dashboard/targets")
+    {
+        return profile_allows_operation(profile, PeerOperation::AccessInspect);
+    }
+    if request_line.contains(" /api/peers/pairing/requests")
+        || request_line.contains(" /api/peers/pairing/identities")
+    {
+        if request_line.starts_with("GET") {
+            return profile_allows_operation(profile, PeerOperation::AccessInspect);
+        }
+        return profile_allows_operation(profile, PeerOperation::AccessManage);
+    }
+    if request_line.contains(" /api/peers/pairing/invite") {
+        return profile_allows_operation(profile, PeerOperation::AccessManage);
+    }
     if request_line.contains(" /api/peers/pairing/") {
         return profile_allows_operation(profile, PeerOperation::PeerManage);
     }
     if request_line.contains(" /api/peers") {
         if request_line.starts_with("GET") {
-            return profile_allows_operation(profile, PeerOperation::PresenceRead);
+            return profile_allows_operation(profile, PeerOperation::PeerInspect);
         }
         return profile_allows_operation(profile, PeerOperation::PeerManage);
     }
@@ -545,6 +564,30 @@ mod tests {
         assert!(!profile_allows_operation(
             "peer-operator",
             PeerOperation::RuntimeControl
+        ));
+        assert!(profile_allows_operation(
+            "peer-root",
+            PeerOperation::AccessInspect
+        ));
+        assert!(profile_allows_operation(
+            "peer-root",
+            PeerOperation::PeerInspect
+        ));
+        assert!(profile_allows_operation(
+            "peer-root",
+            PeerOperation::PeerManage
+        ));
+        assert!(!profile_allows_operation(
+            "peer-root",
+            PeerOperation::AccessManage
+        ));
+        assert!(!profile_allows_operation(
+            "peer-operator",
+            PeerOperation::AccessInspect
+        ));
+        assert!(!profile_allows_operation(
+            "peer-operator",
+            PeerOperation::PeerInspect
         ));
     }
 

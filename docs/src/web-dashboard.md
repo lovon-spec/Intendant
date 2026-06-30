@@ -292,8 +292,8 @@ Unified administration for how dashboards and daemons reach each other:
   is user/client access and is root dashboard access in the single-user product.
   Inbound peer identities are daemon-to-daemon grants with peer profiles. The
   tab renders the overview-backed principal, supported-principal-kind, grant,
-  policy, and transport rows so the summary cards and detailed model use the
-  same source of truth.
+  policy, permission, and transport rows so the summary cards and detailed model
+  use the same source of truth.
 - **Invitations** contains peer onboarding flows: Grant Peer Invite, Join Invite,
   Request Peer Access, Manual Add, and inbound peer access requests.
 - **Public Shares** is the placeholder surface for future explicit public or
@@ -317,6 +317,13 @@ and peer federation:
 - A **policy** defines the shape of authority behind a grant. `root` and
   `peer-profile` are enforced today. Scoped human IAM, directory-scoped file
   access, and public shares are design targets, not hidden enforcement.
+- A **permission** is the operation gate the daemon enforces. Access
+  administration now separates `access.inspect` from `access.manage`, and peer
+  topology separates `peer.inspect` from `peer.manage`. Owner/root dashboard
+  sessions have all four. Existing peer profiles are mapped conservatively:
+  `peer-root` can inspect access and inspect/manage peer topology, but
+  `access.manage` remains reserved for trusted user/client owner sessions until
+  human IAM is deliberately designed.
 - A **transport** is only how the route is carried: browser mTLS, hosted
   Connect/WebRTC tunnel, local/debug HTTP, or daemon-to-daemon peer mTLS. The
   product UI should not make Connect a separate access system.
@@ -336,11 +343,11 @@ The important security-domain split is:
 
 The model is backend-backed. `GET /api/access/overview` and the
 dashboard-control `api_access_overview` method return schema version 1 with
-`scope`, `targets`, `principals`, `grants`, `policies`, `transports`,
-`supported_principal_kinds`, and explicit unresolved architecture notes. This
-overview is descriptive for now: it exposes one product model over the current
-enforcement paths rather than replacing mTLS, Connect account checks, or peer
-profiles.
+`scope`, `targets`, `principals`, `grants`, `policies`, `permissions`,
+`transports`, `supported_principal_kinds`, and explicit unresolved architecture
+notes. This overview is descriptive for now: it exposes one product model over
+the current enforcement paths rather than replacing mTLS, Connect account
+checks, or peer profiles.
 
 `GET /api/dashboard/targets` and `api_dashboard_targets` remain the compatibility
 target model used by older UI paths: target id/host id, display label, access
@@ -1355,6 +1362,9 @@ list, and identity revoke over the DataChannel when it is connected. Mutating
 pairing operations deliberately fail rather than silently falling back after a
 WebRTC RPC error, so an operator does not approve or mint credentials over an
 unexpected transport.
+Pairing authorization follows the access/peer split: request and identity lists
+require `access.inspect`, invite/approve/revoke require `access.manage`, and
+join/request-access/poll remain peer-topology operations gated by `peer.manage`.
 General peer and coordinator controls are covered by the same rule. Peer add,
 remove, eligibility discovery, per-peer message/task/approval, peer-display
 signaling, and coordinator route calls use `api_peer_add`, `api_peer_remove`,

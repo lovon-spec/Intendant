@@ -584,7 +584,9 @@ In the Access UI and `/api/access/overview`, a `[[peer]]` entry appears as a
 peer-daemon principal with a peer-profile grant to a daemon target. Browser mTLS
 and hosted/passkey dashboard access are user/client grants instead. The same
 page shows both kinds of access, but the config entry only persists the peer
-route and its daemon-to-daemon credentials.
+route and its daemon-to-daemon credentials. Peer profiles are not human IAM:
+`peer-root` maps to peer inspection/management and access inspection, while
+human/account access management remains owner/root user-client authority.
 
 ### `mcp_servers`
 

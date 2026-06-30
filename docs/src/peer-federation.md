@@ -543,6 +543,9 @@ profile/capability metadata decides which doors that keycard opens. Use
 `peer-root` only when the other daemon should have all peer operations,
 including settings, shell, files, and runtime control. Older profile names such
 as `operator`, `admin-peer`, and `peer-daemon` remain compatibility aliases.
+`peer-root` can inspect the unified access model and inspect/manage peer
+topology, but it is still daemon-to-daemon authority; it does not grant future
+human/account `access.manage` authority.
 The card's `auth` field tells connecting peers what proof to send. Construct it
 via the `AuthRequirements` helpers:
 

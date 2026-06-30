@@ -23684,6 +23684,31 @@ fn access_overview_response_value_with_identities(
             "status": "planned",
             "summary": "Future explicit grants for publishing selected stats or artifacts."
         }],
+        "permissions": [{
+            "id": "access.inspect",
+            "label": "Access inspect",
+            "domain": "access",
+            "status": "enforced",
+            "summary": "Read targets, principals, grants, policies, transports, and access architecture notes."
+        }, {
+            "id": "access.manage",
+            "label": "Access manage",
+            "domain": "access",
+            "status": "enforced",
+            "summary": "Approve, revoke, or change access grants. Currently reserved for trusted owner/root sessions."
+        }, {
+            "id": "peer.inspect",
+            "label": "Peer inspect",
+            "domain": "peer",
+            "status": "enforced",
+            "summary": "Read configured peer routes and peer eligibility without changing them."
+        }, {
+            "id": "peer.manage",
+            "label": "Peer manage",
+            "domain": "peer",
+            "status": "enforced",
+            "summary": "Create, remove, pair, and use daemon peer routes."
+        }],
         "transports": transports,
         "supported_principal_kinds": [{
             "kind": "browser_session",
@@ -35819,6 +35844,20 @@ mod tests {
                     && policy["status"] == "enforced"),
             "peer profile policy should be visible in the overview"
         );
+        let permissions = payload["permissions"].as_array().expect("permissions");
+        for expected in [
+            "access.inspect",
+            "access.manage",
+            "peer.inspect",
+            "peer.manage",
+        ] {
+            assert!(
+                permissions
+                    .iter()
+                    .any(|permission| permission["id"].as_str() == Some(expected)),
+                "{expected} permission should be visible in the overview"
+            );
+        }
 
         handle.abort();
     }

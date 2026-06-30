@@ -1916,26 +1916,26 @@ fn dashboard_control_method_operation(
             Some(PeerOperation::SessionInspect)
         }
         "config" => Some(PeerOperation::RuntimeControl),
-        "api_peers"
-        | "api_access_overview"
-        | "api_dashboard_targets"
-        | "api_peer_add"
+        "api_access_overview" | "api_dashboard_targets" => Some(PeerOperation::AccessInspect),
+        "api_peer_pairing_requests" | "api_peer_pairing_identities" => {
+            Some(PeerOperation::AccessInspect)
+        }
+        "api_peer_pairing_request_decision" | "api_peer_pairing_identity_revoke" => {
+            Some(PeerOperation::AccessManage)
+        }
+        "api_peer_pairing_invite" => Some(PeerOperation::AccessManage),
+        "api_peers" | "api_peer_eligible" => Some(PeerOperation::PeerInspect),
+        "api_peer_add"
         | "api_peer_remove"
-        | "api_peer_eligible"
         | "api_peer_message"
         | "api_peer_task"
         | "api_peer_approval"
         | "api_peer_webrtc_signal"
         | "api_peer_file_transfer_signal"
         | "api_peer_dashboard_control_signal"
-        | "api_peer_pairing_invite"
         | "api_peer_pairing_join"
         | "api_peer_pairing_request_access"
         | "api_peer_pairing_request_access_poll"
-        | "api_peer_pairing_requests"
-        | "api_peer_pairing_request_decision"
-        | "api_peer_pairing_identities"
-        | "api_peer_pairing_identity_revoke"
         | "api_coordinator_route" => Some(PeerOperation::PeerManage),
         "api_sessions"
         | "api_sessions_stream"
@@ -3777,14 +3777,30 @@ fn status_response_frame(id: String, runtime: &ControlRuntime) -> serde_json::Va
         runtime,
         crate::peer::access_policy::PeerOperation::RuntimeControl,
     );
+    let access_inspect = runtime_allows_operation(
+        runtime,
+        crate::peer::access_policy::PeerOperation::AccessInspect,
+    );
+    let access_manage = runtime_allows_operation(
+        runtime,
+        crate::peer::access_policy::PeerOperation::AccessManage,
+    );
+    let peer_inspect = runtime_allows_operation(
+        runtime,
+        crate::peer::access_policy::PeerOperation::PeerInspect,
+    );
     let peer_manage =
         runtime_allows_operation(runtime, crate::peer::access_policy::PeerOperation::PeerManage);
     let message =
         runtime_allows_operation(runtime, crate::peer::access_policy::PeerOperation::Message);
     let capabilities = [
-        ("api_peers_available", peer_registry_available && peer_manage),
-        ("api_access_overview_available", peer_manage),
-        ("api_dashboard_targets_available", peer_manage),
+        ("access_inspect_available", access_inspect),
+        ("access_manage_available", access_manage),
+        ("peer_inspect_available", peer_inspect),
+        ("peer_manage_available", peer_manage),
+        ("api_peers_available", peer_registry_available && peer_inspect),
+        ("api_access_overview_available", access_inspect),
+        ("api_dashboard_targets_available", access_inspect),
         ("api_agent_card_available", presence_read),
         ("api_cached_bootstrap_events_available", session_inspect),
         ("api_browser_workspace_snapshot_available", session_inspect),
@@ -3905,7 +3921,29 @@ fn status_response_frame(id: String, runtime: &ControlRuntime) -> serde_json::Va
             "api_peer_dashboard_control_signal_available",
             peer_registry_available && peer_manage,
         ),
-        ("api_peer_pairing_available", peer_manage),
+        ("api_peer_pairing_available", peer_manage || access_manage),
+        ("api_peer_pairing_invite_available", access_manage),
+        ("api_peer_pairing_join_available", peer_manage),
+        (
+            "api_peer_pairing_request_access_available",
+            peer_manage,
+        ),
+        (
+            "api_peer_pairing_request_decision_available",
+            access_manage,
+        ),
+        (
+            "api_peer_pairing_requests_available",
+            access_inspect || access_manage,
+        ),
+        (
+            "api_peer_pairing_identities_available",
+            access_inspect || access_manage,
+        ),
+        (
+            "api_peer_pairing_identity_revoke_available",
+            access_manage,
+        ),
         ("api_coordinator_available", peer_registry_available && peer_manage),
     ];
     for (name, available) in capabilities {
@@ -9660,6 +9698,108 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn peer_dashboard_grants_split_access_and_peer_permissions() {
+        let (tx, _rx) = mpsc::channel::<ControlTaskResponse>(8);
+        let mut pending = HashMap::new();
+        let mut outbound = OutboundControlQueue::new();
+        let mut peer_root = runtime();
+        peer_root.grant = DashboardControlGrant::Peer {
+            fingerprint: "fingerprint".into(),
+            label: "peer-root".into(),
+            profile: "peer-root".into(),
+            filesystem: crate::peer::access_policy::FilesystemAccessPolicy::default(),
+        };
+
+        let status = test_control_frame_response(
+            r#"{"t":"request","id":"s1","method":"status"}"#,
+            &mut peer_root,
+            &tx,
+            &mut pending,
+            &mut outbound,
+        )
+        .unwrap();
+        assert_eq!(status["ok"], true);
+        assert_eq!(status["result"]["access_inspect_available"], true);
+        assert_eq!(status["result"]["access_manage_available"], false);
+        assert_eq!(status["result"]["peer_inspect_available"], true);
+        assert_eq!(status["result"]["peer_manage_available"], true);
+        assert_eq!(status["result"]["api_access_overview_available"], true);
+        assert_eq!(status["result"]["api_dashboard_targets_available"], true);
+        assert_eq!(
+            status["result"]["api_peer_pairing_invite_available"],
+            false
+        );
+        assert_eq!(status["result"]["api_peer_pairing_join_available"], true);
+        assert_eq!(
+            status["result"]["api_peer_pairing_request_decision_available"],
+            false
+        );
+        assert_eq!(
+            status["result"]["api_peer_pairing_identity_revoke_available"],
+            false
+        );
+
+        let overview = test_control_frame_response(
+            r#"{"t":"request","id":"a1","method":"api_access_overview"}"#,
+            &mut peer_root,
+            &tx,
+            &mut pending,
+            &mut outbound,
+        )
+        .unwrap();
+        assert_eq!(overview["ok"], true);
+
+        let revoke = test_control_frame_response(
+            r#"{"t":"request","id":"r1","method":"api_peer_pairing_identity_revoke","params":{"identity":"peer-a"}}"#,
+            &mut peer_root,
+            &tx,
+            &mut pending,
+            &mut outbound,
+        )
+        .unwrap();
+        assert_eq!(revoke["ok"], false);
+        assert!(revoke["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("not allowed for profile peer-root"));
+
+        let invite = test_control_frame_response(
+            r#"{"t":"request","id":"i1","method":"api_peer_pairing_invite","params":{}}"#,
+            &mut peer_root,
+            &tx,
+            &mut pending,
+            &mut outbound,
+        )
+        .unwrap();
+        assert_eq!(invite["ok"], false);
+        assert!(invite["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("not allowed for profile peer-root"));
+
+        let mut peer_operator = runtime();
+        peer_operator.grant = DashboardControlGrant::Peer {
+            fingerprint: "fingerprint".into(),
+            label: "peer-operator".into(),
+            profile: "peer-operator".into(),
+            filesystem: crate::peer::access_policy::FilesystemAccessPolicy::default(),
+        };
+        let denied = test_control_frame_response(
+            r#"{"t":"request","id":"a2","method":"api_access_overview"}"#,
+            &mut peer_operator,
+            &tx,
+            &mut pending,
+            &mut outbound,
+        )
+        .unwrap();
+        assert_eq!(denied["ok"], false);
+        assert!(denied["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("not allowed for profile peer-operator"));
+    }
+
     #[tokio::test]
     async fn control_frames_answer_hello_ping_and_config() {
         let mut rt = runtime();
@@ -9780,6 +9920,10 @@ mod tests {
         assert_eq!(status["result"]["presence_frames_available"], true);
         assert_eq!(status["result"]["presence_active_handoff_available"], false);
         assert_eq!(status["result"]["presence_tool_request_available"], true);
+        assert_eq!(status["result"]["access_inspect_available"], true);
+        assert_eq!(status["result"]["access_manage_available"], true);
+        assert_eq!(status["result"]["peer_inspect_available"], true);
+        assert_eq!(status["result"]["peer_manage_available"], true);
         assert_eq!(status["result"]["api_presence_video_frame_available"], true);
         assert_eq!(status["result"]["api_sessions_available"], true);
         assert_eq!(status["result"]["api_sessions_stream_available"], true);
@@ -9876,6 +10020,31 @@ mod tests {
         assert_eq!(status["result"]["api_peer_mutations_available"], false);
         assert_eq!(status["result"]["api_peer_webrtc_signal_available"], false);
         assert_eq!(status["result"]["api_peer_pairing_available"], true);
+        assert_eq!(
+            status["result"]["api_peer_pairing_invite_available"],
+            true
+        );
+        assert_eq!(status["result"]["api_peer_pairing_join_available"], true);
+        assert_eq!(
+            status["result"]["api_peer_pairing_request_access_available"],
+            true
+        );
+        assert_eq!(
+            status["result"]["api_peer_pairing_request_decision_available"],
+            true
+        );
+        assert_eq!(
+            status["result"]["api_peer_pairing_requests_available"],
+            true
+        );
+        assert_eq!(
+            status["result"]["api_peer_pairing_identities_available"],
+            true
+        );
+        assert_eq!(
+            status["result"]["api_peer_pairing_identity_revoke_available"],
+            true
+        );
         assert_eq!(status["result"]["api_coordinator_available"], false);
 
         let peers = test_control_frame_response(
