@@ -33127,6 +33127,16 @@ function accessGrantRow(grant, principalLabels, targetLabels) {
   };
 }
 
+function accessPolicyRow(policy) {
+  return {
+    main: accessModelLabel(policy.label, policy.id || 'Policy'),
+    meta: accessModelLabel(policy.id, 'Policy'),
+    detail: accessModelLabel(policy.summary),
+    status: policy.status || 'planned',
+    title: accessModelLabel(policy.id),
+  };
+}
+
 function accessTransportRow(transport, targetLabels) {
   const target = targetLabels.get(accessModelLabel(transport.target_id))
     || accessModelLabel(transport.target_id, 'Target');
@@ -33148,10 +33158,12 @@ function renderAccessModelDetails() {
   const principalLabels = accessOverviewPrincipalLabelMap(overview);
   const principals = Array.isArray(overview.principals) ? overview.principals : [];
   const grants = Array.isArray(overview.grants) ? overview.grants : [];
+  const policies = Array.isArray(overview.policies) ? overview.policies : [];
   const transports = Array.isArray(overview.transports) ? overview.transports : [];
   el.append(
     accessModelCreateSection('Principals', principals.map(accessPrincipalRow)),
     accessModelCreateSection('Grants', grants.map(grant => accessGrantRow(grant, principalLabels, targetLabels))),
+    accessModelCreateSection('Policies', policies.map(accessPolicyRow)),
     accessModelCreateSection('Transports', transports.map(transport => accessTransportRow(transport, targetLabels)))
   );
 }

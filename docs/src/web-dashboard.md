@@ -291,8 +291,8 @@ Unified administration for how dashboards and daemons reach each other:
 - **Grants** separates user/client access from peer access. The current browser
   is user/client access and is root dashboard access in the single-user product.
   Inbound peer identities are daemon-to-daemon grants with peer profiles. The
-  tab renders the overview-backed principal, grant, and transport rows so the
-  summary cards and detailed model use the same source of truth.
+  tab renders the overview-backed principal, grant, policy, and transport rows
+  so the summary cards and detailed model use the same source of truth.
 - **Invitations** contains peer onboarding flows: Grant Peer Invite, Join Invite,
   Request Peer Access, Manual Add, and inbound peer access requests.
 - **Public Shares** is the placeholder surface for future explicit public or
