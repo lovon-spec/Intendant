@@ -20,17 +20,10 @@ struct McpClientHandler;
 
 impl ClientHandler for McpClientHandler {
     fn get_info(&self) -> ClientInfo {
-        ClientInfo {
-            client_info: Implementation {
-                name: "intendant".into(),
-                version: env!("CARGO_PKG_VERSION").into(),
-                title: None,
-                description: None,
-                icons: None,
-                website_url: None,
-            },
-            ..Default::default()
-        }
+        ClientInfo::new(
+            Default::default(),
+            Implementation::new("intendant", env!("CARGO_PKG_VERSION")),
+        )
     }
 }
 
@@ -145,14 +138,14 @@ impl McpClientManager {
                 None
             };
 
+        let mut request = CallToolRequestParams::new(actual_tool.to_string());
+        if let Some(args_map) = args_map {
+            request = request.with_arguments(args_map);
+        }
+
         let result = server
             .peer
-            .call_tool(CallToolRequestParams {
-                name: actual_tool.to_string().into(),
-                arguments: args_map,
-                meta: None,
-                task: None,
-            })
+            .call_tool(request)
             .await
             .map_err(|e| CallerError::Provider(format!("MCP tool call failed: {}", e)))?;
 

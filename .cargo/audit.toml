@@ -1,0 +1,7 @@
+[advisories]
+ignore = [
+    # RUSTSEC-2023-0071 has no patched stable rsa release. Intendant uses
+    # rsa only for local keypair generation when minting access certificates,
+    # not as a network-observable RSA decrypt/sign oracle.
+    "RUSTSEC-2023-0071",
+]

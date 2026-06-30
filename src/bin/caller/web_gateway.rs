@@ -7907,12 +7907,18 @@ fn codex_session_list_summary_from_file(path: &Path) -> Option<CodexSessionListS
     Some(summary)
 }
 
-/// Resolve Codex's home directory: `$CODEX_HOME` if set (non-empty), else
-/// `<home>/.codex`. Codex writes its session rollouts under `CODEX_HOME` when
-/// that env var is set (common on managed/headless installs), so the dashboard
-/// session scan must honor it rather than assuming `~/.codex` — otherwise
-/// codex sessions never appear in the listing.
+/// Resolve Codex's home directory for a home-scoped session scan.
+///
+/// Codex writes session rollouts under `$CODEX_HOME` when that env var is set
+/// (common on managed/headless installs), so the dashboard scan for the active
+/// user must honor it rather than assuming `~/.codex`. For explicit alternate
+/// homes, keep the scan scoped to that home; otherwise tests and targeted
+/// home scans can accidentally read the live user's Codex sessions.
 fn codex_dir(home: &Path) -> PathBuf {
+    if home != crate::platform::home_dir() {
+        return home.join(".codex");
+    }
+
     std::env::var_os("CODEX_HOME")
         .map(PathBuf::from)
         .filter(|p| !p.as_os_str().is_empty())

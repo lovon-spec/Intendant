@@ -10884,39 +10884,32 @@ fn resource_definitions() -> Vec<Resource> {
 #[tool_handler]
 impl ServerHandler for IntendantServer {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo {
-            instructions: Some(
-                "Intendant AI agent runtime. This MCP server exposes the same controls \
-                 and observations as the TUI. Use tools to control the agent (approve, \
-                 deny, respond, set_autonomy, quit), manage controller restarts \
-                 (schedule_controller_restart, controller_turn_complete, \
-                 get_restart_status, cancel_controller_restart), manage loop \
-                 intervention (request_controller_loop_halt, clear_controller_loop_halt, \
-                 intervene_controller_loop, get_controller_loop_status), and observe state \
-                 (get_status, get_logs, get_pending_approval, get_pending_input). \
-                 Resources provide push-based state updates via subscriptions."
-                    .into(),
-            ),
-            capabilities: ServerCapabilities::builder()
+        let mut implementation = Implementation::new("intendant", env!("CARGO_PKG_VERSION"));
+        implementation.title = Some("Intendant AI Agent Runtime".to_string());
+        implementation.description =
+            Some("MCP interface for controlling and observing the Intendant AI agent".to_string());
+
+        ServerInfo::new(
+            ServerCapabilities::builder()
                 .enable_tools()
                 .enable_tool_list_changed()
                 .enable_resources()
                 .enable_resources_subscribe()
                 .enable_resources_list_changed()
                 .build(),
-            server_info: Implementation {
-                name: "intendant".to_string(),
-                title: Some("Intendant AI Agent Runtime".to_string()),
-                version: env!("CARGO_PKG_VERSION").to_string(),
-                description: Some(
-                    "MCP interface for controlling and observing the Intendant AI agent"
-                        .to_string(),
-                ),
-                icons: None,
-                website_url: None,
-            },
-            ..Default::default()
-        }
+        )
+        .with_instructions(
+            "Intendant AI agent runtime. This MCP server exposes the same controls \
+             and observations as the TUI. Use tools to control the agent (approve, \
+             deny, respond, set_autonomy, quit), manage controller restarts \
+             (schedule_controller_restart, controller_turn_complete, \
+             get_restart_status, cancel_controller_restart), manage loop \
+             intervention (request_controller_loop_halt, clear_controller_loop_halt, \
+             intervene_controller_loop, get_controller_loop_status), and observe state \
+             (get_status, get_logs, get_pending_approval, get_pending_input). \
+             Resources provide push-based state updates via subscriptions.",
+        )
+        .with_server_info(implementation)
     }
 
     async fn list_resources(
@@ -10939,9 +10932,10 @@ impl ServerHandler for IntendantServer {
         if request.uri == RESOURCE_LOOP_URI {
             let value = collect_controller_loop_status(&controller_loop_dir());
             let json = serde_json::to_string_pretty(&value).unwrap_or_else(|_| "null".to_string());
-            return Ok(ReadResourceResult {
-                contents: vec![ResourceContents::text(json, request.uri)],
-            });
+            return Ok(ReadResourceResult::new(vec![ResourceContents::text(
+                json,
+                request.uri,
+            )]));
         }
 
         let s = self.state.read().await;
@@ -10993,9 +10987,10 @@ impl ServerHandler for IntendantServer {
             }
         };
 
-        Ok(ReadResourceResult {
-            contents: vec![ResourceContents::text(json, request.uri)],
-        })
+        Ok(ReadResourceResult::new(vec![ResourceContents::text(
+            json,
+            request.uri,
+        )]))
     }
 
     async fn subscribe(
