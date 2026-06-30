@@ -51,7 +51,7 @@ dirs = "6"
 # Windows, which `CreateProcess` (and thus `Command::new`) does not do. Pure
 # Rust, so no setup-script changes are needed.
 which = "8"
-rmcp = { version = "0.16", features = ["server", "transport-io", "client", "transport-child-process"] }
+rmcp = { version = ">=1.4.0, <1.5.0", features = ["server", "transport-io", "client", "transport-child-process"] }
 schemars = "1"
 base64 = "0.22"
 bip39 = { version = "2", default-features = false, features = ["std"] }
