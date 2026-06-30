@@ -1618,6 +1618,10 @@ struct RendezvousEvent {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     client_nonce: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    user_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    account_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     claim_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     challenge: Option<String>,
@@ -2026,6 +2030,8 @@ async fn browser_offer(
                 .map(str::trim)
                 .filter(|v| !v.is_empty())
                 .map(str::to_string),
+            user_id: Some(user.id.to_string()),
+            account_name: Some(user.account_name.clone()),
             ..RendezvousEvent::default()
         },
     )

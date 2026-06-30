@@ -187,6 +187,10 @@ pub struct DashboardControlRegistry {
 #[derive(Clone, Debug)]
 pub enum DashboardControlGrant {
     TrustedLocal,
+    UserClient {
+        principal: crate::access::iam::AccessPrincipal,
+        iam_state: crate::access::iam::LocalIamState,
+    },
     Peer {
         fingerprint: String,
         label: String,
@@ -205,20 +209,21 @@ impl DashboardControlGrant {
     fn label(&self) -> &str {
         match self {
             Self::TrustedLocal => "trusted-local",
+            Self::UserClient { principal, .. } => principal.label.as_str(),
             Self::Peer { label, .. } => label.as_str(),
         }
     }
 
     fn profile(&self) -> Option<&str> {
         match self {
-            Self::TrustedLocal => None,
+            Self::TrustedLocal | Self::UserClient { .. } => None,
             Self::Peer { profile, .. } => Some(profile.as_str()),
         }
     }
 
     fn filesystem(&self) -> Option<&crate::peer::access_policy::FilesystemAccessPolicy> {
         match self {
-            Self::TrustedLocal => None,
+            Self::TrustedLocal | Self::UserClient { .. } => None,
             Self::Peer { filesystem, .. } => Some(filesystem),
         }
     }
@@ -229,6 +234,7 @@ impl DashboardControlGrant {
                 "dashboard-control",
                 "webrtc-datachannel",
             ),
+            Self::UserClient { principal, .. } => principal.clone(),
             Self::Peer {
                 fingerprint,
                 label,
@@ -243,9 +249,25 @@ impl DashboardControlGrant {
         }
     }
 
+    fn access_decision(
+        &self,
+        op: crate::peer::access_policy::PeerOperation,
+    ) -> crate::access::iam::AccessDecision {
+        match self {
+            Self::UserClient {
+                principal,
+                iam_state,
+            } => crate::access::iam::evaluate_principal_operation_with_state(
+                iam_state, principal, op,
+            ),
+            _ => crate::access::iam::evaluate_principal_operation(&self.access_principal(), op),
+        }
+    }
+
     fn wire_kind(&self) -> &'static str {
         match self {
             Self::TrustedLocal => "trusted-local",
+            Self::UserClient { .. } => "user-client",
             Self::Peer { .. } => "peer",
         }
     }
@@ -1909,8 +1931,7 @@ fn runtime_operation_decision(
     runtime: &ControlRuntime,
     op: crate::peer::access_policy::PeerOperation,
 ) -> crate::access::iam::AccessDecision {
-    let principal = runtime.grant.access_principal();
-    crate::access::iam::evaluate_principal_operation(&principal, op)
+    runtime.grant.access_decision(op)
 }
 
 fn dashboard_control_frame_operation(t: &str) -> Option<crate::peer::access_policy::PeerOperation> {
@@ -3776,9 +3797,10 @@ fn status_response_frame(id: String, runtime: &ControlRuntime) -> serde_json::Va
             "principal_kind": access_principal.kind,
             "principal_binding": match runtime.grant {
                 DashboardControlGrant::TrustedLocal => "root_session",
+                DashboardControlGrant::UserClient { .. } => "user_client",
                 DashboardControlGrant::Peer { .. } => "peer_daemon",
             },
-            "user_client_grants": false
+            "user_client_grants": matches!(runtime.grant, DashboardControlGrant::UserClient { .. })
         }),
     );
 
@@ -9647,6 +9669,44 @@ mod tests {
         }
     }
 
+    fn scoped_user_client_grant() -> DashboardControlGrant {
+        let mut iam_state = crate::access::iam::LocalIamState::default();
+        iam_state.principals.push(crate::access::iam::IamPrincipal {
+            id: "principal:browser-cert:fp123".to_string(),
+            kind: "browser_certificate".to_string(),
+            label: "Alice browser".to_string(),
+            status: "active".to_string(),
+            source: "local_iam_state".to_string(),
+            account: None,
+            organization: None,
+            authn: vec![serde_json::json!({
+                "kind": "browser_mtls_cert",
+                "fingerprint": "fp123"
+            })],
+            notes: None,
+            created_at_unix_ms: Some(100),
+        });
+        iam_state.grants.push(crate::access::iam::IamGrant {
+            id: "grant:browser-cert:fp123:inspect".to_string(),
+            principal_id: "principal:browser-cert:fp123".to_string(),
+            target_id: "local".to_string(),
+            role_id: "role:scoped-human".to_string(),
+            policy_id: "policy:local-user-client".to_string(),
+            status: "active".to_string(),
+            source: "local_iam_state".to_string(),
+            reason: "test grant".to_string(),
+            created_at_unix_ms: Some(101),
+            revoked_at_unix_ms: None,
+        });
+        let principal =
+            crate::access::iam::principal_for_browser_mtls_cert(&iam_state, "fp123", "https")
+                .unwrap();
+        DashboardControlGrant::UserClient {
+            principal,
+            iam_state,
+        }
+    }
+
     struct DashboardControlStubDisplayBackend;
 
     #[async_trait::async_trait]
@@ -10223,6 +10283,40 @@ mod tests {
         assert_eq!(cancelled["ok"], false);
         assert_eq!(cancelled["cancelled"], true);
         assert!(pending.get("q1").is_none());
+    }
+
+    #[test]
+    fn scoped_user_client_grant_limits_dashboard_control_permissions() {
+        let mut rt = runtime();
+        rt.grant = scoped_user_client_grant();
+
+        assert!(runtime_allows_operation(
+            &rt,
+            crate::peer::access_policy::PeerOperation::AccessInspect
+        ));
+        assert!(!runtime_allows_operation(
+            &rt,
+            crate::peer::access_policy::PeerOperation::AccessManage
+        ));
+
+        let status = status_response_frame("s1".to_string(), &rt);
+        assert_eq!(status["t"], "response");
+        assert_eq!(status["ok"], true);
+        assert_eq!(status["result"]["grant_kind"], "user-client");
+        assert_eq!(
+            status["result"]["access_principal"]["kind"],
+            "browser_certificate"
+        );
+        assert_eq!(
+            status["result"]["iam_enforcement"]["principal_binding"],
+            "user_client"
+        );
+        assert_eq!(
+            status["result"]["iam_enforcement"]["user_client_grants"],
+            true
+        );
+        assert_eq!(status["result"]["access_inspect_available"], true);
+        assert_eq!(status["result"]["access_manage_available"], false);
     }
 
     #[tokio::test]

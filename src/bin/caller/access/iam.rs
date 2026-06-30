@@ -136,6 +136,10 @@ pub struct AccessPrincipal {
     pub transport: String,
     #[serde(default)]
     pub peer_profile: Option<String>,
+    #[serde(default)]
+    pub account: Option<Value>,
+    #[serde(default)]
+    pub authn: Vec<Value>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -158,6 +162,8 @@ impl AccessPrincipal {
             grant_id: Some("grant:root:dashboard".to_string()),
             transport: transport.into(),
             peer_profile: None,
+            account: None,
+            authn: Vec::new(),
         }
     }
 
@@ -183,6 +189,45 @@ impl AccessPrincipal {
             grant_id: Some(format!("grant:peer-profile:{fingerprint}")),
             transport: transport.into(),
             peer_profile: Some(profile),
+            account: None,
+            authn: Vec::new(),
+        }
+    }
+
+    pub fn local_user_client(
+        principal: &IamPrincipal,
+        grant: &IamGrant,
+        transport: impl Into<String>,
+    ) -> Self {
+        let role_id = if grant.role_id.trim().is_empty() {
+            "role:scoped-human".to_string()
+        } else {
+            grant.role_id.clone()
+        };
+        let kind = if principal.kind.trim().is_empty() {
+            "human_user".to_string()
+        } else {
+            principal.kind.clone()
+        };
+        Self {
+            id: principal.id.clone(),
+            kind,
+            label: if principal.label.trim().is_empty() {
+                principal.id.clone()
+            } else {
+                principal.label.clone()
+            },
+            source: if principal.source.trim().is_empty() {
+                "local_iam_state".to_string()
+            } else {
+                principal.source.clone()
+            },
+            role_id,
+            grant_id: Some(grant.id.clone()),
+            transport: transport.into(),
+            peer_profile: None,
+            account: principal.account.clone(),
+            authn: principal.authn.clone(),
         }
     }
 
@@ -364,15 +409,15 @@ pub fn overview_metadata(load: &LoadedIamState) -> Value {
             "write_api_available": false,
             "operation_evaluator": true,
             "enforce_root_and_peer_grants": true,
-            "enforce_user_client_grants": false
+            "enforce_user_client_grants": true
         },
         "enforcement": {
             "root_session_grants": true,
             "peer_profile_grants": true,
-            "user_client_grants": false,
-            "principal_binding": "root_session_and_peer_daemon",
-            "enforced_principal_kinds": ["root_session", "peer_daemon"],
-            "reason": "The daemon currently enforces trusted owner/root dashboard sessions and daemon peer profiles, but not stable scoped human/device principals."
+            "user_client_grants": true,
+            "principal_binding": "root_peer_and_local_user_client",
+            "enforced_principal_kinds": ["root_session", "peer_daemon", "human_user", "browser_certificate", "connect_account"],
+            "reason": "The daemon enforces trusted owner/root dashboard sessions, daemon peer profiles, and active local IAM user/client grants when requests bind to browser mTLS or Connect account identities."
         }
     })
 }
@@ -418,8 +463,96 @@ pub fn evaluate_principal_operation(
         _ => AccessDecision::denied(
             principal,
             op,
-            "scoped user/client principals are not enforceable until stable request binding exists",
+            "scoped user/client principal requires local IAM state evaluation",
         ),
+    }
+}
+
+pub fn evaluate_principal_operation_with_state(
+    state: &LocalIamState,
+    principal: &AccessPrincipal,
+    op: crate::peer::access_policy::PeerOperation,
+) -> AccessDecision {
+    if matches!(principal.kind.as_str(), "root_session" | "peer_daemon") {
+        return evaluate_principal_operation(principal, op);
+    }
+
+    let Some(grant_id) = principal.grant_id.as_deref() else {
+        return AccessDecision::denied(principal, op, "principal has no local IAM grant");
+    };
+    let Some(grant) = state.grants.iter().find(|grant| grant.id == grant_id) else {
+        return AccessDecision::denied(
+            principal,
+            op,
+            format!("local IAM grant {grant_id} was not found"),
+        );
+    };
+    if grant.principal_id != principal.id {
+        return AccessDecision::denied(
+            principal,
+            op,
+            format!(
+                "local IAM grant {} belongs to {}",
+                grant.id, grant.principal_id
+            ),
+        );
+    }
+    if !is_enforced_status(&grant.status) {
+        return AccessDecision::denied(
+            principal,
+            op,
+            format!("local IAM grant {} is not active", grant.id),
+        );
+    }
+
+    let Some(principal_record) = state
+        .principals
+        .iter()
+        .find(|record| record.id == principal.id)
+    else {
+        return AccessDecision::denied(
+            principal,
+            op,
+            format!("local IAM principal {} was not found", principal.id),
+        );
+    };
+    if !is_enforced_status(&principal_record.status) {
+        return AccessDecision::denied(
+            principal,
+            op,
+            format!("local IAM principal {} is not active", principal.id),
+        );
+    }
+
+    let role_id = if grant.role_id.trim().is_empty() {
+        "role:scoped-human"
+    } else {
+        grant.role_id.as_str()
+    };
+    let Some(role) = state.roles.iter().find(|role| role.id == role_id) else {
+        return AccessDecision::denied(
+            principal,
+            op,
+            format!("local IAM role {role_id} was not found"),
+        );
+    };
+    let permission = operation_permission_id(op);
+    if role
+        .permissions
+        .iter()
+        .any(|candidate| candidate == permission)
+    {
+        AccessDecision::allowed(
+            principal,
+            op,
+            format!("local IAM role {role_id} allows {permission}"),
+        )
+    } else {
+        AccessDecision::denied(
+            principal,
+            op,
+            format!("local IAM role {role_id} does not allow {permission}"),
+        )
     }
 }
 
@@ -489,10 +622,10 @@ pub fn grant_overview_values(state: &LocalIamState, default_target_id: &str) -> 
                 "policy_id": if grant.policy_id.is_empty() { "policy:scoped-human" } else { grant.policy_id.as_str() },
                 "role": role_id,
                 "role_label": role_label(state, role_id),
-                "transport_id": "transport:future-user-client-binding",
+                "transport_id": "transport:local-user-client-binding",
                 "source": if grant.source.is_empty() { "local_iam_state" } else { grant.source.as_str() },
                 "status": if grant.status.is_empty() { "draft" } else { grant.status.as_str() },
-                "enforced": false,
+                "enforced": is_enforced_status(&grant.status),
                 "reason": grant.reason.clone(),
                 "created_at_unix_ms": grant.created_at_unix_ms,
                 "revoked_at_unix_ms": grant.revoked_at_unix_ms
@@ -541,8 +674,8 @@ fn builtin_role_templates() -> Vec<IamRole> {
         IamRole {
             id: "role:scoped-human".to_string(),
             label: "Scoped human".to_string(),
-            status: "planned".to_string(),
-            summary: "Future user/client IAM role once stable browser/passkey principals are bound to daemon requests.".to_string(),
+            status: "enforced".to_string(),
+            summary: "Minimal user/client IAM role for stable browser mTLS and Connect account request bindings.".to_string(),
             permissions: vec!["access.inspect".to_string()],
             source: "builtin".to_string(),
         },
@@ -606,6 +739,75 @@ fn role_label(state: &LocalIamState, role_id: &str) -> String {
             }
         })
         .unwrap_or_else(|| role_id.to_string())
+}
+
+pub fn is_enforced_status(status: &str) -> bool {
+    matches!(
+        status.trim().to_ascii_lowercase().as_str(),
+        "active" | "enforced"
+    )
+}
+
+pub fn principal_for_browser_mtls_cert(
+    state: &LocalIamState,
+    fingerprint: &str,
+    transport: impl Into<String>,
+) -> Option<AccessPrincipal> {
+    principal_for_authn(
+        state,
+        "browser_mtls_cert",
+        "fingerprint",
+        fingerprint,
+        transport,
+    )
+}
+
+pub fn principal_for_connect_account(
+    state: &LocalIamState,
+    user_id: &str,
+    account_name: Option<&str>,
+    transport: impl Into<String>,
+) -> Option<AccessPrincipal> {
+    let transport = transport.into();
+    principal_for_authn(
+        state,
+        "connect_account",
+        "user_id",
+        user_id,
+        transport.clone(),
+    )
+    .or_else(|| {
+        account_name.and_then(|name| {
+            principal_for_authn(state, "connect_account", "account_name", name, transport)
+        })
+    })
+}
+
+fn principal_for_authn(
+    state: &LocalIamState,
+    authn_kind: &str,
+    key: &str,
+    value: &str,
+    transport: impl Into<String>,
+) -> Option<AccessPrincipal> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    let principal = state.principals.iter().find(|principal| {
+        is_enforced_status(&principal.status)
+            && principal.authn.iter().any(|authn| {
+                authn.get("kind").and_then(Value::as_str) == Some(authn_kind)
+                    && authn.get(key).and_then(Value::as_str) == Some(value)
+            })
+    })?;
+    let grant = state
+        .grants
+        .iter()
+        .find(|grant| grant.principal_id == principal.id && is_enforced_status(&grant.status))?;
+    Some(AccessPrincipal::local_user_client(
+        principal, grant, transport,
+    ))
 }
 
 #[allow(dead_code)]
@@ -716,6 +918,74 @@ mod tests {
         assert_eq!(grants[0]["target_id"], "local-daemon");
         assert_eq!(grants[0]["status"], "draft");
         assert_eq!(grants[0]["enforced"], false);
+    }
+
+    fn active_browser_cert_state() -> LocalIamState {
+        let mut state = LocalIamState::default();
+        state.principals.push(IamPrincipal {
+            id: "principal:browser-cert:fp123".to_string(),
+            kind: "browser_certificate".to_string(),
+            label: "Alice laptop browser".to_string(),
+            status: "active".to_string(),
+            source: "local_iam_state".to_string(),
+            account: None,
+            organization: None,
+            authn: vec![json!({
+                "kind": "browser_mtls_cert",
+                "fingerprint": "fp123"
+            })],
+            notes: None,
+            created_at_unix_ms: Some(100),
+        });
+        state.grants.push(IamGrant {
+            id: "grant:browser-cert:fp123:inspect".to_string(),
+            principal_id: "principal:browser-cert:fp123".to_string(),
+            target_id: "local".to_string(),
+            role_id: "role:scoped-human".to_string(),
+            policy_id: "policy:local-user-client".to_string(),
+            status: "active".to_string(),
+            source: "local_iam_state".to_string(),
+            reason: "test scoped browser certificate".to_string(),
+            created_at_unix_ms: Some(101),
+            revoked_at_unix_ms: None,
+        });
+        state
+    }
+
+    #[test]
+    fn active_browser_cert_binding_uses_local_role_permissions() {
+        let state = active_browser_cert_state();
+        let principal = principal_for_browser_mtls_cert(&state, "fp123", "https").unwrap();
+
+        assert_eq!(principal.kind, "browser_certificate");
+        assert_eq!(
+            principal.grant_id.as_deref(),
+            Some("grant:browser-cert:fp123:inspect")
+        );
+        assert!(
+            evaluate_principal_operation_with_state(
+                &state,
+                &principal,
+                crate::peer::access_policy::PeerOperation::AccessInspect,
+            )
+            .allowed
+        );
+        assert!(
+            !evaluate_principal_operation_with_state(
+                &state,
+                &principal,
+                crate::peer::access_policy::PeerOperation::AccessManage,
+            )
+            .allowed
+        );
+    }
+
+    #[test]
+    fn draft_browser_cert_binding_is_not_resolved() {
+        let mut state = active_browser_cert_state();
+        state.principals[0].status = "draft".to_string();
+
+        assert!(principal_for_browser_mtls_cert(&state, "fp123", "https").is_none());
     }
 
     #[test]

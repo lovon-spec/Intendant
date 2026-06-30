@@ -363,13 +363,16 @@ checks, or peer profiles.
 The local IAM foundation lives beside the native access cert store as
 `iam.json` and is also available at `GET /api/access/iam/state` or
 dashboard-control `api_access_iam_state`. Its schema contains `principals`,
-`roles`, `grants`, and `audit_events`. The daemon currently exposes this state
-for inspection and merges managed principals/grants into the unified overview,
-but it does not enforce scoped user/client grants yet. The `iam.enforcement`
-object reports `root_session_grants: true`, `peer_profile_grants: true`,
-`user_client_grants: false`, and `principal_binding:
-root_session_and_peer_daemon` until browser mTLS or Connect requests can be
-bound to stable human/device principals.
+`roles`, `grants`, and `audit_events`. The daemon exposes this state for
+inspection, merges managed principals/grants into the unified overview, and
+enforces active scoped user/client grants when a request can be bound to a
+stable local principal. Today those stable bindings are browser mTLS client
+certificate fingerprints and hosted Connect account metadata. Existing owner
+browser mTLS and hosted Connect requests remain root-compatible when no active
+local binding exists, but an active matching local principal/grant wins over the
+root fallback. The `iam.enforcement` object reports `root_session_grants: true`,
+`peer_profile_grants: true`, `user_client_grants: true`, and
+`principal_binding: root_peer_and_local_user_client`.
 
 `GET /api/dashboard/targets` and `api_dashboard_targets` remain the compatibility
 target model used by older UI paths: target id/host id, display label, access

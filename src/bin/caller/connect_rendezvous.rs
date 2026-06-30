@@ -47,6 +47,10 @@ struct RendezvousEvent {
     #[serde(default)]
     client_nonce: Option<String>,
     #[serde(default)]
+    user_id: Option<String>,
+    #[serde(default)]
+    account_name: Option<String>,
+    #[serde(default)]
     claim_id: Option<String>,
     #[serde(default)]
     challenge: Option<String>,
@@ -301,8 +305,18 @@ async fn handle_event(
                 .map(str::trim)
                 .filter(|nonce| !nonce.is_empty())
                 .map(str::to_string);
+            let grant = match connect_dashboard_grant(
+                event.user_id.as_deref(),
+                event.account_name.as_deref(),
+            ) {
+                Ok(grant) => grant,
+                Err(e) => {
+                    let _ = post_error(client, base_url, config, daemon_id, &event.id, &e).await;
+                    return;
+                }
+            };
             match dashboard_control
-                .answer_offer(sdp.to_string(), session_grant, client_nonce)
+                .answer_offer_with_grant(sdp.to_string(), session_grant, client_nonce, grant)
                 .await
             {
                 Ok(answer) => {
@@ -429,6 +443,53 @@ async fn handle_event(
     }
 }
 
+fn connect_dashboard_grant(
+    user_id: Option<&str>,
+    account_name: Option<&str>,
+) -> Result<crate::dashboard_control::DashboardControlGrant, String> {
+    let has_user_id = user_id
+        .map(str::trim)
+        .is_some_and(|value| !value.is_empty());
+    let has_account_name = account_name
+        .map(str::trim)
+        .is_some_and(|value| !value.is_empty());
+    if !has_user_id && !has_account_name {
+        return Ok(crate::dashboard_control::DashboardControlGrant::TrustedLocal);
+    }
+
+    let cert_dir = crate::access::backend::select_backend().cert_dir();
+    let path = crate::access::iam::iam_state_path(&cert_dir);
+    if !path.exists() {
+        return Ok(crate::dashboard_control::DashboardControlGrant::TrustedLocal);
+    }
+    let state = crate::access::iam::load_state(&cert_dir)
+        .map_err(|e| format!("local IAM state is invalid: {e}"))?;
+    Ok(connect_dashboard_grant_from_state(
+        state,
+        user_id.unwrap_or_default(),
+        account_name,
+    ))
+}
+
+fn connect_dashboard_grant_from_state(
+    state: crate::access::iam::LocalIamState,
+    user_id: &str,
+    account_name: Option<&str>,
+) -> crate::dashboard_control::DashboardControlGrant {
+    match crate::access::iam::principal_for_connect_account(
+        &state,
+        user_id,
+        account_name,
+        "connect-dashboard-control",
+    ) {
+        Some(principal) => crate::dashboard_control::DashboardControlGrant::UserClient {
+            principal,
+            iam_state: state,
+        },
+        None => crate::dashboard_control::DashboardControlGrant::TrustedLocal,
+    }
+}
+
 fn claim_signing_payload(
     claim_id: &str,
     daemon_id: &str,
@@ -545,6 +606,68 @@ mod tests {
         assert_eq!(
             join_url(&base, "/api/daemon/next").unwrap().as_str(),
             "https://connect.example/root/api/daemon/next"
+        );
+    }
+
+    #[test]
+    fn connect_account_metadata_can_bind_to_scoped_local_grant() {
+        let mut state = crate::access::iam::LocalIamState::default();
+        state.principals.push(crate::access::iam::IamPrincipal {
+            id: "principal:connect:alice".to_string(),
+            kind: "connect_account".to_string(),
+            label: "alice".to_string(),
+            status: "active".to_string(),
+            source: "local_iam_state".to_string(),
+            account: Some(serde_json::json!({
+                "provider": "intendant.dev",
+                "account_name": "alice"
+            })),
+            organization: None,
+            authn: vec![serde_json::json!({
+                "kind": "connect_account",
+                "user_id": "user-123",
+                "account_name": "alice"
+            })],
+            notes: None,
+            created_at_unix_ms: Some(100),
+        });
+        state.grants.push(crate::access::iam::IamGrant {
+            id: "grant:connect:alice:inspect".to_string(),
+            principal_id: "principal:connect:alice".to_string(),
+            target_id: "local".to_string(),
+            role_id: "role:scoped-human".to_string(),
+            policy_id: "policy:local-user-client".to_string(),
+            status: "active".to_string(),
+            source: "local_iam_state".to_string(),
+            reason: "test Connect account grant".to_string(),
+            created_at_unix_ms: Some(101),
+            revoked_at_unix_ms: None,
+        });
+
+        let grant = connect_dashboard_grant_from_state(state, "user-123", Some("alice"));
+        let crate::dashboard_control::DashboardControlGrant::UserClient {
+            principal,
+            iam_state,
+        } = grant
+        else {
+            panic!("expected scoped user-client grant");
+        };
+        assert_eq!(principal.kind, "connect_account");
+        assert!(
+            crate::access::iam::evaluate_principal_operation_with_state(
+                &iam_state,
+                &principal,
+                crate::peer::access_policy::PeerOperation::AccessInspect,
+            )
+            .allowed
+        );
+        assert!(
+            !crate::access::iam::evaluate_principal_operation_with_state(
+                &iam_state,
+                &principal,
+                crate::peer::access_policy::PeerOperation::AccessManage,
+            )
+            .allowed
         );
     }
 }

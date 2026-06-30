@@ -18086,6 +18086,21 @@ pub fn spawn_web_gateway(
                         finalize_http_stream(&mut stream).await;
                         return;
                     }
+                    let cert_dir = crate::access::backend::select_backend().cert_dir();
+                    let dashboard_control_grant_for_ws = match dashboard_control_grant_for_client(
+                        &cert_dir,
+                        peer_connection_identity.as_ref(),
+                        tls_client_cert_fingerprint.as_deref(),
+                    ) {
+                        Ok(grant) => grant,
+                        Err(message) => {
+                            use tokio::io::AsyncWriteExt;
+                            let response = json_error("500 Internal Server Error", message);
+                            let _ = stream.write_all(response.as_bytes()).await;
+                            finalize_http_stream(&mut stream).await;
+                            return;
+                        }
+                    };
                     let peer_identity_for_ws = peer_connection_identity.clone();
                     let ws_stream = match tokio_tungstenite::accept_async(stream).await {
                         Ok(ws) => ws,
@@ -18404,6 +18419,7 @@ pub fn spawn_web_gateway(
                     let task_tx_inbound = task_tx.clone();
                     let terminal_registry_inbound = terminal_registry.clone();
                     let dashboard_control_inbound = Arc::clone(&dashboard_control);
+                    let dashboard_control_grant_inbound = dashboard_control_grant_for_ws.clone();
                     let peer_file_transfer_registry_inbound =
                         Arc::clone(&peer_file_transfer_registry);
                     let peer_identity_inbound = peer_identity_for_ws.clone();
@@ -19873,7 +19889,12 @@ pub fn spawn_web_gateway(
                                                 continue;
                                             }
                                             match dashboard_control_inbound
-                                                .answer_offer(sdp, None, client_nonce)
+                                                .answer_offer_with_grant(
+                                                    sdp,
+                                                    None,
+                                                    client_nonce,
+                                                    dashboard_control_grant_inbound.clone(),
+                                                )
                                                 .await
                                             {
                                                 Ok(answer) => {
@@ -20708,16 +20729,28 @@ pub fn spawn_web_gateway(
                         return;
                     }
 
-                    let http_access_principal = http_access_principal(
+                    let cert_dir = crate::access::backend::select_backend().cert_dir();
+                    let http_access_context = match http_access_context(
+                        &cert_dir,
                         peer_connection_identity.as_ref(),
+                        tls_client_cert_fingerprint.as_deref(),
                         tls_client_cert_present,
                         is_tls,
-                    );
+                    ) {
+                        Ok(context) => context,
+                        Err(message) => {
+                            use tokio::io::AsyncWriteExt;
+                            let response = json_error("500 Internal Server Error", message);
+                            let _ = stream.write_all(response.as_bytes()).await;
+                            finalize_http_stream(&mut stream).await;
+                            return;
+                        }
+                    };
 
                     if let Some((op, kind)) = peer_filesystem_query_request(req_method, req_path) {
                         let path = query_param(request_line, "path").unwrap_or_default();
                         if let Err(message) = authorize_http_filesystem_access(
-                            &http_access_principal,
+                            &http_access_context,
                             peer_connection_identity.as_ref(),
                             op,
                             kind,
@@ -20744,15 +20777,12 @@ pub fn spawn_web_gateway(
                         if let Some(op) =
                             crate::peer::access_policy::federation_http_operation(request_line)
                         {
-                            let decision = crate::access::iam::evaluate_principal_operation(
-                                &http_access_principal,
-                                op,
-                            );
+                            let decision = http_access_context.decision(op);
                             if !decision.allowed {
                                 use tokio::io::AsyncWriteExt;
                                 let body = serde_json::json!({
                                     "error": "principal does not allow this operation",
-                                    "principal": http_access_principal.as_value(),
+                                    "principal": http_access_context.principal.as_value(),
                                     "permission": decision.permission,
                                     "reason": decision.reason,
                                 })
@@ -21014,7 +21044,7 @@ pub fn spawn_web_gateway(
                         let body_text = read_post_body(&header_text, &mut stream).await;
                         let response = match serde_json::from_str::<FsMkdirRequest>(&body_text) {
                             Ok(req) => match authorize_http_filesystem_access(
-                                &http_access_principal,
+                                &http_access_context,
                                 peer_connection_identity.as_ref(),
                                 crate::peer::access_policy::PeerOperation::FilesystemWrite,
                                 crate::peer::access_policy::FilesystemAccessKind::Write,
@@ -23748,12 +23778,12 @@ fn access_overview_response_value_with_identities_and_iam(
     ));
     if iam_state.state.managed_grant_count() > 0 {
         transports.push(serde_json::json!({
-            "id": "transport:future-user-client-binding",
-            "kind": "future_user_client_binding",
-            "kind_label": "Future user/client binding",
-            "label": "Future user/client binding",
-            "status": "planned",
-            "implementation": "future Connect account or per-device browser mTLS principal binding",
+            "id": "transport:local-user-client-binding",
+            "kind": "local_user_client_binding",
+            "kind_label": "Local user/client binding",
+            "label": "Local user/client binding",
+            "status": "active",
+            "implementation": "browser mTLS fingerprints and hosted Connect account metadata",
             "target_id": local_target_id.clone()
         }));
     }
@@ -26346,21 +26376,106 @@ fn peer_filesystem_query_request(
     }
 }
 
-fn http_access_principal(
+struct HttpAccessContext {
+    principal: crate::access::iam::AccessPrincipal,
+    iam_state: Option<crate::access::iam::LocalIamState>,
+}
+
+impl HttpAccessContext {
+    fn decision(
+        &self,
+        op: crate::peer::access_policy::PeerOperation,
+    ) -> crate::access::iam::AccessDecision {
+        match &self.iam_state {
+            Some(state) => crate::access::iam::evaluate_principal_operation_with_state(
+                state,
+                &self.principal,
+                op,
+            ),
+            None => crate::access::iam::evaluate_principal_operation(&self.principal, op),
+        }
+    }
+}
+
+fn http_access_context(
+    cert_dir: &std::path::Path,
     identity: Option<&PeerConnectionIdentity>,
+    tls_client_cert_fingerprint: Option<&str>,
     tls_client_cert_present: bool,
     is_tls: bool,
-) -> crate::access::iam::AccessPrincipal {
+) -> Result<HttpAccessContext, String> {
     if let Some(identity) = identity {
-        return peer_identity_access_principal(identity, "peer-http");
+        return Ok(HttpAccessContext {
+            principal: peer_identity_access_principal(identity, "peer-http"),
+            iam_state: None,
+        });
+    }
+    let transport = if is_tls { "https" } else { "http" };
+    if let Some(fingerprint) = tls_client_cert_fingerprint {
+        if let Some(state) = load_local_iam_state_for_request(cert_dir)? {
+            if let Some(principal) =
+                crate::access::iam::principal_for_browser_mtls_cert(&state, fingerprint, transport)
+            {
+                return Ok(HttpAccessContext {
+                    principal,
+                    iam_state: Some(state),
+                });
+            }
+        }
     }
     let source = if tls_client_cert_present {
         "browser-mtls"
     } else {
         "trusted-dashboard-http"
     };
-    let transport = if is_tls { "https" } else { "http" };
-    crate::access::iam::AccessPrincipal::root_dashboard_session(source, transport)
+    Ok(HttpAccessContext {
+        principal: crate::access::iam::AccessPrincipal::root_dashboard_session(source, transport),
+        iam_state: None,
+    })
+}
+
+fn load_local_iam_state_for_request(
+    cert_dir: &std::path::Path,
+) -> Result<Option<crate::access::iam::LocalIamState>, String> {
+    let path = crate::access::iam::iam_state_path(cert_dir);
+    if !path.exists() {
+        return Ok(None);
+    }
+    crate::access::iam::load_state(cert_dir)
+        .map(Some)
+        .map_err(|e| format!("local IAM state is invalid: {e}"))
+}
+
+fn dashboard_control_grant_for_client(
+    cert_dir: &std::path::Path,
+    identity: Option<&PeerConnectionIdentity>,
+    tls_client_cert_fingerprint: Option<&str>,
+) -> Result<crate::dashboard_control::DashboardControlGrant, String> {
+    if let Some(identity) = identity {
+        return Ok(crate::dashboard_control::DashboardControlGrant::Peer {
+            fingerprint: identity.fingerprint.clone(),
+            label: identity.label.clone(),
+            profile: identity.profile.clone(),
+            filesystem: identity.filesystem.clone(),
+        });
+    }
+    if let Some(fingerprint) = tls_client_cert_fingerprint {
+        if let Some(state) = load_local_iam_state_for_request(cert_dir)? {
+            if let Some(principal) = crate::access::iam::principal_for_browser_mtls_cert(
+                &state,
+                fingerprint,
+                "webrtc-datachannel",
+            ) {
+                return Ok(
+                    crate::dashboard_control::DashboardControlGrant::UserClient {
+                        principal,
+                        iam_state: state,
+                    },
+                );
+            }
+        }
+    }
+    Ok(crate::dashboard_control::DashboardControlGrant::TrustedLocal)
 }
 
 fn peer_identity_access_principal(
@@ -26391,14 +26506,14 @@ fn peer_identity_allows_operation(
 }
 
 fn authorize_http_filesystem_access(
-    principal: &crate::access::iam::AccessPrincipal,
+    access: &HttpAccessContext,
     identity: Option<&PeerConnectionIdentity>,
     op: crate::peer::access_policy::PeerOperation,
     kind: crate::peer::access_policy::FilesystemAccessKind,
     raw_path: &str,
     bus: &EventBus,
 ) -> Result<(), String> {
-    let decision = crate::access::iam::evaluate_principal_operation(principal, op);
+    let decision = access.decision(op);
     if !decision.allowed {
         if let Some(identity) = identity {
             audit_peer_filesystem_access(bus, identity, op, raw_path, false, &decision.reason);
@@ -36040,7 +36155,7 @@ mod tests {
         }
         assert_eq!(
             payload["iam"]["capabilities"]["enforce_user_client_grants"],
-            false
+            true
         );
         assert_eq!(
             payload["iam"]["capabilities"]["enforce_root_and_peer_grants"],
@@ -36048,7 +36163,7 @@ mod tests {
         );
         assert_eq!(
             payload["iam"]["enforcement"]["principal_binding"],
-            "root_session_and_peer_daemon"
+            "root_peer_and_local_user_client"
         );
 
         handle.abort();
@@ -36717,16 +36832,14 @@ mod tests {
 
     #[test]
     fn http_access_principal_maps_root_and_peer_routes() {
-        let root = http_access_principal(None, true, true);
-        assert_eq!(root.kind, "root_session");
-        assert_eq!(root.source, "browser-mtls");
-        assert_eq!(root.transport, "https");
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = http_access_context(tmp.path(), None, Some("unbound-fp"), true, true).unwrap();
+        assert_eq!(root.principal.kind, "root_session");
+        assert_eq!(root.principal.source, "browser-mtls");
+        assert_eq!(root.principal.transport, "https");
         assert!(
-            crate::access::iam::evaluate_principal_operation(
-                &root,
-                crate::peer::access_policy::PeerOperation::AccessManage,
-            )
-            .allowed
+            root.decision(crate::peer::access_policy::PeerOperation::AccessManage)
+                .allowed
         );
 
         let peer_identity = PeerConnectionIdentity {
@@ -36735,9 +36848,14 @@ mod tests {
             profile: "peer-operator".to_string(),
             filesystem: crate::peer::access_policy::FilesystemAccessPolicy::default(),
         };
-        let peer = http_access_principal(Some(&peer_identity), true, true);
-        assert_eq!(peer.kind, "peer_daemon");
-        assert_eq!(peer.peer_profile.as_deref(), Some("peer-operator"));
+        let peer =
+            http_access_context(tmp.path(), Some(&peer_identity), Some("abc123"), true, true)
+                .unwrap();
+        assert_eq!(peer.principal.kind, "peer_daemon");
+        assert_eq!(
+            peer.principal.peer_profile.as_deref(),
+            Some("peer-operator")
+        );
         assert!(peer_identity_allows_operation(
             Some(&peer_identity),
             crate::peer::access_policy::PeerOperation::DisplayView,
@@ -36749,18 +36867,60 @@ mod tests {
             "peer-test",
         ));
         assert!(
-            crate::access::iam::evaluate_principal_operation(
-                &peer,
-                crate::peer::access_policy::PeerOperation::DisplayView,
-            )
-            .allowed
+            peer.decision(crate::peer::access_policy::PeerOperation::DisplayView)
+                .allowed
         );
         assert!(
-            !crate::access::iam::evaluate_principal_operation(
-                &peer,
-                crate::peer::access_policy::PeerOperation::AccessInspect,
-            )
-            .allowed
+            !peer
+                .decision(crate::peer::access_policy::PeerOperation::AccessInspect)
+                .allowed
+        );
+    }
+
+    #[test]
+    fn http_access_context_uses_active_browser_cert_binding() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut state = crate::access::iam::LocalIamState::default();
+        state.principals.push(crate::access::iam::IamPrincipal {
+            id: "principal:browser-cert:fp123".to_string(),
+            kind: "browser_certificate".to_string(),
+            label: "Alice browser".to_string(),
+            status: "active".to_string(),
+            source: "local_iam_state".to_string(),
+            account: None,
+            organization: None,
+            authn: vec![serde_json::json!({
+                "kind": "browser_mtls_cert",
+                "fingerprint": "fp123"
+            })],
+            notes: None,
+            created_at_unix_ms: Some(100),
+        });
+        state.grants.push(crate::access::iam::IamGrant {
+            id: "grant:browser-cert:fp123:inspect".to_string(),
+            principal_id: "principal:browser-cert:fp123".to_string(),
+            target_id: "local".to_string(),
+            role_id: "role:scoped-human".to_string(),
+            policy_id: "policy:local-user-client".to_string(),
+            status: "active".to_string(),
+            source: "local_iam_state".to_string(),
+            reason: "test scoped browser certificate".to_string(),
+            created_at_unix_ms: Some(101),
+            revoked_at_unix_ms: None,
+        });
+        crate::access::iam::save_state(tmp.path(), &state).unwrap();
+
+        let access = http_access_context(tmp.path(), None, Some("fp123"), true, true).unwrap();
+        assert_eq!(access.principal.kind, "browser_certificate");
+        assert!(
+            access
+                .decision(crate::peer::access_policy::PeerOperation::AccessInspect)
+                .allowed
+        );
+        assert!(
+            !access
+                .decision(crate::peer::access_policy::PeerOperation::AccessManage)
+                .allowed
         );
     }
 

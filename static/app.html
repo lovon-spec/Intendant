@@ -33235,8 +33235,8 @@ function accessOverviewModel() {
       }, {
         id: 'role:scoped-human',
         label: 'Scoped human',
-        status: 'planned',
-        summary: 'Future user/client IAM role once stable browser/passkey principals are bound to daemon requests.',
+        status: 'enforced',
+        summary: 'Minimal user/client IAM role for stable browser mTLS and Connect account request bindings.',
         permissions: ['access.inspect'],
         source: 'builtin',
       }],
@@ -33247,15 +33247,15 @@ function accessOverviewModel() {
         write_api_available: false,
         operation_evaluator: true,
         enforce_root_and_peer_grants: true,
-        enforce_user_client_grants: false,
+        enforce_user_client_grants: true,
       },
       enforcement: {
         root_session_grants: true,
         peer_profile_grants: true,
-        user_client_grants: false,
-        principal_binding: 'root_session_and_peer_daemon',
-        enforced_principal_kinds: ['root_session', 'peer_daemon'],
-        reason: 'The daemon currently enforces trusted owner/root dashboard sessions and daemon peer profiles, but not stable scoped human/device principals.',
+        user_client_grants: true,
+        principal_binding: 'root_peer_and_local_user_client',
+        enforced_principal_kinds: ['root_session', 'peer_daemon', 'human_user', 'browser_certificate', 'connect_account'],
+        reason: 'The daemon enforces trusted owner/root dashboard sessions, daemon peer profiles, and active local IAM user/client grants when requests bind to browser mTLS or Connect account identities.',
       },
     },
   };
@@ -33304,8 +33304,8 @@ function accessOverviewCards() {
     title: 'IAM foundation',
     kind: accessIamLoadLabel(iam),
     detail: iamCapabilities.enforce_root_and_peer_grants
-      ? `Root sessions and peer profiles use the IAM evaluator. Scoped user/client grants are not enforced yet. ${accessIamEnforcementReason(iam)}`
-      : `Local IAM state is visible, but scoped user/client grants are not enforced yet. ${accessIamEnforcementReason(iam)}`,
+      ? `Root sessions, peer profiles, and active bound user/client grants use the IAM evaluator. ${accessIamEnforcementReason(iam)}`
+      : `Local IAM state is visible. ${accessIamEnforcementReason(iam)}`,
     actions: [{ label: 'Policies', onClick: () => routeTo('access', 'policies') }],
   }, {
     title: 'Policies',
@@ -33977,7 +33977,7 @@ function renderAccessOverviewDetails() {
       ['Operation evaluator', iamCapabilities.operation_evaluator ? 'Enabled' : 'Not enabled'],
       ['Root/peer enforcement', iamCapabilities.enforce_root_and_peer_grants ? 'Enabled' : 'Not enabled'],
       ['User grant enforcement', iamEnforcement.user_client_grants ? 'Enabled' : 'Not enabled'],
-      ['Binding', accessModelLabel(iamEnforcement.principal_binding, 'root_session_and_peer_daemon')],
+      ['Binding', accessModelLabel(iamEnforcement.principal_binding, 'root_peer_and_local_user_client')],
       ['Reason', accessIamEnforcementReason(iam)],
     ],
   }]);
