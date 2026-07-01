@@ -347,12 +347,14 @@ INTENDANT_CONNECT_TOKEN="shared daemon bearer token" \
 `intendant-connect` is intended to sit behind public TLS for the configured
 origin. It handles passkey-only account sessions, claim-phrase ownership proof,
 daemon list/open/revoke/label UI, account-backed fleet target metadata,
-short-lived dashboard grants, WebRTC signaling, active-session close on revoke,
-and a capped audit log. The state file durably stores users/passkeys, daemon
-ownership, labels, hashed claim phrases, account-scoped fleet navigation
-records, and audit events. Plain claim phrases, WebAuthn challenge state,
-pending offers, issued dashboard grants, rate limits, web sessions, and active
-dashboard session tracking are memory-only. The claim API field remains named
+rendezvous routing grants, WebRTC signaling, active-session close on revoke, and
+a capped audit log. The target daemon still requires a daemon-local IAM grant
+for the routed Connect account before it answers hosted dashboard control. The
+state file durably stores users/passkeys, daemon ownership, labels, hashed claim
+phrases, account-scoped fleet navigation records, and audit events. Plain claim
+phrases, WebAuthn challenge state, pending offers, issued routing grants, rate
+limits, web sessions, and active dashboard session tracking are memory-only. The
+claim API field remains named
 `claim_code` for compatibility, but newly generated claims are standard 12-word
 BIP39 English mnemonic phrases rather than short PIN-style codes.
 
@@ -406,7 +408,7 @@ Backups should be encrypted because the state file is the authoritative account
 and device registry. It stores account handles, passkey public-key records,
 daemon ownership and labels, hashed claim phrases, and audit entries. It does
 not store plaintext claim phrases, WebAuthn challenges, active browser sessions,
-pending offers, dashboard grants, or rate-limit buckets. Create an encrypted
+pending offers, routing grants, or rate-limit buckets. Create an encrypted
 backup with:
 
 ```bash
@@ -469,12 +471,13 @@ PLAYWRIGHT_NODE_PATH=/path/to/node_modules \
   node scripts/validate-connect-rendezvous.cjs
 ```
 
-The emulator intentionally has no account, passkey, claim phrase, durable device
-registry, or authorization-grant policy. It exists to prove the
-browser-public-origin -> rendezvous -> daemon-outbound-signaling -> direct
-WebRTC DataChannel path while keeping the normal dashboard mTLS default in
-place. The hosted MVP validator covers passkeys, claim proof, grant binding,
-revoke, and audit.
+The emulator intentionally has no account signup, passkey ceremony, claim
+phrase, durable device registry, or authorization policy of its own. The
+validator seeds a temporary daemon-local IAM grant for the emulator's fixed test
+Connect account, then proves the browser-public-origin -> rendezvous ->
+daemon-outbound-signaling -> direct WebRTC DataChannel path while keeping the
+normal dashboard mTLS default in place. The hosted MVP validator covers the real
+account/passkey flow, claim proof, local grant binding, revoke, and audit.
 
 ### `[server]` (daemon and federation)
 
@@ -615,10 +618,12 @@ through the IAM operation evaluator. The daemon can currently bind scoped
 user/client grants to browser mTLS certificate fingerprints, hosted Connect
 account metadata, or a combined `human_user` principal that carries both
 bindings plus optional account/provider and organization metadata. Matching
-active records are enforced by role. Unbound owner browser mTLS and Connect
-dashboard sessions keep the existing root-compatible fallback, but a known local
-IAM record in `draft` or `revoked` status denies instead of falling back to
-root. Root users can create these records through the Access UI,
+active records are enforced by role. Unbound owner browser mTLS dashboard
+sessions keep the existing root-compatible fallback so direct/self-hosted access
+remains first-class. Connect dashboard sessions do not have an implicit root
+fallback: the routed Connect account must match local IAM, and a record in
+`draft` or `revoked` status denies instead of falling back to root. Root users
+can create these records through the Access UI,
 `POST /api/access/iam/user-client-grants`, or dashboard-control
 `api_access_iam_upsert_user_client_grant`; existing records can be activated,
 drafted, revoked, or role-changed through `POST /api/access/iam/grants/update`

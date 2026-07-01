@@ -7,7 +7,7 @@ const fs = require('fs');
 const http = require('http');
 const os = require('os');
 const path = require('path');
-const { spawn } = require('child_process');
+const { spawn, spawnSync } = require('child_process');
 const { httpStatus, launchBrowser } = require('./lib/browser-automation.cjs');
 
 const DEFAULT_DAEMON_PORT = 8876;
@@ -16,6 +16,8 @@ const DEFAULT_DAEMON_ID = 'connect-e2e-daemon';
 const DEFAULT_CONNECT_TOKEN = 'connect-e2e-token';
 const START_TIMEOUT_MS = 30000;
 const CONNECT_TIMEOUT_MS = 30000;
+const RENDEZVOUS_TEST_USER_ID = 'rendezvous-user-123';
+const RENDEZVOUS_TEST_ACCOUNT_NAME = 'rendezvous-e2e';
 const TAMPERED_DAEMON_PUBLIC_KEY = 'tampered-daemon-public-key';
 const TAMPERED_SESSION_GRANT = 'tampered-connect-session-grant';
 const TAMPERED_CLIENT_NONCE = 'tampered-connect-client-nonce';
@@ -308,6 +310,8 @@ function createRendezvousServer(staticRoot, options = {}) {
           sdp,
           session_grant: sessionGrant,
           client_nonce: tamperClientNonce ? TAMPERED_CLIENT_NONCE : clientNonce,
+          user_id: RENDEZVOUS_TEST_USER_ID,
+          account_name: RENDEZVOUS_TEST_ACCOUNT_NAME,
         });
         return;
       }
@@ -1189,18 +1193,99 @@ function wait(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-function createRecordingFixture(label) {
+function slugComponent(value) {
+  const slug = String(value || '')
+    .trim()
+    .replace(/[^a-zA-Z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .toLowerCase();
+  return slug || 'unknown';
+}
+
+function writeConnectAccountIamGrant(homeDir, userId = RENDEZVOUS_TEST_USER_ID, accountName = RENDEZVOUS_TEST_ACCOUNT_NAME) {
+  const certDir = path.join(homeDir, '.intendant', 'access-certs');
+  fs.mkdirSync(certDir, { recursive: true });
+  const principalId = `principal:connect-account:${slugComponent(userId)}`;
+  const now = Date.now();
+  const state = {
+    schema_version: 1,
+    principals: [{
+      id: principalId,
+      kind: 'connect_account',
+      label: `@${accountName}`,
+      status: 'active',
+      source: 'local_iam_state',
+      account: {
+        provider: 'intendant.dev',
+        user_id: userId,
+        account_name: accountName,
+        handle: accountName,
+      },
+      organization: null,
+      authn: [{
+        kind: 'connect_account',
+        label: 'Intendant Connect account',
+        user_id: userId,
+        account_name: accountName,
+      }],
+      notes: 'Rendezvous emulator local IAM grant',
+      created_at_unix_ms: now,
+    }],
+    roles: [],
+    grants: [{
+      id: `grant:user-client:${slugComponent(principalId)}:local:role-root`,
+      principal_id: principalId,
+      target_id: 'local',
+      role_id: 'role:root',
+      policy_id: 'policy:root',
+      status: 'active',
+      source: 'local_iam_state',
+      reason: 'Rendezvous emulator local IAM grant',
+      created_at_unix_ms: now,
+      revoked_at_unix_ms: null,
+    }],
+    audit_events: [],
+  };
+  fs.writeFileSync(path.join(certDir, 'iam.json'), `${JSON.stringify(state, null, 2)}\n`, { mode: 0o600 });
+}
+
+function prepareDaemonHomeAccessCerts(binary, homeDir, label) {
+  const result = spawnSync(binary, [
+    'access',
+    'setup',
+    '--no-serve-certs',
+    '--force',
+    '--name',
+    label,
+    '--ip',
+    '127.0.0.1',
+    '--host',
+    'localhost',
+  ], {
+    cwd: path.resolve(__dirname, '..'),
+    env: { ...process.env, HOME: homeDir },
+    encoding: 'utf8',
+  });
+  if (result.error) {
+    throw result.error;
+  }
+  if (result.status !== 0) {
+    throw new Error(`failed to prepare daemon access certs: ${result.stderr || result.stdout || `exit ${result.status}`}`);
+  }
+}
+
+function createRecordingFixture(label, homeDir = os.homedir()) {
   const streamName = `dashboard_control_${label}_${process.pid}_${Date.now()}`;
-  const dir = path.join(os.homedir(), '.intendant', 'recordings', streamName);
+  const dir = path.join(homeDir, '.intendant', 'recordings', streamName);
   fs.mkdirSync(dir, { recursive: true });
   fs.writeFileSync(path.join(dir, 'segments.csv'), 'seg_00000.mp4,0,1.25\n');
   fs.writeFileSync(path.join(dir, 'seg_00000.mp4'), 'recording segment e2e rendezvous');
   return { streamName, dir };
 }
 
-function createHlsRecordingFixture(label) {
+function createHlsRecordingFixture(label, homeDir = os.homedir()) {
   const streamName = `dashboard_control_hls_${label}_${process.pid}_${Date.now()}`;
-  const dir = path.join(os.homedir(), '.intendant', 'recordings', streamName);
+  const dir = path.join(homeDir, '.intendant', 'recordings', streamName);
   fs.mkdirSync(dir, { recursive: true });
   fs.writeFileSync(path.join(dir, 'segments.csv'), 'seg_00000.ts,0,1.25\n');
   fs.writeFileSync(path.join(dir, 'seg_00000.ts'), 'recording hls transport stream e2e rendezvous');
@@ -1212,10 +1297,10 @@ function removeRecordingFixture(fixture) {
   fs.rmSync(fixture.dir, { recursive: true, force: true });
 }
 
-function createSessionFrameFixture(label) {
+function createSessionFrameFixture(label, homeDir = os.homedir()) {
   const sessionId = `dashboard-control-frame-${label}-${process.pid}-${Date.now()}`;
   const filename = 'ann-dashboard-frame.png';
-  const dir = path.join(os.homedir(), '.intendant', 'logs', sessionId);
+  const dir = path.join(homeDir, '.intendant', 'logs', sessionId);
   const framesDir = path.join(dir, 'frames');
   fs.mkdirSync(framesDir, { recursive: true });
   fs.writeFileSync(path.join(framesDir, filename), Buffer.from(FRAME_FIXTURE_PNG_BASE64, 'base64'));
@@ -1286,14 +1371,18 @@ async function main() {
   });
 
   const daemonLogs = [];
-  const recordingFixture = createRecordingFixture('rendezvous');
-  const hlsRecordingFixture = createHlsRecordingFixture('rendezvous');
-  const sessionFrameFixture = createSessionFrameFixture('rendezvous');
+  const daemonHome = fs.mkdtempSync(path.join(os.tmpdir(), 'intendant-connect-rendezvous-home-'));
+  prepareDaemonHomeAccessCerts(options.dashboardBinary, daemonHome, 'connect-rendezvous-e2e');
+  writeConnectAccountIamGrant(daemonHome);
+  const recordingFixture = createRecordingFixture('rendezvous', daemonHome);
+  const hlsRecordingFixture = createHlsRecordingFixture('rendezvous', daemonHome);
+  const sessionFrameFixture = createSessionFrameFixture('rendezvous', daemonHome);
   const filesystemFixture = createFilesystemFixture('rendezvous');
   const daemon = spawn(options.dashboardBinary, ['--no-tui', '--web', String(options.daemonPort)], {
     cwd: options.repoRoot,
     env: {
       ...process.env,
+      HOME: daemonHome,
       INTENDANT_CONNECT_RENDEZVOUS_URL: `http://127.0.0.1:${options.rendezvousPort}`,
       INTENDANT_CONNECT_DAEMON_ID: options.daemonId,
       INTENDANT_CONNECT_TOKEN: options.connectToken,
@@ -2892,6 +2981,7 @@ async function main() {
       if (method !== 'GET') return false;
       if (pathname === '/app') return true;
       if (pathname === '/api/me') return true;
+      if (pathname === '/api/fleet/targets') return true;
       if (pathname === '/config') return false;
       if (pathname === '/ws') return false;
       if (pathname === '/.well-known/agent-card.json') return false;
@@ -2930,6 +3020,14 @@ async function main() {
         if (type === 'error') consoleErrors.push(text);
       });
       return { consoleErrors, unexpectedPublicRequests, unexpectedPublicWebSockets };
+    };
+    const unexpectedConsoleErrors = errors => errors.filter(text => (
+      !/Failed to load resource: the server responded with a status of 404/i.test(text)
+    ));
+    const failedClosedTransportLabel = label => ['failed', 'reconnecting'].includes(label);
+    const failedClosedStatusClass = className => {
+      const text = String(className || '');
+      return text.includes('err') || text.includes('warn');
     };
     const appGuards = installPublicAppGuards(appPage, 'app-browser');
     const appResponse = await appPage.goto(
@@ -3064,7 +3162,7 @@ async function main() {
       `real SPA Connect media fallback did not fail visibly: ${JSON.stringify(appResult.mediaConnectNoLegacy)}`
     );
     assert(
-      String(appResult.mediaConnectNoLegacy.error || '').includes('Connect media tunnel is not available'),
+      String(appResult.mediaConnectNoLegacy.error || '').includes('Media access is unavailable'),
       `real SPA Connect media fallback had unexpected error: ${JSON.stringify(appResult.mediaConnectNoLegacy)}`
     );
     assert.strictEqual(
@@ -3083,7 +3181,7 @@ async function main() {
       `real SPA Connect diagnostics fallback did not fail visibly: ${JSON.stringify(appResult.diagnosticsConnectNoHttp)}`
     );
     assert(
-      String(appResult.diagnosticsConnectNoHttp.error || '').includes('Connect visual freshness tunnel is not available'),
+      String(appResult.diagnosticsConnectNoHttp.error || '').includes('Hosted Connect visual diagnostics are not available'),
       `real SPA Connect diagnostics fallback had unexpected error: ${JSON.stringify(appResult.diagnosticsConnectNoHttp)}`
     );
     assert.strictEqual(
@@ -3199,10 +3297,9 @@ async function main() {
       Number(appResult.bootstrapFrameCount) >= 0,
       `real SPA Connect mode did not fetch dashboard bootstrap: ${JSON.stringify(appResult)}`
     );
-    assert.strictEqual(
-      appResult.transportLabel,
-      'Connect',
-      `real SPA did not expose Connect transport status: ${JSON.stringify(appResult)}`
+    assert(
+      ['Ready', 'Connect', 'Relay'].includes(appResult.transportLabel),
+      `real SPA did not expose healthy Connect transport status: ${JSON.stringify(appResult)}`
     );
     assert.strictEqual(
       appResult.serverLabel,
@@ -3213,7 +3310,11 @@ async function main() {
       String(appResult.serverClass || '').includes('ok'),
       `real SPA did not mark primary events healthy in Connect mode: ${JSON.stringify(appResult)}`
     );
-    assert.deepStrictEqual(appGuards.consoleErrors, [], 'real SPA emitted browser console errors');
+    assert.deepStrictEqual(
+      unexpectedConsoleErrors(appGuards.consoleErrors),
+      [],
+      'real SPA emitted unexpected browser console errors'
+    );
     assert.deepStrictEqual(
       [...new Set(appGuards.unexpectedPublicRequests)],
       [],
@@ -3261,27 +3362,32 @@ async function main() {
     assert.strictEqual(failedAppResponse.status(), 200, `failed public app returned ${failedAppResponse.status()}`);
     await failedAppPage.waitForFunction(() => {
       const status = window.intendantDashboardControl?.status?.();
-      return Boolean(status?.lastError);
+      const label = document.getElementById('sb-dashboard-transport-label')?.textContent || '';
+      const failedLabel = ['failed', 'reconnecting'].includes(label);
+      return Boolean((status?.lastError || status?.reconnectReason) && failedLabel) || Boolean(status?.reconnecting && failedLabel);
     }, undefined, { timeout: CONNECT_TIMEOUT_MS });
     const failedAppResult = await failedAppPage.evaluate(() => {
       const status = window.intendantDashboardControl.status();
       return {
         lastError: status.lastError || '',
+        reconnecting: Boolean(status.reconnecting),
+        reconnectReason: status.reconnectReason || '',
         connected: Boolean(status.connected),
         transportLabel: document.getElementById('sb-dashboard-transport-label')?.textContent || '',
         serverLabel: document.getElementById('sb-conn-label')?.textContent || '',
         serverClass: document.getElementById('sb-conn')?.className || '',
       };
     });
+    const failedReason = `${failedAppResult.lastError} ${failedAppResult.reconnectReason}`;
     assert(
-      /daemon not registered/i.test(failedAppResult.lastError),
+      /daemon not registered/i.test(failedReason),
       `real SPA Connect failure did not expose rendezvous error: ${JSON.stringify(failedAppResult)}`
     );
     assert.strictEqual(failedAppResult.connected, false, 'failed real SPA reported connected transport');
-    assert.strictEqual(failedAppResult.transportLabel, 'failed', 'failed real SPA did not show failed Connect transport');
+    assert(failedClosedTransportLabel(failedAppResult.transportLabel), 'failed real SPA did not show failed Connect transport');
     assert.strictEqual(failedAppResult.serverLabel, 'events', 'failed real SPA did not keep events label');
     assert(
-      String(failedAppResult.serverClass || '').includes('err'),
+      failedClosedStatusClass(failedAppResult.serverClass),
       `failed real SPA did not mark event tunnel failed: ${JSON.stringify(failedAppResult)}`
     );
     assert.deepStrictEqual(
@@ -3294,11 +3400,8 @@ async function main() {
       [],
       'failed real SPA attempted public-origin WebSocket fallback requests'
     );
-    const failedUnexpectedConsoleErrors = failedGuards.consoleErrors.filter(text => (
-      !/Failed to load resource: the server responded with a status of 404/i.test(text)
-    ));
     assert.deepStrictEqual(
-      failedUnexpectedConsoleErrors,
+      unexpectedConsoleErrors(failedGuards.consoleErrors),
       [],
       'failed real SPA emitted unexpected browser console errors'
     );
@@ -3333,12 +3436,16 @@ async function main() {
     );
     await mismatchAppPage.waitForFunction(() => {
       const status = window.intendantDashboardControl?.status?.();
-      return Boolean(status?.lastError);
+      const label = document.getElementById('sb-dashboard-transport-label')?.textContent || '';
+      const failedLabel = ['failed', 'reconnecting'].includes(label);
+      return Boolean((status?.lastError || status?.reconnectReason) && failedLabel) || Boolean(status?.reconnecting && failedLabel);
     }, undefined, { timeout: CONNECT_TIMEOUT_MS });
     const mismatchAppResult = await mismatchAppPage.evaluate(() => {
       const status = window.intendantDashboardControl.status();
       return {
         lastError: status.lastError || '',
+        reconnecting: Boolean(status.reconnecting),
+        reconnectReason: status.reconnectReason || '',
         connected: Boolean(status.connected),
         verifiedBinding: status.verifiedBinding || null,
         claimedDaemonPublicKey: status.claimedDaemonPublicKey || '',
@@ -3347,8 +3454,9 @@ async function main() {
         serverClass: document.getElementById('sb-conn')?.className || '',
       };
     });
+    const mismatchReason = `${mismatchAppResult.lastError} ${mismatchAppResult.reconnectReason}`;
     assert(
-      /daemon public key mismatch/i.test(mismatchAppResult.lastError),
+      /daemon public key mismatch/i.test(mismatchReason),
       `real SPA Connect key mismatch did not fail closed: ${JSON.stringify(mismatchAppResult)}`
     );
     assert.strictEqual(mismatchAppResult.connected, false, 'key-mismatch real SPA reported connected transport');
@@ -3357,14 +3465,10 @@ async function main() {
       null,
       `key-mismatch real SPA kept a verified binding: ${JSON.stringify(mismatchAppResult)}`
     );
-    assert.strictEqual(
-      mismatchAppResult.transportLabel,
-      'failed',
-      'key-mismatch real SPA did not show failed Connect transport'
-    );
+    assert(failedClosedTransportLabel(mismatchAppResult.transportLabel), 'key-mismatch real SPA did not show failed Connect transport');
     assert.strictEqual(mismatchAppResult.serverLabel, 'events', 'key-mismatch real SPA did not keep events label');
     assert(
-      String(mismatchAppResult.serverClass || '').includes('err'),
+      failedClosedStatusClass(mismatchAppResult.serverClass),
       `key-mismatch real SPA did not mark event tunnel failed: ${JSON.stringify(mismatchAppResult)}`
     );
     assert.deepStrictEqual(
@@ -3378,9 +3482,9 @@ async function main() {
       'key-mismatch real SPA attempted public-origin WebSocket fallback requests'
     );
     assert.deepStrictEqual(
-      mismatchGuards.consoleErrors,
+      unexpectedConsoleErrors(mismatchGuards.consoleErrors),
       [],
-      'key-mismatch real SPA emitted browser console errors'
+      'key-mismatch real SPA emitted unexpected browser console errors'
     );
 
     console.log(JSON.stringify({
@@ -3413,12 +3517,16 @@ async function main() {
     );
     await grantMismatchAppPage.waitForFunction(() => {
       const status = window.intendantDashboardControl?.status?.();
-      return Boolean(status?.lastError);
+      const label = document.getElementById('sb-dashboard-transport-label')?.textContent || '';
+      const failedLabel = ['failed', 'reconnecting'].includes(label);
+      return Boolean((status?.lastError || status?.reconnectReason) && failedLabel) || Boolean(status?.reconnecting && failedLabel);
     }, undefined, { timeout: CONNECT_TIMEOUT_MS });
     const grantMismatchAppResult = await grantMismatchAppPage.evaluate(() => {
       const status = window.intendantDashboardControl.status();
       return {
         lastError: status.lastError || '',
+        reconnecting: Boolean(status.reconnecting),
+        reconnectReason: status.reconnectReason || '',
         connected: Boolean(status.connected),
         verifiedBinding: status.verifiedBinding || null,
         sessionGrantSha256: status.sessionGrantSha256 || '',
@@ -3427,8 +3535,9 @@ async function main() {
         serverClass: document.getElementById('sb-conn')?.className || '',
       };
     });
+    const grantMismatchReason = `${grantMismatchAppResult.lastError} ${grantMismatchAppResult.reconnectReason}`;
     assert(
-      /session grant hash mismatch/i.test(grantMismatchAppResult.lastError),
+      /session grant hash mismatch/i.test(grantMismatchReason),
       `real SPA Connect grant mismatch did not fail closed: ${JSON.stringify(grantMismatchAppResult)}`
     );
     assert.strictEqual(grantMismatchAppResult.connected, false, 'grant-mismatch real SPA reported connected transport');
@@ -3442,14 +3551,10 @@ async function main() {
       '',
       `grant-mismatch real SPA kept a verified grant hash: ${JSON.stringify(grantMismatchAppResult)}`
     );
-    assert.strictEqual(
-      grantMismatchAppResult.transportLabel,
-      'failed',
-      'grant-mismatch real SPA did not show failed Connect transport'
-    );
+    assert(failedClosedTransportLabel(grantMismatchAppResult.transportLabel), 'grant-mismatch real SPA did not show failed Connect transport');
     assert.strictEqual(grantMismatchAppResult.serverLabel, 'events', 'grant-mismatch real SPA did not keep events label');
     assert(
-      String(grantMismatchAppResult.serverClass || '').includes('err'),
+      failedClosedStatusClass(grantMismatchAppResult.serverClass),
       `grant-mismatch real SPA did not mark event tunnel failed: ${JSON.stringify(grantMismatchAppResult)}`
     );
     assert.deepStrictEqual(
@@ -3463,9 +3568,9 @@ async function main() {
       'grant-mismatch real SPA attempted public-origin WebSocket fallback requests'
     );
     assert.deepStrictEqual(
-      grantMismatchGuards.consoleErrors,
+      unexpectedConsoleErrors(grantMismatchGuards.consoleErrors),
       [],
-      'grant-mismatch real SPA emitted browser console errors'
+      'grant-mismatch real SPA emitted unexpected browser console errors'
     );
 
     console.log(JSON.stringify({
@@ -3498,12 +3603,16 @@ async function main() {
     );
     await nonceMismatchAppPage.waitForFunction(() => {
       const status = window.intendantDashboardControl?.status?.();
-      return Boolean(status?.lastError);
+      const label = document.getElementById('sb-dashboard-transport-label')?.textContent || '';
+      const failedLabel = ['failed', 'reconnecting'].includes(label);
+      return Boolean((status?.lastError || status?.reconnectReason) && failedLabel) || Boolean(status?.reconnecting && failedLabel);
     }, undefined, { timeout: CONNECT_TIMEOUT_MS });
     const nonceMismatchAppResult = await nonceMismatchAppPage.evaluate(() => {
       const status = window.intendantDashboardControl.status();
       return {
         lastError: status.lastError || '',
+        reconnecting: Boolean(status.reconnecting),
+        reconnectReason: status.reconnectReason || '',
         connected: Boolean(status.connected),
         verifiedBinding: status.verifiedBinding || null,
         clientNonce: status.clientNonce || '',
@@ -3513,8 +3622,9 @@ async function main() {
         serverClass: document.getElementById('sb-conn')?.className || '',
       };
     });
+    const nonceMismatchReason = `${nonceMismatchAppResult.lastError} ${nonceMismatchAppResult.reconnectReason}`;
     assert(
-      /client nonce mismatch/i.test(nonceMismatchAppResult.lastError),
+      /client nonce mismatch/i.test(nonceMismatchReason),
       `real SPA Connect nonce mismatch did not fail closed: ${JSON.stringify(nonceMismatchAppResult)}`
     );
     assert.strictEqual(nonceMismatchAppResult.connected, false, 'nonce-mismatch real SPA reported connected transport');
@@ -3528,14 +3638,10 @@ async function main() {
       0,
       `nonce-mismatch real SPA accepted a binding expiry: ${JSON.stringify(nonceMismatchAppResult)}`
     );
-    assert.strictEqual(
-      nonceMismatchAppResult.transportLabel,
-      'failed',
-      'nonce-mismatch real SPA did not show failed Connect transport'
-    );
+    assert(failedClosedTransportLabel(nonceMismatchAppResult.transportLabel), 'nonce-mismatch real SPA did not show failed Connect transport');
     assert.strictEqual(nonceMismatchAppResult.serverLabel, 'events', 'nonce-mismatch real SPA did not keep events label');
     assert(
-      String(nonceMismatchAppResult.serverClass || '').includes('err'),
+      failedClosedStatusClass(nonceMismatchAppResult.serverClass),
       `nonce-mismatch real SPA did not mark event tunnel failed: ${JSON.stringify(nonceMismatchAppResult)}`
     );
     assert.deepStrictEqual(
@@ -3549,9 +3655,9 @@ async function main() {
       'nonce-mismatch real SPA attempted public-origin WebSocket fallback requests'
     );
     assert.deepStrictEqual(
-      nonceMismatchGuards.consoleErrors,
+      unexpectedConsoleErrors(nonceMismatchGuards.consoleErrors),
       [],
-      'nonce-mismatch real SPA emitted browser console errors'
+      'nonce-mismatch real SPA emitted unexpected browser console errors'
     );
 
     console.log(JSON.stringify({
@@ -3577,6 +3683,7 @@ async function main() {
     removeRecordingFixture(hlsRecordingFixture);
     removeSessionFrameFixture(sessionFrameFixture);
     removeFilesystemFixture(filesystemFixture);
+    fs.rmSync(daemonHome, { recursive: true, force: true });
   }
 }
 

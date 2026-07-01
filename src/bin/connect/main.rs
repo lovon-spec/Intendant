@@ -672,7 +672,7 @@ async fn connect_ui(State(state): State<Arc<AppState>>) -> Html<String> {
     Html(connect_ui_html(
         &state.config.public_origin,
         "Intendant Connect",
-        "Passkey access",
+        "Rendezvous account",
     ))
 }
 
@@ -680,7 +680,7 @@ async fn access_ui(State(state): State<Arc<AppState>>) -> Html<String> {
     Html(connect_ui_html(
         &state.config.public_origin,
         "Intendant Access",
-        "Fleet access",
+        "Rendezvous and fleet navigation",
     ))
 }
 
@@ -2779,6 +2779,7 @@ fn connect_ui_html(origin: &str, product_title: &str, account_subtitle: &str) ->
     .handle {{ color: var(--text); font-size: 17px; font-weight: 750; overflow-wrap: anywhere; }}
     .metric-row {{ display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 10px; }}
     .claim-strip {{ display: grid; grid-template-columns: minmax(220px, 1fr) auto; gap: 9px; align-items: end; padding-bottom: 16px; border-bottom: 1px solid var(--line); }}
+    .notice {{ padding: 12px 13px; border: 1px solid rgba(255, 209, 102, .35); border-radius: 7px; color: var(--muted); background: rgba(255, 209, 102, .07); font-size: 13px; line-height: 1.4; }}
     .status {{ min-height: 20px; color: var(--muted); font-size: 13px; line-height: 1.35; overflow-wrap: anywhere; }}
     .status.status-ok {{ color: var(--ok); }}
     .status.status-err {{ color: var(--err); }}
@@ -2872,18 +2873,19 @@ fn connect_ui_html(origin: &str, product_title: &str, account_subtitle: &str) ->
     <section id="manage" class="hidden">
       <div class="panel-header">
         <div class="panel-title">
-          <h2>Daemons</h2>
+          <h2>Rendezvous Daemons</h2>
           <div id="who" class="sub"></div>
         </div>
         <button id="refresh" class="secondary">Refresh</button>
       </div>
       <div class="panel-body stack">
+        <div class="notice">This account is for rendezvous and navigation. Each daemon must still authorize this account through its local IAM before hosted dashboard access opens.</div>
         <div class="claim-strip">
           <div>
-            <label for="claim-code">Claim phrase</label>
+            <label for="claim-code">Rendezvous claim phrase</label>
             <input id="claim-code" autocomplete="off" spellcheck="false" placeholder="12-word claim phrase">
           </div>
-          <button id="claim">Claim</button>
+          <button id="claim">Claim route</button>
         </div>
         <div id="claim-status" class="status"></div>
         <div class="table-wrap">
@@ -2899,7 +2901,7 @@ fn connect_ui_html(origin: &str, product_title: &str, account_subtitle: &str) ->
       <div class="panel-header">
         <div class="panel-title">
           <h2>Access Targets</h2>
-          <div class="sub">Account-backed fleet navigation; each daemon still enforces its own access locally</div>
+          <div class="sub">Fleet navigation and rendezvous routes; target daemons enforce local IAM</div>
         </div>
       </div>
       <div class="panel-body">
@@ -3071,7 +3073,7 @@ async function claimDaemon() {{
       await new Promise(resolve => setTimeout(resolve, 750));
       const status = await api(`/api/claims/${{encodeURIComponent(start.claim_id)}}`);
       if (status.result?.status === 'approved') {{
-        setStatus('claim-status', `Claimed ${{status.result.daemon_id}}`, 'ok');
+        setStatus('claim-status', `Rendezvous route claimed for ${{status.result.daemon_id}}. Add a local IAM grant on that daemon before using hosted dashboard access.`, 'ok');
         $('claim-code').value = '';
         await refreshAll();
         return;
@@ -3136,7 +3138,7 @@ function renderDaemons() {{
   const rows = $('daemon-rows');
   rows.innerHTML = '';
   if (state.daemons.length === 0) {{
-    rows.innerHTML = '<tr><td colspan="4" class="empty-state">No claimed daemons</td></tr>';
+    rows.innerHTML = '<tr><td colspan="4" class="empty-state">No claimed rendezvous daemons</td></tr>';
     return;
   }}
   for (const daemon of state.daemons) {{
@@ -3149,7 +3151,7 @@ function renderDaemons() {{
       <td data-cell-label="Activity"><div class="daemon-activity"><span class="pill ${{daemon.online ? 'ok' : 'warn'}}">${{daemon.online ? 'online' : 'idle'}}</span><span class="sub">${{escapeHtml(lastSeen)}}</span></div></td>
       <td data-cell-label="Public key"><code title="${{escapeAttr(key)}}">${{escapeHtml(compactKey(key))}}</code></td>
       <td class="action-cell" data-cell-label="Actions"><div class="actions">
-        <button data-open="${{escapeAttr(daemon.daemon_id)}}">Open</button>
+        <button data-open="${{escapeAttr(daemon.daemon_id)}}">Open tunnel</button>
         <button class="secondary" data-rename="${{escapeAttr(daemon.daemon_id)}}">Rename</button>
         <button class="danger" data-revoke="${{escapeAttr(daemon.daemon_id)}}">Revoke</button>
       </div></td>`;
@@ -3188,7 +3190,7 @@ function renderFleetTargets() {{
   const rows = $('fleet-rows');
   rows.innerHTML = '';
   if (state.fleetTargets.length === 0) {{
-    rows.innerHTML = '<tr><td colspan="4" class="empty-state">No access targets</td></tr>';
+    rows.innerHTML = '<tr><td colspan="4" class="empty-state">No rendezvous targets</td></tr>';
     return;
   }}
   for (const target of state.fleetTargets) {{
@@ -3207,7 +3209,7 @@ function renderFleetTargets() {{
       <td data-cell-label="Route"><div class="target-route"><span class="pill ${{statusClass}}">${{escapeHtml(statusText)}}</span><span class="sub">${{escapeHtml(route)}}</span></div></td>
       <td data-cell-label="Authority"><div class="target-route"><span class="pill">${{escapeHtml(source.replaceAll('_', ' '))}}</span><span class="sub">${{escapeHtml(auth)}}</span></div></td>
       <td class="action-cell" data-cell-label="Actions"><div class="actions">
-        <button data-fleet-open="${{escapeAttr(url)}}" ${{url ? '' : 'disabled'}}>Open</button>
+        <button data-fleet-open="${{escapeAttr(url)}}" ${{url ? '' : 'disabled'}}>Open tunnel</button>
         <button class="secondary" data-fleet-forget="${{escapeAttr(id)}}" ${{canForget ? '' : 'disabled'}}>Forget</button>
       </div></td>`;
     rows.appendChild(tr);
@@ -3365,10 +3367,15 @@ mod tests {
 
     #[test]
     fn access_ui_uses_access_branding() {
-        let html = connect_ui_html("https://intendant.dev", "Intendant Access", "Fleet access");
+        let html = connect_ui_html(
+            "https://intendant.dev",
+            "Intendant Access",
+            "Rendezvous and fleet navigation",
+        );
         assert!(html.contains("<title>Intendant Access</title>"));
         assert!(html.contains("<h1>Intendant Access</h1>"));
-        assert!(html.contains(">Fleet access</div>"));
+        assert!(html.contains(">Rendezvous and fleet navigation</div>"));
+        assert!(html.contains("target daemons enforce local IAM"));
     }
 
     #[test]

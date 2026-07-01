@@ -5,7 +5,7 @@ const assert = require('assert');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const { spawn } = require('child_process');
+const { spawn, spawnSync } = require('child_process');
 const { launchBrowser } = require('./lib/browser-automation.cjs');
 
 const DEFAULT_CONNECT_PORT = 9886;
@@ -99,6 +99,89 @@ async function waitBounded(promise, timeoutMs) {
     ]);
   } finally {
     if (timer) clearTimeout(timer);
+  }
+}
+
+function slugComponent(value) {
+  const slug = String(value || '')
+    .trim()
+    .replace(/[^a-zA-Z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .toLowerCase();
+  return slug || 'unknown';
+}
+
+function writeConnectAccountIamGrant(homeDir, user) {
+  assert(user && user.id, `Connect user id missing: ${JSON.stringify(user)}`);
+  assert(user.account_name, `Connect account name missing: ${JSON.stringify(user)}`);
+  const certDir = path.join(homeDir, '.intendant', 'access-certs');
+  fs.mkdirSync(certDir, { recursive: true });
+  const principalId = `principal:connect-account:${slugComponent(user.id)}`;
+  const now = Date.now();
+  const state = {
+    schema_version: 1,
+    principals: [{
+      id: principalId,
+      kind: 'connect_account',
+      label: `@${user.account_name}`,
+      status: 'active',
+      source: 'local_iam_state',
+      account: {
+        provider: 'intendant.dev',
+        user_id: user.id,
+        account_name: user.account_name,
+        handle: user.account_name,
+      },
+      organization: null,
+      authn: [{
+        kind: 'connect_account',
+        label: 'Intendant Connect account',
+        user_id: user.id,
+        account_name: user.account_name,
+      }],
+      notes: 'Hosted Connect E2E local IAM grant',
+      created_at_unix_ms: now,
+    }],
+    roles: [],
+    grants: [{
+      id: `grant:user-client:${slugComponent(principalId)}:local:role-root`,
+      principal_id: principalId,
+      target_id: 'local',
+      role_id: 'role:root',
+      policy_id: 'policy:root',
+      status: 'active',
+      source: 'local_iam_state',
+      reason: 'Hosted Connect E2E local IAM grant',
+      created_at_unix_ms: now,
+      revoked_at_unix_ms: null,
+    }],
+    audit_events: [],
+  };
+  fs.writeFileSync(path.join(certDir, 'iam.json'), `${JSON.stringify(state, null, 2)}\n`, { mode: 0o600 });
+}
+
+function prepareDaemonHomeAccessCerts(binary, homeDir, label) {
+  const result = spawnSync(binary, [
+    'access',
+    'setup',
+    '--no-serve-certs',
+    '--force',
+    '--name',
+    label,
+    '--ip',
+    '127.0.0.1',
+    '--host',
+    'localhost',
+  ], {
+    cwd: path.resolve(__dirname, '..'),
+    env: { ...process.env, HOME: homeDir },
+    encoding: 'utf8',
+  });
+  if (result.error) {
+    throw result.error;
+  }
+  if (result.status !== 0) {
+    throw new Error(`failed to prepare daemon access certs: ${result.stderr || result.stdout || `exit ${result.status}`}`);
   }
 }
 
@@ -239,6 +322,9 @@ async function main() {
   }
 
   try {
+    const daemonHome = path.join(tmp, 'daemon-home');
+    fs.mkdirSync(daemonHome, { recursive: true });
+    prepareDaemonHomeAccessCerts(options.daemonBinary, daemonHome, 'connect-hosted-mvp-e2e');
     const genericDownloadText = [
       'connect generic download fixture',
       'range one',
@@ -270,6 +356,7 @@ async function main() {
       cwd: tmp,
       env: {
         ...process.env,
+        HOME: daemonHome,
         INTENDANT_CONNECT_RENDEZVOUS_URL: connectApi,
         INTENDANT_CONNECT_DAEMON_ID: options.daemonId,
         INTENDANT_CONNECT_TOKEN: options.connectToken,
@@ -313,13 +400,15 @@ async function main() {
     });
 
     await click(page, '#claim');
-    await page.waitForFunction(() => document.getElementById('claim-status').textContent.includes('Claimed'), {
+    await page.waitForFunction(() => document.getElementById('claim-status').textContent.includes('Rendezvous route claimed'), {
       timeout: START_TIMEOUT_MS,
     });
 
     const daemons = await page.evaluate(async () => fetch('/api/daemons').then(r => r.json()));
     assert.strictEqual(daemons.daemons.length, 1, `expected one claimed daemon: ${JSON.stringify(daemons)}`);
     assert.strictEqual(daemons.daemons[0].daemon_id, options.daemonId);
+    const connectMe = await page.evaluate(async () => fetch('/api/me').then(r => r.json()));
+    writeConnectAccountIamGrant(daemonHome, connectMe.user);
     const labelResult = await page.evaluate(`(async () => {
       const daemonId = ${JSON.stringify(options.daemonId)};
       const me = await fetch('/api/me').then(r => r.json());
@@ -412,9 +501,9 @@ async function main() {
       `dashboard access status should be user-facing: ${JSON.stringify(filesAccessUi)}`
     );
     assert.strictEqual(filesAccessUi.diagnosticsLegend, 'Connection Diagnostics', `Access Diagnostics should own transport details: ${JSON.stringify(filesAccessUi)}`);
-    assert(filesAccessUi.files.text.includes('This daemon'), `Files target summary did not identify the local daemon: ${JSON.stringify(filesAccessUi)}`);
-    assert(filesAccessUi.files.text.includes('Hosted Connect'), `Files target summary did not name Hosted Connect mode: ${JSON.stringify(filesAccessUi)}`);
-    assert(filesAccessUi.files.text.includes('full dashboard access'), `Files target summary did not summarize access: ${JSON.stringify(filesAccessUi)}`);
+    assert(filesAccessUi.files.text.includes('connect-hosted-mvp-e2e'), `Files target summary did not identify the local daemon: ${JSON.stringify(filesAccessUi)}`);
+    assert(filesAccessUi.files.text.includes('Intendant Connect'), `Files target summary did not name Connect mode: ${JSON.stringify(filesAccessUi)}`);
+    assert(filesAccessUi.files.text.includes('Root via Intendant Connect'), `Files target summary did not summarize access: ${JSON.stringify(filesAccessUi)}`);
     assert(filesAccessUi.files.text.includes('Files'), `Files target summary did not include the Files capability: ${JSON.stringify(filesAccessUi)}`);
     assert(!/\b(DataChannel|dashboard-control|tunnel|mTLS|ICE)\b/i.test(`${filesAccessUi.statusLabel} ${filesAccessUi.files.text}`), `Files target summary leaked protocol wording: ${JSON.stringify(filesAccessUi)}`);
     const filesDownloadPanel = await page.evaluate(`window.intendantDashboardFiles._debugProbeDownloadPath(${JSON.stringify(genericDownloadPath)}, { chunkBytes: 11 })`);
@@ -463,8 +552,8 @@ async function main() {
     const shellToken = `connect_shell_${Date.now()}`;
     await click(page, '#tab-terminal .subtab-btn[data-term-tab="shell"]');
     const shellAccessUi = await dashboardAccessUi(page);
-    assert(shellAccessUi.shell.text.includes('This daemon'), `Shell target summary did not identify the local daemon: ${JSON.stringify(shellAccessUi)}`);
-    assert(shellAccessUi.shell.text.includes('Hosted Connect'), `Shell target summary did not name Hosted Connect mode: ${JSON.stringify(shellAccessUi)}`);
+    assert(shellAccessUi.shell.text.includes('connect-hosted-mvp-e2e'), `Shell target summary did not identify the local daemon: ${JSON.stringify(shellAccessUi)}`);
+    assert(shellAccessUi.shell.text.includes('Intendant Connect'), `Shell target summary did not name Connect mode: ${JSON.stringify(shellAccessUi)}`);
     assert(shellAccessUi.shell.text.includes('Shell'), `Shell target summary did not include the Shell capability: ${JSON.stringify(shellAccessUi)}`);
     assert(!/\b(DataChannel|dashboard-control|tunnel|mTLS|ICE)\b/i.test(shellAccessUi.shell.text), `Shell target summary leaked protocol wording: ${JSON.stringify(shellAccessUi)}`);
     await page.waitForFunction(() => Boolean(document.querySelector('#term-pane-shell.active #shell-container .xterm')), {

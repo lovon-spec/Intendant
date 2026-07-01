@@ -447,115 +447,113 @@ fn connect_dashboard_grant(
     user_id: Option<&str>,
     account_name: Option<&str>,
 ) -> Result<crate::dashboard_control::DashboardControlGrant, String> {
-    let has_user_id = user_id
+    let user_id = user_id.map(str::trim).filter(|value| !value.is_empty());
+    let account_name = account_name
         .map(str::trim)
-        .is_some_and(|value| !value.is_empty());
-    let has_account_name = account_name
-        .map(str::trim)
-        .is_some_and(|value| !value.is_empty());
-    if !has_user_id && !has_account_name {
-        return Ok(crate::dashboard_control::DashboardControlGrant::TrustedLocal);
+        .filter(|value| !value.is_empty());
+    if user_id.is_none() && account_name.is_none() {
+        return Err(connect_account_not_authorized_message(
+            None,
+            None,
+            Some("the Connect offer did not include account identity"),
+        ));
     }
 
     let cert_dir = crate::access::backend::select_backend().cert_dir();
     let path = crate::access::iam::iam_state_path(&cert_dir);
     if !path.exists() {
-        return Ok(connect_dashboard_root_grant(user_id, account_name));
+        return Err(connect_account_not_authorized_message(
+            user_id,
+            account_name,
+            Some("no daemon-local IAM state exists"),
+        ));
     }
     let state = crate::access::iam::load_state(&cert_dir)
         .map_err(|e| format!("local IAM state is invalid: {e}"))?;
-    Ok(connect_dashboard_grant_from_state(
+    connect_dashboard_grant_from_state(
         state,
-        user_id.unwrap_or_default(),
+        user_id,
         account_name,
-    ))
+    )
 }
 
 fn connect_dashboard_grant_from_state(
     state: crate::access::iam::LocalIamState,
-    user_id: &str,
-    account_name: Option<&str>,
-) -> crate::dashboard_control::DashboardControlGrant {
-    match crate::access::iam::principal_for_connect_account(
-        &state,
-        user_id,
-        account_name,
-        "connect-dashboard-control",
-    ) {
-        Some(principal) => crate::dashboard_control::DashboardControlGrant::UserClient {
-            principal,
-            iam_state: state,
-        },
-        None => match crate::access::iam::principal_for_connect_account_any_status(
-            &state,
-            user_id,
-            account_name,
-            "connect-dashboard-control",
-        ) {
-            Some(principal) => crate::dashboard_control::DashboardControlGrant::UserClient {
-                principal,
-                iam_state: state,
-            },
-            None => connect_dashboard_root_grant(Some(user_id), account_name),
-        },
-    }
-}
-
-fn connect_dashboard_root_grant(
     user_id: Option<&str>,
     account_name: Option<&str>,
-) -> crate::dashboard_control::DashboardControlGrant {
+) -> Result<crate::dashboard_control::DashboardControlGrant, String> {
     let user_id = user_id.map(str::trim).filter(|value| !value.is_empty());
     let account_name = account_name
         .map(str::trim)
         .filter(|value| !value.is_empty());
-    let mut account = serde_json::Map::new();
-    account.insert(
-        "provider".to_string(),
-        serde_json::Value::String("intendant.dev".to_string()),
-    );
-    if let Some(user_id) = user_id {
-        account.insert(
-            "user_id".to_string(),
-            serde_json::Value::String(user_id.to_string()),
-        );
-    }
-    if let Some(account_name) = account_name {
-        account.insert(
-            "account_name".to_string(),
-            serde_json::Value::String(account_name.to_string()),
-        );
-    }
-    let label = account_name
-        .map(|name| format!("@{name}"))
-        .or_else(|| {
-            user_id.map(|id| {
-                format!(
-                    "Connect account {}",
-                    id.chars().take(12).collect::<String>()
-                )
-            })
-        })
-        .unwrap_or_else(|| "Connect account".to_string());
-    let mut authn = account.clone();
-    authn.insert(
-        "kind".to_string(),
-        serde_json::Value::String("connect_account".to_string()),
-    );
-    authn.insert(
-        "label".to_string(),
-        serde_json::Value::String("Intendant Connect account".to_string()),
-    );
-    crate::dashboard_control::DashboardControlGrant::UserClientRoot {
-        principal: crate::access::iam::AccessPrincipal::root_user_client(
-            "connect-account",
-            "connect-dashboard-control",
-            label,
-            Some(serde_json::Value::Object(account)),
+    if user_id.is_none() && account_name.is_none() {
+        return Err(connect_account_not_authorized_message(
             None,
-            vec![serde_json::Value::Object(authn)],
-        ),
+            None,
+            Some("the Connect offer did not include account identity"),
+        ));
     }
+
+    match crate::access::iam::principal_for_connect_account(
+        &state,
+        user_id.unwrap_or_default(),
+        account_name,
+        "connect-dashboard-control",
+    ) {
+        Some(principal) => Ok(crate::dashboard_control::DashboardControlGrant::UserClient {
+            principal,
+            iam_state: state,
+        }),
+        None => match crate::access::iam::principal_for_connect_account_any_status(
+            &state,
+            user_id.unwrap_or_default(),
+            account_name,
+            "connect-dashboard-control",
+        ) {
+            Some(principal) => Ok(crate::dashboard_control::DashboardControlGrant::UserClient {
+                principal,
+                iam_state: state,
+            }),
+            None => Err(connect_account_not_authorized_message(
+                user_id,
+                account_name,
+                Some("no matching daemon-local Connect account grant exists"),
+            )),
+        },
+    }
+}
+
+fn connect_account_not_authorized_message(
+    user_id: Option<&str>,
+    account_name: Option<&str>,
+    detail: Option<&str>,
+) -> String {
+    let user_id = user_id.map(str::trim).filter(|value| !value.is_empty());
+    let account_name = account_name
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let identity = match (account_name, user_id) {
+        (Some(name), Some(id)) => format!("@{name} ({})", id.chars().take(12).collect::<String>()),
+        (Some(name), None) => format!("@{name}"),
+        (None, Some(id)) => format!("Connect account {}", id.chars().take(12).collect::<String>()),
+        (None, None) => "Connect account".to_string(),
+    };
+    let mut message = format!(
+        "{identity} is not authorized by this daemon. Open this daemon's Access page through direct mTLS/local root access and add a local IAM grant for the Connect account before using hosted Connect."
+    );
+    if let Some(detail) = detail.and_then(|value| {
+        let value = value.trim();
+        if value.is_empty() {
+            None
+        } else {
+            Some(value)
+        }
+    }) {
+        message.push_str(" Detail: ");
+        message.push_str(detail);
+        message.push('.');
+    }
+    message
 }
 
 fn claim_signing_payload(
@@ -712,7 +710,8 @@ mod tests {
             revoked_at_unix_ms: None,
         });
 
-        let grant = connect_dashboard_grant_from_state(state, "user-123", Some("alice"));
+        let grant =
+            connect_dashboard_grant_from_state(state, Some("user-123"), Some("alice")).unwrap();
         let crate::dashboard_control::DashboardControlGrant::UserClient {
             principal,
             iam_state,
@@ -740,29 +739,21 @@ mod tests {
     }
 
     #[test]
-    fn unmatched_connect_account_metadata_remains_root_but_identified() {
+    fn unmatched_connect_account_metadata_requires_local_iam_grant() {
         let state = crate::access::iam::LocalIamState::default();
-        let grant = connect_dashboard_grant_from_state(state, "user-123", Some("alice"));
-        let crate::dashboard_control::DashboardControlGrant::UserClientRoot { principal } = grant
-        else {
-            panic!("expected identified root user-client grant");
-        };
-        assert_eq!(principal.kind, "root_session");
-        assert_eq!(principal.label, "@alice");
-        assert_eq!(
-            principal.account.as_ref().and_then(|account| account
-                .get("account_name")
-                .and_then(serde_json::Value::as_str)),
-            Some("alice")
-        );
-        assert_eq!(
-            principal
-                .authn
-                .first()
-                .and_then(|authn| authn.get("kind"))
-                .and_then(serde_json::Value::as_str),
-            Some("connect_account")
-        );
+        let error =
+            connect_dashboard_grant_from_state(state, Some("user-123"), Some("alice")).unwrap_err();
+        assert!(error.contains("@alice"));
+        assert!(error.contains("local IAM grant"));
+        assert!(error.contains("direct mTLS"));
+    }
+
+    #[test]
+    fn connect_offer_without_account_identity_is_rejected() {
+        let state = crate::access::iam::LocalIamState::default();
+        let error = connect_dashboard_grant_from_state(state, None, None).unwrap_err();
+        assert!(error.contains("not authorized"));
+        assert!(error.contains("did not include account identity"));
     }
 
     #[test]
@@ -800,7 +791,8 @@ mod tests {
             revoked_at_unix_ms: Some(102),
         });
 
-        let grant = connect_dashboard_grant_from_state(state, "user-123", Some("alice"));
+        let grant =
+            connect_dashboard_grant_from_state(state, Some("user-123"), Some("alice")).unwrap();
         let crate::dashboard_control::DashboardControlGrant::UserClient {
             principal,
             iam_state,

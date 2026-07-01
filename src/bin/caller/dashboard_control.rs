@@ -2227,15 +2227,19 @@ fn control_frame_response(
                         runtime.peer_registry.as_ref(),
                     ),
                 })),
-                "api_access_overview" => Some(serde_json::json!({
-                    "t": "response",
-                    "id": id,
-                    "ok": true,
-                    "result": crate::web_gateway::access_overview_response_value(
-                        &runtime.agent_card,
-                        runtime.peer_registry.as_ref(),
-                    ),
-                })),
+                "api_access_overview" => {
+                    let current_principal = runtime.grant.access_principal();
+                    Some(serde_json::json!({
+                        "t": "response",
+                        "id": id,
+                        "ok": true,
+                        "result": crate::web_gateway::access_overview_response_value_for_principal(
+                            &runtime.agent_card,
+                            runtime.peer_registry.as_ref(),
+                            Some(&current_principal),
+                        ),
+                    }))
+                }
                 "api_access_iam_state" => Some(serde_json::json!({
                     "t": "response",
                     "id": id,

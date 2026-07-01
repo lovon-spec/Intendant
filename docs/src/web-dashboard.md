@@ -374,10 +374,11 @@ The important security-domain split is:
 
 - **User/client daemon access** means a human-operated dashboard can control a
   daemon. Hosted Connect passkey access and browser mTLS client certificates are
-  both in this domain. Unbound owner sessions remain root-compatible; active
-  local IAM bindings can scope a browser certificate, Connect account, or
-  combined human mTLS user through this same domain. Future coworker/team access
-  belongs here, not in peer federation.
+  both in this domain. Unbound browser mTLS owner sessions remain
+  root-compatible; hosted Connect sessions require a daemon-local IAM binding
+  for the routed account. Active local IAM bindings can scope a browser
+  certificate, Connect account, or combined human mTLS user through this same
+  domain. Future coworker/team access belongs here, not in peer federation.
 - **Peer access** means one daemon can call capabilities on another daemon. That
   uses daemon-to-daemon mTLS identities and peer profiles such as `peer-operator`
   or `peer-root`. Peer access does not imply that the human's browser can open
@@ -404,10 +405,11 @@ stable local principal. Today those stable bindings are browser mTLS client
 certificate fingerprints, hosted Connect account metadata, and `human_user`
 records that can combine both while carrying optional account provider,
 verified-provider, handle, and organization metadata. Existing owner browser
-mTLS and hosted Connect requests remain root-compatible when no active local
-binding exists. Once a browser certificate or Connect account has any matching
-local IAM record, that record wins over the root fallback: active grants are
-evaluated by role, while draft or revoked records deny instead of silently
+mTLS requests remain root-compatible when no active local binding exists so
+direct/self-hosted access stays first-class. Hosted Connect requests do **not**
+get that root fallback: the daemon only answers a Connect dashboard offer when
+the Connect account matches a daemon-local IAM principal/grant. Active grants
+are evaluated by role, while draft or revoked records deny instead of silently
 becoming root again. The `iam.enforcement` object reports
 `root_session_grants: true`, `peer_profile_grants: true`,
 `user_client_grants: true`, and
@@ -733,9 +735,12 @@ That harness enables `window.intendantDashboardControl` in the real SPA and
 asserts that the verified DataChannel reports `signalingMode: "local-http"`.
 
 This slice is a local low-level harness for the dashboard-control tunnel. It
-does not implement account login, passkeys, daemon claiming, or a durable daemon
-registry. Its job is to keep the same-origin tunnel protocol easy to exercise
-while the hosted Connect service owns the account and daemon-claim UX.
+does not implement account signup, passkeys, daemon claiming, or a durable
+daemon registry. Its job is to keep the same-origin tunnel protocol easy to
+exercise while the hosted Connect service owns the account and daemon-claim UX.
+The validator seeds a temporary daemon-local IAM grant for its fixed test
+Connect account so the tunnel still exercises the same no-implicit-root rule as
+hosted Connect.
 
 ### Local Rendezvous Emulator Slice
 
@@ -814,10 +819,12 @@ then performs these browser passes:
    binding or expiry.
 
 This is still a protocol emulator rather than the consumer Connect service. It
-has no account, passkey, daemon claim, revocation, audit log, or hosted public
-HTTPS. The emulator's grant is only an opaque per-offer session value used to
-prove that a Connect-issued grant can be carried through signaling and bound
-into the daemon-signed WebRTC session statement.
+has no account signup, passkey ceremony, daemon claim, revocation, audit log, or
+hosted public HTTPS. Its fixed test account metadata must match the temporary
+daemon-local IAM grant seeded by the validator. The emulator's per-offer session
+value is only an opaque binding token used to prove that rendezvous state can be
+carried through signaling and bound into the daemon-signed WebRTC session
+statement; it is not dashboard authority.
 
 ### Hosted Connect Production Alpha
 
@@ -876,11 +883,11 @@ The hosted MVP flow is:
    challenge with its daemon identity key, and Connect verifies the signature
    before assigning ownership.
 5. The user chooses the daemon in Connect and opens the dashboard. Connect
-   issues a short-lived opaque dashboard grant, forwards the browser SDP offer
+   issues a short-lived opaque routing/session grant, forwards the browser SDP offer
    to the daemon, and waits for the daemon answer.
 6. The daemon signs the same WebRTC binding used by the local/rendezvous paths,
    including the offer hash, answer hash, browser nonce, expiry, daemon public
-   key, and hash of the Connect-issued grant.
+   key, and hash of the Connect-issued routing grant.
 7. Connect validates that the answer came from the registered daemon key and
    that the signed grant hash matches before returning the answer to the
    browser. The browser independently verifies the daemon-signed binding before
@@ -888,7 +895,7 @@ The hosted MVP flow is:
 
 The state file durably stores users, passkeys, daemon ownership, hashed claim
 phrases, account-scoped fleet navigation metadata, and a capped audit log. Plain
-claim phrases, WebAuthn challenge state, browser offers, and dashboard grants
+claim phrases, WebAuthn challenge state, browser offers, and routing grants
 are memory-only. The service exposes a minimal account/fleet UI today: passkey
 registration/login, claim-phrase entry, daemon list, daemon labels, open
 dashboard, revoke ownership, fleet target listing/forget, and audit events.
@@ -1046,19 +1053,23 @@ encrypted with DTLS, but the browser learns the DTLS fingerprint through
 signaling. Therefore the signaling path must be authenticated and bound to the
 daemon the user intended to reach.
 
-The minimal trust model is:
+The high-assurance trust model is:
 
-- **Intendant Connect** is trusted for public HTTPS, account/passkey login,
-  daemon claiming, dashboard JavaScript delivery, and WebRTC signaling.
+- **Trusted dashboard code** is loaded from a daemon-served mTLS origin, or from
+  another locally pinned/installed bundle. The hosted `intendant.dev` origin is
+  not the root admin trust anchor in this mode.
+- **Intendant Connect** is a public rendezvous/mailbox and optional WebRTC relay
+  helper. It can help route signaling and store convenience fleet metadata, but
+  it is not sufficient authority to open a dashboard.
 - **The daemon** has a persistent daemon identity key, separate from both the
   ephemeral WebRTC DTLS certificate and peer mTLS client certificates.
 - **The browser** accepts a dashboard tunnel only when it receives a fresh
   daemon-signed session statement bound to the claimed daemon identity, the
-  current user/device, the Connect-issued grant, the WebRTC session material, an
-  expiry, and a nonce.
-- **The daemon** accepts dashboard control only after verifying a fresh
-  Connect-issued session grant and applying local policy before exposing
-  control-plane APIs over the DataChannel.
+  current user/device/account metadata, the Connect-issued routing grant, the
+  WebRTC session material, an expiry, and a nonce.
+- **The daemon** accepts Connect dashboard control only when the routed Connect
+  account matches a daemon-local IAM principal/grant, then applies that local
+  role before exposing control-plane APIs over the DataChannel.
 
 The current experimental tunnel implements the daemon-signed binding locally: the
 browser sends a fresh challenge nonce with its SDP offer, and the daemon signs
@@ -1077,17 +1088,16 @@ the DataChannel only when the signed binding key matches the registered key. It
 also models grant binding with an opaque per-offer value and nonce binding with a
 browser-generated challenge: the browser accepts the answer only when that
 visible grant hashes to the daemon-signed grant hash and the signed nonce matches
-the nonce it put in the offer. This does not solve account ownership,
-authorization-grant issuance, revocation, or clone recovery; it prevents the
-browser from treating an arbitrary valid daemon signature, stale binding,
-mismatched grant, or mismatched browser challenge as the claimed session.
+the nonce it put in the offer. This does not make Connect an authorization
+authority; the daemon still requires local IAM for Connect account access.
 
-This makes the security boundary explicit: Intendant Connect is in the trusted
-computing base for consumer dashboard access. A compromised Connect service or
-compromised served JavaScript can mislead the browser unless a later design adds
-out-of-band daemon key verification or an independently pinned web app. That is
-an acceptable product tradeoff only if it is documented as the consumer
-cloud-assisted mode, not as a local/offline replacement for mTLS.
+This makes the security boundary explicit: hosted Connect is in the trusted
+computing base only when the user chooses to load root-capable dashboard
+JavaScript from the hosted origin. The high-assurance path keeps trusted admin
+code local/daemon-served and uses `intendant.dev` only for rendezvous, relay, and
+optional metadata sync. A compromised Connect service can then delay, drop, or
+misroute signaling, but it cannot by itself mint daemon-local dashboard
+authority.
 
 #### Claim and Login Flow
 
@@ -1101,10 +1111,14 @@ A concrete flow should look like this:
 5. Connect records the daemon identity public key, owner account, device label,
    and any local policy metadata the daemon chooses to expose.
 6. On later visits, the browser signs in with a passkey and selects the daemon.
-7. Connect issues a short-lived dashboard session grant to the daemon and
-   brokers WebRTC signaling between browser and daemon.
-8. The daemon signs the WebRTC session binding with its daemon identity key
-   before it accepts dashboard RPC over the DataChannel.
+7. A root/admin user opens the daemon-served Access page over direct mTLS and
+   creates a daemon-local IAM grant for the Connect account if hosted
+   rendezvous should be allowed.
+8. Connect issues a short-lived routing/session grant and brokers WebRTC
+   signaling between browser and daemon.
+9. The daemon checks that the routed Connect account matches local IAM, signs
+   the WebRTC session binding with its daemon identity key, and only then
+   accepts dashboard RPC over the DataChannel.
 
 Passkey step-up can then protect high-impact actions such as approving a peer
 access request, changing autonomy policy, exposing display control, or minting
@@ -1468,8 +1482,8 @@ request has been attempted.
 This design should not remove local/offline mTLS. It gives the product two clear
 dashboard access modes:
 
-- **Consumer cloud-assisted mode:** public Intendant Connect origin, passkey
-  login, daemon-scoped WebRTC dashboard tunnel.
+- **Consumer cloud-assisted mode:** public Intendant Connect origin for
+  account/rendezvous UX, with dashboard access still gated by daemon-local IAM.
 - **Local/offline/power-user mode:** direct daemon HTTPS/WSS with browser mTLS
   enrollment, as implemented today.
 
@@ -1498,18 +1512,23 @@ The current implementation has crossed from protocol sketch into hosted MVP:
    pairing actions, local display signaling, and media/editor writes.
 4. The daemon has a disabled-by-default outbound Connect polling client.
 5. `intendant-connect` provides the hosted production alpha: passkey-only
-   account sessions, daemon registration, claim-phrase ownership proof,
-   short-lived dashboard grants, signaling, labels, revoke, active tunnel close,
-   rate limits, CSRF protection, readiness checks, and audit.
-6. The browser and hosted service both verify that the daemon-signed WebRTC
-   binding matches the registered daemon identity and Connect-issued grant.
-7. Focused validators cover the local bootstrap, local rendezvous emulator, and
+   account sessions, daemon registration, claim-phrase route ownership proof,
+   rendezvous signaling, labels, revoke, active tunnel close, rate limits, CSRF
+   protection, readiness checks, and audit.
+6. The daemon refuses Connect dashboard-control offers unless the routed Connect account
+   matches daemon-local IAM; Connect account ownership is no longer an implicit
+   root grant.
+7. The browser and hosted service both verify that the daemon-signed WebRTC
+   binding matches the registered daemon identity and Connect-issued routing
+   grant.
+8. Focused validators cover the local bootstrap, local rendezvous emulator, and
    hosted Connect MVP paths.
-8. `connect.intendant.dev` has a repeatable production-alpha deploy path plus
+9. `connect.intendant.dev` has a repeatable production-alpha deploy path plus
    encrypted state backup/restore scripts.
 
-The remaining rollout work is production operations and breadth, not proving the
-core browser-trust escape hatch:
+The remaining rollout work is production operations, breadth, and making the
+local trusted Access app pleasant enough that hosted Connect can stay a
+rendezvous/convenience layer:
 
 1. Add durable/database-backed rate limits, structured metrics, and database
    migrations.
@@ -1533,9 +1552,9 @@ Non-goals for this path:
 
 Remaining design questions before production rollout:
 
-- Do we need an additional app-integrity story such as signed static assets or a
-  pinned web bundle, even though the hosted MVP serves the dashboard JavaScript
-  from Intendant Connect?
+- Do we want an additional app-integrity story such as signed static assets,
+  pinned PWA bundles, or browser extension packaging for users who want trusted
+  local dashboard code without a native app?
 - How are daemon identity keys backed up, rotated, revoked, and recovered after
   VM cloning or disk restore?
 - What local policy does the daemon enforce when Connect says a signed-in user

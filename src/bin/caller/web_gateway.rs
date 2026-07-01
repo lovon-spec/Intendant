@@ -22650,9 +22650,10 @@ pub fn spawn_web_gateway(
                         let _ = stream.write_all(response.as_bytes()).await;
                     } else if request_line.contains(" /api/access/overview") {
                         use tokio::io::AsyncWriteExt;
-                        let body = access_overview_response_body(
+                        let body = access_overview_response_body_for_principal(
                             &agent_card_value_for_targets,
                             peer_registry.as_ref(),
+                            &http_access_context.principal,
                         );
                         let response = json_response("200 OK", body);
                         let _ = stream.write_all(response.as_bytes()).await;
@@ -23635,9 +23636,10 @@ pub(crate) fn dashboard_targets_response_body(
 /// gives every dashboard route the same vocabulary - principals, targets,
 /// grants, policies, and transports - while the existing mTLS, Connect, and
 /// peer-profile paths continue to enforce their current rules.
-pub(crate) fn access_overview_response_value(
+pub(crate) fn access_overview_response_value_for_principal(
     agent_card: &serde_json::Value,
     registry: Option<&crate::peer::PeerRegistry>,
+    current_principal: Option<&crate::access::iam::AccessPrincipal>,
 ) -> serde_json::Value {
     let inbound_peer_identities = access_overview_inbound_peer_identities();
     let cert_dir = crate::access::backend::select_backend().cert_dir();
@@ -23647,6 +23649,7 @@ pub(crate) fn access_overview_response_value(
         registry,
         &inbound_peer_identities,
         &iam_state,
+        current_principal,
     )
 }
 
@@ -23678,6 +23681,7 @@ fn access_overview_response_value_with_identities(
         registry,
         inbound_peer_identities,
         &iam_state,
+        None,
     )
 }
 
@@ -23686,6 +23690,7 @@ fn access_overview_response_value_with_identities_and_iam(
     registry: Option<&crate::peer::PeerRegistry>,
     inbound_peer_identities: &[crate::peer::access_policy::PeerIdentityRecord],
     iam_state: &crate::access::iam::LoadedIamState,
+    current_principal: Option<&crate::access::iam::AccessPrincipal>,
 ) -> serde_json::Value {
     let targets_value = dashboard_targets_response_value(agent_card, registry);
     let targets = targets_value
@@ -23710,42 +23715,13 @@ fn access_overview_response_value_with_identities_and_iam(
         .unwrap_or("This daemon")
         .to_string();
 
-    let mut principals = vec![serde_json::json!({
-        "id": "principal:current-browser-session",
-        "kind": "browser_session",
-        "kind_label": "Current browser session",
-        "label": "Current browser",
-        "source": "trusted_dashboard_session",
-        "local": true,
-        "account": serde_json::Value::Null,
-        "organization": serde_json::Value::Null,
-        "authn": [{
-            "kind": "trusted_dashboard_session",
-            "label": "Trusted dashboard session"
-        }]
-    })];
-    let mut grants = vec![serde_json::json!({
-        "id": format!("grant:current-browser:{}:root", local_target_id),
-        "principal_id": "principal:current-browser-session",
-        "target_id": local_target_id.clone(),
-        "kind": "user_client_root",
-        "kind_label": "User/client root",
-        "policy_id": "policy:root",
-        "role": "root",
-        "role_label": "Root",
-        "transport_id": "transport:current-dashboard",
-        "source": "trusted_dashboard_session",
-        "status": "active"
-    })];
-    let mut transports = vec![serde_json::json!({
-        "id": "transport:current-dashboard",
-        "kind": "current_dashboard",
-        "kind_label": "Current dashboard transport",
-        "label": "Current dashboard",
-        "status": "connected",
-        "implementation": "local_mtls_or_hosted_tunnel",
-        "target_id": local_target_id.clone()
-    })];
+    let (mut principals, mut grants, mut transports) =
+        current_access_overview_subject(&local_target_id, current_principal);
+    let current_principal_id = principals
+        .first()
+        .and_then(|principal| principal.get("id"))
+        .and_then(|id| id.as_str())
+        .map(ToOwned::to_owned);
 
     for target in targets.iter().filter(|target| {
         !target
@@ -23869,9 +23845,19 @@ fn access_overview_response_value_with_identities_and_iam(
         }));
     }
 
-    principals.extend(crate::access::iam::principal_overview_values(
-        &iam_state.state,
-    ));
+    principals.extend(
+        crate::access::iam::principal_overview_values(&iam_state.state)
+            .into_iter()
+            .filter(|principal| {
+                let Some(current_principal_id) = current_principal_id.as_deref() else {
+                    return true;
+                };
+                principal
+                    .get("id")
+                    .and_then(|id| id.as_str())
+                    != Some(current_principal_id)
+            }),
+    );
     grants.extend(crate::access::iam::grant_overview_values(
         &iam_state.state,
         &local_target_id,
@@ -23944,11 +23930,186 @@ fn access_overview_response_value_with_identities_and_iam(
     })
 }
 
-pub(crate) fn access_overview_response_body(
+fn current_access_overview_subject(
+    local_target_id: &str,
+    current_principal: Option<&crate::access::iam::AccessPrincipal>,
+) -> (
+    Vec<serde_json::Value>,
+    Vec<serde_json::Value>,
+    Vec<serde_json::Value>,
+) {
+    let Some(principal) = current_principal else {
+        return (
+            vec![serde_json::json!({
+                "id": "principal:current-browser-session",
+                "kind": "browser_session",
+                "kind_label": "Current browser session",
+                "label": "Current browser",
+                "source": "trusted_dashboard_session",
+                "local": true,
+                "account": serde_json::Value::Null,
+                "organization": serde_json::Value::Null,
+                "authn": [{
+                    "kind": "trusted_dashboard_session",
+                    "label": "Trusted dashboard session"
+                }]
+            })],
+            vec![serde_json::json!({
+                "id": format!("grant:current-browser:{local_target_id}:root"),
+                "principal_id": "principal:current-browser-session",
+                "target_id": local_target_id,
+                "kind": "user_client_root",
+                "kind_label": "User/client root",
+                "policy_id": "policy:root",
+                "role": "root",
+                "role_label": "Root",
+                "transport_id": "transport:current-dashboard",
+                "source": "trusted_dashboard_session",
+                "status": "active"
+            })],
+            vec![serde_json::json!({
+                "id": "transport:current-dashboard",
+                "kind": "current_dashboard",
+                "kind_label": "Current dashboard transport",
+                "label": "Current dashboard",
+                "status": "connected",
+                "implementation": "local_mtls_or_hosted_tunnel",
+                "target_id": local_target_id
+            })],
+        );
+    };
+
+    let principal_id = if principal.id.trim().is_empty() {
+        "principal:current-dashboard".to_string()
+    } else {
+        principal.id.clone()
+    };
+    let role_id = if principal.role_id.trim().is_empty() {
+        "role:scoped-human"
+    } else {
+        principal.role_id.as_str()
+    };
+    let role_value = if role_id == "role:root" {
+        "root"
+    } else {
+        role_id
+    };
+    let (grant_kind, grant_kind_label) = match principal.kind.as_str() {
+        "root_session" => ("user_client_root", "User/client root"),
+        "peer_daemon" => ("daemon_peer_profile", "Daemon peer profile"),
+        _ => ("user_client_local_iam", "Local IAM user/client grant"),
+    };
+    let (transport_id, transport_kind, transport_label, implementation) =
+        current_access_overview_transport(principal);
+    (
+        vec![serde_json::json!({
+            "id": principal_id.clone(),
+            "kind": principal.kind.clone(),
+            "kind_label": current_access_overview_principal_kind_label(&principal.kind),
+            "label": principal.label.clone(),
+            "source": principal.source.clone(),
+            "local": true,
+            "account": principal.account.clone(),
+            "organization": principal.organization.clone(),
+            "authn": principal.authn.clone(),
+            "role_id": principal.role_id.clone(),
+            "grant_id": principal.grant_id.clone(),
+            "transport": principal.transport.clone()
+        })],
+        vec![serde_json::json!({
+            "id": principal.grant_id.as_deref().unwrap_or("grant:current-dashboard"),
+            "principal_id": principal_id,
+            "target_id": local_target_id,
+            "kind": grant_kind,
+            "kind_label": grant_kind_label,
+            "policy_id": if role_id == "role:root" { "policy:root" } else { "policy:local-user-client" },
+            "role": role_value,
+            "role_label": current_access_overview_role_label(role_id),
+            "transport_id": transport_id,
+            "source": principal.source.clone(),
+            "status": "active"
+        })],
+        vec![serde_json::json!({
+            "id": transport_id,
+            "kind": transport_kind,
+            "kind_label": transport_label,
+            "label": transport_label,
+            "status": "connected",
+            "implementation": implementation,
+            "target_id": local_target_id
+        })],
+    )
+}
+
+fn current_access_overview_principal_kind_label(kind: &str) -> &'static str {
+    match kind {
+        "root_session" => "Root dashboard session",
+        "browser_certificate" => "Browser certificate",
+        "connect_account" => "Connect account",
+        "human_user" => "Human user",
+        "peer_daemon" => "Peer daemon",
+        _ => "Current access principal",
+    }
+}
+
+fn current_access_overview_role_label(role_id: &str) -> &'static str {
+    match role_id {
+        "role:root" | "root" => "Root",
+        "role:peer-profile" | "peer_profile" => "Peer profile",
+        "role:scoped-human" | "scoped_human" => "Scoped human",
+        "role:observer" | "observer" => "Observer",
+        "role:session-reader" | "session_reader" => "Session reader",
+        "role:terminal" | "terminal" => "Terminal",
+        "role:files-read" | "files_read" => "Files read",
+        "role:files-write" | "files_write" => "Files write",
+        "role:operator" | "operator" => "Operator",
+        _ => "IAM role",
+    }
+}
+
+fn current_access_overview_transport(
+    principal: &crate::access::iam::AccessPrincipal,
+) -> (&'static str, &'static str, &'static str, &'static str) {
+    let source = principal.source.as_str();
+    let transport = principal.transport.as_str();
+    if source == "connect-account" || transport.contains("connect") {
+        (
+            "transport:connect-rendezvous",
+            "connect_rendezvous",
+            "Intendant Connect rendezvous",
+            "hosted rendezvous with daemon-local IAM enforcement",
+        )
+    } else if source == "browser-mtls" || transport == "https" {
+        (
+            "transport:browser-mtls",
+            "browser_mtls",
+            "Browser mTLS",
+            "browser client certificate with daemon-local enforcement",
+        )
+    } else if source.contains("peer") || transport.contains("peer") {
+        (
+            "transport:peer-dashboard-control",
+            "peer_dashboard_control",
+            "Peer dashboard control",
+            "daemon peer identity with peer-profile enforcement",
+        )
+    } else {
+        (
+            "transport:current-dashboard",
+            "current_dashboard",
+            "Current dashboard transport",
+            "local trusted dashboard transport",
+        )
+    }
+}
+
+pub(crate) fn access_overview_response_body_for_principal(
     agent_card: &serde_json::Value,
     registry: Option<&crate::peer::PeerRegistry>,
+    current_principal: &crate::access::iam::AccessPrincipal,
 ) -> String {
-    access_overview_response_value(agent_card, registry).to_string()
+    access_overview_response_value_for_principal(agent_card, registry, Some(current_principal))
+        .to_string()
 }
 
 pub(crate) fn access_iam_state_response_value() -> serde_json::Value {
@@ -36569,8 +36730,13 @@ mod tests {
             status: crate::access::iam::IamStateStatus::Loaded,
         };
 
-        let payload =
-            access_overview_response_value_with_identities_and_iam(&agent_card, None, &[], &loaded);
+        let payload = access_overview_response_value_with_identities_and_iam(
+            &agent_card,
+            None,
+            &[],
+            &loaded,
+            None,
+        );
 
         let principals = payload["principals"].as_array().expect("principals");
         assert!(principals.iter().any(|principal| {
